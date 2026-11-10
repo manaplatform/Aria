@@ -1,0 +1,28 @@
+# Dependencies and package-manager state
+node_modules/
+.pnpm-store/
+
+# Build output and caches
+**/dist/
+**/dist-electron/
+**/out/
+**/release/
+.vite/
+.turbo/
+coverage/
+*.tsbuildinfo
+
+# Local environment files (keep the documented template)
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
