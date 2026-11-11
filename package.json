@@ -7,6 +7,9 @@
     "dev:api": "pnpm --filter @aria/api start:dev",
     "dev:desktop": "pnpm --filter @aria/desktop dev",
     "build": "pnpm --recursive --sort run build",
-    "typecheck": "pnpm --recursive --sort run typecheck"
+    "typecheck": "pnpm --recursive --sort run typecheck",
+    "lint": "pnpm --filter @aria/desktop lint",
+    "test": "pnpm --filter @aria/desktop test",
+    "test:electron": "pnpm --filter @aria/desktop build && pnpm --filter @aria/desktop test:electron"
   }
 }
