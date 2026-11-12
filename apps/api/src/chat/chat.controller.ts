@@ -15,11 +15,15 @@ import type { ChatEvent } from '@aria/shared';
 import { AiService, providerError } from '../ai/ai.service';
 import { ChatRequestDto } from './chat.dto';
 import { LocalApiGuard } from './local-api.guard';
+import { ProvidersService } from '../providers/providers.service';
 
 @Controller('chat')
 @UseGuards(LocalApiGuard)
 export class ChatController {
-  constructor(@Inject(AiService) private readonly ai: AiService) {}
+  constructor(
+    @Inject(AiService) private readonly ai: AiService,
+    @Inject(ProvidersService) private readonly providers: ProvidersService,
+  ) {}
 
   @Get('capabilities')
   capabilities() {
@@ -40,7 +44,7 @@ export class ChatController {
       throw new BadRequestException(
         'Provide a user message and at most 100,000 characters of context.',
       );
-    if (!this.ai.capabilities().configured)
+    if (!process.env.OPENAI_API_KEY?.trim() || !(input.model || this.ai.capabilities().model))
       throw new ServiceUnavailableException(
         'Configure an API key and model in Settings to start chatting.',
       );
@@ -78,7 +82,9 @@ export class ChatController {
     }, 15000);
     try {
       send({ type: 'started' });
-      const result = this.ai.generate(input.messages, controller.signal);
+      const model = input.model || this.ai.capabilities().model;
+      await this.providers.assertModel(model, controller.signal, 'chat');
+      const result = this.ai.generate(input.messages, controller.signal, model);
       let failed = false;
       let hasText = false;
       for await (const part of result.stream) {

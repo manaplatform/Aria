@@ -1,7 +1,11 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
-import type { ProviderSettings, ProviderSettingsInput } from '@aria/shared';
+import type {
+  ProviderConnectionInput,
+  ProviderSettings,
+  ProviderSettingsInput,
+} from '@aria/shared';
 
 const endpoint = z
   .string()
@@ -20,10 +24,25 @@ const endpoint = z
       return false;
     }
   }, 'Enter an HTTP or HTTPS provider endpoint without credentials, a query, or a fragment.');
+export const emptyModels = { chat: '', image: '', speech: '', transcription: '', live: '' };
+const modelId = z.string().trim().max(200);
+export const modelsSchema = z
+  .object({ chat: modelId, image: modelId, speech: modelId, transcription: modelId, live: modelId })
+  .strict();
+export const providerConnectionSchema = z
+  .object({
+    provider: z.literal('openai'),
+    baseUrl: endpoint,
+    apiKey: z.string().trim().max(16000).optional(),
+    removeKey: z.boolean().optional(),
+  })
+  .strict();
 export const providerSettingsSchema = z
   .object({
+    provider: z.literal('openai').default('openai'),
     baseUrl: endpoint,
     model: z.string().trim().max(200),
+    models: modelsSchema.optional(),
     systemPrompt: z.string().max(16000),
     apiKey: z.string().trim().max(16000).optional(),
     removeKey: z.boolean().optional(),
@@ -51,7 +70,12 @@ export class ProviderStorage {
       );
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT')
-        return { baseUrl: 'https://api.openai.com/v1', model: '', systemPrompt: '' };
+        return {
+          provider: 'openai' as const,
+          baseUrl: 'https://api.openai.com/v1',
+          model: '',
+          systemPrompt: '',
+        };
       throw new ProviderConfigurationError(
         'Provider settings could not be read. Your saved file has been preserved.',
       );
@@ -63,10 +87,11 @@ export class ProviderStorage {
     await fs.writeFile(`${filename}.tmp`, JSON.stringify(data), { mode: 0o600 });
     await fs.rename(`${filename}.tmp`, filename);
   }
-  async resolve() {
+  async resolve(draft?: ProviderConnectionInput) {
     const stored = await this.read();
-    let apiKey = this.env.OPENAI_API_KEY?.trim() || '';
-    if (!apiKey && stored.encryptedKey) {
+    if (draft) providerConnectionSchema.parse(draft);
+    let apiKey = this.env.OPENAI_API_KEY?.trim() || draft?.apiKey?.trim() || '';
+    if (!apiKey && stored.encryptedKey && !draft?.removeKey) {
       try {
         const value = await this.cipher.decrypt(Buffer.from(stored.encryptedKey, 'base64'));
         apiKey = value.result;
@@ -81,12 +106,18 @@ export class ProviderStorage {
         );
       }
     }
-    const baseUrl = this.env.OPENAI_BASE_URL?.trim() || stored.baseUrl;
+    const baseUrl = this.env.OPENAI_BASE_URL?.trim() || draft?.baseUrl || stored.baseUrl;
     if (!endpoint.safeParse(baseUrl).success)
       throw new ProviderConfigurationError('The configured provider endpoint is invalid.');
     return {
+      provider: 'openai' as const,
       baseUrl,
-      model: this.env.OPENAI_MODEL?.trim() || stored.model,
+      model: this.env.OPENAI_MODEL?.trim() || stored.models?.chat || stored.model,
+      models: {
+        ...emptyModels,
+        ...stored.models,
+        chat: this.env.OPENAI_MODEL?.trim() || stored.models?.chat || stored.model,
+      },
       systemPrompt: this.env.ARIA_SYSTEM_PROMPT?.trim()
         ? this.env.ARIA_SYSTEM_PROMPT
         : stored.systemPrompt,
@@ -96,8 +127,14 @@ export class ProviderStorage {
   async get(): Promise<ProviderSettings> {
     const stored = await this.read();
     return {
+      provider: 'openai',
       baseUrl: this.env.OPENAI_BASE_URL?.trim() || stored.baseUrl,
-      model: this.env.OPENAI_MODEL?.trim() || stored.model,
+      model: this.env.OPENAI_MODEL?.trim() || stored.models?.chat || stored.model,
+      models: {
+        ...emptyModels,
+        ...stored.models,
+        chat: this.env.OPENAI_MODEL?.trim() || stored.models?.chat || stored.model,
+      },
       systemPrompt: this.env.ARIA_SYSTEM_PROMPT?.trim()
         ? this.env.ARIA_SYSTEM_PROMPT
         : stored.systemPrompt,
@@ -148,8 +185,10 @@ export class ProviderStorage {
       }
     }
     await this.write({
+      provider: 'openai',
       baseUrl: parsed.baseUrl,
-      model: parsed.model,
+      model: parsed.models?.chat ?? parsed.model,
+      models: parsed.models ?? { ...emptyModels, chat: parsed.model },
       systemPrompt: parsed.systemPrompt,
       ...(encryptedKey ? { encryptedKey } : {}),
     });

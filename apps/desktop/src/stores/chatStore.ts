@@ -5,10 +5,14 @@ import type {
   ChatMessage,
   ChatRequest,
   ChatServiceStatus,
+  MediaAsset,
+  OperationInput,
 } from '@aria/shared';
 import { desktop, errorMessage } from '../services/desktop';
 import { flushPersistence, useWorkspaceStore } from './workspaceStore';
 import { notify } from './uiStore';
+import { refreshProvider } from './providerStore';
+import { applyLiveEvent, endLiveVoice, useLiveVoiceStore } from './liveVoiceStore';
 
 export const useChatStore = create<{ status: ChatServiceStatus }>(() => ({
   status: { state: 'starting', configured: false, model: '' },
@@ -21,6 +25,10 @@ export function updateChat(update: (chat: ChatData) => ChatData): void {
   }));
 }
 export function selectChat(id: string | null): void {
+  if (useLiveVoiceStore.getState().phase !== 'idle') {
+    void endLiveVoice().then(() => selectChat(id));
+    return;
+  }
   updateChat((chat) => ({
     ...chat,
     selectedId: id && chat.conversations.some((item) => item.id === id) ? id : null,
@@ -39,6 +47,21 @@ export function setChatDraft(
           ),
         }
       : { ...chat, newDraft: draft },
+  );
+}
+export function setChatAttachments(
+  assets: MediaAsset[],
+  id = useWorkspaceStore.getState().data.chat.selectedId,
+): void {
+  updateChat((chat) =>
+    id
+      ? {
+          ...chat,
+          conversations: chat.conversations.map((item) =>
+            item.id === id ? { ...item, attachments: assets } : item,
+          ),
+        }
+      : { ...chat, newAttachments: assets },
   );
 }
 export function renameChat(id: string, title: string): void {
@@ -82,7 +105,8 @@ export function applyChatEvent(event: ChatEvent): void {
           status: 'streaming',
           content: (next.content + event.text).slice(0, 100000),
         };
-      if (event.type === 'completed') return { ...next, status: 'completed' };
+      if (event.type === 'completed')
+        return { ...next, status: 'completed', ...(event.assets ? { assets: event.assets } : {}) };
       if (event.type === 'stopped') return { ...next, status: 'stopped' };
       return { ...next, status: event.interrupted ? 'interrupted' : 'failed', error: event.error };
     }),
@@ -103,7 +127,8 @@ export function buildChatContext(messages: ChatMessage[]): ChatRequest['messages
       user.role === 'user' &&
       assistant?.role === 'assistant' &&
       assistant.status === 'completed' &&
-      assistant.content
+      assistant.content &&
+      (!assistant.operation || assistant.operation.mode === 'chat')
     )
       pairs.push([
         { role: 'user', content: user.content },
@@ -117,7 +142,7 @@ export function buildChatContext(messages: ChatMessage[]): ChatRequest['messages
     size -= recent.shift()!.reduce((sum, item) => sum + item.content.length, 0);
   return [...recent.flat(), { role: 'user', content: latest.content }];
 }
-async function submitRequest(request: ChatRequest): Promise<void> {
+async function submitRequest(request: ChatRequest, operation?: OperationInput): Promise<void> {
   try {
     await flushPersistence();
     const state = useWorkspaceStore.getState();
@@ -132,7 +157,14 @@ async function submitRequest(request: ChatRequest): Promise<void> {
       )
     )
       return;
-    await desktop().submitChat(request);
+    if (operation && operation.mode !== 'chat')
+      await desktop().submitMedia({
+        ...operation,
+        requestId: request.requestId,
+        conversationId: request.conversationId,
+        assistantMessageId: request.assistantMessageId,
+      });
+    else await desktop().submitChat(request);
   } catch (error) {
     applyChatEvent({
       ...request,
@@ -143,12 +175,24 @@ async function submitRequest(request: ChatRequest): Promise<void> {
     });
   }
 }
-export async function sendChat(): Promise<void> {
+export async function sendChat(options?: Omit<OperationInput, 'prompt'>): Promise<void> {
   const { status } = useChatStore.getState();
-  if (status.state !== 'ready' || !status.configured) return;
+  if (
+    status.state !== 'ready' ||
+    (!status.configured && !options?.model) ||
+    useLiveVoiceStore.getState().phase !== 'idle'
+  )
+    return;
   const chat = useWorkspaceStore.getState().data.chat;
   const selected = chat.conversations.find((item) => item.id === chat.selectedId);
-  const text = (selected?.draft ?? chat.newDraft).trim();
+  const prompt = (selected?.draft ?? chat.newDraft).trim();
+  const attachments = selected?.attachments ?? chat.newAttachments ?? [];
+  const text =
+    prompt ||
+    (options?.mode === 'transcription' && attachments[0]
+      ? `Transcribe ${attachments[0].name}`
+      : '');
+  const operation: OperationInput | undefined = options ? { ...options, prompt } : undefined;
   if (
     !text ||
     chat.messages.some((item) => item.conversationId === selected?.id && generating(item))
@@ -180,12 +224,15 @@ export async function sendChat(): Promise<void> {
     createdAt: now,
     status: 'completed',
     sequence: 0,
+    ...(attachments.length ? { assets: attachments } : {}),
+    ...(operation ? { operation } : {}),
   };
   const assistant: ChatMessage = {
     ...user,
     id: crypto.randomUUID(),
     role: 'assistant',
     content: '',
+    assets: undefined,
     status: 'pending',
   };
   const history = [
@@ -196,47 +243,73 @@ export async function sendChat(): Promise<void> {
     ...current,
     selectedId: conversation.id,
     newDraft: selected ? current.newDraft : '',
+    newAttachments: selected ? current.newAttachments : [],
     conversations: selected
       ? current.conversations.map((item) =>
-          item.id === conversation.id ? { ...item, draft: '', updatedAt: now } : item,
+          item.id === conversation.id
+            ? { ...item, draft: '', attachments: [], updatedAt: now }
+            : item,
         )
       : [...current.conversations, conversation],
     messages: [...current.messages, user, assistant],
   }));
-  await submitRequest({
-    requestId,
-    conversationId: conversation.id,
-    assistantMessageId: assistant.id,
-    messages: buildChatContext(history),
-  });
+  await submitRequest(
+    {
+      requestId,
+      conversationId: conversation.id,
+      assistantMessageId: assistant.id,
+      messages:
+        options?.mode && options.mode !== 'chat'
+          ? [{ role: 'user', content: text }]
+          : buildChatContext(history),
+      ...(options?.model ? { model: options.model } : {}),
+    },
+    operation,
+  );
 }
 export async function regenerateChat(id: string): Promise<void> {
   const { status } = useChatStore.getState();
-  if (status.state !== 'ready' || !status.configured) return;
+  if (status.state !== 'ready' || useLiveVoiceStore.getState().phase !== 'idle') return;
   const chat = useWorkspaceStore.getState().data.chat;
   const history = chat.messages.filter((item) => item.conversationId === id);
   const last = history.at(-1);
-  if (!last || last.role !== 'assistant' || history.some(generating)) return;
+  if (!last || last.role !== 'assistant' || last.liveSessionId || history.some(generating)) return;
   const requestId = crypto.randomUUID();
   updateChat((current) => ({
     ...current,
     messages: current.messages.map((item) =>
       item.id === last.id
-        ? { ...item, requestId, content: '', error: undefined, sequence: 0, status: 'pending' }
+        ? {
+            ...item,
+            requestId,
+            content: '',
+            assets: undefined,
+            error: undefined,
+            sequence: 0,
+            status: 'pending',
+          }
         : item,
     ),
     conversations: current.conversations.map((item) =>
       item.id === id ? { ...item, updatedAt: new Date().toISOString() } : item,
     ),
   }));
-  await submitRequest({
-    requestId,
-    conversationId: id,
-    assistantMessageId: last.id,
-    messages: buildChatContext(history.slice(0, -1)),
-  });
+  await submitRequest(
+    {
+      requestId,
+      conversationId: id,
+      assistantMessageId: last.id,
+      messages: buildChatContext(history.slice(0, -1)),
+      ...(last.operation?.model ? { model: last.operation.model } : {}),
+    },
+    last.operation,
+  );
 }
 export async function stopChat(id: string): Promise<void> {
+  if (useLiveVoiceStore.getState().conversationId === id) {
+    await endLiveVoice();
+    return;
+  }
   const message = useWorkspaceStore
     .getState()
     .data.chat.messages.find((item) => item.conversationId === id && generating(item));
@@ -254,6 +327,7 @@ export async function stopChat(id: string): Promise<void> {
   }
 }
 export async function stopAllChats(): Promise<void> {
+  await endLiveVoice();
   const ids = new Set(
     useWorkspaceStore
       .getState()
@@ -288,9 +362,13 @@ export function bindChatBridge(): () => void {
   let active = true;
   let updated = false;
   const events = window.aria.onChatEvent(applyChatEvent);
+  const liveEvents = window.aria.onLiveEvent?.(applyLiveEvent);
+  void refreshProvider();
   const status = window.aria.onChatStatus((value) => {
     updated = true;
     useChatStore.setState({ status: value });
+    if (value.state === 'ready') void refreshProvider();
+    if (value.state === 'failed') void endLiveVoice();
   });
   void window.aria
     .chatStatus()
@@ -311,6 +389,8 @@ export function bindChatBridge(): () => void {
   return () => {
     active = false;
     events();
+    liveEvents?.();
     status();
+    void endLiveVoice();
   };
 }

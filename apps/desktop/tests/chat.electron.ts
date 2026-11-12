@@ -13,7 +13,12 @@ let page: Page;
 let temporary: string;
 let errors: string[];
 const modifier = process.platform === 'darwin' ? 'Meta' : 'Control';
-async function launch(configured = true, development = false, expectedConfiguration = configured) {
+async function launch(
+  configured = true,
+  development = false,
+  expectedConfiguration = configured,
+  fakeMicrophone = false,
+) {
   const env = Object.fromEntries(
     Object.entries(process.env).filter(
       (entry): entry is [string, string] => entry[1] !== undefined,
@@ -27,7 +32,15 @@ async function launch(configured = true, development = false, expectedConfigurat
   env.ARIA_SYSTEM_PROMPT = '';
   if (development) env.VITE_DEV_SERVER_URL = 'http://127.0.0.1:5174';
   else delete env.VITE_DEV_SERVER_URL;
-  app = await electron.launch({ args: [root], env });
+  app = await electron.launch({
+    args: [
+      ...(fakeMicrophone
+        ? ['--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream']
+        : []),
+      root,
+    ],
+    env,
+  });
   page = await app.firstWindow();
   page.on('pageerror', (error) => errors.push(error.message));
   await expect(page.getByRole('navigation', { name: 'Chat navigation' })).toBeVisible();
@@ -100,7 +113,7 @@ test('opens directly into chat without a project and restores appearance, sideba
     'A draft saved without choosing a folder',
   );
   expect(
-    JSON.parse(await fs.readFile(path.join(temporary, 'aria-v2.json'), 'utf8')).workspaces,
+    JSON.parse(await fs.readFile(path.join(temporary, 'aria-v3.json'), 'utf8')).workspaces,
   ).toEqual([]);
 });
 test('streams through the managed NestJS API, renders Markdown, manages conversations, and stops background replies', async () => {
@@ -241,8 +254,14 @@ test('configures a provider in Settings using native encrypted storage and resto
     return;
   }
   await page.getByLabel('Provider endpoint', { exact: true }).fill(fixture.baseUrl);
-  await page.getByLabel('Model', { exact: true }).fill('fixture-model');
   await page.getByLabel('API key', { exact: true }).fill('test-only-key');
+  await page.getByRole('button', { name: 'Load models', exact: true }).click();
+  await expect(page.getByLabel('Chat model', { exact: true })).toBeEnabled();
+  await page.getByLabel('Chat model', { exact: true }).selectOption('fixture-model');
+  await page.getByLabel('Image model', { exact: true }).selectOption('gpt-image-2.6-flare');
+  await page.getByLabel('Speech model', { exact: true }).selectOption('gpt-realtime-2.1-mini');
+  await page.getByLabel('Transcribe model', { exact: true }).selectOption('gpt-transcribe');
+  await page.getByLabel('Live Voice model', { exact: true }).selectOption('gpt-live-1');
   await page.getByLabel('System instructions', { exact: true }).fill('Give useful answers.');
   await page.getByRole('button', { name: 'Save & reconnect', exact: true }).click();
   await expect(page.getByText('Model settings saved.', { exact: true })).toBeVisible();
@@ -250,6 +269,13 @@ test('configures a provider in Settings using native encrypted storage and resto
   const saved = await fs.readFile(path.join(temporary, 'provider.json'), 'utf8');
   expect(saved).not.toContain('test-only-key');
   expect(JSON.parse(saved).encryptedKey).toBeTruthy();
+  expect(JSON.parse(saved).models).toEqual({
+    chat: 'fixture-model',
+    image: 'gpt-image-2.6-flare',
+    speech: 'gpt-realtime-2.1-mini',
+    transcription: 'gpt-transcribe',
+    live: 'gpt-live-1',
+  });
   await page.getByRole('button', { name: 'Back to chat', exact: true }).click();
   await send('Use my saved provider');
   await expect(page.locator('.from-assistant[data-status="completed"]')).toHaveCount(1);
@@ -261,4 +287,117 @@ test('configures a provider in Settings using native encrypted storage and resto
   await launch(false, false, true);
   await send('The saved key still works');
   await expect(page.locator('.from-assistant[data-status="completed"]')).toHaveCount(2);
+});
+
+test('creates images, edits references, transcribes audio, exports speech, and restores media history', async () => {
+  await launch();
+  await page.getByLabel('Creation mode', { exact: true }).selectOption('image');
+  await page.getByLabel('Image model', { exact: true }).selectOption('gpt-image-2.6-flare');
+  await send('A calm mountain');
+  const image = page.locator('.from-assistant img');
+  await expect(image).toBeVisible();
+  await expect.poll(() => image.evaluate((node: HTMLImageElement) => node.naturalWidth)).toBe(1);
+  const exportPath = path.join(temporary, 'exported-image.png');
+  await app.evaluate(({ dialog }, filePath) => {
+    dialog.showSaveDialog = async () => ({ canceled: false, filePath });
+  }, exportPath);
+  await page.getByRole('button', { name: 'Download', exact: true }).click();
+  await expect
+    .poll(async () => {
+      try {
+        return (await fs.readFile(exportPath)).equals(fixture.png);
+      } catch {
+        return false;
+      }
+    })
+    .toBe(true);
+  await page.getByRole('button', { name: 'Use image', exact: true }).click();
+  await send('Add a little snow');
+  await expect(page.locator('.from-assistant[data-status="completed"]')).toHaveCount(2);
+  expect(fixture.mediaReceived.at(-1)?.path).toBe('/v1/images/edits');
+  await page.getByLabel('Creation mode', { exact: true }).selectOption('transcription');
+  await page.getByLabel('Transcribe model', { exact: true }).selectOption('gpt-transcribe');
+  const recordingPath = path.join(temporary, 'recording.wav');
+  await fs.writeFile(recordingPath, fixture.wav);
+  await app.evaluate(({ dialog }, filePath) => {
+    dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [filePath] });
+  }, recordingPath);
+  await page.getByRole('button', { name: 'Audio file', exact: true }).click();
+  await page.getByRole('button', { name: 'Send message', exact: true }).click();
+  await expect(page.locator('.from-assistant').last()).toContainText(
+    'A transcript from the uploaded audio.',
+  );
+  await page.getByLabel('Creation mode', { exact: true }).selectOption('speech');
+  await page.getByLabel('Speech model', { exact: true }).selectOption('tts-1');
+  await expect(page.getByLabel('Speech voice', { exact: true })).toHaveValue('alloy');
+  await send('A little clarity.');
+  await expect(page.locator('.from-assistant audio')).toBeVisible();
+  await expect
+    .poll(() =>
+      page.locator('.from-assistant audio').evaluate((node: HTMLAudioElement) => node.readyState),
+    )
+    .toBeGreaterThanOrEqual(1);
+  await page.getByLabel('Speech model', { exact: true }).selectOption('gpt-realtime-2.1-mini');
+  await page.getByRole('button', { name: 'Regenerate', exact: true }).click();
+  await expect(page.locator('.from-assistant[data-status="completed"]')).toHaveCount(4);
+  expect(fixture.mediaReceived.at(-1)?.path).toBe('/v1/audio/speech');
+  expect(fixture.mediaReceived.at(-1)?.body).toContain('"model":"tts-1"');
+  await app.close();
+  await launch();
+  await expect(page.locator('.from-assistant img')).toHaveCount(2);
+  await expect(page.locator('.from-assistant audio')).toHaveCount(1);
+  await expect(page.getByRole('alert')).toHaveCount(0);
+  const saved = JSON.parse(await fs.readFile(path.join(temporary, 'aria-v3.json'), 'utf8'));
+  expect(saved.version).toBe(3);
+  expect(JSON.stringify(saved)).not.toContain('base64');
+});
+
+test('cancels media generation and preserves the original model for explicit retry', async () => {
+  await launch();
+  await page.getByLabel('Creation mode', { exact: true }).selectOption('image');
+  await page.getByLabel('Image model', { exact: true }).selectOption('gpt-image-2.6-flare');
+  const cancelled = fixture.cancelled;
+  await send('[slow] mountain');
+  await page.getByRole('button', { name: 'Stop response', exact: true }).click();
+  await expect(page.locator('.from-assistant[data-status="stopped"]')).toHaveCount(1);
+  await expect.poll(() => fixture.cancelled).toBeGreaterThan(cancelled);
+  await send('[fail] image request');
+  await expect(page.locator('.from-assistant[data-status="failed"]')).toHaveCount(1);
+  await expect(page.getByRole('alert')).not.toContainText('secret-response-text');
+  await page.getByRole('button', { name: 'Retry response', exact: true }).click();
+  await expect(page.locator('.from-assistant[data-status="failed"]')).toHaveCount(1);
+});
+
+test('uses a synthetic microphone for GPT-Live, saves captions and assistant audio, and releases the microphone on end', async () => {
+  await launch(true, false, true, true);
+  await page.getByText('Live voice options', { exact: true }).click();
+  await page.getByLabel('Live Voice model', { exact: true }).selectOption('gpt-live-1');
+  await page.getByLabel('Voice backend model', { exact: true }).selectOption('gpt-6-luna');
+  await page.getByRole('button', { name: 'Start live voice conversation', exact: true }).click();
+  await expect(page.getByText('Hello from my microphone.', { exact: true })).toBeVisible();
+  await expect(page.locator('.from-assistant .markdown')).toContainText('Hello from GPT-Live.');
+  await page.getByRole('button', { name: 'Mute microphone', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Unmute microphone', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'End voice conversation', exact: true }).click();
+  await expect(
+    page.getByRole('button', { name: 'Start live voice conversation', exact: true }),
+  ).toBeVisible();
+  await expect(page.locator('.from-assistant audio')).toBeVisible();
+  await expect
+    .poll(() =>
+      page.locator('.from-assistant audio').evaluate((node: HTMLAudioElement) => node.readyState),
+    )
+    .toBeGreaterThanOrEqual(1);
+  await expect(page.getByRole('alert')).toHaveCount(0);
+  await app.close();
+  await launch();
+  await expect(page.locator('.from-assistant .markdown')).toContainText('Hello from GPT-Live.');
+  const saved = JSON.parse(await fs.readFile(path.join(temporary, 'aria-v3.json'), 'utf8'));
+  expect(
+    saved.chat.messages.find((message: { role: string }) => message.role === 'user').assets,
+  ).toBeUndefined();
+  expect(
+    saved.chat.messages.find((message: { role: string }) => message.role === 'assistant').assets[0]
+      .name,
+  ).toBe('aria-live-replies.wav');
 });

@@ -190,7 +190,7 @@ export interface Preferences {
   profileName: string;
 }
 export interface LocalData {
-  version: 2;
+  version: 3;
   workspaces: Workspace[];
   conversations: Conversation[];
   tasks: Task[];
@@ -205,6 +205,7 @@ export interface ChatConversation {
   pinned: boolean;
   createdAt: string;
   updatedAt: string;
+  attachments?: MediaAsset[];
 }
 export type ChatMessageStatus =
   'pending' | 'streaming' | 'completed' | 'stopped' | 'failed' | 'interrupted';
@@ -218,18 +219,25 @@ export interface ChatMessage {
   status: ChatMessageStatus;
   sequence: number;
   error?: string;
+  operation?: OperationInput;
+  assets?: MediaAsset[];
+  liveSessionId?: string;
+  liveConfig?: { model: string; chatModel: string; voice: string };
+  fragments?: { text: string; startMs: number; endMs: number }[];
 }
 export interface ChatData {
   conversations: ChatConversation[];
   messages: ChatMessage[];
   selectedId: string | null;
   newDraft: string;
+  newAttachments?: MediaAsset[];
 }
 export interface ChatRequest {
   requestId: string;
   conversationId: string;
   assistantMessageId: string;
   messages: { role: 'user' | 'assistant'; content: string }[];
+  model?: string;
 }
 export type ChatEvent = {
   requestId: string;
@@ -239,7 +247,7 @@ export type ChatEvent = {
 } & (
   | { type: 'started' }
   | { type: 'delta'; text: string }
-  | { type: 'completed' }
+  | { type: 'completed'; assets?: MediaAsset[] }
   | { type: 'stopped' }
   | { type: 'failed'; error: string; interrupted: boolean }
 );
@@ -257,8 +265,10 @@ export interface ChatServiceStatus {
   error?: string;
 }
 export interface ProviderSettings {
+  provider: ProviderId;
   baseUrl: string;
   model: string;
+  models: ModelSelections;
   systemPrompt: string;
   keyConfigured: boolean;
   encryptionAvailable: boolean;
@@ -268,12 +278,62 @@ export interface ProviderSettings {
   >;
 }
 export interface ProviderSettingsInput {
+  provider?: ProviderId;
   baseUrl: string;
   model: string;
+  models?: ModelSelections;
   systemPrompt: string;
   apiKey?: string;
   removeKey?: boolean;
 }
+export type ProviderId = 'openai';
+export type GenerationMode = 'chat' | 'image' | 'speech' | 'transcription' | 'live';
+export type ModelSelections = Record<GenerationMode, string>;
+export interface ProviderConnectionInput {
+  provider: ProviderId;
+  baseUrl: string;
+  apiKey?: string;
+  removeKey?: boolean;
+}
+export interface ProviderModel {
+  id: string;
+  modes: GenerationMode[];
+  deprecated?: boolean;
+  shutdownDate?: string;
+}
+export interface MediaAsset {
+  id: string;
+  name: string;
+  mimeType: string;
+  size: number;
+}
+export interface OperationInput {
+  mode: Exclude<GenerationMode, 'live'>;
+  model: string;
+  prompt: string;
+  voice?: string;
+  assetIds: string[];
+}
+export interface MediaRequest extends OperationInput {
+  requestId: string;
+  conversationId: string;
+  assistantMessageId: string;
+}
+export interface LiveRequest {
+  sessionId: string;
+  conversationId: string;
+  model: string;
+  chatModel: string;
+  voice: string;
+  messages: ChatRequest['messages'];
+}
+export type LiveEvent = { sessionId: string; conversationId: string } & (
+  | { type: 'ready' }
+  | { type: 'audio'; audio: string }
+  | { type: 'transcript'; role: 'user' | 'assistant'; text: string; startMs: number; endMs: number }
+  | { type: 'ended'; asset?: MediaAsset }
+  | { type: 'failed'; error: string; asset?: MediaAsset }
+);
 export interface InitialState {
   data: LocalData;
   warning?: string;
@@ -319,6 +379,15 @@ export interface DesktopBridge {
   saveProviderSettings(settings: ProviderSettingsInput): Promise<ProviderSettings>;
   restartChatService(): Promise<void>;
   testProvider(): Promise<void>;
+  providerModels(connection?: ProviderConnectionInput): Promise<ProviderModel[]>;
+  chooseMedia(kind: 'image' | 'audio'): Promise<MediaAsset[]>;
+  exportMedia(id: string): Promise<void>;
+  submitMedia(request: MediaRequest): Promise<void>;
+  startLive(request: LiveRequest): Promise<void>;
+  sendLiveAudio(sessionId: string, audio: Uint8Array): void;
+  muteLive(sessionId: string, muted: boolean): Promise<void>;
+  endLive(): Promise<void>;
+  onLiveEvent(callback: (event: LiveEvent) => void): () => void;
   submitChat(request: ChatRequest): Promise<void>;
   cancelChat(requestId: string): Promise<void>;
   onChatEvent(callback: (event: ChatEvent) => void): () => void;

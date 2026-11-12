@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { UtilityProcess } from 'electron';
 import type { ChatEvent, ChatRequest, ChatServiceStatus } from '@aria/shared';
 import { z } from 'zod';
+import WebSocket from 'ws';
 import { chatRequestSchema, readChatEvents } from './chat-protocol';
 import { ProviderConfigurationError, type ProviderStorage } from './provider-storage';
 
@@ -35,6 +36,10 @@ export class ChatService {
     this.status = status;
     this.emitStatus(this.getStatus());
   }
+  assertConversationIdle(conversationId: string): void {
+    if ([...this.requests.values()].some((r) => r.request.conversationId === conversationId))
+      throw new Error('This conversation already has a response in progress.');
+  }
   assertIdle(): void {
     if (this.requests.size)
       throw new Error('Stop active responses before changing the connection.');
@@ -50,7 +55,24 @@ export class ChatService {
     const generation = ++this.generation;
     this.setStatus({ state: 'starting', configured: false, model: '' });
     try {
-      const provider = await this.provider.resolve();
+      let provider: Awaited<ReturnType<ProviderStorage['resolve']>>;
+      let configurationError: string | undefined;
+      try {
+        provider = await this.provider.resolve();
+      } catch (error) {
+        if (!(error instanceof ProviderConfigurationError)) throw error;
+        // Keep the private API available so a replacement key can be discovered and saved.
+        const settings = await this.provider.get();
+        provider = {
+          provider: settings.provider,
+          baseUrl: settings.baseUrl,
+          model: settings.model,
+          models: settings.models,
+          systemPrompt: settings.systemPrompt,
+          apiKey: '',
+        };
+        configurationError = error.message;
+      }
       if (generation !== this.generation) return;
       this.token = randomUUID() + randomUUID();
       const child = this.launch({
@@ -115,7 +137,12 @@ export class ChatService {
       const capabilities = z
         .object({ configured: z.boolean(), model: z.string() })
         .parse(await response.json());
-      if (generation === this.generation) this.setStatus({ state: 'ready', ...capabilities });
+      if (generation === this.generation)
+        this.setStatus({
+          state: 'ready',
+          ...capabilities,
+          ...(configurationError ? { configured: false, error: configurationError } : {}),
+        });
     } catch (error) {
       if (generation === this.generation) {
         this.child?.kill();
@@ -135,9 +162,38 @@ export class ChatService {
   private headers() {
     return { 'Content-Type': 'application/json', Authorization: `Bearer ${this.token}` };
   }
+  async http(route: string, init: RequestInit = {}): Promise<Response> {
+    if (!this.url || this.status.state !== 'ready')
+      throw new Error('Restart the service in Settings before trying again.');
+    const response = await fetch(`${this.url}/${route}`, {
+      ...init,
+      headers: { Authorization: `Bearer ${this.token}`, ...init.headers },
+    });
+    if (!response.ok) {
+      let message = 'The request failed. Check the connection settings and try again.';
+      try {
+        const value = await response.json();
+        if (typeof value.message === 'string' && value.message.length <= 2000)
+          message = value.message;
+      } catch {
+        /* Never surface raw response bodies. */
+      }
+      throw new Error(message);
+    }
+    return response;
+  }
+  voiceSocket(): WebSocket {
+    if (!this.url || this.status.state !== 'ready')
+      throw new Error('Restart the service before starting voice.');
+    return new WebSocket(`${this.url.replace('http:', 'ws:')}/voice`, {
+      headers: { Authorization: `Bearer ${this.token}` },
+      maxPayload: 300000,
+      handshakeTimeout: 15000,
+    });
+  }
   private begin(input: ChatRequest, emit = this.emitEvent): ActiveRequest {
     const request = chatRequestSchema.parse(input);
-    if (this.status.state !== 'ready' || !this.status.configured || !this.url)
+    if (this.status.state !== 'ready' || (!request.model && !this.status.configured) || !this.url)
       throw new Error('Configure your provider in Settings before sending a message.');
     if (
       this.requests.has(request.requestId) ||

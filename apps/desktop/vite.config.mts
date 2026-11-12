@@ -7,6 +7,10 @@ export default defineConfig(({ command }) => {
   const nonce = command === 'serve' ? randomBytes(18).toString('base64') : undefined;
   return {
     base: './',
+    // AudioWorklet modules must remain same-origin files under the renderer CSP.
+    build: {
+      assetsInlineLimit: (file) => (file.endsWith('microphone-worklet.js') ? false : undefined),
+    },
     resolve: { alias: { '@': fileURLToPath(new URL('./src', import.meta.url)) } },
     html: { cspNonce: nonce },
     plugins: [

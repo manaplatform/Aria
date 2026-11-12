@@ -5,12 +5,13 @@ import {
   IsArray,
   IsIn,
   IsNotEmpty,
+  IsOptional,
   IsString,
   MaxLength,
   ValidateNested,
 } from 'class-validator';
 
-class ChatInputDto {
+export class ChatInputDto {
   @IsIn(['user', 'assistant'])
   role!: 'user' | 'assistant';
 
@@ -21,6 +22,11 @@ class ChatInputDto {
 }
 
 export class ChatRequestDto {
+  @IsOptional()
+  @IsString()
+  @MaxLength(200)
+  model?: string;
+
   @IsString()
   @IsNotEmpty()
   @MaxLength(200)

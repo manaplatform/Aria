@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer } from 'electron';
-import type { ChatEvent, ChatServiceStatus, DesktopBridge } from '@aria/shared';
+import type { ChatEvent, ChatServiceStatus, DesktopBridge, LiveEvent } from '@aria/shared';
 
 const bridge: DesktopBridge = {
   platform: process.platform,
@@ -30,6 +30,19 @@ const bridge: DesktopBridge = {
   saveProviderSettings: (settings) => ipcRenderer.invoke('aria:save-provider-settings', settings),
   restartChatService: () => ipcRenderer.invoke('aria:restart-chat-service'),
   testProvider: () => ipcRenderer.invoke('aria:test-provider'),
+  providerModels: (connection) => ipcRenderer.invoke('aria:provider-models', connection),
+  chooseMedia: (kind) => ipcRenderer.invoke('aria:choose-media', kind),
+  exportMedia: (id) => ipcRenderer.invoke('aria:export-media', id),
+  submitMedia: (request) => ipcRenderer.invoke('aria:submit-media', request),
+  startLive: (request) => ipcRenderer.invoke('aria:start-live', request),
+  sendLiveAudio: (id, audio) => ipcRenderer.send('aria:live-audio', id, audio),
+  muteLive: (id, muted) => ipcRenderer.invoke('aria:mute-live', id, muted),
+  endLive: () => ipcRenderer.invoke('aria:end-live'),
+  onLiveEvent: (callback) => {
+    const listener = (_event: Electron.IpcRendererEvent, event: LiveEvent) => callback(event);
+    ipcRenderer.on('aria:live-event', listener);
+    return () => ipcRenderer.removeListener('aria:live-event', listener);
+  },
   submitChat: (request) => ipcRenderer.invoke('aria:submit-chat', request),
   cancelChat: (id) => ipcRenderer.invoke('aria:cancel-chat', id),
   onChatEvent: (callback) => {

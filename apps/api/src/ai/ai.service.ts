@@ -19,7 +19,11 @@ export class AiService {
     };
   }
 
-  generate(messages: ChatRequest['messages'], signal: AbortSignal): ReturnType<typeof streamText> {
+  generate(
+    messages: ChatRequest['messages'],
+    signal: AbortSignal,
+    model = process.env.OPENAI_MODEL!,
+  ): ReturnType<typeof streamText> {
     const baseURL = process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1';
     const official = new URL(baseURL).origin === 'https://api.openai.com';
     const provider = createOpenAICompatible({
@@ -29,10 +33,8 @@ export class AiService {
     });
     return streamText({
       model: official
-        ? createOpenAI({ baseURL, apiKey: process.env.OPENAI_API_KEY }).responses(
-            process.env.OPENAI_MODEL!,
-          )
-        : provider.chatModel(process.env.OPENAI_MODEL!),
+        ? createOpenAI({ baseURL, apiKey: process.env.OPENAI_API_KEY }).responses(model)
+        : provider.chatModel(model),
       ...(official ? { providerOptions: { openai: { store: false } } } : {}),
       system: process.env.ARIA_SYSTEM_PROMPT || DEFAULT_SYSTEM_PROMPT,
       messages,

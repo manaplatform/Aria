@@ -7,6 +7,7 @@ export const chatRequestSchema = z
     requestId: id,
     conversationId: id,
     assistantMessageId: id,
+    model: z.string().min(1).max(200).optional(),
     messages: z
       .array(
         z
