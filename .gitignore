@@ -26,3 +26,9 @@ yarn-debug.log*
 # OS files
 .DS_Store
 Thumbs.db
+
+# Desktop test artifacts
+**/test-results/
+**/playwright-report/
+**/.artifacts/
+**/.vitest/
