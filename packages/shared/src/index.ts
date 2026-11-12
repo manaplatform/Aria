@@ -1,3 +1,18 @@
+import type {
+  ConnectionInput,
+  DiscoveredModel,
+  RegistryInput,
+  RegistrySettings,
+} from './model-registry.js';
+import type {
+  ConductorActivity,
+  ConductorAttempt,
+  ConductorEvent,
+  ConductorRunInfo,
+} from './conductor.js';
+export * from './model-registry.js';
+export * from './conductor.js';
+
 export interface HealthResponse {
   status: 'ok';
 }
@@ -220,8 +235,15 @@ export interface ChatMessage {
   sequence: number;
   error?: string;
   operation?: OperationInput;
+  activity?: ConductorActivity[];
+  attempts?: ConductorAttempt[];
+  run?: ConductorRunInfo;
+  retryConfirmed?: boolean;
+  settingsHelp?: boolean;
+  partial?: boolean;
   assets?: MediaAsset[];
   liveSessionId?: string;
+  delegatedFromVoice?: boolean;
   liveConfig?: { model: string; chatModel: string; voice: string };
   fragments?: { text: string; startMs: number; endMs: number }[];
 }
@@ -237,7 +259,8 @@ export interface ChatRequest {
   conversationId: string;
   assistantMessageId: string;
   messages: { role: 'user' | 'assistant'; content: string }[];
-  model?: string;
+  attachmentIds?: string[];
+  expectedRevision?: string;
 }
 export type ChatEvent = {
   requestId: string;
@@ -245,62 +268,26 @@ export type ChatEvent = {
   assistantMessageId: string;
   sequence: number;
 } & (
-  | { type: 'started' }
-  | { type: 'delta'; text: string }
+  | ConductorEvent
+  | { type: 'asset'; asset: MediaAsset }
   | { type: 'completed'; assets?: MediaAsset[] }
-  | { type: 'stopped' }
-  | { type: 'failed'; error: string; interrupted: boolean }
 );
 export interface ChatCapabilities {
   configured: boolean;
   model: string;
   streaming: true;
   cancellation: true;
-  attachments: false;
+  attachments: boolean;
 }
 export interface ChatServiceStatus {
   state: 'starting' | 'ready' | 'failed';
   configured: boolean;
   model: string;
   error?: string;
+  revision?: string;
+  voiceReady?: boolean;
 }
-export interface ProviderSettings {
-  provider: ProviderId;
-  baseUrl: string;
-  model: string;
-  models: ModelSelections;
-  systemPrompt: string;
-  keyConfigured: boolean;
-  encryptionAvailable: boolean;
-  sources: Record<
-    'baseUrl' | 'model' | 'systemPrompt' | 'apiKey',
-    'environment' | 'settings' | 'default'
-  >;
-}
-export interface ProviderSettingsInput {
-  provider?: ProviderId;
-  baseUrl: string;
-  model: string;
-  models?: ModelSelections;
-  systemPrompt: string;
-  apiKey?: string;
-  removeKey?: boolean;
-}
-export type ProviderId = 'openai';
 export type GenerationMode = 'chat' | 'image' | 'speech' | 'transcription' | 'live';
-export type ModelSelections = Record<GenerationMode, string>;
-export interface ProviderConnectionInput {
-  provider: ProviderId;
-  baseUrl: string;
-  apiKey?: string;
-  removeKey?: boolean;
-}
-export interface ProviderModel {
-  id: string;
-  modes: GenerationMode[];
-  deprecated?: boolean;
-  shutdownDate?: string;
-}
 export interface MediaAsset {
   id: string;
   name: string;
@@ -314,21 +301,19 @@ export interface OperationInput {
   voice?: string;
   assetIds: string[];
 }
-export interface MediaRequest extends OperationInput {
-  requestId: string;
-  conversationId: string;
-  assistantMessageId: string;
-}
 export interface LiveRequest {
   sessionId: string;
   conversationId: string;
-  model: string;
-  chatModel: string;
-  voice: string;
+  assistantMessageId: string;
   messages: ChatRequest['messages'];
 }
 export type LiveEvent = { sessionId: string; conversationId: string } & (
   | { type: 'ready' }
+  | {
+      type: 'conductor';
+      requestId: string;
+      event: ConductorEvent | { type: 'asset'; asset: MediaAsset };
+    }
   | { type: 'audio'; audio: string }
   | { type: 'transcript'; role: 'user' | 'assistant'; text: string; startMs: number; endMs: number }
   | { type: 'ended'; asset?: MediaAsset }
@@ -375,14 +360,14 @@ export interface DesktopBridge {
   openExternal(url: string): Promise<void>;
   chatStatus(): Promise<ChatServiceStatus>;
   onChatStatus(callback: (status: ChatServiceStatus) => void): () => void;
-  providerSettings(): Promise<ProviderSettings>;
-  saveProviderSettings(settings: ProviderSettingsInput): Promise<ProviderSettings>;
   restartChatService(): Promise<void>;
-  testProvider(): Promise<void>;
-  providerModels(connection?: ProviderConnectionInput): Promise<ProviderModel[]>;
-  chooseMedia(kind: 'image' | 'audio'): Promise<MediaAsset[]>;
+  registrySettings(): Promise<RegistrySettings>;
+  saveRegistry(settings: RegistryInput): Promise<RegistrySettings>;
+  discoverModels(connection: ConnectionInput): Promise<DiscoveredModel[]>;
+  verifyModel(connection: ConnectionInput, model: string): Promise<void>;
+  importRegistryEnvironment(): Promise<RegistrySettings>;
+  chooseMedia(kind: 'image' | 'audio' | 'text' | 'any'): Promise<MediaAsset[]>;
   exportMedia(id: string): Promise<void>;
-  submitMedia(request: MediaRequest): Promise<void>;
   startLive(request: LiveRequest): Promise<void>;
   sendLiveAudio(sessionId: string, audio: Uint8Array): void;
   muteLive(sessionId: string, muted: boolean): Promise<void>;

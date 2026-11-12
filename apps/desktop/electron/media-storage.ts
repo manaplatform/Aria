@@ -8,6 +8,7 @@ export const assetSchema = z
     id: z.string().uuid(),
     name: z.string().min(1).max(255),
     mimeType: z.enum([
+      'text/plain',
       'image/png',
       'image/jpeg',
       'image/webp',
@@ -50,8 +51,16 @@ export class MediaStorage {
   private filename(id: string, suffix = '') {
     return path.join(this.directory, `${z.string().uuid().parse(id)}${suffix}`);
   }
+  private textType(bytes: Buffer) {
+    if (
+      bytes.length > 1_000_000 ||
+      new TextDecoder('utf-8', { fatal: true }).decode(bytes).includes('\0')
+    )
+      throw new Error('Choose a UTF-8 text file up to 1 MB.');
+    return 'text/plain';
+  }
   async put(bytes: Buffer, name: string, expected?: string): Promise<MediaAsset> {
-    const mimeType = identifyMedia(bytes);
+    const mimeType = expected === 'text/plain' ? this.textType(bytes) : identifyMedia(bytes);
     if (expected && expected !== mimeType)
       throw new Error('The provider returned an unexpected media format.');
     const asset = assetSchema.parse({
@@ -77,24 +86,69 @@ export class MediaStorage {
         JSON.parse(await fs.readFile(this.filename(id, '.json'), 'utf8')),
       );
       if (asset.id !== id) throw new Error('Mismatched asset.');
-      const bytes = await fs.readFile(this.filename(id));
-      if (bytes.length !== asset.size || identifyMedia(bytes) !== asset.mimeType)
+      const file = await fs.open(this.filename(id), 'r');
+      let bytes: Buffer;
+      try {
+        const stat = await file.stat();
+        if (!stat.isFile() || stat.size !== asset.size) throw new Error('Invalid asset size.');
+        bytes = Buffer.alloc(asset.size);
+        if ((await file.read(bytes, 0, bytes.length, 0)).bytesRead !== asset.size)
+          throw new Error('Incomplete asset.');
+      } finally {
+        await file.close();
+      }
+      if (
+        bytes.length !== asset.size ||
+        (asset.mimeType === 'text/plain' ? this.textType(bytes) : identifyMedia(bytes)) !==
+          asset.mimeType
+      )
         throw new Error('Invalid asset.');
       return { asset, bytes };
     } catch {
       throw new Error('This media file is missing or unreadable.');
     }
   }
-  async import(filename: string, kind: 'image' | 'audio'): Promise<MediaAsset> {
+  async import(filename: string, kind: 'image' | 'audio' | 'text' | 'any'): Promise<MediaAsset> {
     const stat = await fs.stat(filename);
-    if (!stat.isFile() || stat.size > (kind === 'image' ? 20_000_000 : 25_000_000))
-      throw new Error(`Choose a ${kind} file up to ${kind === 'image' ? 20 : 25} MB.`);
+    const isText =
+      kind === 'text' ||
+      (kind === 'any' &&
+        /\.(txt|md|csv|tsv|json|[cm]?[jt]sx?|py|html|css|ya?ml|xml|toml|log|rs|go|java|sql)$/i.test(
+          filename,
+        ));
+    const max = isText ? 1_000_000 : kind === 'image' ? 20_000_000 : 25_000_000;
+    if (!stat.isFile() || stat.size > max)
+      throw new Error(`Choose a supported file up to ${max / 1_000_000} MB.`);
     const bytes = await fs.readFile(filename);
-    const mime = identifyMedia(bytes);
-    if ((kind === 'image') !== mime.startsWith('image/'))
+    const mime = isText ? this.textType(bytes) : identifyMedia(bytes);
+    if (mime.startsWith('image/') && bytes.length > 20_000_000)
+      throw new Error('Choose an image up to 20 MB.');
+    if (
+      (kind === 'image' && !mime.startsWith('image/')) ||
+      (kind === 'audio' && mime.startsWith('image/'))
+    )
       throw new Error(`Choose a supported ${kind} file.`);
-    return this.put(bytes, path.basename(filename));
+    return this.put(bytes, path.basename(filename), mime);
   }
+  async remove(id: string) {
+    await Promise.all([
+      fs.rm(this.filename(id), { force: true }),
+      fs.rm(this.filename(id, '.json'), { force: true }),
+      fs.rm(this.filename(id, '.tmp'), { force: true }),
+    ]);
+  }
+  async pruneUnreferenced(data: LocalData) {
+    const retained = referencedAssets(data);
+    const names = await fs.readdir(this.directory).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') return [];
+      throw error;
+    });
+    for (const name of names) {
+      const id = name.replace(/\.(tmp|json)$/, '');
+      if (z.string().uuid().safeParse(id).success && !retained.has(id)) await this.remove(id);
+    }
+  }
+
   async prune(previous: LocalData, next: LocalData) {
     const retained = referencedAssets(next);
     await Promise.all(

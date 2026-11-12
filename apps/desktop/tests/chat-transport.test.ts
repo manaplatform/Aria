@@ -3,7 +3,12 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import http from 'node:http';
 import type { UtilityProcess } from 'electron';
-import type { ChatEvent, ChatRequest, ChatServiceStatus } from '@aria/shared';
+import {
+  emptyRegistryPolicy,
+  type ChatEvent,
+  type ChatRequest,
+  type ChatServiceStatus,
+} from '@aria/shared';
 import { readChatEvents } from '../electron/chat-protocol';
 import { ChatService } from '../electron/chat-service';
 import { ProviderConfigurationError, type ProviderStorage } from '../electron/provider-storage';
@@ -60,8 +65,10 @@ class Child extends EventEmitter {
     setImmediate(() => this.emit('exit', 0));
     return true;
   }
-  postMessage() {
-    this.kill();
+  registry: unknown;
+  postMessage(value: unknown) {
+    if (value === 'shutdown') this.kill();
+    else this.registry = value;
   }
 }
 let server: http.Server;
@@ -76,6 +83,10 @@ beforeEach(async () => {
   events = [];
   states = [];
   server = http.createServer(async (incoming, response) => {
+    if (incoming.method === 'DELETE') {
+      response.end('{}');
+      return;
+    }
     if (incoming.url === '/chat/capabilities') {
       response.setHeader('Content-Type', 'application/json');
       response.end(JSON.stringify({ configured: true, model: 'test-model' }));
@@ -102,19 +113,22 @@ beforeEach(async () => {
   const port = (server.address() as { port: number }).port;
   const provider = {
     resolve: async () => ({
-      apiKey: 'test-only-key',
-      baseUrl: 'http://localhost/v1',
-      model: 'test-model',
-      systemPrompt: '',
+      ...emptyRegistryPolicy,
+      revision: 'test-revision',
+      connections: [],
     }),
-  } as ProviderStorage;
+  } as unknown as ProviderStorage;
   service = new ChatService(
     provider,
     (env) => {
-      expect(env.OPENAI_API_KEY).toBe('test-only-key');
+      expect(env.OPENAI_API_KEY).toBeUndefined();
       const child = new Child();
       children.push(child);
-      setImmediate(() => child.emit('message', { type: 'ready', port }));
+      setImmediate(() => {
+        child.emit('message', { type: 'configure' });
+        expect(child.registry).toHaveProperty('registry');
+        child.emit('message', { type: 'ready', port });
+      });
       return child as unknown as UtilityProcess;
     },
     (event) => events.push(event),
@@ -176,20 +190,17 @@ it('keeps the private API available for replacement-key discovery when a saved k
     resolve: async () => {
       throw new ProviderConfigurationError('The saved API key could not be unlocked.');
     },
-    get: async () => ({
-      provider: 'openai',
-      baseUrl: 'https://api.openai.com/v1',
-      model: 'saved-model',
-      models: { chat: 'saved-model', image: '', speech: '', transcription: '', live: '' },
-      systemPrompt: '',
-    }),
   } as unknown as ProviderStorage;
   const recovering = new ChatService(
     broken,
     (env) => {
-      expect(env.OPENAI_API_KEY).toBe('');
+      expect(env.OPENAI_API_KEY).toBeUndefined();
       const child = new Child();
-      setImmediate(() => child.emit('message', { type: 'ready', port }));
+      setImmediate(() => {
+        child.emit('message', { type: 'configure' });
+        expect(child.registry).toHaveProperty('registry');
+        child.emit('message', { type: 'ready', port });
+      });
       return child as unknown as UtilityProcess;
     },
     () => undefined,

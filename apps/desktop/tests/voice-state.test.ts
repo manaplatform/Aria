@@ -24,25 +24,15 @@ import {
   muteLiveVoice,
   useLiveVoiceStore,
 } from '../src/stores/liveVoiceStore';
-import { useProviderStore } from '../src/stores/providerStore';
+import { useChatStore } from '../src/stores/chatStore';
 import { useWorkspaceStore, flushPersistence } from '../src/stores/workspaceStore';
 import { emptyData } from '../src/services/desktop';
 beforeEach(() => {
   vi.clearAllMocks();
   capture.open.mockResolvedValue(undefined);
   useWorkspaceStore.setState({ data: emptyData(), ready: true, saveError: null });
-  useProviderStore.setState({
-    selections: {
-      chat: 'gpt-chat-from-api',
-      image: '',
-      speech: '',
-      transcription: '',
-      live: 'gpt-live-from-api',
-    },
-    models: [
-      { id: 'gpt-chat-from-api', modes: ['chat'] },
-      { id: 'gpt-live-from-api', modes: ['live'] },
-    ],
+  useChatStore.setState({
+    status: { state: 'ready', configured: true, model: 'primary', voiceReady: true },
   });
   useLiveVoiceStore.setState({
     phase: 'idle',
@@ -115,7 +105,6 @@ it('saves timestamped captions and assistant audio, mutes capture, and releases 
     content: 'Hello world',
     status: 'completed',
     assets: [asset],
-    liveConfig: { model: 'gpt-live-from-api', chatModel: 'gpt-chat-from-api', voice: 'marin' },
   });
   expect(messages.find((m) => m.role === 'user')?.assets).toBeUndefined();
   expect(capture.close).toHaveBeenCalled();

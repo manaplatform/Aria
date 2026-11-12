@@ -5,6 +5,7 @@ import { NestFactory } from '@nestjs/core';
 import { ValidationPipe } from '@nestjs/common';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import { AppModule } from './app.module';
+import { ModelRegistry } from './providers/model-registry.service';
 
 if (process.env.ARIA_MANAGED !== '1')
   config({ path: process.env.DOTENV_CONFIG_PATH || path.resolve(__dirname, '../../..', '.env') });
@@ -35,6 +36,23 @@ if (require.main === module) {
         };
       }
     ).parentPort;
+    if (managed) {
+      if (!parentPort) throw new Error('The managed API requires its desktop parent.');
+      parentPort.postMessage({ type: 'configure' });
+      await new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('Configuration timed out.')), 10_000);
+        parentPort.on('message', ({ data }) => {
+          if (!data || typeof data !== 'object' || !('registry' in data)) return;
+          clearTimeout(timeout);
+          try {
+            app.get(ModelRegistry).install(data.registry);
+            resolve();
+          } catch {
+            reject(new Error('Invalid registry configuration.'));
+          }
+        });
+      });
+    }
     parentPort?.postMessage({ type: 'ready', port });
     parentPort?.on('message', (event) => {
       if (event.data === 'shutdown') void app.close().then(() => process.exit(0));

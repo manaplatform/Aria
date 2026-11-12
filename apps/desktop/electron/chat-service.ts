@@ -1,10 +1,20 @@
 import { randomUUID } from 'node:crypto';
 import type { UtilityProcess } from 'electron';
-import type { ChatEvent, ChatRequest, ChatServiceStatus } from '@aria/shared';
+import {
+  conductorLimits,
+  emptyRegistryPolicy,
+  type ArtifactReference,
+  type ChatEvent,
+  type ChatRequest,
+  type ChatServiceStatus,
+  type MediaAsset,
+  type RuntimeRegistry,
+} from '@aria/shared';
 import { z } from 'zod';
 import WebSocket from 'ws';
 import { chatRequestSchema, readChatEvents } from './chat-protocol';
 import { ProviderConfigurationError, type ProviderStorage } from './provider-storage';
+import type { MediaStorage } from './media-storage';
 
 interface ActiveRequest {
   request: ChatRequest;
@@ -28,6 +38,7 @@ export class ChatService {
     private readonly launch: (env: NodeJS.ProcessEnv) => UtilityProcess,
     private readonly emitEvent: (event: ChatEvent) => void,
     private readonly emitStatus: (status: ChatServiceStatus) => void,
+    private readonly assets?: MediaStorage,
   ) {}
   getStatus(): ChatServiceStatus {
     return { ...this.status };
@@ -55,35 +66,21 @@ export class ChatService {
     const generation = ++this.generation;
     this.setStatus({ state: 'starting', configured: false, model: '' });
     try {
-      let provider: Awaited<ReturnType<ProviderStorage['resolve']>>;
+      let registry: RuntimeRegistry;
       let configurationError: string | undefined;
       try {
-        provider = await this.provider.resolve();
+        registry = await this.provider.resolve();
       } catch (error) {
         if (!(error instanceof ProviderConfigurationError)) throw error;
-        // Keep the private API available so a replacement key can be discovered and saved.
-        const settings = await this.provider.get();
-        provider = {
-          provider: settings.provider,
-          baseUrl: settings.baseUrl,
-          model: settings.model,
-          models: settings.models,
-          systemPrompt: settings.systemPrompt,
-          apiKey: '',
-        };
+        registry = { ...emptyRegistryPolicy, revision: '', connections: [] };
         configurationError = error.message;
       }
       if (generation !== this.generation) return;
       this.token = randomUUID() + randomUUID();
-      const child = this.launch({
-        ...process.env,
-        ARIA_MANAGED: '1',
-        ARIA_INTERNAL_TOKEN: this.token,
-        OPENAI_BASE_URL: provider.baseUrl,
-        OPENAI_MODEL: provider.model,
-        OPENAI_API_KEY: provider.apiKey,
-        ARIA_SYSTEM_PROMPT: provider.systemPrompt,
-      });
+      const env = { ...process.env };
+      for (const key of ['OPENAI_API_KEY', 'OPENAI_MODEL', 'OPENAI_BASE_URL', 'ARIA_SYSTEM_PROMPT'])
+        delete env[key];
+      const child = this.launch({ ...env, ARIA_MANAGED: '1', ARIA_INTERNAL_TOKEN: this.token });
       this.child = child;
       const port = await new Promise<number>((resolve, reject) => {
         const timer = setTimeout(() => {
@@ -91,6 +88,15 @@ export class ChatService {
           reject(new Error('Startup timed out.'));
         }, 15000);
         const ready = (message: unknown) => {
+          if (
+            message &&
+            typeof message === 'object' &&
+            'type' in message &&
+            message.type === 'configure'
+          ) {
+            child.postMessage({ registry });
+            return;
+          }
           const parsed = z
             .object({ type: z.literal('ready'), port: z.number().int().min(1).max(65535) })
             .safeParse(message);
@@ -125,7 +131,7 @@ export class ChatService {
         this.setStatus({
           state: 'failed',
           configured: false,
-          model: provider.model,
+          model: this.status.model,
           error: 'The chat service stopped. Restart it in Settings, then retry your response.',
         });
       });
@@ -135,7 +141,12 @@ export class ChatService {
       });
       if (!response.ok) throw new Error('Service did not become ready.');
       const capabilities = z
-        .object({ configured: z.boolean(), model: z.string() })
+        .object({
+          configured: z.boolean(),
+          model: z.string(),
+          revision: z.string().optional(),
+          voiceReady: z.boolean().optional(),
+        })
         .parse(await response.json());
       if (generation === this.generation)
         this.setStatus({
@@ -167,6 +178,7 @@ export class ChatService {
       throw new Error('Restart the service in Settings before trying again.');
     const response = await fetch(`${this.url}/${route}`, {
       ...init,
+      redirect: 'error',
       headers: { Authorization: `Bearer ${this.token}`, ...init.headers },
     });
     if (!response.ok) {
@@ -193,8 +205,12 @@ export class ChatService {
   }
   private begin(input: ChatRequest, emit = this.emitEvent): ActiveRequest {
     const request = chatRequestSchema.parse(input);
-    if (this.status.state !== 'ready' || (!request.model && !this.status.configured) || !this.url)
+    if (this.status.state !== 'ready' || !this.status.configured || !this.url)
       throw new Error('Configure your provider in Settings before sending a message.');
+    if (request.expectedRevision && this.status.revision !== request.expectedRevision)
+      throw new Error('The AI Models configuration changed. Send again to use current settings.');
+    if (this.requests.size >= conductorLimits.turns)
+      throw new Error('Aria is handling too many turns. Stop a response or try again shortly.');
     if (
       this.requests.has(request.requestId) ||
       [...this.requests.values()].some(
@@ -221,8 +237,11 @@ export class ChatService {
   private async consume(active: ActiveRequest): Promise<void> {
     const { request, controller } = active;
     let terminal = false;
+    let failure = 'The response was interrupted. Check the connection and send it again.';
+    const artifacts = new Map<string, string>();
     try {
-      const response = await fetch(`${this.url}/chat/stream`, {
+      if (request.attachmentIds?.length) await this.stage(request, controller.signal);
+      const response = await this.http('chat/stream', {
         method: 'POST',
         headers: this.headers(),
         body: JSON.stringify(request),
@@ -249,15 +268,38 @@ export class ChatService {
           active.length += event.text.length;
           if (active.length > 100000) throw new Error('Response exceeded the local message limit.');
         }
+        if (event.type === 'reset') active.length = 0;
         if (active.stopped) break;
-        active.emit(event);
+        if (event.type === 'artifact') {
+          const asset = await this.importArtifact(
+            request.requestId,
+            event.artifact,
+            controller.signal,
+          );
+          if (active.stopped) break;
+          artifacts.set(event.artifact.id, asset.id);
+          active.emit({
+            type: 'asset',
+            asset,
+            requestId: event.requestId,
+            conversationId: event.conversationId,
+            assistantMessageId: event.assistantMessageId,
+            sequence: event.sequence,
+          });
+        } else if (event.type === 'activity' && event.activity.resultId) {
+          active.emit({
+            ...event,
+            activity: { ...event.activity, resultId: artifacts.get(event.activity.resultId) },
+          });
+        } else active.emit(event);
         if (['completed', 'failed', 'stopped'].includes(event.type)) {
           terminal = true;
           break;
         }
       }
-    } catch {
-      /* Keep the partial response and send one terminal event below. */
+    } catch (error) {
+      if (error instanceof Error && !controller.signal.aborted)
+        failure = error.message.slice(0, 2000);
     } finally {
       if (!terminal)
         active.emit({
@@ -269,12 +311,13 @@ export class ChatService {
             ? { type: 'stopped' as const }
             : {
                 type: 'failed' as const,
-                error: 'The response was interrupted. Check your connection and retry.',
+                error: failure,
                 interrupted: true,
               }),
         });
       controller.abort();
       this.requests.delete(request.requestId);
+      void this.releaseAssets(request.requestId);
     }
   }
   async cancel(requestId: string): Promise<void> {
@@ -287,34 +330,71 @@ export class ChatService {
   async cancelAll(): Promise<void> {
     await Promise.all([...this.requests.keys()].map((id) => this.cancel(id)));
   }
-  async testProvider(): Promise<void> {
-    this.assertIdle();
-    let result: ChatEvent | undefined;
-    const requestId = randomUUID();
-    const active = this.begin(
-      {
-        requestId,
-        conversationId: `test-${requestId}`,
-        assistantMessageId: randomUUID(),
-        messages: [{ role: 'user', content: 'Reply with OK.' }],
-      },
-      (event) => {
-        result = event;
-      },
-    );
-    const timeout = setTimeout(() => {
-      void this.cancel(requestId);
-    }, 15000);
-    try {
-      await active.done;
-    } finally {
-      clearTimeout(timeout);
+  private async stage(request: ChatRequest, signal: AbortSignal) {
+    if (!this.assets) throw new Error('Local attachments are unavailable.');
+    const form = new FormData();
+    const metadata: MediaAsset[] = [];
+    for (const id of request.attachmentIds ?? []) {
+      signal.throwIfAborted();
+      const { asset, bytes } = await this.assets.get(id);
+      metadata.push(asset);
+      form.append('files', new Blob([new Uint8Array(bytes)], { type: asset.mimeType }), id);
     }
-    if (result?.type !== 'completed')
-      throw new Error(
-        result?.type === 'failed' ? result.error : 'The provider test did not complete.',
-      );
+    form.set('metadata', JSON.stringify(metadata));
+    const response = await this.http(`chat/${encodeURIComponent(request.requestId)}/attachments`, {
+      method: 'POST',
+      body: form,
+      signal,
+    });
+    await response.body?.cancel();
   }
+
+  async importArtifact(requestId: string, artifact: ArtifactReference, signal?: AbortSignal) {
+    if (!this.assets) throw new Error('Local artifact storage is unavailable.');
+    const response = await this.http(
+      `chat/${encodeURIComponent(requestId)}/artifacts/${artifact.id}`,
+      { signal },
+    );
+    const mime = response.headers.get('content-type')?.split(';')[0];
+    if (!response.body || mime !== artifact.mimeType) {
+      await response.body?.cancel();
+      throw new Error('Aria received an unexpected artifact format.');
+    }
+    const reader = response.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let bytes = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        bytes += value.byteLength;
+        if (bytes > artifact.size || bytes > conductorLimits.artifactBytes)
+          throw new Error('Aria received an oversized artifact.');
+        chunks.push(value);
+      }
+    } finally {
+      await reader.cancel().catch(() => undefined);
+      reader.releaseLock();
+    }
+    signal?.throwIfAborted();
+    if (bytes !== artifact.size) throw new Error('The artifact download was incomplete.');
+    const asset = await this.assets.put(Buffer.concat(chunks), artifact.name, mime);
+    if (signal?.aborted) {
+      await this.assets.remove(asset.id);
+      signal.throwIfAborted();
+    }
+    return asset;
+  }
+
+  async releaseAssets(requestId: string) {
+    await this.http(`chat/${encodeURIComponent(requestId)}/assets`, {
+      method: 'DELETE',
+      signal: AbortSignal.timeout(3000),
+    })
+      .then((response) => response.body?.cancel())
+      .catch(() => undefined);
+  }
+
   async restart(): Promise<void> {
     this.assertIdle();
     if (this.starting) await this.starting;

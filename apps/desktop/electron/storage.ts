@@ -1,3 +1,4 @@
+import { activitySchema, conductorAttemptSchema, endActivity, runInfoSchema } from '@aria/shared';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
@@ -127,6 +128,13 @@ const chatSchema = z
           sequence: z.number().int().nonnegative(),
           error: z.string().max(2000).optional(),
           operation: operationSchema.optional(),
+          activity: z.array(activitySchema).max(12).optional(),
+          attempts: z.array(conductorAttemptSchema).max(2).optional(),
+          run: runInfoSchema.optional(),
+          retryConfirmed: z.boolean().optional(),
+          settingsHelp: z.boolean().optional(),
+          partial: z.boolean().optional(),
+          delegatedFromVoice: z.boolean().optional(),
           assets: z.array(assetSchema).max(4).optional(),
           liveSessionId: id.optional(),
           liveConfig: z.object({ model: id, chatModel: id, voice: id }).strict().optional(),
@@ -250,7 +258,9 @@ export class LocalStorage {
           ? {
               ...message,
               status: 'interrupted',
-              error: 'Aria closed before this response finished. You can retry it.',
+              error: 'Aria closed before this response finished. You can send it again.',
+              retryConfirmed: false,
+              activity: endActivity(message.activity),
             }
           : message,
       );

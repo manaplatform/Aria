@@ -1,47 +1,26 @@
 import { create } from 'zustand';
-import type {
-  GenerationMode,
-  ModelSelections,
-  ProviderModel,
-  ProviderSettings,
-} from '@aria/shared';
+import type { RegistrySettings } from '@aria/shared';
 import { desktop, errorMessage } from '../services/desktop';
-const defaults: ModelSelections = { chat: '', image: '', speech: '', transcription: '', live: '' };
-interface ProviderState {
-  settings: ProviderSettings | null;
-  models: ProviderModel[];
-  selections: ModelSelections;
+
+export const useProviderStore = create<{
+  settings: RegistrySettings | null;
   loading: boolean;
   error: string;
-  select: (mode: GenerationMode, id: string) => void;
+}>(() => ({ settings: null, loading: false, error: '' }));
+
+let generation = 0;
+export function installRegistrySettings(settings: RegistrySettings) {
+  generation++;
+  useProviderStore.setState({ settings, loading: false, error: '' });
 }
-export const useProviderStore = create<ProviderState>((set) => ({
-  settings: null,
-  models: [],
-  selections: defaults,
-  loading: false,
-  error: '',
-  select: (mode, id) => set((state) => ({ selections: { ...state.selections, [mode]: id } })),
-}));
-let revision = 0;
 export async function refreshProvider() {
-  const current = ++revision;
-  useProviderStore.setState({ loading: true, error: '', models: [] });
+  const current = ++generation;
+  useProviderStore.setState({ loading: true, error: '' });
   try {
-    const settings = await desktop().providerSettings();
-    if (current !== revision) return;
-    useProviderStore.setState({
-      settings,
-      selections: {
-        ...defaults,
-        ...settings.models,
-        chat: settings.models?.chat || settings.model,
-      },
-    });
-    const models = settings.keyConfigured ? await desktop().providerModels() : [];
-    if (current === revision) useProviderStore.setState({ models, loading: false });
+    const settings = await desktop().registrySettings();
+    if (current === generation) installRegistrySettings(settings);
   } catch (error) {
-    if (current === revision)
-      useProviderStore.setState({ loading: false, error: errorMessage(error), models: [] });
+    if (current === generation)
+      useProviderStore.setState({ loading: false, error: errorMessage(error) });
   }
 }

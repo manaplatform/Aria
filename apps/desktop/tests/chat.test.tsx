@@ -20,7 +20,6 @@ import {
   stopChat,
   useChatStore,
 } from '../src/stores/chatStore';
-import { useProviderStore } from '../src/stores/providerStore';
 import { useLiveVoiceStore } from '../src/stores/liveVoiceStore';
 import { conversationDateGroup } from '../src/hooks/useConversations';
 
@@ -28,12 +27,6 @@ let requests: ChatRequest[];
 beforeEach(() => {
   requests = [];
   useLiveVoiceStore.setState({ phase: 'idle', sessionId: null, conversationId: null });
-  useProviderStore.setState({
-    models: [{ id: 'test-model', modes: ['chat'] }],
-    selections: { chat: 'test-model', image: '', speech: '', transcription: '', live: '' },
-    loading: false,
-    error: '',
-  });
   window.aria = {
     platform: 'darwin',
     save: vi.fn().mockResolvedValue(undefined),
@@ -153,7 +146,7 @@ it('offers actionable failure and retry without fabricating assistant content', 
   mount();
   expect(screen.getByRole('alert')).toHaveTextContent('Connection unavailable');
   expect(useWorkspaceStore.getState().data.chat.messages[1].content).toBe('');
-  expect(screen.getByRole('button', { name: 'Retry response' })).toBeEnabled();
+  expect(screen.getByRole('button', { name: 'Send again' })).toBeEnabled();
 });
 it('searches message contents and supports rename, pin, and confirmed deletion', async () => {
   const user = userEvent.setup();

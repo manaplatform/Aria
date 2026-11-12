@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { endActivity } from '@aria/shared';
 import type {
   ChatData,
   ChatEvent,
@@ -6,12 +7,10 @@ import type {
   ChatRequest,
   ChatServiceStatus,
   MediaAsset,
-  OperationInput,
 } from '@aria/shared';
 import { desktop, errorMessage } from '../services/desktop';
 import { flushPersistence, useWorkspaceStore } from './workspaceStore';
 import { notify } from './uiStore';
-import { refreshProvider } from './providerStore';
 import { applyLiveEvent, endLiveVoice, useLiveVoiceStore } from './liveVoiceStore';
 
 export const useChatStore = create<{ status: ChatServiceStatus }>(() => ({
@@ -98,17 +97,48 @@ export function applyChatEvent(event: ChatEvent): void {
     messages: current.messages.map((item) => {
       if (item.id !== message.id) return item;
       const next = { ...item, sequence: event.sequence };
-      if (event.type === 'started') return { ...next, status: 'streaming' };
+      if (event.type === 'started') return { ...next, status: 'streaming', run: event.run };
+      if (event.type === 'reset') return { ...next, content: '' };
       if (event.type === 'delta')
         return {
           ...next,
           status: 'streaming',
           content: (next.content + event.text).slice(0, 100000),
         };
+      if (event.type === 'activity') {
+        const activity = next.activity ?? [];
+        const previous = activity.find((item) => item.stepId === event.activity.stepId);
+        return {
+          ...next,
+          activity: previous
+            ? activity.map((item) =>
+                item.stepId === event.activity.stepId ? event.activity : item,
+              )
+            : [...activity, event.activity].slice(0, 12),
+        };
+      }
+      if (event.type === 'artifact') return next;
+      if (event.type === 'asset')
+        return { ...next, assets: [...(next.assets ?? []), event.asset].slice(0, 4) };
       if (event.type === 'completed')
-        return { ...next, status: 'completed', ...(event.assets ? { assets: event.assets } : {}) };
-      if (event.type === 'stopped') return { ...next, status: 'stopped' };
-      return { ...next, status: event.interrupted ? 'interrupted' : 'failed', error: event.error };
+        return {
+          ...next,
+          status: 'completed',
+          ...('assets' in event ? { assets: event.assets } : {}),
+          ...('run' in event ? { run: event.run, partial: event.partial } : {}),
+        };
+      const settleActivity = endActivity(next.activity);
+      if (event.type === 'stopped')
+        return { ...next, status: 'stopped', activity: settleActivity, retryConfirmed: false };
+      return {
+        ...next,
+        status: event.interrupted ? 'interrupted' : 'failed',
+        error: event.error,
+        activity: settleActivity,
+        run: event.run ?? next.run,
+        settingsHelp: event.settingsHelp,
+        retryConfirmed: Boolean(event.run && !event.run.billableChildStarted),
+      };
     }),
   }));
 }
@@ -142,7 +172,7 @@ export function buildChatContext(messages: ChatMessage[]): ChatRequest['messages
     size -= recent.shift()!.reduce((sum, item) => sum + item.content.length, 0);
   return [...recent.flat(), { role: 'user', content: latest.content }];
 }
-async function submitRequest(request: ChatRequest, operation?: OperationInput): Promise<void> {
+async function submitRequest(request: ChatRequest): Promise<void> {
   try {
     await flushPersistence();
     const state = useWorkspaceStore.getState();
@@ -157,14 +187,7 @@ async function submitRequest(request: ChatRequest, operation?: OperationInput): 
       )
     )
       return;
-    if (operation && operation.mode !== 'chat')
-      await desktop().submitMedia({
-        ...operation,
-        requestId: request.requestId,
-        conversationId: request.conversationId,
-        assistantMessageId: request.assistantMessageId,
-      });
-    else await desktop().submitChat(request);
+    await desktop().submitChat(request);
   } catch (error) {
     applyChatEvent({
       ...request,
@@ -175,11 +198,11 @@ async function submitRequest(request: ChatRequest, operation?: OperationInput): 
     });
   }
 }
-export async function sendChat(options?: Omit<OperationInput, 'prompt'>): Promise<void> {
+export async function sendChat(): Promise<void> {
   const { status } = useChatStore.getState();
   if (
     status.state !== 'ready' ||
-    (!status.configured && !options?.model) ||
+    !status.configured ||
     useLiveVoiceStore.getState().phase !== 'idle'
   )
     return;
@@ -187,12 +210,7 @@ export async function sendChat(options?: Omit<OperationInput, 'prompt'>): Promis
   const selected = chat.conversations.find((item) => item.id === chat.selectedId);
   const prompt = (selected?.draft ?? chat.newDraft).trim();
   const attachments = selected?.attachments ?? chat.newAttachments ?? [];
-  const text =
-    prompt ||
-    (options?.mode === 'transcription' && attachments[0]
-      ? `Transcribe ${attachments[0].name}`
-      : '');
-  const operation: OperationInput | undefined = options ? { ...options, prompt } : undefined;
+  const text = prompt || (attachments.length ? 'See attached files.' : '');
   if (
     !text ||
     chat.messages.some((item) => item.conversationId === selected?.id && generating(item))
@@ -225,7 +243,6 @@ export async function sendChat(options?: Omit<OperationInput, 'prompt'>): Promis
     status: 'completed',
     sequence: 0,
     ...(attachments.length ? { assets: attachments } : {}),
-    ...(operation ? { operation } : {}),
   };
   const assistant: ChatMessage = {
     ...user,
@@ -253,27 +270,49 @@ export async function sendChat(options?: Omit<OperationInput, 'prompt'>): Promis
       : [...current.conversations, conversation],
     messages: [...current.messages, user, assistant],
   }));
-  await submitRequest(
-    {
-      requestId,
-      conversationId: conversation.id,
-      assistantMessageId: assistant.id,
-      messages:
-        options?.mode && options.mode !== 'chat'
-          ? [{ role: 'user', content: text }]
-          : buildChatContext(history),
-      ...(options?.model ? { model: options.model } : {}),
-    },
-    operation,
-  );
+  await submitRequest({
+    requestId,
+    conversationId: conversation.id,
+    assistantMessageId: assistant.id,
+    messages: buildChatContext(history),
+    attachmentIds: attachments.map((asset) => asset.id),
+  });
 }
-export async function regenerateChat(id: string): Promise<void> {
+export async function regenerateChat(id: string, expectedRevision?: string): Promise<void> {
   const { status } = useChatStore.getState();
-  if (status.state !== 'ready' || useLiveVoiceStore.getState().phase !== 'idle') return;
+  if (
+    status.state !== 'ready' ||
+    !status.configured ||
+    useLiveVoiceStore.getState().phase !== 'idle'
+  )
+    return;
   const chat = useWorkspaceStore.getState().data.chat;
   const history = chat.messages.filter((item) => item.conversationId === id);
   const last = history.at(-1);
-  if (!last || last.role !== 'assistant' || last.liveSessionId || history.some(generating)) return;
+  if (
+    !last ||
+    last.role !== 'assistant' ||
+    last.liveSessionId ||
+    last.delegatedFromVoice ||
+    history.some(generating)
+  )
+    return;
+  if (
+    expectedRevision &&
+    (!last.retryConfirmed ||
+      last.run?.revision !== expectedRevision ||
+      status.revision !== expectedRevision)
+  )
+    return;
+  const attempts = [...(last.attempts ?? [])];
+  if (last.run)
+    attempts.push({
+      requestId: last.requestId,
+      run: last.run,
+      activity: last.activity ?? [],
+      outcome:
+        last.status === 'pending' || last.status === 'streaming' ? 'interrupted' : last.status,
+    });
   const requestId = crypto.randomUUID();
   updateChat((current) => ({
     ...current,
@@ -284,6 +323,13 @@ export async function regenerateChat(id: string): Promise<void> {
             requestId,
             content: '',
             assets: undefined,
+            operation: undefined,
+            run: undefined,
+            activity: undefined,
+            attempts: attempts.slice(-2),
+            partial: undefined,
+            retryConfirmed: undefined,
+            settingsHelp: undefined,
             error: undefined,
             sequence: 0,
             status: 'pending',
@@ -294,16 +340,15 @@ export async function regenerateChat(id: string): Promise<void> {
       item.id === id ? { ...item, updatedAt: new Date().toISOString() } : item,
     ),
   }));
-  await submitRequest(
-    {
-      requestId,
-      conversationId: id,
-      assistantMessageId: last.id,
-      messages: buildChatContext(history.slice(0, -1)),
-      ...(last.operation?.model ? { model: last.operation.model } : {}),
-    },
-    last.operation,
-  );
+  const user = history.at(-2);
+  await submitRequest({
+    requestId,
+    conversationId: id,
+    assistantMessageId: last.id,
+    expectedRevision,
+    messages: buildChatContext(history.slice(0, -1)),
+    attachmentIds: user?.assets?.map((asset) => asset.id) ?? user?.operation?.assetIds ?? [],
+  });
 }
 export async function stopChat(id: string): Promise<void> {
   if (useLiveVoiceStore.getState().conversationId === id) {
@@ -317,7 +362,14 @@ export async function stopChat(id: string): Promise<void> {
   updateChat((chat) => ({
     ...chat,
     messages: chat.messages.map((item) =>
-      item.id === message.id ? { ...item, status: 'stopped' } : item,
+      item.id === message.id
+        ? {
+            ...item,
+            status: 'stopped',
+            activity: endActivity(item.activity),
+            retryConfirmed: false,
+          }
+        : item,
     ),
   }));
   try {
@@ -363,11 +415,9 @@ export function bindChatBridge(): () => void {
   let updated = false;
   const events = window.aria.onChatEvent(applyChatEvent);
   const liveEvents = window.aria.onLiveEvent?.(applyLiveEvent);
-  void refreshProvider();
   const status = window.aria.onChatStatus((value) => {
     updated = true;
     useChatStore.setState({ status: value });
-    if (value.state === 'ready') void refreshProvider();
     if (value.state === 'failed') void endLiveVoice();
   });
   void window.aria

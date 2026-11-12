@@ -17,11 +17,17 @@ import { mkdirSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { LocalStorage, localDataSchema } from './storage';
-import { ProviderStorage, providerSettingsSchema } from './provider-storage';
+import { ProviderStorage } from './provider-storage';
+import {
+  connectionInputSchema,
+  endActivity,
+  identifier,
+  modelCapabilitySchema,
+  registryInputSchema,
+} from '@aria/shared';
 import { ChatService } from './chat-service';
 import { MediaStorage } from './media-storage';
-import { MediaService, mediaRequestSchema, liveRequestSchema } from './media-service';
-import { providerConnectionSchema } from './provider-storage';
+import { MediaService, liveRequestSchema } from './media-service';
 import { chatRequestSchema } from './chat-protocol';
 import {
   checkHealth,
@@ -85,10 +91,14 @@ function validateSender(event: IpcMainInvokeEvent): void {
 const catalogSchema = z
   .array(
     z.object({
-      id: z.string().min(1).max(200),
-      modes: z.array(z.enum(['chat', 'image', 'speech', 'transcription', 'live'])),
-      deprecated: z.boolean().optional(),
-      shutdownDate: z.string().optional(),
+      id: identifier,
+      capabilities: z.array(modelCapabilitySchema).max(12),
+      source: z.enum(['provider', 'documentation', 'unknown']),
+      transport: z.enum(['realtime', 'speech-api', 'inline-png', 'base64-image']).optional(),
+      voices: z.array(z.string().max(40)).max(24).optional(),
+      contextTokens: z.number().nonnegative().optional(),
+      inputCost: z.number().nonnegative().optional(),
+      outputCost: z.number().nonnegative().optional(),
     }),
   )
   .max(10000);
@@ -96,14 +106,23 @@ async function loadModels(connection: { provider: 'openai'; baseUrl: string; api
   const response = await chat.http('providers/models', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      provider: connection.provider,
-      baseUrl: connection.baseUrl,
-      apiKey: connection.apiKey,
-    }),
+    body: JSON.stringify(connection),
     signal: AbortSignal.timeout(20000),
   });
   return catalogSchema.parse(await response.json());
+}
+async function changeRegistry<T>(save: () => Promise<T>) {
+  if (configuring) throw new Error('AI Models settings are already being saved.');
+  chat.assertIdle();
+  media.assertIdle();
+  configuring = true;
+  try {
+    const saved = await save();
+    await chat.restart();
+    return saved;
+  } finally {
+    configuring = false;
+  }
 }
 function registerIpc(): void {
   const handle = (channel: string, fn: (...args: unknown[]) => unknown) =>
@@ -135,7 +154,9 @@ function registerIpc(): void {
             ? {
                 ...message,
                 status: 'interrupted',
-                error: 'This response was interrupted. You can retry it.',
+                error: 'This response was interrupted. You can send it again.',
+                retryConfirmed: false,
+                activity: endActivity(message.activity),
               }
             : message,
         ),
@@ -206,110 +227,119 @@ function registerIpc(): void {
   handle('aria:copy', (text) => clipboard.writeText(z.string().max(10_000_000).parse(text)));
   handle('aria:open-external', (url) => shell.openExternal(safeExternalUrl(string.parse(url))));
   handle('aria:chat-status', () => chat.getStatus());
-  handle('aria:provider-settings', () => provider.get());
-  handle('aria:save-provider-settings', async (input) => {
-    if (configuring) throw new Error('Connection settings are already being saved.');
-    chat.assertIdle();
-    media.assertIdle();
-    const parsed = providerSettingsSchema.parse(input);
-    configuring = true;
-    try {
-      const effective = await provider.resolve({
-        provider: parsed.provider,
-        baseUrl: parsed.baseUrl,
-        apiKey: parsed.apiKey,
-        removeKey: parsed.removeKey,
-      });
-      if (effective.apiKey) {
-        const models = await loadModels(effective);
-        const selections = parsed.models ?? { chat: parsed.model };
-        const selected = {
-          ...selections,
-          chat: process.env.OPENAI_MODEL?.trim() || selections.chat,
-        };
-        if (
-          Object.entries(selected).some(
-            ([mode, id]) =>
-              id &&
-              !models.some(
-                (m) =>
-                  m.id === id &&
-                  (m.modes.length === 0 ||
-                    m.modes.includes(
-                      mode as 'chat' | 'image' | 'speech' | 'transcription' | 'live',
-                    )),
-              ),
-          )
-        )
-          throw new Error(
-            'A selected model is unavailable. Refresh models and select a replacement.',
-          );
-      }
-      const settings = await provider.save(parsed);
-      await chat.restart();
-      return settings;
-    } finally {
-      configuring = false;
-    }
+  handle('aria:registry-settings', () => provider.get());
+  handle('aria:save-registry', (input) =>
+    changeRegistry(() => provider.save(registryInputSchema.parse(input), loadModels)),
+  );
+  handle('aria:import-registry-environment', () =>
+    changeRegistry(() => provider.importEnvironment()),
+  );
+  handle('aria:restart-chat-service', () => changeRegistry(async () => undefined));
+  handle('aria:discover-models', async (input) => {
+    if (configuring) throw new Error('Wait for settings to finish saving.');
+    return loadModels(await provider.preview(connectionInputSchema.parse(input)));
   });
-  handle('aria:restart-chat-service', async () => {
-    if (configuring) throw new Error('Wait for connection settings to finish saving.');
-    media.assertIdle();
-    await chat.restart();
-  });
-  handle('aria:test-provider', async () => {
-    if (configuring) throw new Error('Wait for connection settings to finish saving.');
-    media.assertIdle();
-    await chat.testProvider();
+  handle('aria:verify-model', async (input, id) => {
+    if (configuring) throw new Error('Wait for settings to finish saving.');
+    const draft = connectionInputSchema.parse(input);
+    const model = identifier.parse(id);
+    const connection = await provider.preview(draft);
+    const response = await chat.http('providers/verify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...connection, model }),
+      signal: AbortSignal.timeout(20000),
+    });
+    z.object({ verified: z.literal(true) }).parse(await response.json());
+    provider.markVerified(draft, connection.apiKey, model);
   });
   handle('aria:submit-chat', (input) => {
     if (configuring) throw new Error('Wait for connection settings to finish saving.');
     const parsed = chatRequestSchema.parse(input);
-    media.assertConversationIdle(parsed.conversationId);
+    media.assertIdle();
+    if (parsed.attachmentIds?.length) {
+      const messages = initial.data.chat.messages.filter(
+        (message) => message.conversationId === parsed.conversationId,
+      );
+      const assistant = messages.at(-1);
+      const latest = messages.at(-2);
+      if (
+        assistant?.id !== parsed.assistantMessageId ||
+        assistant.requestId !== parsed.requestId ||
+        latest?.role !== 'user' ||
+        parsed.attachmentIds.some(
+          (id) =>
+            !latest.assets?.some((asset) => asset.id === id) &&
+            !latest.operation?.assetIds.includes(id),
+        )
+      )
+        throw new Error('Attach the files to this turn before sending them.');
+    }
     chat.submit(parsed);
   });
-  handle('aria:cancel-chat', async (id) => {
-    const parsed = z.string().min(1).max(200).parse(id);
-    await Promise.all([chat.cancel(parsed), media.cancel(parsed)]);
-  });
-  handle('aria:provider-models', async (input) => {
-    if (configuring) throw new Error('Wait for settings to finish saving.');
-    return loadModels(
-      await provider.resolve(
-        input === undefined ? undefined : providerConnectionSchema.parse(input),
-      ),
-    );
-  });
+  handle('aria:cancel-chat', (id) => chat.cancel(identifier.parse(id)));
   handle('aria:choose-media', async (kind) => {
-    const parsed = z.enum(['image', 'audio']).parse(kind);
+    const parsed = z.enum(['image', 'audio', 'text', 'any']).parse(kind);
     const result = await dialog.showOpenDialog(mainWindow!, {
-      title: parsed === 'image' ? 'Choose reference images' : 'Choose audio to transcribe',
-      properties: parsed === 'image' ? ['openFile', 'multiSelections'] : ['openFile'],
+      title: 'Attach files to this message',
+      properties: ['openFile', 'multiSelections'],
       filters: [
         {
-          name: parsed === 'image' ? 'Images' : 'Audio',
-          extensions:
-            parsed === 'image'
-              ? ['png', 'jpg', 'jpeg', 'webp']
-              : ['flac', 'mp3', 'mp4', 'mpeg', 'mpga', 'm4a', 'ogg', 'wav', 'webm'],
+          name: 'Images, audio, and text',
+          extensions: [
+            'png',
+            'jpg',
+            'jpeg',
+            'webp',
+            'flac',
+            'mp3',
+            'mp4',
+            'mpeg',
+            'mpga',
+            'm4a',
+            'ogg',
+            'wav',
+            'webm',
+            'txt',
+            'md',
+            'csv',
+            'tsv',
+            'json',
+            'ts',
+            'js',
+            'py',
+            'tsx',
+            'jsx',
+            'html',
+            'css',
+            'yaml',
+            'yml',
+            'xml',
+            'toml',
+            'log',
+            'rs',
+            'go',
+            'java',
+            'sql',
+          ],
         },
       ],
     });
     if (result.canceled) return [];
-    if (result.filePaths.length > (parsed === 'image' ? 4 : 1))
-      throw new Error('Choose up to four images or one audio file.');
-    return Promise.all(result.filePaths.map((filename) => assets.import(filename, parsed)));
+    if (result.filePaths.length > 4) throw new Error('Choose up to four attachments.');
+    const imported = [];
+    try {
+      for (const filename of result.filePaths) imported.push(await assets.import(filename, parsed));
+      return imported;
+    } catch (error) {
+      await Promise.allSettled(imported.map((asset) => assets.remove(asset.id)));
+      throw error;
+    }
   });
   handle('aria:export-media', async (id) => {
     const { asset, bytes } = await assets.get(z.string().uuid().parse(id));
     const result = await dialog.showSaveDialog(mainWindow!, { defaultPath: asset.name });
     if (!result.canceled && result.filePath) await fs.writeFile(result.filePath, bytes);
-  });
-  handle('aria:submit-media', (input) => {
-    if (configuring) throw new Error('Wait for settings to finish saving.');
-    const parsed = mediaRequestSchema.parse(input);
-    chat.assertConversationIdle(parsed.conversationId);
-    media.submit(parsed);
   });
   handle('aria:start-live', async (input) => {
     if (configuring) throw new Error('Wait for settings to finish saving.');
@@ -414,6 +444,7 @@ app
     storage = new LocalStorage(directory);
     initial = await storage.load();
     assets = new MediaStorage(directory);
+    if (!initial.warning) await assets.pruneUnreferenced(initial.data).catch(() => undefined);
     protocol.handle('aria-media', async (request) => {
       try {
         const url = new URL(request.url);
@@ -425,6 +456,7 @@ app
           'Cache-Control': 'no-store',
           'Accept-Ranges': 'bytes',
           'Content-Security-Policy': "default-src 'none'",
+          'X-Content-Type-Options': 'nosniff',
         };
         const range = request.headers.get('range');
         if (range) {
@@ -450,7 +482,9 @@ app
       }
     });
     provider = new ProviderStorage(directory, {
-      available: () => safeStorage.isAsyncEncryptionAvailable(),
+      available: async () =>
+        (await safeStorage.isAsyncEncryptionAvailable()) &&
+        (process.platform !== 'linux' || safeStorage.getSelectedStorageBackend() !== 'basic_text'),
       encrypt: (value) => safeStorage.encryptStringAsync(value),
       decrypt: (value) => safeStorage.decryptStringAsync(value),
     });
@@ -470,12 +504,10 @@ app
         if (mainWindow && !mainWindow.webContents.isDestroyed())
           mainWindow.webContents.send('aria:chat-status-update', status);
       },
-    );
-    media = new MediaService(
-      chat,
       assets,
-      (event) => mainWindow?.webContents.send('aria:chat-event', event),
-      (event) => mainWindow?.webContents.send('aria:live-event', event),
+    );
+    media = new MediaService(chat, assets, (event) =>
+      mainWindow?.webContents.send('aria:live-event', event),
     );
     registerIpc();
     createWindow();

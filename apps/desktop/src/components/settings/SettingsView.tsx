@@ -1,5 +1,5 @@
-import { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useEffect, useState } from 'react';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { ArrowLeft, ArrowUpRight, Check, Monitor, Moon, Sun, UserRound } from 'lucide-react';
 import { useWorkspaceStore } from '../../stores/workspaceStore';
 import { Button, Field } from '../ui';
@@ -10,6 +10,10 @@ export default function SettingsView() {
   const update = useWorkspaceStore((state) => state.preferences);
   const [name, setName] = useState(preferences.profileName);
   const navigate = useNavigate();
+  const { hash } = useLocation();
+  useEffect(() => {
+    if (hash === '#ai-models') document.getElementById('ai-models')?.scrollIntoView?.();
+  }, [hash]);
   const modifier = window.aria?.platform === 'darwin' ? '⌘' : 'Ctrl';
   return (
     <div className="page-scroll chat-settings">

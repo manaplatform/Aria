@@ -1,5 +1,10 @@
 import { z } from 'zod';
-import type { ChatEvent } from '@aria/shared';
+import {
+  activitySchema,
+  artifactReferenceSchema,
+  runInfoSchema,
+  type ChatEvent,
+} from '@aria/shared';
 
 const id = z.string().min(1).max(200);
 export const chatRequestSchema = z
@@ -7,7 +12,8 @@ export const chatRequestSchema = z
     requestId: id,
     conversationId: id,
     assistantMessageId: id,
-    model: z.string().min(1).max(200).optional(),
+    attachmentIds: z.array(z.string().uuid()).max(4).optional(),
+    expectedRevision: z.string().max(100).optional(),
     messages: z
       .array(
         z
@@ -20,6 +26,7 @@ export const chatRequestSchema = z
   .strict()
   .refine(
     (request) =>
+      new Set(request.attachmentIds).size === (request.attachmentIds?.length ?? 0) &&
       request.messages.at(-1)?.role === 'user' &&
       request.messages.every((message) => message.content.trim()) &&
       request.messages.reduce((sum, message) => sum + message.content.length, 0) <= 100000,
@@ -32,15 +39,35 @@ const envelope = z.object({
   assistantMessageId: id,
   sequence: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
 });
-const eventSchema = z.discriminatedUnion('type', [
-  envelope.extend({ type: z.literal('started') }).strict(),
-  envelope.extend({ type: z.literal('delta'), text: z.string().max(100000) }).strict(),
-  envelope.extend({ type: z.literal('completed') }).strict(),
-  envelope.extend({ type: z.literal('stopped') }).strict(),
-  envelope
-    .extend({ type: z.literal('failed'), error: z.string().max(2000), interrupted: z.boolean() })
-    .strict(),
+export const conductorEventSchema = z.discriminatedUnion('type', [
+  z.strictObject({ type: z.literal('started'), run: runInfoSchema.optional() }),
+  z.strictObject({ type: z.literal('delta'), text: z.string().max(100000) }),
+  z.strictObject({ type: z.literal('reset') }),
+  z.strictObject({ type: z.literal('activity'), activity: activitySchema }),
+  z.strictObject({ type: z.literal('artifact'), artifact: artifactReferenceSchema }),
+  z.strictObject({
+    type: z.literal('completed'),
+    partial: z.boolean().optional(),
+    run: runInfoSchema.optional(),
+  }),
+  z.strictObject({ type: z.literal('stopped') }),
+  z.strictObject({
+    type: z.literal('failed'),
+    error: z.string().max(2000),
+    interrupted: z.boolean(),
+    run: runInfoSchema.optional(),
+    settingsHelp: z.boolean().optional(),
+  }),
 ]);
+
+function parseEvent(input: unknown): ChatEvent {
+  const raw = z.record(z.string(), z.unknown()).parse(input);
+  const { requestId, conversationId, assistantMessageId, sequence, ...payload } = raw;
+  return {
+    ...envelope.parse({ requestId, conversationId, assistantMessageId, sequence }),
+    ...conductorEventSchema.parse(payload),
+  };
+}
 
 /** Decode across arbitrary byte/frame boundaries; comments are SSE heartbeats. */
 export async function* readChatEvents(body: ReadableStream<Uint8Array>): AsyncGenerator<ChatEvent> {
@@ -61,7 +88,7 @@ export async function* readChatEvents(body: ReadableStream<Uint8Array>): AsyncGe
           .filter((line) => line.startsWith('data:'))
           .map((line) => line.slice(5).replace(/^ /, ''))
           .join('\n');
-        if (data) yield eventSchema.parse(JSON.parse(data));
+        if (data) yield parseEvent(JSON.parse(data));
       }
       if (buffer.length > 250000) throw new Error('Chat stream frame is too large.');
       if (done) {
