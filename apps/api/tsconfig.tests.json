@@ -1,0 +1,11 @@
+{
+  "extends": "./tsconfig.build.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "rootDir": "../..",
+    "types": ["node"]
+  },
+  "include": ["tests", "../../tests/provider-fixture.ts", "vitest.config.mts"]
+}

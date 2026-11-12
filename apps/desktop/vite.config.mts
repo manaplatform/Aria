@@ -16,8 +16,16 @@ export default defineConfig(({ command }) => {
         ? [
             {
               name: 'aria-dev-csp',
-              transformIndexHtml: (html: string) =>
-                html.replace("script-src 'self'", `script-src 'self' 'nonce-${nonce}'`),
+              transformIndexHtml: (
+                html: string,
+                context: { server?: { config: { server: { port?: number } } } },
+              ) =>
+                html
+                  .replace("script-src 'self'", `script-src 'self' 'nonce-${nonce}'`)
+                  .replace(
+                    'ws://127.0.0.1:5173',
+                    `ws://127.0.0.1:${context.server?.config.server.port ?? 5173}`,
+                  ),
             },
           ]
         : []),

@@ -86,7 +86,10 @@ export default function Settings() {
           <div className="settings-section-heading row">
             <div>
               <h2>Backend connection</h2>
-              <p>Health checks are available. AI services are not implemented.</p>
+              <p>
+                This connection is for legacy workspace integrations. General chat uses its own
+                managed service.
+              </p>
             </div>
             <Badge tone={health?.reachable ? 'success' : 'neutral'}>
               {health?.reachable ? 'API reachable' : 'Disconnected'}

@@ -1,13 +1,14 @@
 import type { DesktopBridge, LocalData } from '@aria/shared';
 export const emptyData = (): LocalData => ({
-  version: 1,
+  version: 2,
   workspaces: [],
   conversations: [],
   tasks: [],
   plans: [],
+  chat: { conversations: [], messages: [], selectedId: null, newDraft: '' },
   preferences: {
     theme: 'dark',
-    route: '/home',
+    route: '/chat',
     activeWorkspaceId: null,
     sidebarCollapsed: false,
     rightOpen: true,
@@ -15,6 +16,8 @@ export const emptyData = (): LocalData => ({
     sectionHeights: {},
     collapsedSections: [],
     apiUrl: 'http://localhost:3000',
+    chatSidebarCollapsed: false,
+    profileName: 'You',
   },
 });
 export function desktop(): DesktopBridge {
@@ -22,7 +25,10 @@ export function desktop(): DesktopBridge {
   return window.aria;
 }
 export const errorMessage = (error: unknown): string =>
-  error instanceof Error ? error.message : String(error);
+  (error instanceof Error ? error.message : String(error)).replace(
+    /^Error invoking remote method 'aria:[a-z-]+': (?:Error: )?/,
+    '',
+  );
 export async function copyText(text: string): Promise<void> {
   if (window.aria) await window.aria.copy(text);
   else await navigator.clipboard.writeText(text);

@@ -170,7 +170,7 @@ export function HistoryPage() {
               key={conversation.id}
               onClick={() => {
                 useWorkspaceStore.getState().selectConversation(conversation.id);
-                navigate('/workspace');
+                navigate('/advanced/workspace');
               }}
             >
               <FileText size={18} />
@@ -197,7 +197,9 @@ export function HistoryPage() {
                 : 'Your saved drafts will appear here as you work.'
             }
             action={
-              workspace && <Button onClick={() => navigate('/workspace')}>Open workspace</Button>
+              workspace && (
+                <Button onClick={() => navigate('/advanced/workspace')}>Open workspace</Button>
+              )
             }
           />
         )}

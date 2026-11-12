@@ -1,15 +1,12 @@
 import { Component, lazy, Suspense, useEffect, type ErrorInfo, type ReactNode } from 'react';
 import { HashRouter, Navigate, Route, Routes } from 'react-router-dom';
-import DesktopShell from './components/layout/DesktopShell';
+import ChatLayout from './components/layout/ChatLayout';
 import { Button, ErrorState, Skeleton, TooltipProvider } from './components/ui';
 import { flushPersistence, initializeWorkspace, useWorkspaceStore } from './stores/workspaceStore';
-import { disconnectWorkspace } from './stores/executionStore';
-import { useConnectionStore } from './stores/connectionStore';
-import { AgentsPage, HistoryPage, TasksPage, TerminalPage } from './pages/WorkPages';
-const Home = lazy(() => import('./pages/Home'));
-const ChatWorkspace = lazy(() => import('./components/chat/ChatWorkspace'));
-const Knowledge = lazy(() => import('./pages/Knowledge'));
-const Settings = lazy(() => import('./pages/Settings'));
+import { bindChatBridge, stopAllChats } from './stores/chatStore';
+const ChatView = lazy(() => import('./components/chat/ChatView'));
+const SettingsView = lazy(() => import('./components/settings/SettingsView'));
+const LegacyWorkspace = lazy(() => import('./pages/LegacyWorkspace'));
 class ErrorBoundary extends Component<{ children: ReactNode }, { error: string | null }> {
   state = { error: null as string | null };
   static getDerivedStateFromError(error: Error) {
@@ -36,6 +33,7 @@ function Application() {
   useEffect(
     () =>
       window.aria?.onBeforeClose(async () => {
+        await stopAllChats();
         await flushPersistence();
         if (useWorkspaceStore.getState().saveError)
           throw new Error(useWorkspaceStore.getState().saveError!);
@@ -44,19 +42,13 @@ function Application() {
   );
   useEffect(() => {
     void initializeWorkspace();
-    const focus = () => {
-      void useConnectionStore
-        .getState()
-        .check(useWorkspaceStore.getState().data.preferences.apiUrl);
-    };
-    const timer = setInterval(focus, 30000);
-    window.addEventListener('focus', focus);
-    void initializeWorkspace().then(focus);
+    const flush = () => void flushPersistence();
+    window.addEventListener('blur', flush);
     return () => {
-      clearInterval(timer);
-      window.removeEventListener('focus', focus);
+      window.removeEventListener('blur', flush);
     };
   }, []);
+  useEffect(() => (ready ? bindChatBridge() : undefined), [ready]);
   useEffect(() => {
     const query = window.matchMedia('(prefers-color-scheme: dark)');
     const apply = () => {
@@ -67,12 +59,6 @@ function Application() {
     query.addEventListener('change', apply);
     return () => query.removeEventListener('change', apply);
   }, [theme]);
-  // Disconnect on actual window disposal; StrictMode's initial effect replay must not tear down the shared adapter.
-  useEffect(() => {
-    const close = () => disconnectWorkspace();
-    window.addEventListener('unload', close);
-    return () => window.removeEventListener('unload', close);
-  }, []);
   if (error) return <ErrorState message={error} retry={() => window.location.reload()} />;
   if (!ready)
     return (
@@ -82,21 +68,16 @@ function Application() {
     );
   return (
     <HashRouter>
-      <DesktopShell>
-        <Suspense fallback={<Skeleton />}>
-          <Routes>
-            <Route path="/home" element={<Home />} />
-            <Route path="/workspace" element={<ChatWorkspace />} />
-            <Route path="/agents" element={<AgentsPage />} />
-            <Route path="/tasks" element={<TasksPage />} />
-            <Route path="/terminal" element={<TerminalPage />} />
-            <Route path="/knowledge" element={<Knowledge />} />
-            <Route path="/history" element={<HistoryPage />} />
-            <Route path="/settings" element={<Settings />} />
-            <Route path="*" element={<Navigate to="/home" replace />} />
-          </Routes>
-        </Suspense>
-      </DesktopShell>
+      <Suspense fallback={<Skeleton />}>
+        <Routes>
+          <Route element={<ChatLayout />}>
+            <Route path="/chat" element={<ChatView />} />
+            <Route path="/settings" element={<SettingsView />} />
+          </Route>
+          <Route path="/advanced/*" element={<LegacyWorkspace />} />
+          <Route path="*" element={<Navigate to="/chat" replace />} />
+        </Routes>
+      </Suspense>
     </HashRouter>
   );
 }
