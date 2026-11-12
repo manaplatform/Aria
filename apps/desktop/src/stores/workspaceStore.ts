@@ -226,9 +226,14 @@ export function activeConversation(
 }
 let bootstrap: Promise<void> | undefined;
 let saveTimer: ReturnType<typeof setTimeout> | undefined;
+let checkpointTimer: ReturnType<typeof setTimeout> | undefined;
 let dirty = false;
 let persistenceQueue: Promise<void> = Promise.resolve();
 export function flushPersistence(): Promise<void> {
+  if (checkpointTimer) {
+    clearTimeout(checkpointTimer);
+    checkpointTimer = undefined;
+  }
   if (saveTimer) {
     clearTimeout(saveTimer);
     saveTimer = undefined;
@@ -251,6 +256,10 @@ export function flushPersistence(): Promise<void> {
 useWorkspaceStore.subscribe((state, previous) => {
   if (!state.ready || state.data === previous.data) return;
   dirty = true;
+  // Continuous streaming must not postpone persistence until the response ends.
+  checkpointTimer ??= setTimeout(() => {
+    void flushPersistence();
+  }, 2000);
   if (saveTimer) clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
     void flushPersistence();
@@ -263,13 +272,11 @@ export function initializeWorkspace(): Promise<void> {
         ? await desktop().load()
         : {
             data: emptyData(),
-            warning: 'Browser preview: open Aria Desktop to access local projects and persistence.',
+            warning: 'Browser preview: open Aria Desktop for AI chat and local persistence.',
           };
-      if (!window.location.hash || window.location.hash === '#/')
-        window.location.hash = initial.data.preferences.route;
+      window.location.hash = '/chat';
       useWorkspaceStore.setState({ data: initial.data, ready: true });
       if (initial.warning) notify(initial.warning, true);
-      await connectWorkspace(initial.data.preferences.activeWorkspaceId ?? '', false);
     } catch (error) {
       useWorkspaceStore.setState({ ready: true, loadError: errorMessage(error) });
     }

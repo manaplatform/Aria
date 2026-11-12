@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer } from 'electron';
-import type { DesktopBridge } from '@aria/shared';
+import type { ChatEvent, ChatServiceStatus, DesktopBridge } from '@aria/shared';
 
 const bridge: DesktopBridge = {
   platform: process.platform,
@@ -25,5 +25,27 @@ const bridge: DesktopBridge = {
   health: (url) => ipcRenderer.invoke('aria:health', url),
   copy: (text) => ipcRenderer.invoke('aria:copy', text),
   openExternal: (url) => ipcRenderer.invoke('aria:open-external', url),
+  chatStatus: () => ipcRenderer.invoke('aria:chat-status'),
+  providerSettings: () => ipcRenderer.invoke('aria:provider-settings'),
+  saveProviderSettings: (settings) => ipcRenderer.invoke('aria:save-provider-settings', settings),
+  restartChatService: () => ipcRenderer.invoke('aria:restart-chat-service'),
+  testProvider: () => ipcRenderer.invoke('aria:test-provider'),
+  submitChat: (request) => ipcRenderer.invoke('aria:submit-chat', request),
+  cancelChat: (id) => ipcRenderer.invoke('aria:cancel-chat', id),
+  onChatEvent: (callback) => {
+    const listener = (_event: Electron.IpcRendererEvent, event: ChatEvent) => callback(event);
+    ipcRenderer.on('aria:chat-event', listener);
+    return () => {
+      ipcRenderer.removeListener('aria:chat-event', listener);
+    };
+  },
+  onChatStatus: (callback) => {
+    const listener = (_event: Electron.IpcRendererEvent, status: ChatServiceStatus) =>
+      callback(status);
+    ipcRenderer.on('aria:chat-status-update', listener);
+    return () => {
+      ipcRenderer.removeListener('aria:chat-status-update', listener);
+    };
+  },
 };
 contextBridge.exposeInMainWorld('aria', bridge);

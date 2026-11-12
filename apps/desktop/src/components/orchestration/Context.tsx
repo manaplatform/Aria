@@ -69,14 +69,14 @@ export function RepositoryContext() {
       <div>
         <File size={15} />
         <span>Files</span>
-        <button onClick={() => navigate('/knowledge')}>
+        <button onClick={() => navigate('/advanced/knowledge')}>
           {conversation?.attachments.length ?? 0} attached · Browse files
         </button>
       </div>
       <div>
         <BookOpen size={15} />
         <span>Docs</span>
-        <button onClick={() => navigate('/knowledge')}>Project documents</button>
+        <button onClick={() => navigate('/advanced/knowledge')}>Project documents</button>
       </div>
       <div>
         <Layers size={15} />

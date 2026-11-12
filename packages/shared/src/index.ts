@@ -186,14 +186,93 @@ export interface Preferences {
   sectionHeights: Record<string, number>;
   collapsedSections: string[];
   apiUrl: string;
+  chatSidebarCollapsed: boolean;
+  profileName: string;
 }
 export interface LocalData {
-  version: 1;
+  version: 2;
   workspaces: Workspace[];
   conversations: Conversation[];
   tasks: Task[];
   plans: Plan[];
   preferences: Preferences;
+  chat: ChatData;
+}
+export interface ChatConversation {
+  id: string;
+  title: string;
+  draft: string;
+  pinned: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+export type ChatMessageStatus =
+  'pending' | 'streaming' | 'completed' | 'stopped' | 'failed' | 'interrupted';
+export interface ChatMessage {
+  id: string;
+  conversationId: string;
+  requestId: string;
+  role: 'user' | 'assistant';
+  content: string;
+  createdAt: string;
+  status: ChatMessageStatus;
+  sequence: number;
+  error?: string;
+}
+export interface ChatData {
+  conversations: ChatConversation[];
+  messages: ChatMessage[];
+  selectedId: string | null;
+  newDraft: string;
+}
+export interface ChatRequest {
+  requestId: string;
+  conversationId: string;
+  assistantMessageId: string;
+  messages: { role: 'user' | 'assistant'; content: string }[];
+}
+export type ChatEvent = {
+  requestId: string;
+  conversationId: string;
+  assistantMessageId: string;
+  sequence: number;
+} & (
+  | { type: 'started' }
+  | { type: 'delta'; text: string }
+  | { type: 'completed' }
+  | { type: 'stopped' }
+  | { type: 'failed'; error: string; interrupted: boolean }
+);
+export interface ChatCapabilities {
+  configured: boolean;
+  model: string;
+  streaming: true;
+  cancellation: true;
+  attachments: false;
+}
+export interface ChatServiceStatus {
+  state: 'starting' | 'ready' | 'failed';
+  configured: boolean;
+  model: string;
+  error?: string;
+}
+export interface ProviderSettings {
+  baseUrl: string;
+  model: string;
+  systemPrompt: string;
+  keyConfigured: boolean;
+  encryptionAvailable: boolean;
+  sources: Record<
+    'baseUrl' | 'model' | 'systemPrompt' | 'apiKey',
+    'environment' | 'settings' | 'default'
+  >;
+}
+export interface ProviderSettingsInput {
+  baseUrl: string;
+  model: string;
+  systemPrompt: string;
+  apiKey?: string;
+  removeKey?: boolean;
 }
 export interface InitialState {
   data: LocalData;
@@ -234,4 +313,13 @@ export interface DesktopBridge {
   health(baseUrl: string): Promise<HealthResult>;
   copy(text: string): Promise<void>;
   openExternal(url: string): Promise<void>;
+  chatStatus(): Promise<ChatServiceStatus>;
+  onChatStatus(callback: (status: ChatServiceStatus) => void): () => void;
+  providerSettings(): Promise<ProviderSettings>;
+  saveProviderSettings(settings: ProviderSettingsInput): Promise<ProviderSettings>;
+  restartChatService(): Promise<void>;
+  testProvider(): Promise<void>;
+  submitChat(request: ChatRequest): Promise<void>;
+  cancelChat(requestId: string): Promise<void>;
+  onChatEvent(callback: (event: ChatEvent) => void): () => void;
 }

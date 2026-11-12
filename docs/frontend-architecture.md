@@ -1,92 +1,45 @@
-# Aria desktop frontend
+# Aria desktop architecture
 
-The frontend is implemented in the existing Electron + React 18 + Vite monorepo. Native window frames, context isolation, disabled renderer Node integration, and the NestJS health API are preserved. The desktop does not require the API to start.
+## Chat-first renderer
 
-## Available behavior
+The primary routes are `/chat` and `/settings`. Startup always enters chat, restoring the selected conversation or a welcome screen. Projects are never required. Chat layout, sidebar, conversation list/menus, welcome prompts, message rendering, composer, and settings are separate typed React components. Zustand supplies runtime chat status; the existing workspace store remains the single owner of all persisted application data.
 
-| Area       | Local projects                                                  | Opt-in sample workspace                                                                        |
-| ---------- | --------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| Projects   | Native folder picker, recent projects, read-only Git branch     | Clearly labelled Acme Platform fixture                                                         |
-| Chat       | Autosaved drafts and file references; Send unavailable          | Deterministic, labelled streaming response                                                     |
-| Planning   | Manually managed tasks, dependencies, statuses, plan checklists | Isolated editable sample tasks and checklists                                                  |
-| Execution  | Unavailable without a backend                                   | Inspectable fixture commands, stdout/stderr, file comparisons, tool results, playback and stop |
-| Agents     | Explicit unavailable state                                      | Inspectable hierarchy and attributed activity                                                  |
-| Approvals  | Unavailable without a backend                                   | Simulated acknowledged approve/deny; no external operation                                     |
-| Context    | Read-only directory/file previews and attachments               | Sample file content                                                                            |
-| Connection | Real `/health` request from Electron main                       | Same connection diagnostics; sample content is independent                                     |
+The sidebar groups pinned/recent conversations by local calendar date, searches titles and messages, and supports rename/deletion. Below 900px it becomes a Radix dialog with focus management and Escape dismissal. Native Electron framing preserves macOS traffic lights and Windows controls. CSS tokens provide dark/light/system themes and reduced-motion support.
 
-A successful health check never enables chat or execution. No provider-backed AI, shell execution service, GitHub integration, vector index, or persistent AI memory is included. There is no silent demo fallback.
+Chat operations live in `chatStore`, not message components. Submission creates a conversation only on first send, records the user message and pending assistant immediately, flushes persistence, then invokes the bridge. New drafts typed during submission are not cleared afterward. Each conversation can have one active response, and responses continue across navigation. Request/message/conversation IDs and monotonic sequences reject stale, duplicate, stopped, deleted, and superseded updates.
 
-## Component and state boundaries
+Retry/regeneration reuses the latest user turn and replaces only its assistant answer. Provider context contains the latest user message and at most 20 completed prior turns, bounded to 100,000 characters. Full local history is retained. Connection errors and incomplete streams preserve partial content and expose explicit retry.
 
-- `components/ui`: locally owned shadcn-style Radix primitives, Tailwind utilities, variant-based buttons, overlays, menus, tooltips, tabs, states, copy controls, and accessible resize handles.
-- `components/layout`: navigation, project selection, toolbar/search, responsive shell and orchestration panels.
-- `components/chat`: composer, conversation rendering, safe Markdown and code blocks.
-- `components/execution`: event cards, lazy-loaded terminal and file comparison viewers, virtualized long activity/output lists.
-- `components/orchestration`: manual tasks/plans, agent hierarchy, repository context, acknowledged approvals.
-- `pages`: Home, Knowledge, Settings, and page compositions for Agents, Tasks, Terminal and History. Workspace uses the chat composition.
-- `stores`: persisted local workspace state, normalized live entities, connection diagnostics, and transient notifications. Selectors keep output chunks from rerendering the desktop shell.
-- `services`: narrow local desktop access, the backend capability adapter, sample adapter, and exact output-line assembly.
-- `styles/tokens.css`: semantic light/dark tokens, sizing, typography, motion, elevation and layering. Responsive CSS switches at 1440px and 1100px.
+Markdown uses react-markdown and remark-gfm without raw HTML execution. Code/message copying uses the existing clipboard bridge. HTTP(S) links use validated main-process opening. Remote images are not loaded. File attachments are intentionally absent until real content delivery exists.
 
-Shared domain and bridge contracts live in `packages/shared`. Hash routing works under both Vite and the production `file://` loader. UI preferences restore navigation, theme, project, mode, widths, section heights and collapse state. At narrow widths the orchestration drawer starts closed to prioritize the main view.
+## Managed NestJS service
 
-## IPC, files and persistence
+Electron main launches the staged API after app readiness with `utilityProcess.fork`, using Electron’s embedded Node runtime. A private ready handshake reports an ephemeral loopback port. Main generates a per-launch bearer token; only main receives the port/token. The renderer never receives provider credentials from persisted settings, the internal token, or arbitrary network/process access.
 
-`window.aria` retains `platform` and exposes only named operations: load/save local data, choose a project, inspect its repository, list/read scoped files, choose attachments, check health, copy, open HTTP(S) links, and flush before closing. Main validates the sender, arguments and persisted data. Renderer Node integration remains disabled and the preload runs sandboxed.
+The API preserves `/health`. Authenticated `/chat/capabilities` reports configuration and supported features. `/chat/stream` validates DTOs, applies server-owned system instructions, and streams through Vercel AI SDK. Official OpenAI endpoints use its native Responses provider with `store: false`; custom endpoints use the OpenAI-compatible Chat Completions provider. This avoids sending legacy `max_tokens` to modern OpenAI reasoning models. Missing setup returns an explicit service-unavailable response. Provider errors are sanitized and automatic generation retries are disabled.
 
-Main process file access resolves real paths inside a previously selected project. Absolute paths, escaping traversal/symlinks, unregistered roots, unsafe external protocols, and credential-bearing external URLs are rejected. Directory browsing omits `.git`, `node_modules`, `.DS_Store` and symlinks. Git runs only fixed read-only argument arrays, with no shell. This implementation never edits project files or runs user-entered commands.
+Main validates named IPC operations and the sender, performs HTTP/SSE requests, decodes byte/frame boundaries, and forwards typed events. The renderer’s existing strict CSP, context isolation, sandbox, and disabled Node integration are retained. Stop aborts HTTP; NestJS propagates response disconnect to the provider. Main rejects mismatched IDs, missing sequences, malformed/oversized frames, and streams without a terminal event.
 
-Local work is written atomically to `workspace-v1.json` in Electron's application-data directory. Draft saves are debounced and serialized; a close handshake waits for the last save. A save failure is visible and keeps the window open. Unreadable documents are preserved in a timestamped recovery copy. Sample events, messages, tasks, plans, and approvals are kept in memory and never serialized into local work. UI preferences remain global.
+Unexpected process exit interrupts active requests. Settings offers explicit service restart; requests are never automatically replayed. Closing flushes partial replies and drafts before destroying the window. Application exit shuts down the utility process, with bounded termination fallback. Renderer reload also cancels outstanding requests and restores saved pending replies as interrupted.
 
-Text previews are bounded to 1 MiB, identify truncation, and suppress binary content. Browsing is per-directory, with a 5,000-entry limit. Local storage is bounded to 8 MB, 500 drafts, 2,000 tasks and 100 plans. These limits produce explicit errors. Clipboard payloads are limited to 10 million characters. File previews and context references are not uploaded.
+Build/predev compiles the API and uses `pnpm deploy --prod` to stage a portable runtime in desktop build output. Only API distribution files and production dependencies are included. This supports repository production launches without a separate Node installation; installer packaging/signing remains separate.
 
-Production CSP disallows inline scripts. Development uses a fresh nonce for Vite's React refresh preamble; the production policy remains strict. External navigation and window creation are blocked in the application renderer. Supported links go through the validated main-process bridge.
+## Provider configuration
 
-## Connecting future services
+Settings edits endpoint, model, key, and system instructions. Only transient password input exists in the renderer; input clears after submission. Main uses Electron 45’s asynchronous safeStorage APIs and writes encrypted key bytes to `provider.json` outside conversation storage. Availability/encryption/decryption failures produce actionable errors, never plaintext fallback. The settings getter returns configuration and source flags, never a key. Rotated encryption keys are re-encrypted when indicated by Electron.
 
-Implement `WorkspaceAdapter` against the backend's actual protocol; do not infer support from `/health`. Enable only capabilities the service really provides. The existing backend adapter returns an empty snapshot and explicit unsupported-operation errors.
+Nonempty provider environment variables override saved values and are shown as environment-managed fields. Main passes effective configuration to the API through environment variables. The default endpoint is OpenAI’s `/v1` endpoint; model selection is explicit. A configured state does not imply valid credentials or a reachable provider. Test connection performs a short real request without creating a conversation and has a bounded timeout.
 
-Snapshots and updates carry stable workspace/entity IDs, revisions, event sequences, chunk IDs, and a resume cursor. The projection deduplicates output, rejects stale revisions and late workspace responses, and buffers frequent updates at 50ms. Subscriptions return cleanup functions; switching projects disposes the previous adapter subscription. A future transport must validate its wire payloads and implement its own reconnect/resume behavior before advertising streaming. The current backend has no live transport to reconnect.
+## Persistence and legacy compatibility
 
-Approval state changes only after adapter acknowledgement. Pending state is shared between duplicate views. Error feedback retains the pending request. Command display text and executable/argument arrays are separate fields: the UI displays the supplied text and never reconstructs an executable shell command from it.
+Application schema v2 adds project-independent conversations, messages, selected chat, welcome draft, pin state, per-conversation drafts, profile name, and chat sidebar preference. `aria-v2.json` is the current document. If absent, the validated `workspace-v1.json` is migrated once, retaining its original contents and all legacy records. Broken documents are copied to a recovery file. Pending/streaming messages restore as interrupted.
 
-## Verification and limitations
+All persisted mutations use one debounced, serialized writer and an atomic temporary-file rename. The close handshake waits for saving and keeps the window open if saving fails. The 8 MB total bound and schema limits produce visible errors, with no silent history pruning. Provider configuration has its own main-owned serialized settings flow and is never copied into conversation data.
 
-Run from the repository root:
+Legacy screens are lazily mounted under `/advanced/*`, accessed only through Advanced settings. Their project file boundaries, fixed read-only Git operations, manual task dependency checks, sample labels, and unavailable execution capabilities remain in place. Their adapters and keyboard shortcuts exist only while the legacy shell is mounted. Legacy data and sample data never become primary chat history. Workspace/legacy preferences remain separate from chat navigation preferences.
 
-```sh
-pnpm typecheck
-pnpm lint
-pnpm test
-pnpm build
-pnpm test:electron
-```
+## Verification
 
-Electron tests use isolated temporary projects and application-data directories. They cover built file-loaded startup, Vite development startup, all navigation destinations, local task/plan flows, file copying, close-time draft persistence, appearance restoration, sample streaming and approvals, keyboard search, panel resize/collapse, and screenshots at 1600, 1440, 1280, 1024 and 720 pixels. Screenshots are generated under `apps/desktop/.artifacts/screenshots/` and ignored by Git.
+Unit/component tests cover migration, save failures, key encryption/precedence, request validation, real SDK request construction against a local provider fixture, SSE framing, cancellation, process restart, late events, context bounds, composer keyboard/IME behavior, conversation management, safe Markdown, and existing legacy services.
 
-Unit/component tests cover event projection, stale project responses, dependency validation, sample cleanup and acknowledgements, path/link boundaries, malformed data recovery, preview limits, health checks, Markdown safety, composer keyboard/IME handling, reading-position preservation, and long/chunked output.
-
-Acceptance was exercised on macOS. Windows/Linux retain native framing and platform-neutral IPC, but runtime acceptance on those operating systems remains unverified. Installer packaging, application icons, auto-update, backend authentication and real agent execution remain separate work.
-
-## Changed files
-
-Paths below are relative to the repository root.
-
-| Change                            | Files                                                                                                                                                                                                                                                                                       |
-| --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Expanded contracts                | `packages/shared/src/index.ts`                                                                                                                                                                                                                                                              |
-| Updated desktop entry and styling | `apps/desktop/src/App.tsx`, `apps/desktop/src/styles.css`, `apps/desktop/index.html`                                                                                                                                                                                                        |
-| New shared UI and tokens          | `apps/desktop/src/components/ui/index.tsx`, `apps/desktop/src/lib/utils.ts`, `apps/desktop/src/styles/tokens.css`, `apps/desktop/src/types.d.ts`                                                                                                                                            |
-| New shell                         | `apps/desktop/src/components/layout/{DesktopShell,OrchestrationSidebar}.tsx`                                                                                                                                                                                                                |
-| New chat                          | `apps/desktop/src/components/chat/{ChatWorkspace,MarkdownRenderer}.tsx`                                                                                                                                                                                                                     |
-| New execution views               | `apps/desktop/src/components/execution/{ExecutionTimeline,TerminalOutput,DiffViewer}.tsx`                                                                                                                                                                                                   |
-| New orchestration views           | `apps/desktop/src/components/orchestration/{Tasks,Agents,Approvals,Context}.tsx`                                                                                                                                                                                                            |
-| New pages and hooks               | `apps/desktop/src/pages/{Home,Knowledge,Settings,WorkPages}.tsx`, `apps/desktop/src/hooks/useWorkspace.ts`                                                                                                                                                                                  |
-| New stores                        | `apps/desktop/src/stores/{workspaceStore,executionStore,connectionStore,uiStore}.ts`                                                                                                                                                                                                        |
-| New adapters and helpers          | `apps/desktop/src/services/{desktop,adapters,sample,output}.ts`                                                                                                                                                                                                                             |
-| Updated Electron bridge           | `apps/desktop/electron/{main,preload}.ts`                                                                                                                                                                                                                                                   |
-| New main-process services         | `apps/desktop/electron/{project,storage}.ts`                                                                                                                                                                                                                                                |
-| New verification                  | `apps/desktop/tests/{adapters,events,output,security}.test.ts`, `apps/desktop/tests/ui.test.tsx`, `apps/desktop/tests/{setup.ts,workspace.electron.ts}`                                                                                                                                     |
-| Build and tooling                 | New `apps/desktop/{vite.config.mts,vitest.config.mts,playwright.config.ts,eslint.config.mjs,tsconfig.tests.json,components.json}` and root `.prettierrc.json`; updated desktop `tsconfig.json`, package manifests, lockfile, and `.gitignore`. `vite.config.mts` replaces `vite.config.ts`. |
-| Documentation                     | Updated `README.md`; added this architecture and delivery inventory.                                                                                                                                                                                                                        |
+Playwright launches actual Electron in built and Vite development modes. Tests cover first-run chat, secure settings, real NestJS streaming to the fixture provider, copying, history management, background replies, interruption/restart, close-time persistence, responsive dialogs, and legacy workflows. Screenshots are generated under desktop `.artifacts/screenshots`. CI defines macOS/Windows jobs; local macOS execution cannot establish Windows runtime acceptance. Live commercial-provider acceptance requires configured credentials and is reported separately from fixture testing.

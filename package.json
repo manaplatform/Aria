@@ -9,7 +9,7 @@
     "build": "pnpm --recursive --sort run build",
     "typecheck": "pnpm --recursive --sort run typecheck",
     "lint": "pnpm --filter @aria/desktop lint",
-    "test": "pnpm --filter @aria/desktop test",
+    "test": "pnpm --recursive --sort --if-present run test",
     "test:electron": "pnpm --filter @aria/desktop build && pnpm --filter @aria/desktop test:electron"
   }
 }

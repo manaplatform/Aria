@@ -116,7 +116,7 @@ export async function checkHealth(
       throw new Error(`Unexpected health response (${response.status}).`);
     return {
       reachable: true,
-      message: 'API reachable. AI services are not implemented.',
+      message: 'API reachable. Legacy workspace execution services are not implemented.',
       checkedAt: new Date().toISOString(),
     };
   } catch (error) {

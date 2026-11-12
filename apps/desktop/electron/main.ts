@@ -5,14 +5,20 @@ import {
   dialog,
   ipcMain,
   shell,
+  safeStorage,
+  utilityProcess,
   type IpcMainInvokeEvent,
 } from 'electron';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { promises as fs } from 'node:fs';
+import { mkdirSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { LocalStorage, localDataSchema } from './storage';
+import { ProviderStorage, providerSettingsSchema } from './provider-storage';
+import { ChatService } from './chat-service';
+import { chatRequestSchema } from './chat-protocol';
 import {
   checkHealth,
   listFiles,
@@ -23,8 +29,17 @@ import {
 } from './project';
 
 app.setName('Aria');
+if (process.env.ARIA_TEST_DATA_DIR) {
+  mkdirSync(process.env.ARIA_TEST_DATA_DIR, { recursive: true });
+  app.setPath('userData', path.resolve(process.env.ARIA_TEST_DATA_DIR));
+}
 let mainWindow: BrowserWindow | null = null;
 let storage: LocalStorage;
+let provider: ProviderStorage;
+let chat: ChatService;
+let configuring = false;
+let shutdownComplete = false;
+let shutdown: Promise<void> | undefined;
 let initial: Awaited<ReturnType<LocalStorage['load']>>;
 const string = z.string().max(8000);
 const devServerUrl = process.env.VITE_DEV_SERVER_URL;
@@ -63,7 +78,24 @@ function registerIpc(): void {
     quitting = false;
     dialog.showErrorBox('Local changes could not be saved', string.parse(error));
   });
-  handle('aria:load', () => initial);
+  handle('aria:load', () => ({
+    ...initial,
+    data: {
+      ...initial.data,
+      chat: {
+        ...initial.data.chat,
+        messages: initial.data.chat.messages.map((message) =>
+          ['pending', 'streaming'].includes(message.status)
+            ? {
+                ...message,
+                status: 'interrupted',
+                error: 'This response was interrupted. You can retry it.',
+              }
+            : message,
+        ),
+      },
+    },
+  }));
   handle('aria:save', async (data) => {
     const parsed = localDataSchema.parse(data);
     await storage.save(parsed);
@@ -120,6 +152,34 @@ function registerIpc(): void {
   handle('aria:health', (url) => checkHealth(string.parse(url)));
   handle('aria:copy', (text) => clipboard.writeText(z.string().max(10_000_000).parse(text)));
   handle('aria:open-external', (url) => shell.openExternal(safeExternalUrl(string.parse(url))));
+  handle('aria:chat-status', () => chat.getStatus());
+  handle('aria:provider-settings', () => provider.get());
+  handle('aria:save-provider-settings', async (input) => {
+    if (configuring) throw new Error('Connection settings are already being saved.');
+    chat.assertIdle();
+    const parsed = providerSettingsSchema.parse(input);
+    configuring = true;
+    try {
+      const settings = await provider.save(parsed);
+      await chat.restart();
+      return settings;
+    } finally {
+      configuring = false;
+    }
+  });
+  handle('aria:restart-chat-service', async () => {
+    if (configuring) throw new Error('Wait for connection settings to finish saving.');
+    await chat.restart();
+  });
+  handle('aria:test-provider', async () => {
+    if (configuring) throw new Error('Wait for connection settings to finish saving.');
+    await chat.testProvider();
+  });
+  handle('aria:submit-chat', (input) => {
+    if (configuring) throw new Error('Wait for connection settings to finish saving.');
+    chat.submit(chatRequestSchema.parse(input));
+  });
+  handle('aria:cancel-chat', (id) => chat.cancel(z.string().min(1).max(200).parse(id)));
 }
 function createWindow(): void {
   closeFlushEnabled = false;
@@ -140,6 +200,10 @@ function createWindow(): void {
   mainWindow.webContents.on('render-process-gone', () => {
     closeFlushEnabled = false;
     closePending = false;
+    void chat.cancelAll();
+  });
+  mainWindow.webContents.on('did-start-navigation', (event) => {
+    if (event.isMainFrame && !event.isSameDocument) void chat.cancelAll();
   });
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   mainWindow.webContents.on('will-navigate', (event) => event.preventDefault());
@@ -163,10 +227,41 @@ function createWindow(): void {
 app
   .whenReady()
   .then(async () => {
-    storage = new LocalStorage(process.env.ARIA_TEST_DATA_DIR || app.getPath('userData'));
+    if (!app.isPackaged) {
+      try {
+        process.loadEnvFile(path.resolve(__dirname, '../../..', '.env'));
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+    }
+    const directory = process.env.ARIA_TEST_DATA_DIR || app.getPath('userData');
+    storage = new LocalStorage(directory);
     initial = await storage.load();
+    provider = new ProviderStorage(directory, {
+      available: () => safeStorage.isAsyncEncryptionAvailable(),
+      encrypt: (value) => safeStorage.encryptStringAsync(value),
+      decrypt: (value) => safeStorage.decryptStringAsync(value),
+    });
+    chat = new ChatService(
+      provider,
+      (env) =>
+        utilityProcess.fork(path.join(__dirname, 'api/dist/main.js'), [], {
+          env: env as Record<string, string>,
+          stdio: 'ignore',
+          serviceName: 'Aria Chat API',
+        }),
+      (event) => {
+        if (mainWindow && !mainWindow.webContents.isDestroyed())
+          mainWindow.webContents.send('aria:chat-event', event);
+      },
+      (status) => {
+        if (mainWindow && !mainWindow.webContents.isDestroyed())
+          mainWindow.webContents.send('aria:chat-status-update', status);
+      },
+    );
     registerIpc();
     createWindow();
+    void chat.start();
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow();
     });
@@ -178,6 +273,14 @@ app
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
 });
-app.on('before-quit', () => {
+app.on('before-quit', (event) => {
   quitting = true;
+  // The window close handshake flushes renderer state before this final shutdown.
+  if (!mainWindow && chat && !shutdownComplete) {
+    event.preventDefault();
+    shutdown ??= chat.close().finally(() => {
+      shutdownComplete = true;
+      app.quit();
+    });
+  }
 });

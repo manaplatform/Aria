@@ -41,7 +41,7 @@ export default function Home() {
               onClick={() =>
                 void choose().then(() => {
                   if (useWorkspaceStore.getState().data.preferences.activeWorkspaceId)
-                    navigate('/workspace');
+                    navigate('/advanced/workspace');
                 })
               }
             >
@@ -51,7 +51,7 @@ export default function Home() {
             <Button
               onClick={() => {
                 enterSample();
-                navigate('/workspace');
+                navigate('/advanced/workspace');
               }}
             >
               <Sparkles size={15} />
@@ -78,7 +78,7 @@ export default function Home() {
                   className="project-card"
                   onClick={() => {
                     select(workspace.id);
-                    navigate('/workspace');
+                    navigate('/advanced/workspace');
                   }}
                 >
                   <span className="project-icon">
@@ -151,7 +151,7 @@ export default function Home() {
           <Button
             onClick={() => {
               enterSample();
-              navigate('/workspace');
+              navigate('/advanced/workspace');
             }}
           >
             Take a look
@@ -162,7 +162,7 @@ export default function Home() {
           <>
             <div className="home-section-heading">
               <h2>Pick up a draft</h2>
-              <Button variant="ghost" size="sm" onClick={() => navigate('/history')}>
+              <Button variant="ghost" size="sm" onClick={() => navigate('/advanced/history')}>
                 View history
                 <ArrowRight size={13} />
               </Button>
@@ -178,7 +178,7 @@ export default function Home() {
                   onClick={() => {
                     select(conversation.workspaceId);
                     useWorkspaceStore.getState().selectConversation(conversation.id);
-                    navigate('/workspace');
+                    navigate('/advanced/workspace');
                   }}
                 >
                   <ListChecks size={16} />

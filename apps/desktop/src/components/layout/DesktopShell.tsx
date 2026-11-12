@@ -1,3 +1,4 @@
+import { AriaMark } from './AriaMark';
 import { useEffect, useState, type ReactNode } from 'react';
 import { NavLink, useLocation, useNavigate } from 'react-router-dom';
 import {
@@ -44,33 +45,15 @@ import {
 import { TaskEditor } from '../orchestration/Tasks';
 import OrchestrationSidebar from './OrchestrationSidebar';
 export const destinations = [
-  { path: '/home', label: 'Home', icon: Home },
-  { path: '/workspace', label: 'Workspace', icon: Layers },
-  { path: '/agents', label: 'Agents', icon: Bot },
-  { path: '/tasks', label: 'Tasks', icon: ListTodo },
-  { path: '/terminal', label: 'Terminal', icon: Terminal },
-  { path: '/knowledge', label: 'Knowledge', icon: BookOpen },
-  { path: '/history', label: 'History', icon: History },
-  { path: '/settings', label: 'Settings', icon: Settings },
+  { path: '/advanced/home', label: 'Home', icon: Home },
+  { path: '/advanced/workspace', label: 'Workspace', icon: Layers },
+  { path: '/advanced/agents', label: 'Agents', icon: Bot },
+  { path: '/advanced/tasks', label: 'Tasks', icon: ListTodo },
+  { path: '/advanced/terminal', label: 'Terminal', icon: Terminal },
+  { path: '/advanced/knowledge', label: 'Knowledge', icon: BookOpen },
+  { path: '/advanced/history', label: 'History', icon: History },
+  { path: '/advanced/settings', label: 'Settings', icon: Settings },
 ];
-export function AriaMark({ small = false }: { small?: boolean }) {
-  return (
-    <svg className={small ? 'aria-mark small' : 'aria-mark'} viewBox="0 0 40 40" aria-hidden="true">
-      <defs>
-        <linearGradient id={small ? 'aria-small' : 'aria-brand'} x1="0" y1="1" x2="1" y2="0">
-          <stop stopColor="#6476ed" />
-          <stop offset=".5" stopColor="#a78bfa" />
-          <stop offset="1" stopColor="#7449eb" />
-        </linearGradient>
-      </defs>
-      <path
-        d="M16 6c2-4 6-4 8 0l13 25c3 6-4 10-8 5L20 23l-9 13c-4 5-11 1-8-5Z"
-        fill={`url(#${small ? 'aria-small' : 'aria-brand'})`}
-      />
-      <path d="m20 10 9 26c-3-1-7-7-9-13l-4-9Z" fill="#c4b5fd" opacity=".65" />
-    </svg>
-  );
-}
 function AppSidebar() {
   const workspace = useWorkspace();
   const tasks = useTasks();
@@ -105,7 +88,9 @@ function AppSidebar() {
           >
             <destination.icon size={18} />
             <span>{destination.label}</span>
-            {destination.path === '/tasks' && tasks.length > 0 && <small>{tasks.length}</small>}
+            {destination.path === '/advanced/tasks' && tasks.length > 0 && (
+              <small>{tasks.length}</small>
+            )}
           </NavLink>
         ))}
       </nav>
@@ -134,7 +119,7 @@ function AppSidebar() {
                 key={item.id}
                 onSelect={() => {
                   select(item.id);
-                  navigate('/workspace');
+                  navigate('/advanced/workspace');
                 }}
               >
                 <FolderOpen size={14} />
@@ -148,7 +133,7 @@ function AppSidebar() {
             <MenuItem
               onSelect={() => {
                 useWorkspaceStore.getState().enterSample();
-                navigate('/workspace');
+                navigate('/advanced/workspace');
               }}
             >
               <Sparkles size={14} />
@@ -262,7 +247,7 @@ function CommandSearch({ open, onClose }: { open: boolean; onClose: () => void }
               key={item.id}
               onClick={() => {
                 useWorkspaceStore.getState().selectWorkspace(item.id);
-                go('/workspace');
+                go('/advanced/workspace');
               }}
             >
               <FolderOpen size={16} />
@@ -274,7 +259,7 @@ function CommandSearch({ open, onClose }: { open: boolean; onClose: () => void }
           .filter((task) => matches(task.title))
           .slice(0, 10)
           .map((task) => (
-            <button key={task.id} onClick={() => go('/tasks')}>
+            <button key={task.id} onClick={() => go('/advanced/tasks')}>
               <ListTodo size={16} />
               <span>{task.title}</span>
               <Badge>Task</Badge>
@@ -289,7 +274,7 @@ function CommandSearch({ open, onClose }: { open: boolean; onClose: () => void }
               onClick={() => {
                 useWorkspaceStore.getState().selectWorkspace(item.workspaceId);
                 useWorkspaceStore.getState().selectConversation(item.id);
-                go('/workspace');
+                go('/advanced/workspace');
               }}
             >
               <History size={16} />
@@ -327,7 +312,7 @@ export default function DesktopShell({ children }: { children: ReactNode }) {
   }, [location.pathname, setPrefs]);
   useEffect(() => {
     const resize = () => setWidth(window.innerWidth);
-    const browse = () => navigate('/knowledge');
+    const browse = () => navigate('/advanced/knowledge');
     const key = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && ['k', 'l'].includes(event.key.toLowerCase())) {
         event.preventDefault();
@@ -346,7 +331,9 @@ export default function DesktopShell({ children }: { children: ReactNode }) {
       window.removeEventListener('blur', flushPersistence);
     };
   }, [navigate]);
-  const hasRight = ['/workspace', '/agents', '/tasks'].includes(location.pathname);
+  const hasRight = ['/advanced/workspace', '/advanced/agents', '/advanced/tasks'].includes(
+    location.pathname,
+  );
   const narrow = width < 1100;
   const rightWidth = Math.max(
     280,
@@ -422,7 +409,7 @@ export default function DesktopShell({ children }: { children: ReactNode }) {
             <button
               className="profile-avatar"
               aria-label="Open settings"
-              onClick={() => navigate('/settings')}
+              onClick={() => navigate('/advanced/settings')}
             >
               A
             </button>
@@ -520,7 +507,7 @@ export default function DesktopShell({ children }: { children: ReactNode }) {
           <Button
             onClick={() => {
               setNotifications(false);
-              navigate('/settings');
+              navigate('/advanced/settings');
             }}
           >
             <CircleHelp size={14} />

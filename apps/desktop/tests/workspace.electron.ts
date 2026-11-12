@@ -17,10 +17,15 @@ async function launch(development = false) {
   );
   env.ARIA_TEST_DATA_DIR = path.join(temporary, 'data');
   delete env.ELECTRON_RUN_AS_NODE;
-  if (development) env.VITE_DEV_SERVER_URL = 'http://127.0.0.1:5173';
+  if (development) env.VITE_DEV_SERVER_URL = 'http://127.0.0.1:5174';
   app = await electron.launch({ args: [desktopRoot], env });
   page = await app.firstWindow();
   page.on('pageerror', (error) => errors.push(error.message));
+  await expect(page.getByRole('navigation', { name: 'Chat navigation' })).toBeVisible();
+}
+async function openLegacy() {
+  await page.getByRole('button', { name: 'Open settings', exact: true }).click();
+  await page.getByRole('button', { name: 'Open legacy workspace', exact: true }).click();
   await expect(page.getByRole('navigation', { name: 'Main navigation' })).toBeVisible();
 }
 test.beforeEach(async () => {
@@ -30,6 +35,7 @@ test.beforeEach(async () => {
   await fs.writeFile(path.join(project, 'hello.ts'), 'export const hello = "Aria";\n');
   errors.length = 0;
   await launch();
+  await openLegacy();
 });
 test.afterEach(async () => {
   await app.close();
@@ -98,6 +104,7 @@ test('built desktop routes, local project work, persistence, and security', asyn
   await page.getByRole('textbox', { name: 'Message Aria' }).fill('Saved on close');
   await app.close();
   await launch();
+  await openLegacy();
   await page.getByRole('link', { name: 'Workspace', exact: true }).click();
   await expect(page.getByRole('textbox', { name: 'Message Aria' })).toHaveValue('Saved on close');
   await expect(page.locator('html')).toHaveAttribute('data-theme', 'light');
@@ -125,7 +132,7 @@ test('sample workflow, keyboard search, approvals, responsive panels, and screen
   await page.getByRole('button', { name: 'Approve sample request', exact: true }).click();
   await expect(page.getByRole('dialog')).not.toBeVisible();
   await expect(page.getByText('approved', { exact: true }).first()).toBeVisible();
-  await page.keyboard.press('Meta+k');
+  await page.keyboard.press(process.platform === 'darwin' ? 'Meta+k' : 'Control+k');
   await expect(page.getByRole('dialog', { name: 'Search Aria' })).toBeVisible();
   await page.getByRole('textbox', { name: 'Search commands' }).fill('Terminal');
   await page.getByRole('button', { name: 'Terminal', exact: true }).click();
@@ -185,6 +192,7 @@ test('sample workflow, keyboard search, approvals, responsive panels, and screen
 test('development Electron startup with nonce-protected Vite refresh', async () => {
   await app.close();
   await launch(true);
+  await openLegacy();
   await expect(page.getByText('Good work starts')).toBeVisible();
   await page.getByRole('button', { name: 'Explore sample', exact: true }).click();
   await expect(page.getByRole('textbox', { name: 'Message Aria' })).toBeVisible();

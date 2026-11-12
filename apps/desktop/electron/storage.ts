@@ -20,7 +20,7 @@ const file = z.object({
   path: z.string().max(8000),
   size: z.number().nonnegative(),
 });
-export const localDataSchema = z.object({
+export const legacyDataSchema = z.object({
   version: z.literal(1),
   workspaces: z
     .array(
@@ -89,16 +89,89 @@ export const localDataSchema = z.object({
     apiUrl: z.string().max(2000),
   }),
 });
+const chatSchema = z
+  .object({
+    conversations: z
+      .array(
+        z.object({
+          id,
+          title: z.string().min(1).max(1000),
+          draft: text,
+          pinned: z.boolean(),
+          createdAt: z.string(),
+          updatedAt: z.string(),
+        }),
+      )
+      .max(500),
+    messages: z
+      .array(
+        z.object({
+          id,
+          conversationId: id,
+          requestId: id,
+          role: z.enum(['user', 'assistant']),
+          content: text,
+          createdAt: z.string(),
+          status: z.enum(['pending', 'streaming', 'completed', 'stopped', 'failed', 'interrupted']),
+          sequence: z.number().int().nonnegative(),
+          error: z.string().max(2000).optional(),
+        }),
+      )
+      .max(20000),
+    selectedId: id.nullable(),
+    newDraft: text,
+  })
+  .superRefine((chat, context) => {
+    const ids = new Set(chat.conversations.map((item) => item.id));
+    if (
+      ids.size !== chat.conversations.length ||
+      new Set(chat.messages.map((item) => item.id)).size !== chat.messages.length
+    )
+      context.addIssue({ code: 'custom', message: 'Duplicate chat identifiers.' });
+    if (
+      (chat.selectedId && !ids.has(chat.selectedId)) ||
+      chat.messages.some((item) => !ids.has(item.conversationId))
+    )
+      context.addIssue({ code: 'custom', message: 'Chat references a missing conversation.' });
+  });
+export const localDataSchema = legacyDataSchema.extend({
+  version: z.literal(2),
+  preferences: legacyDataSchema.shape.preferences.extend({
+    route: z
+      .string()
+      .regex(
+        /^\/(chat|settings|advanced(?:\/(?:home|workspace|agents|tasks|terminal|knowledge|history|settings))?)$/,
+      ),
+    chatSidebarCollapsed: z.boolean(),
+    profileName: z.string().trim().min(1).max(80),
+  }),
+  chat: chatSchema,
+});
+export function migrateLegacy(input: unknown): LocalData {
+  const legacy = legacyDataSchema.parse(input);
+  return localDataSchema.parse({
+    ...legacy,
+    version: 2,
+    preferences: {
+      ...legacy.preferences,
+      route: '/chat',
+      chatSidebarCollapsed: false,
+      profileName: 'You',
+    },
+    chat: { conversations: [], messages: [], selectedId: null, newDraft: '' },
+  });
+}
 export function emptyData(): LocalData {
   return {
-    version: 1,
+    version: 2,
     workspaces: [],
     conversations: [],
     tasks: [],
     plans: [],
+    chat: { conversations: [], messages: [], selectedId: null, newDraft: '' },
     preferences: {
       theme: 'dark',
-      route: '/home',
+      route: '/chat',
       activeWorkspaceId: null,
       sidebarCollapsed: false,
       rightOpen: true,
@@ -106,6 +179,8 @@ export function emptyData(): LocalData {
       sectionHeights: {},
       collapsedSections: [],
       apiUrl: 'http://localhost:3000',
+      chatSidebarCollapsed: false,
+      profileName: 'You',
     },
   };
 }
@@ -115,20 +190,42 @@ export class LocalStorage {
   private readonly registered = new Map<string, string>();
   constructor(private readonly directory: string) {}
   get filename(): string {
-    return path.join(this.directory, 'workspace-v1.json');
+    return path.join(this.directory, 'aria-v2.json');
   }
   async load(): Promise<InitialState> {
     let warning: string | undefined;
+    let filename = this.filename;
+    let migrated = false;
     try {
-      this.data = localDataSchema.parse(JSON.parse(await fs.readFile(this.filename, 'utf8')));
+      let serialized: string;
+      try {
+        serialized = await fs.readFile(filename, 'utf8');
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        filename = path.join(this.directory, 'workspace-v1.json');
+        serialized = await fs.readFile(filename, 'utf8');
+        migrated = true;
+      }
+      const input: unknown = JSON.parse(serialized);
+      this.data = migrated ? migrateLegacy(input) : localDataSchema.parse(input);
+      this.data.chat.messages = this.data.chat.messages.map((message) =>
+        ['pending', 'streaming'].includes(message.status)
+          ? {
+              ...message,
+              status: 'interrupted',
+              error: 'Aria closed before this response finished. You can retry it.',
+            }
+          : message,
+      );
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-        const recovery = `${this.filename}.recovery-${Date.now()}`;
-        await fs.copyFile(this.filename, recovery);
+        const recovery = `${filename}.recovery-${Date.now()}`;
+        await fs.copyFile(filename, recovery);
         warning = `Saved data could not be read. A recovery copy was preserved at ${recovery}.`;
       }
     }
     for (const workspace of this.data.workspaces) this.registered.set(workspace.id, workspace.root);
+    if (migrated && !warning) await this.save(this.data);
     return { data: this.data, warning };
   }
   root(id: string): string {

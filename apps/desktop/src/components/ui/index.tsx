@@ -151,6 +151,7 @@ export function Modal({
   description,
   children,
   className = '',
+  onOpenAutoFocus,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -158,12 +159,16 @@ export function Modal({
   description: string;
   children: ReactNode;
   className?: string;
+  onOpenAutoFocus?: (event: Event) => void;
 }): ReactNode {
   return (
     <Dialog.Root open={open} onOpenChange={onOpenChange}>
       <Dialog.Portal>
         <Dialog.Overlay className="dialog-overlay" />
-        <Dialog.Content className={cn('dialog-content', className)}>
+        <Dialog.Content
+          className={cn('dialog-content', className)}
+          onOpenAutoFocus={onOpenAutoFocus}
+        >
           <div className="dialog-heading">
             <div>
               <Dialog.Title>{title}</Dialog.Title>
