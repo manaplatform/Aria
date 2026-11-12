@@ -1,6 +1,6 @@
 import type { DesktopBridge, LocalData } from '@aria/shared';
 export const emptyData = (): LocalData => ({
-  version: 2,
+  version: 3,
   workspaces: [],
   conversations: [],
   tasks: [],

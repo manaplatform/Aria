@@ -11,5 +11,9 @@
     "lint": "pnpm --filter @aria/desktop lint",
     "test": "pnpm --recursive --sort --if-present run test",
     "test:electron": "pnpm --filter @aria/desktop build && pnpm --filter @aria/desktop test:electron"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.18.2",
+    "ws": "^8.22.2"
   }
 }

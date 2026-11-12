@@ -2,6 +2,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
 import type { InitialState, LocalData } from '@aria/shared';
+import { assetSchema } from './media-storage';
 
 const id = z.string().min(1).max(200);
 const text = z.string().max(100_000);
@@ -89,6 +90,15 @@ export const legacyDataSchema = z.object({
     apiUrl: z.string().max(2000),
   }),
 });
+const operationSchema = z
+  .object({
+    mode: z.enum(['chat', 'image', 'speech', 'transcription']),
+    model: z.string().min(1).max(200),
+    prompt: text,
+    voice: z.string().max(200).optional(),
+    assetIds: z.array(z.string().uuid()).max(4),
+  })
+  .strict();
 const chatSchema = z
   .object({
     conversations: z
@@ -98,6 +108,7 @@ const chatSchema = z
           title: z.string().min(1).max(1000),
           draft: text,
           pinned: z.boolean(),
+          attachments: z.array(assetSchema).max(4).optional(),
           createdAt: z.string(),
           updatedAt: z.string(),
         }),
@@ -115,11 +126,26 @@ const chatSchema = z
           status: z.enum(['pending', 'streaming', 'completed', 'stopped', 'failed', 'interrupted']),
           sequence: z.number().int().nonnegative(),
           error: z.string().max(2000).optional(),
+          operation: operationSchema.optional(),
+          assets: z.array(assetSchema).max(4).optional(),
+          liveSessionId: id.optional(),
+          liveConfig: z.object({ model: id, chatModel: id, voice: id }).strict().optional(),
+          fragments: z
+            .array(
+              z.object({
+                text: z.string().max(10000),
+                startMs: z.number().nonnegative(),
+                endMs: z.number().nonnegative(),
+              }),
+            )
+            .max(20000)
+            .optional(),
         }),
       )
       .max(20000),
     selectedId: id.nullable(),
     newDraft: text,
+    newAttachments: z.array(assetSchema).max(4).optional(),
   })
   .superRefine((chat, context) => {
     const ids = new Set(chat.conversations.map((item) => item.id));
@@ -135,7 +161,7 @@ const chatSchema = z
       context.addIssue({ code: 'custom', message: 'Chat references a missing conversation.' });
   });
 export const localDataSchema = legacyDataSchema.extend({
-  version: z.literal(2),
+  version: z.literal(3),
   preferences: legacyDataSchema.shape.preferences.extend({
     route: z
       .string()
@@ -151,7 +177,7 @@ export function migrateLegacy(input: unknown): LocalData {
   const legacy = legacyDataSchema.parse(input);
   return localDataSchema.parse({
     ...legacy,
-    version: 2,
+    version: 3,
     preferences: {
       ...legacy.preferences,
       route: '/chat',
@@ -163,7 +189,7 @@ export function migrateLegacy(input: unknown): LocalData {
 }
 export function emptyData(): LocalData {
   return {
-    version: 2,
+    version: 3,
     workspaces: [],
     conversations: [],
     tasks: [],
@@ -190,7 +216,7 @@ export class LocalStorage {
   private readonly registered = new Map<string, string>();
   constructor(private readonly directory: string) {}
   get filename(): string {
-    return path.join(this.directory, 'aria-v2.json');
+    return path.join(this.directory, 'aria-v3.json');
   }
   async load(): Promise<InitialState> {
     let warning: string | undefined;
@@ -202,12 +228,23 @@ export class LocalStorage {
         serialized = await fs.readFile(filename, 'utf8');
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-        filename = path.join(this.directory, 'workspace-v1.json');
-        serialized = await fs.readFile(filename, 'utf8');
+        filename = path.join(this.directory, 'aria-v2.json');
+        try {
+          serialized = await fs.readFile(filename, 'utf8');
+        } catch (legacyError) {
+          if ((legacyError as NodeJS.ErrnoException).code !== 'ENOENT') throw legacyError;
+          filename = path.join(this.directory, 'workspace-v1.json');
+          serialized = await fs.readFile(filename, 'utf8');
+        }
         migrated = true;
       }
-      const input: unknown = JSON.parse(serialized);
-      this.data = migrated ? migrateLegacy(input) : localDataSchema.parse(input);
+      const input = JSON.parse(serialized);
+      this.data =
+        input.version === 1
+          ? migrateLegacy(input)
+          : localDataSchema.parse(
+              migrated && input.version === 2 ? { ...input, version: 3 } : input,
+            );
       this.data.chat.messages = this.data.chat.messages.map((message) =>
         ['pending', 'streaming'].includes(message.status)
           ? {

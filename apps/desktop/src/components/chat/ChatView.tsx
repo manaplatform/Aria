@@ -52,7 +52,7 @@ export default function ChatView() {
                 key={message.id}
                 message={message}
                 last={index === messages.length - 1}
-                canRegenerate={!busy && status.state === 'ready' && status.configured}
+                canRegenerate={!busy && status.state === 'ready'}
                 name={name}
               />
             ))}

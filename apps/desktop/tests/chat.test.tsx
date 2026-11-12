@@ -20,11 +20,20 @@ import {
   stopChat,
   useChatStore,
 } from '../src/stores/chatStore';
+import { useProviderStore } from '../src/stores/providerStore';
+import { useLiveVoiceStore } from '../src/stores/liveVoiceStore';
 import { conversationDateGroup } from '../src/hooks/useConversations';
 
 let requests: ChatRequest[];
 beforeEach(() => {
   requests = [];
+  useLiveVoiceStore.setState({ phase: 'idle', sessionId: null, conversationId: null });
+  useProviderStore.setState({
+    models: [{ id: 'test-model', modes: ['chat'] }],
+    selections: { chat: 'test-model', image: '', speech: '', transcription: '', live: '' },
+    loading: false,
+    error: '',
+  });
   window.aria = {
     platform: 'darwin',
     save: vi.fn().mockResolvedValue(undefined),

@@ -6,7 +6,7 @@ import type { UtilityProcess } from 'electron';
 import type { ChatEvent, ChatRequest, ChatServiceStatus } from '@aria/shared';
 import { readChatEvents } from '../electron/chat-protocol';
 import { ChatService } from '../electron/chat-service';
-import type { ProviderStorage } from '../electron/provider-storage';
+import { ProviderConfigurationError, type ProviderStorage } from '../electron/provider-storage';
 
 const request: ChatRequest = {
   requestId: 'request',
@@ -168,4 +168,42 @@ it('never forwards stream events belonging to another conversation', async () =>
   await vi.waitFor(() => expect(events.at(-1)?.type).toBe('failed'));
   expect(events).toHaveLength(1);
   expect(events[0].conversationId).toBe('chat');
+});
+
+it('keeps the private API available for replacement-key discovery when a saved key cannot be unlocked', async () => {
+  const port = (server.address() as { port: number }).port;
+  const broken = {
+    resolve: async () => {
+      throw new ProviderConfigurationError('The saved API key could not be unlocked.');
+    },
+    get: async () => ({
+      provider: 'openai',
+      baseUrl: 'https://api.openai.com/v1',
+      model: 'saved-model',
+      models: { chat: 'saved-model', image: '', speech: '', transcription: '', live: '' },
+      systemPrompt: '',
+    }),
+  } as unknown as ProviderStorage;
+  const recovering = new ChatService(
+    broken,
+    (env) => {
+      expect(env.OPENAI_API_KEY).toBe('');
+      const child = new Child();
+      setImmediate(() => child.emit('message', { type: 'ready', port }));
+      return child as unknown as UtilityProcess;
+    },
+    () => undefined,
+    () => undefined,
+  );
+  try {
+    await recovering.start();
+    expect(recovering.getStatus()).toMatchObject({
+      state: 'ready',
+      configured: false,
+      error: expect.stringContaining('unlocked'),
+    });
+    expect((await recovering.http('chat/capabilities')).ok).toBe(true);
+  } finally {
+    await recovering.close();
+  }
 });

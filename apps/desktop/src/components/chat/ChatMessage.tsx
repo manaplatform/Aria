@@ -4,6 +4,7 @@ import { generating, regenerateChat } from '../../stores/chatStore';
 import { AriaMark } from '../layout/AriaMark';
 import { Button, CopyButton } from '../ui';
 import MarkdownRenderer from './MarkdownRenderer';
+import { MediaPreview } from './MediaPreview';
 
 export function ChatMessage({
   message,
@@ -47,6 +48,30 @@ export function ChatMessage({
           </div>
         ) : null}
       </div>
+      {message.operation && (
+        <p className="chat-response-note">
+          {message.operation.mode === 'transcription'
+            ? 'Transcription'
+            : message.operation.mode === 'speech'
+              ? 'AI-generated speech'
+              : message.operation.mode === 'image'
+                ? 'Image'
+                : 'Chat'}{' '}
+          · {message.operation.model}
+        </p>
+      )}
+      {message.liveSessionId && (
+        <p className="chat-response-note">
+          Live voice{message.role === 'assistant' ? ' · AI-generated audio' : ''}
+        </p>
+      )}
+      {message.assets?.map((asset) => (
+        <MediaPreview
+          key={asset.id}
+          asset={asset}
+          reusable={message.role === 'assistant' && canRegenerate && !busy}
+        />
+      ))}
       {(message.status === 'failed' || message.status === 'interrupted') && (
         <p className="chat-response-error" role="alert">
           {message.error || 'The response did not finish. Please retry.'}
@@ -61,7 +86,7 @@ export function ChatMessage({
               label={`Copy ${message.role === 'user' ? 'message' : 'response'}`}
             />
           )}
-          {message.role === 'assistant' && last && (
+          {message.role === 'assistant' && last && !message.liveSessionId && (
             <Button
               variant="ghost"
               size="sm"

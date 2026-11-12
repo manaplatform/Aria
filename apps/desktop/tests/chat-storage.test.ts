@@ -50,7 +50,7 @@ it('migrates legacy drafts and preferences once, retaining the original document
   const store = new LocalStorage(directory);
   const migrated = await store.load();
   expect(migrated.data).toMatchObject({
-    version: 2,
+    version: 3,
     conversations: legacy.conversations,
     workspaces: legacy.workspaces,
     preferences: { theme: 'light', route: '/chat' },
@@ -134,4 +134,50 @@ it('preserves saved settings when encryption fails and never falls back to plain
   expect(await fs.readFile(path.join(directory, 'provider.json'), 'utf8')).toBe(before);
   await store.save({ ...settings, apiKey: undefined, removeKey: true });
   expect((await store.get()).keyConfigured).toBe(false);
+});
+it('migrates provider defaults and resolves preview keys with environment precedence', async () => {
+  const original = {
+    baseUrl: 'https://proxy.example/v1',
+    model: 'legacy-chat',
+    systemPrompt: 'Keep instructions',
+    encryptedKey: Buffer.from('encrypted:saved-secret').toString('base64'),
+  };
+  await fs.writeFile(path.join(directory, 'provider.json'), JSON.stringify(original));
+  const store = new ProviderStorage(directory, cipher, {});
+  expect(await store.get()).toMatchObject({
+    provider: 'openai',
+    models: { chat: 'legacy-chat', image: '', live: '' },
+  });
+  expect(
+    await store.resolve({
+      provider: 'openai',
+      baseUrl: 'https://preview.example/v1',
+      apiKey: 'preview-key',
+    }),
+  ).toMatchObject({ apiKey: 'preview-key', baseUrl: 'https://preview.example/v1' });
+  expect(await fs.readFile(path.join(directory, 'provider.json'), 'utf8')).toBe(
+    JSON.stringify(original),
+  );
+  const managed = new ProviderStorage(directory, cipher, {
+    OPENAI_API_KEY: 'env-key',
+    OPENAI_BASE_URL: 'https://managed.example/v1',
+    OPENAI_MODEL: 'env-model',
+  });
+  expect(
+    await managed.resolve({
+      provider: 'openai',
+      baseUrl: 'https://preview.example/v1',
+      apiKey: 'preview-key',
+    }),
+  ).toMatchObject({
+    apiKey: 'env-key',
+    baseUrl: 'https://managed.example/v1',
+    models: { chat: 'env-model' },
+  });
+  await expect(
+    store.resolve({ provider: 'unsupported' as 'openai', baseUrl: original.baseUrl }),
+  ).rejects.toThrow();
+  expect(
+    await store.resolve({ provider: 'openai', baseUrl: original.baseUrl, removeKey: true }),
+  ).toMatchObject({ apiKey: '' });
 });
