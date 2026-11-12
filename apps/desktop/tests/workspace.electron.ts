@@ -21,6 +21,8 @@ async function launch(development = false) {
   app = await electron.launch({ args: [desktopRoot], env });
   page = await app.firstWindow();
   page.on('pageerror', (error) => errors.push(error.message));
+  // CI displays can clamp the native window below the desktop layout breakpoint.
+  await page.setViewportSize({ width: 1440, height: 960 });
   await expect(page.getByRole('navigation', { name: 'Chat navigation' })).toBeVisible();
 }
 async function openLegacy() {
@@ -162,13 +164,14 @@ test('sample workflow, keyboard search, approvals, responsive panels, and screen
     [1024, 800],
     [720, 520],
   ]) {
-    await app.evaluate(
-      ({ BrowserWindow }, size) => {
-        BrowserWindow.getAllWindows()[0].setContentSize(size[0], size[1]);
-      },
-      [width, height],
-    );
+    await page.setViewportSize({ width, height });
     await expect(page.getByRole('textbox', { name: 'Message Aria' })).toBeVisible();
+    await expect(page.getByText('Simulated content · no real operations')).toBeVisible({
+      visible: width >= 1100,
+    });
+    await expect(
+      page.getByRole('complementary', { name: 'Orchestration', exact: true }),
+    ).toBeVisible({ visible: width >= 1100 });
     await page.locator('.conversation-scroll').evaluate((element) => element.scrollTo({ top: 0 }));
     await page.screenshot({
       path: path.join(desktopRoot, `.artifacts/screenshots/workspace-${width}.png`),
