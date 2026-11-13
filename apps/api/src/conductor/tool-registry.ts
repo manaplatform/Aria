@@ -15,7 +15,7 @@ import { RunError, type RunFile } from './run-assets';
 export const conductorTools: ToolSet = {
   execute_steps: tool({
     description:
-      'Execute a batch of model or tool steps. Independent steps can run in parallel. Reference results by step ID and include each referenced step in dependsOn. Use only targets and capabilities listed for this turn.',
+      'Execute configured model or tool operations, including image generation and editing. Copy the exact target, capability, and output from a listed eligible operation. Independent steps can run in parallel. Reference results by step ID and include each referenced step in dependsOn.',
     inputSchema: executionBatchSchema,
     strict: false,
   }),

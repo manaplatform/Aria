@@ -115,3 +115,22 @@ it('requires declarations and a successful function-call probe before an unknown
     'unknown',
   );
 });
+it('shows documented capabilities and distinguishes known unsupported operations from unknown models', async () => {
+  window.aria!.discoverModels = vi.fn().mockResolvedValue([
+    {
+      id: 'gpt-image-2.6-sunburst',
+      capabilities: ['image', 'image-edit'],
+      source: 'documentation',
+    },
+    { id: 'text-embedding-3-large', capabilities: [], source: 'documentation' },
+  ]);
+  const user = userEvent.setup();
+  render(<ModelSettings />);
+  await user.click(await screen.findByRole('button', { name: 'Discover models' }));
+
+  expect(await screen.findByText('Image generation · Image editing')).toBeVisible();
+  expect(screen.getByText('No supported Aria operations')).toBeVisible();
+  expect(screen.queryByText('Unknown capabilities')).toBeNull();
+  expect(screen.queryByText('Provider catalog lists only the ID')).toBeNull();
+  expect(screen.queryByRole('button', { name: 'Capabilities' })).toBeNull();
+});

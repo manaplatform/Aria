@@ -79,10 +79,19 @@ export class ExecutionEngine {
       return capabilities.length
         ? [
             {
-              ref: model.ref,
-              model: model.id,
+              name: model.id,
               connection: model.connection.name,
-              capabilities,
+              operations: capabilities.map((capability) => ({
+                capability,
+                output:
+                  capability === 'web-search'
+                    ? toolOutputs.web_search.output
+                    : modelOutputs[capability as keyof typeof modelOutputs],
+                target:
+                  capability === 'web-search'
+                    ? { kind: 'tool', tool: 'web_search', model: model.ref }
+                    : { kind: 'model', model: model.ref },
+              })),
               contextTokens: model.contextTokens,
               inputCost: model.inputCost,
               outputCost: model.outputCost,
@@ -97,6 +106,19 @@ export class ExecutionEngine {
 
   get requiresSettings() {
     return this.failedCapabilities.size > 0;
+  }
+
+  private rejectTarget(capability: Capability) {
+    // Validation has not dispatched anything. Let the primary correct its choice
+    // when another authorized operation exists; invocation failures stay blocked.
+    if (this.canRun(capability))
+      throw new RunError(
+        `The requested target does not provide ${capability}. No operation started. Choose a listed ${capability} operation and copy its exact target and output.`,
+      );
+    this.failedCapabilities.add(capability);
+    throw new RunError(
+      'The selected model is unavailable for this capability. Check AI Models in Settings.',
+    );
   }
 
   get failed() {
@@ -162,12 +184,7 @@ export class ExecutionEngine {
         );
       const model = step.target.model ? this.registry.models.get(step.target.model) : undefined;
       if (step.target.kind === 'model') {
-        if (!model || !this.eligible(model, step.capability)) {
-          this.failedCapabilities.add(step.capability);
-          throw new RunError(
-            'The selected model is unavailable for this capability. Check AI Models in Settings.',
-          );
-        }
+        if (!model || !this.eligible(model, step.capability)) this.rejectTarget(step.capability);
         if (modelOutputs[step.capability as keyof typeof modelOutputs] !== step.output)
           throw new RunError('The selected output does not match the capability.');
       } else {
@@ -178,10 +195,7 @@ export class ExecutionEngine {
           step.target.tool === 'web_search' &&
           (!model || !this.eligible(model, step.capability, true))
         ) {
-          this.failedCapabilities.add(step.capability);
-          throw new RunError(
-            'The backing model is unavailable for Web Search. Check AI Models in Settings.',
-          );
+          this.rejectTarget(step.capability);
         }
         if (step.target.tool !== 'web_search' && step.target.model !== null)
           throw new RunError('This local tool does not use a backing model.');

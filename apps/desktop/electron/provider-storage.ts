@@ -28,7 +28,8 @@ const legacyModels = z.object({
   live: z.string(),
 });
 const legacySchema = z.object({
-  provider: z.literal('openai'),
+  // Original provider.json files predate provider selection and always used OpenAI's protocol.
+  provider: z.literal('openai').default('openai'),
   baseUrl: providerEndpointSchema,
   model: z.string(),
   models: legacyModels.optional(),

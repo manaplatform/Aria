@@ -45,6 +45,7 @@ export async function readBounded(response: Response, limit: number): Promise<Bu
 function describeModel(item: Record<string, unknown>, baseUrl: string): DiscoveredModel {
   const id = item.id as string;
   const official = new URL(baseUrl).origin === 'https://api.openai.com';
+  const documented = official ? documentedModel(id) : undefined;
   const raw = Array.isArray(item.capabilities) ? item.capabilities : undefined;
   const capabilities = raw?.slice(0, 32).flatMap((value) => {
     const capability = modelCapabilitySchema.safeParse(value);
@@ -52,12 +53,10 @@ function describeModel(item: Record<string, unknown>, baseUrl: string): Discover
       ? [capability.data]
       : [];
   });
-  if (!capabilities)
-    return (
-      (official ? documentedModel(id) : undefined) ?? { id, capabilities: [], source: 'unknown' }
-    );
+  if (!capabilities) return documented ?? { id, capabilities: [], source: 'unknown' };
   const transport = item.transport;
   return {
+    ...documented,
     id,
     capabilities: [...new Set(capabilities)],
     source: 'provider',

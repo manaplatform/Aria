@@ -226,6 +226,111 @@ it('uses the same primary for semantic routing and synthesis and reuses image ge
   });
   expect(fixture.mediaReceived.at(-1)?.body).toContain('name="image[]"');
 });
+it.each([
+  fixtureRef('fixture-model'),
+  'gpt-image-2.6-flare',
+  fixtureRef('unconfigured-image-model'),
+])(
+  'lets the primary correct image target %s before dispatching the configured image model',
+  async (target) => {
+    const snapshot = config();
+    for (const model of snapshot.connections[0].models)
+      model.delegate = model.id === 'gpt-image-2.6-flare';
+    registry.install(snapshot);
+    const prompt = `Make a panda image dancing (${target})`;
+    const instructions = 'Create an image of a happy panda dancing.';
+    fixture.continueWithTool(prompt, 'execute_steps', {
+      steps: [step('panda', 'gpt-image-2.6-flare', 'image', 'image', { instructions })],
+    });
+    const count = fixture.mediaReceived.length;
+    const primaryCalls = fixture.received.length;
+    const result = await read(prompt, [
+      step('invalid', '', 'image', 'image', {
+        target: { kind: 'model', model: target },
+        instructions,
+      }),
+    ]);
+    expect(result.events.at(-1)).toMatchObject({
+      type: 'completed',
+      partial: false,
+      run: { primary: fixtureRef('fixture-model'), billableChildStarted: true },
+    });
+    expect(result.bytes).toEqual([fixture.png]);
+    expect(fixture.mediaReceived).toHaveLength(count + 1);
+    expect(fixture.mediaReceived.at(-1)?.path).toBe('/v1/images/generations');
+    expect(JSON.parse(fixture.mediaReceived.at(-1)!.body)).toMatchObject({
+      model: 'gpt-image-2.6-flare',
+      prompt: instructions,
+    });
+    const calls = fixture.received.slice(primaryCalls);
+    expect(calls.map((call) => call.body.model)).toEqual(Array(3).fill('fixture-model'));
+    expect(calls[1].body.messages.at(-1)?.content).toContain('No operation started');
+    expect(calls[0].body.messages[0].content).toContain(
+      JSON.stringify({
+        capability: 'image',
+        output: 'image',
+        target: { kind: 'model', model: fixtureRef('gpt-image-2.6-flare') },
+      }),
+    );
+    expect(result.events.filter((event) => event.type === 'activity')).toHaveLength(3);
+  },
+);
+it('waits for a corrected primary decision after a target rejection without automatically choosing a model', async () => {
+  const count = fixture.mediaReceived.length;
+  const result = await read('Draw a panda with an invalid target', [
+    step('invalid', 'fixture-model', 'image', 'image'),
+  ]);
+  expect(result.events.at(-1)).toMatchObject({
+    type: 'failed',
+    settingsHelp: false,
+    run: { billableChildStarted: false },
+  });
+  expect(result.text).toContain('No operation started');
+  expect(fixture.mediaReceived).toHaveLength(count);
+});
+it('resolves selected Sunburst image operations from authenticated OpenAI IDs and documented capabilities', async () => {
+  const snapshot = config();
+  snapshot.crossConnection = true;
+  snapshot.connections[0].models.find((model) => model.id === 'gpt-image-2.6-flare')!.enabled =
+    false;
+  snapshot.connections.push({
+    id: secondId,
+    name: 'Configured images',
+    baseUrl: 'https://api.openai.com/v1',
+    apiKey: 'image-key',
+    models: [{ id: 'gpt-image-2.6-sunburst', enabled: true, delegate: true, declared: [] }],
+    verified: [],
+    webSearch: false,
+  });
+  registry.install(snapshot);
+  const nativeFetch = globalThis.fetch;
+  const provider = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, options) => {
+    if (String(input) === 'https://api.openai.com/v1/models')
+      return Response.json({ data: [{ id: 'gpt-image-2.6-sunburst' }] });
+    if (String(input) === 'https://api.openai.com/v1/images/generations') {
+      expect(options?.headers).toMatchObject({ Authorization: 'Bearer image-key' });
+      expect(JSON.parse(String(options?.body))).toMatchObject({
+        model: 'gpt-image-2.6-sunburst',
+        output_format: 'png',
+      });
+      expect(JSON.parse(String(options?.body))).not.toHaveProperty('response_format');
+      return Response.json({ data: [{ b64_json: fixture.png.toString('base64') }] });
+    }
+    return nativeFetch(input, options);
+  });
+  const result = await read('Make a dancing panda using the configured image model', [
+    step('panda', '', 'image', 'image', {
+      target: { kind: 'model', model: `${secondId}:gpt-image-2.6-sunburst` },
+    }),
+  ]);
+  expect(result.events.at(-1)?.type).toBe('completed');
+  expect(result.bytes).toEqual([fixture.png]);
+  expect(
+    provider.mock.calls.filter(
+      ([input]) => String(input) === 'https://api.openai.com/v1/images/generations',
+    ),
+  ).toHaveLength(1);
+});
 it('runs dependent transcription, speech, and downloadable text through authorized result references', async () => {
   const recording = file('recording.wav', 'audio/wav', fixture.wav);
   const result = await read(
@@ -453,6 +558,48 @@ it('isolates duplicate provider model IDs by connection and enforces cross-conne
   expect(result.text).toContain('restrict attachment transfer');
   const call = [...fixture.received].reverse().find((call) => call.body.model === 'test-model');
   expect(call?.body.messages).toHaveLength(2);
+});
+it('executes a documented image model from an ID-only OpenAI catalog without capability declarations', async () => {
+  const snapshot = config();
+  snapshot.crossConnection = true;
+  snapshot.connections.push({
+    id: secondId,
+    name: 'OpenAI images',
+    baseUrl: 'https://api.openai.com/v1',
+    apiKey: 'image-fixture-key',
+    verified: [],
+    webSearch: false,
+    models: [{ id: 'gpt-image-2.6-sunburst', enabled: true, delegate: true, declared: [] }],
+  });
+  registry.install(snapshot);
+  const nativeFetch = globalThis.fetch;
+  const provider = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, options) => {
+    if (String(input) === 'https://api.openai.com/v1/models')
+      return Response.json({ data: [{ id: 'gpt-image-2.6-sunburst' }] });
+    if (String(input) === 'https://api.openai.com/v1/images/generations') {
+      expect(JSON.parse(String(options?.body))).toMatchObject({
+        model: 'gpt-image-2.6-sunburst',
+        output_format: 'png',
+        n: 1,
+      });
+      return Response.json({ data: [{ b64_json: fixture.png.toString('base64') }] });
+    }
+    return nativeFetch(input, options);
+  });
+
+  const result = await read('Create a detailed panorama', [
+    step('panorama', '', 'image', 'image', {
+      target: { kind: 'model', model: `${secondId}:gpt-image-2.6-sunburst` },
+    }),
+  ]);
+
+  expect(result.events.at(-1)).toMatchObject({ type: 'completed' });
+  expect(result.bytes).toEqual([fixture.png]);
+  expect(
+    provider.mock.calls.filter(
+      ([input]) => String(input) === 'https://api.openai.com/v1/images/generations',
+    ),
+  ).toHaveLength(1);
 });
 it('searches with the explicitly chosen OpenAI model and feeds sourced results into image generation', async () => {
   const snapshot = config();

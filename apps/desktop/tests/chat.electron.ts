@@ -338,6 +338,32 @@ function planned(
   };
 }
 
+test('corrects a rejected chat-model target and creates a dancing panda with the selected image model', async () => {
+  await launch();
+  const id = await enableFixtureModels(['gpt-image-2.6-flare']);
+  const prompt = 'Make a panda image dancing';
+  const instructions = 'Create an image of a panda dancing.';
+  fixture.queueTool(prompt, 'execute_steps', {
+    steps: [planned(`${id}:fixture-model`, 'image', 'image', { instructions })],
+  });
+  fixture.continueWithTool(prompt, 'execute_steps', {
+    steps: [planned(`${id}:gpt-image-2.6-flare`, 'image', 'image', { instructions })],
+  });
+  const count = fixture.mediaReceived.length;
+  await send(prompt);
+  await expect(page.locator('.from-assistant[data-status="completed"]')).toHaveCount(1);
+  const image = page.locator('.from-assistant img');
+  await expect(image).toBeVisible();
+  await expect.poll(() => image.evaluate((node: HTMLImageElement) => node.naturalWidth)).toBe(1);
+  await expect(page.locator('.conductor-activity')).toContainText('gpt-image-2.6-flare');
+  expect(fixture.mediaReceived).toHaveLength(count + 1);
+  expect(JSON.parse(fixture.mediaReceived.at(-1)!.body)).toMatchObject({
+    model: 'gpt-image-2.6-flare',
+    prompt: instructions,
+  });
+  await expect(page.getByRole('alert')).toHaveCount(0);
+});
+
 test('creates and edits an image, transcribes audio, and restores artifacts and activity on relaunch', async () => {
   await launch();
   const id = await enableFixtureModels(['gpt-image-2.6-flare', 'gpt-transcribe', 'tts-1']);

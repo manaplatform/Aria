@@ -575,6 +575,7 @@ function ConnectionCard({
           };
           const discovered = descriptors.get(id);
           const unknown = discovered?.source === 'unknown';
+          const unsupported = discovered && !unknown && !discovered.capabilities.length;
           const missing = Boolean(catalog.models && !discovered);
           const capabilities = unknown ? model.declared : (discovered?.capabilities ?? []);
           return (
@@ -589,7 +590,9 @@ function ConnectionCard({
                         ? 'Refresh to check availability'
                         : capabilities.length
                           ? capabilities.map((capability) => labels[capability]).join(' · ')
-                          : 'Unknown capabilities'}
+                          : unsupported
+                            ? 'No supported Aria operations'
+                            : 'Unknown capabilities'}
                   </small>
                   {discovered && (
                     <small>

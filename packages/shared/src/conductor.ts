@@ -29,12 +29,23 @@ export const executionStepSchema = z
   .object({
     id: stepId,
     target: z.discriminatedUnion('kind', [
-      z.object({ kind: z.literal('model'), model: modelRefSchema }).strict(),
+      z
+        .object({
+          kind: z.literal('model'),
+          model: modelRefSchema.describe(
+            'Copy the exact connection-qualified reference from a listed operation target, not the display name or bare model ID.',
+          ),
+        })
+        .strict(),
       z
         .object({
           kind: z.literal('tool'),
           tool: z.enum(toolIds),
-          model: modelRefSchema.nullable(),
+          model: modelRefSchema
+            .nullable()
+            .describe(
+              'Copy the listed backing model reference for web_search; use null for local tools.',
+            ),
         })
         .strict(),
     ]),

@@ -208,6 +208,75 @@ it('migrates the selected defaults and keeps the original encrypted provider fil
   );
   expect((await new ProviderStorage(directory, cipher, {}).get()).revision).toBe(migrated.revision);
 });
+it.each([
+  { format: 'chat-only settings', models: undefined },
+  {
+    format: 'per-operation settings',
+    models: {
+      chat: 'legacy-chat',
+      image: 'legacy-image',
+      speech: '',
+      transcription: '',
+      live: '',
+    },
+  },
+])('migrates $format saved before an explicit provider field existed', async ({ models }) => {
+  const legacy = {
+    baseUrl: 'https://api.openai.com/v1',
+    model: 'legacy-chat',
+    systemPrompt: 'Keep original instructions',
+    encryptedKey: Buffer.from('encrypted:original-secret').toString('base64'),
+    ...(models ? { models } : {}),
+  };
+  const original = JSON.stringify(legacy);
+  await fs.writeFile(path.join(directory, 'provider.json'), original);
+
+  const store = new ProviderStorage(directory, cipher, {});
+  const [migrated, loadedAgain] = await Promise.all([store.get(), store.get()]);
+  expect(migrated.connections).toHaveLength(1);
+  const [connection] = migrated.connections;
+  expect(migrated).toMatchObject({
+    primary: modelReference(connection.id, legacy.model),
+    systemPrompt: legacy.systemPrompt,
+  });
+  expect(connection).toMatchObject({
+    baseUrl: legacy.baseUrl,
+    keyConfigured: true,
+    locked: false,
+    models: expect.arrayContaining([
+      { id: legacy.model, enabled: true, delegate: true, declared: ['chat'] },
+    ]),
+  });
+  if (models) {
+    expect(connection.models).toContainEqual({
+      id: models.image,
+      enabled: true,
+      delegate: true,
+      declared: ['image', 'image-edit'],
+    });
+  }
+  const persisted = JSON.parse(await fs.readFile(path.join(directory, 'provider-v2.json'), 'utf8'));
+  expect(persisted.connections[0].encryptedKey).toBe(legacy.encryptedKey);
+  expect((await store.resolve()).connections[0].apiKey).toBe('original-secret');
+  expect(loadedAgain.revision).toBe(migrated.revision);
+  expect(await fs.readFile(path.join(directory, 'provider.json'), 'utf8')).toBe(original);
+});
+it('preserves legacy files with an unsupported explicit provider and reports the migration error', async () => {
+  const original = JSON.stringify({
+    provider: 'unsupported',
+    baseUrl: 'https://provider.example/v1',
+    model: 'legacy-chat',
+    systemPrompt: '',
+  });
+  await fs.writeFile(path.join(directory, 'provider.json'), original);
+
+  const store = new ProviderStorage(directory, cipher, {});
+  await expect(store.get()).rejects.toThrow('Legacy model settings could not be migrated');
+  expect(await fs.readFile(path.join(directory, 'provider.json'), 'utf8')).toBe(original);
+  await expect(fs.stat(path.join(directory, 'provider-v2.json'))).rejects.toMatchObject({
+    code: 'ENOENT',
+  });
+});
 it('requires an exact endpoint and key match for a compatible primary verification', async () => {
   const store = new ProviderStorage(directory, cipher, {});
   const initial = registryDraft(await store.get());
