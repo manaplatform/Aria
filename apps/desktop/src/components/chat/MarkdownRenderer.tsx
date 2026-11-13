@@ -1,3 +1,4 @@
+import type { ConductorSource } from '@aria/shared';
 import type { ReactNode } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -22,25 +23,34 @@ function extractText(node: ReactNode): string {
     return extractText((node.props as { children?: ReactNode }).children);
   return '';
 }
-export default function MarkdownRenderer({ content }: { content: string }): ReactNode {
+export default function MarkdownRenderer({
+  content,
+  sources = [],
+}: {
+  content: string;
+  sources?: ConductorSource[];
+}): ReactNode {
   return (
     <div className="markdown">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         components={{
           pre: ({ children }) => <CodeBlock>{children}</CodeBlock>,
-          a: ({ href, children }) => (
-            <a
-              href={href}
-              onClick={(event) => {
-                event.preventDefault();
-                if (href)
-                  void openExternal(href).catch((error) => notify(errorMessage(error), true));
-              }}
-            >
-              {children}
-            </a>
-          ),
+          a: ({ href, children }) =>
+            !href || (sources.length && !sources.some((source) => source.url === href)) ? (
+              <>{children}</>
+            ) : (
+              <a
+                href={href}
+                onClick={(event) => {
+                  event.preventDefault();
+                  if (href)
+                    void openExternal(href).catch((error) => notify(errorMessage(error), true));
+                }}
+              >
+                {children}
+              </a>
+            ),
           img: ({ alt }) => <span className="muted">[Image: {alt || 'attachment'}]</span>,
         }}
       >

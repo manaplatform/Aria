@@ -897,3 +897,115 @@
     display: none;
   }
 }
+
+.registry-editor,
+.registry-connection {
+  display: grid;
+  gap: 1rem;
+}
+
+.registry-connection {
+  padding: 1rem;
+  border: 1px solid var(--border);
+  border-radius: 0.9rem;
+}
+
+.registry-actions,
+.registry-connection-heading,
+.registry-checkbox {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.65rem;
+}
+
+.registry-connection-heading strong {
+  margin-inline-end: auto;
+}
+
+.registry-settings-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(11rem, 100%), 1fr));
+  gap: 0.75rem;
+}
+
+.registry-editor :is(select, input:not([type='checkbox']), textarea) {
+  min-width: 0;
+  width: 100%;
+  border: 1px solid var(--border);
+  background: var(--background);
+  color: inherit;
+  border-radius: 0.5rem;
+  padding: 0.5rem;
+}
+
+.registry-editor textarea {
+  min-height: 5rem;
+}
+
+.registry-models {
+  list-style: none;
+  display: grid;
+  gap: 0;
+  padding: 0;
+  margin: 0;
+}
+
+.registry-models li {
+  border-block-start: 1px solid var(--border);
+  padding-block: 0.65rem;
+}
+
+.registry-model-row,
+.registry-declarations {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.65rem 1rem;
+  align-items: center;
+}
+
+.registry-model-row > div {
+  min-width: min(13rem, 100%);
+  flex: 1;
+  overflow-wrap: anywhere;
+}
+
+.registry-model-row small {
+  display: block;
+  margin-top: 0.25rem;
+  color: var(--muted);
+}
+
+.registry-declarations {
+  margin-block-start: 0.65rem;
+}
+
+.conductor-activity {
+  font-size: 0.85rem;
+  margin-block: 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: 0.65rem;
+  padding: 0.55rem 0.75rem;
+}
+
+.conductor-activity summary {
+  cursor: pointer;
+}
+.conductor-activity ul {
+  margin-block: 0.6rem 0.2rem;
+  padding-inline-start: 1rem;
+}
+.conductor-activity li + li {
+  margin-block-start: 0.55rem;
+}
+.conductor-activity li small {
+  display: block;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.conductor-sources {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 0.75rem;
+  align-items: baseline;
+}

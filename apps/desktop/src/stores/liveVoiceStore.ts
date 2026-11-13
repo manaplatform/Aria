@@ -1,10 +1,9 @@
 import { create } from 'zustand';
-import type { ChatMessage, LiveEvent } from '@aria/shared';
+import { endActivity, type ChatMessage, type LiveEvent } from '@aria/shared';
 import { desktop, errorMessage } from '../services/desktop';
 import { LiveAudio } from '../audio/liveAudio';
 import { flushPersistence, useWorkspaceStore } from './workspaceStore';
-import { generating, updateChat } from './chatStore';
-import { useProviderStore } from './providerStore';
+import { applyChatEvent, generating, updateChat, useChatStore } from './chatStore';
 import { notify } from './uiStore';
 interface LiveState {
   phase: 'idle' | 'connecting' | 'active' | 'ending';
@@ -25,6 +24,39 @@ let generation = 0;
 export function applyLiveEvent(event: LiveEvent) {
   const state = useLiveVoiceStore.getState();
   if (event.sessionId !== state.sessionId || event.conversationId !== state.conversationId) return;
+  if (event.type === 'conductor') {
+    const messages = useWorkspaceStore.getState().data.chat.messages;
+    const record = messages.find(
+      (item) => item.id === event.requestId && item.conversationId === event.conversationId,
+    );
+    if (!record) {
+      updateChat((chat) => ({
+        ...chat,
+        messages: [
+          ...chat.messages,
+          {
+            id: event.requestId,
+            requestId: event.requestId,
+            conversationId: event.conversationId,
+            role: 'assistant',
+            content: '',
+            status: 'pending',
+            sequence: 0,
+            delegatedFromVoice: true,
+            createdAt: new Date().toISOString(),
+          },
+        ],
+      }));
+    }
+    applyChatEvent({
+      ...event.event,
+      requestId: event.requestId,
+      conversationId: event.conversationId,
+      assistantMessageId: event.requestId,
+      sequence: (record?.sequence ?? 0) + 1,
+    });
+    return;
+  }
   if (event.type === 'ready') {
     if (state.phase === 'connecting') useLiveVoiceStore.setState({ phase: 'active' });
     return;
@@ -76,7 +108,16 @@ export function applyLiveEvent(event: LiveEvent) {
             ...(message.role === 'assistant' && event.asset ? { assets: [event.asset] } : {}),
             ...(event.type === 'failed' ? { error: event.error } : {}),
           }
-        : message,
+        : message.delegatedFromVoice &&
+            message.conversationId === event.conversationId &&
+            generating(message)
+          ? {
+              ...message,
+              status: event.type === 'failed' ? 'interrupted' : 'stopped',
+              activity: endActivity(message.activity),
+              retryConfirmed: false,
+            }
+          : message,
     ),
   }));
   useLiveVoiceStore.setState({
@@ -87,13 +128,10 @@ export function applyLiveEvent(event: LiveEvent) {
     error: event.type === 'failed' ? event.error : '',
   });
 }
-export async function startLiveVoice(voice = 'marin') {
+export async function startLiveVoice() {
   if (useLiveVoiceStore.getState().phase !== 'idle') return;
-  const provider = useProviderStore.getState();
-  const model = provider.selections.live;
-  const chatModel = provider.selections.chat;
-  if (![model, chatModel].every((id) => id && provider.models.some((m) => m.id === id))) {
-    notify('Select an available GPT-Live model and Chat model before starting voice.', true);
+  if (!useChatStore.getState().status.voiceReady) {
+    notify('Configure the Live Voice profile in Settings → AI Models.', true);
     return;
   }
   if (useWorkspaceStore.getState().data.chat.messages.some(generating)) {
@@ -127,7 +165,6 @@ export async function startLiveVoice(voice = 'marin') {
       requestId: sessionId,
       conversationId,
       liveSessionId: sessionId,
-      liveConfig: { model, chatModel, voice },
       role,
       content: '',
       createdAt: now,
@@ -180,9 +217,7 @@ export async function startLiveVoice(voice = 'marin') {
     await desktop().startLive({
       sessionId,
       conversationId,
-      model,
-      chatModel,
-      voice,
+      assistantMessageId: messages[1].id,
       messages: bounded,
     });
   } catch (error) {

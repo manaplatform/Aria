@@ -14,10 +14,9 @@ import {
 import { ChatInputDto } from '../chat/chat.dto';
 export class VoiceStartDto {
   @IsIn(['start']) type!: 'start';
-  @IsString() @MinLength(1) @MaxLength(200) model!: string;
-  @IsString() @MinLength(1) @MaxLength(200) chatModel!: string;
-  @IsIn(['marin', 'cedar', 'alloy', 'ash', 'ballad', 'coral', 'echo', 'sage', 'shimmer', 'verse'])
-  voice!: string;
+  @IsString() @MinLength(1) @MaxLength(200) sessionId!: string;
+  @IsString() @MinLength(1) @MaxLength(200) conversationId!: string;
+  @IsString() @MinLength(1) @MaxLength(200) assistantMessageId!: string;
   @IsArray()
   @ArrayMaxSize(41)
   @ValidateNested({ each: true })

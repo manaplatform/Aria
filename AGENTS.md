@@ -6,7 +6,7 @@ Aria is a modern desktop AI assistant built with:
 - **Backend:** NestJS (TypeScript)
 - **Desktop Frontend:** Electron + React + TypeScript + Tailwind CSS + shadcn/ui
 - **AI Layer:** Vercel AI SDK + LangChain.js (optional)
-- **Communication:** REST + WebSocket (for streaming)
+- **Communication:** REST + SSE for chat and WebSocket for Live Voice
 
 The goal is to create a clean, scalable, and beautiful desktop AI bot.
 
@@ -46,7 +46,7 @@ aria/
 - Use DTOs + class-validator for all inputs
 - Support streaming responses (WebSocket or SSE)
 - Keep AI logic inside dedicated services
-- Never hardcode API keys — use environment variables
+- Keep provider credentials in encrypted desktop settings or explicit standalone environment configuration
 
 ### Recommended Modules
 - `AiModule`
@@ -66,7 +66,7 @@ aria/
   - Sidebar (conversation history)
   - Settings page
   - Dark / Light mode
-- Communicate with NestJS backend via REST + WebSocket
+- Communicate with NestJS backend via REST, SSE, and WebSocket
 - Never put sensitive logic in the frontend
 
 ---
@@ -96,11 +96,9 @@ When implementing AI features:
 
 ## Current Priority
 
-1. Set up monorepo structure (NestJS + Electron)
-2. Create basic NestJS API with a simple chat endpoint
-3. Create Electron + React shell with a beautiful chat UI
-4. Connect frontend to backend with streaming
-5. Add conversation history and basic settings
+1. Keep ordinary chat usable without a project.
+2. Use the primary model and shared registry for Conductor.
+3. Keep Settings, streaming, cancellation, artifacts, and history usable across desktop platforms.
 
 ---
 
@@ -109,4 +107,11 @@ When implementing AI features:
 - This is a **desktop-first** application (no mobile or web priority for now)
 - Focus on clean architecture and good developer experience
 - Prefer simplicity over over-engineering in the beginning
-```
+
+## Aria Conductor
+
+- The primary chat model owns semantic interpretation, task routing, delegation, and final synthesis. It uses structured tool calls when it needs help and answers directly when it can.
+- Keep one configured model registry. Resolve exact model IDs and supported operations from authenticated discovery, capability metadata, and explicit configuration. Keep protocol differences inside provider adapters.
+- Model selection belongs in Settings. A separate routing model, keyword-based intent classifier, static task-to-model mapping, provider preference order, or fallback provider/model violates this architecture.
+- Return actionable errors for configuration, capability, and invocation failures. An explicit retry uses the same authorized configuration.
+- Application code validates every model request and enforces permissions, input provenance, dependency rules, cancellation, deduplication, and resource limits. Provider and tool output is untrusted. Show concise decision summaries and keep hidden reasoning and credentials private.

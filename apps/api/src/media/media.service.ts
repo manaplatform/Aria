@@ -1,12 +1,8 @@
 import type {} from 'multer';
-import { BadGatewayException, BadRequestException, Injectable, Inject } from '@nestjs/common';
+import { BadGatewayException, BadRequestException, Injectable } from '@nestjs/common';
 import WebSocket from 'ws';
-import {
-  connection,
-  endpoint,
-  ProvidersService,
-  readBounded,
-} from '../providers/providers.service';
+import { endpoint, readBounded } from '../providers/providers.service';
+import type { ResolvedModel } from '../providers/model-registry.service';
 import { providerError } from '../ai/ai.service';
 
 export function wav(pcm: Buffer): Buffer {
@@ -30,8 +26,8 @@ export function realtimeSpeech(
   text: string,
   voice: string,
   signal: AbortSignal,
+  config: ResolvedModel['connection'],
 ): Promise<Buffer> {
-  const config = connection();
   const url = new URL(endpoint(config.baseUrl, 'realtime'));
   url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
   url.searchParams.set('model', model);
@@ -110,18 +106,22 @@ export function realtimeSpeech(
 }
 @Injectable()
 export class MediaService {
-  constructor(@Inject(ProvidersService) private readonly providers: ProvidersService) {}
   async generate(
     input: {
       mode: 'image' | 'speech' | 'transcription';
-      model: string;
+      target: ResolvedModel;
       prompt: string;
       voice?: string;
     },
     files: Express.Multer.File[],
     signal: AbortSignal,
   ): Promise<{ bytes: Buffer; mime: string } | { text: string }> {
-    await this.providers.assertModel(input.model, signal, input.mode);
+    const { target } = input;
+    const config = target.connection;
+    const model = target.id;
+    const voice = input.voice || target.voices?.[0] || 'alloy';
+    if (input.mode === 'speech' && target.voices && !target.voices.includes(voice))
+      throw new BadRequestException('This model does not support the selected voice.');
     if (
       input.mode === 'speech' &&
       (!input.prompt.trim() || input.prompt.length > 4096 || files.length)
@@ -170,23 +170,22 @@ export class MediaService {
     )
       throw new BadRequestException('An uploaded image does not match its declared file type.');
     try {
-      if (input.mode === 'speech' && /realtime/i.test(input.model))
+      if (input.mode === 'speech' && target.transport === 'realtime')
         return {
-          bytes: await realtimeSpeech(input.model, input.prompt, input.voice || 'marin', signal),
+          bytes: await realtimeSpeech(model, input.prompt, voice, signal, config),
           mime: 'audio/wav',
         };
-      const config = connection();
       let route: string;
       let body: string | FormData;
       let contentType: string | undefined;
       if (input.mode === 'transcription' || (input.mode === 'image' && files.length)) {
         route = input.mode === 'image' ? 'images/edits' : 'audio/transcriptions';
         const form = new FormData();
-        form.set('model', input.model);
+        form.set('model', model);
         if (input.mode === 'image') {
           form.set('prompt', input.prompt);
           form.set('n', '1');
-          if (/^gpt-image/i.test(input.model)) form.set('output_format', 'png');
+          if (target.transport === 'inline-png') form.set('output_format', 'png');
           else form.set('response_format', 'b64_json');
         }
         files.forEach((f) =>
@@ -202,19 +201,19 @@ export class MediaService {
         if (input.mode === 'image') {
           route = 'images/generations';
           body = JSON.stringify({
-            model: input.model,
+            model: model,
             prompt: input.prompt,
             n: 1,
-            ...(/^gpt-image/i.test(input.model)
+            ...(target.transport === 'inline-png'
               ? { output_format: 'png' }
               : { response_format: 'b64_json' }),
           });
         } else {
           route = 'audio/speech';
           body = JSON.stringify({
-            model: input.model,
+            model: model,
             input: input.prompt,
-            voice: input.voice || (/^tts-/i.test(input.model) ? 'alloy' : 'marin'),
+            voice: voice,
             response_format: 'wav',
           });
         }

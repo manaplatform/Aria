@@ -3,6 +3,8 @@ import {
   ArrayMaxSize,
   ArrayMinSize,
   IsArray,
+  ArrayUnique,
+  IsUUID,
   IsIn,
   IsNotEmpty,
   IsOptional,
@@ -23,9 +25,16 @@ export class ChatInputDto {
 
 export class ChatRequestDto {
   @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(4)
+  @ArrayUnique()
+  @IsUUID('all', { each: true })
+  attachmentIds?: string[];
+
+  @IsOptional()
   @IsString()
-  @MaxLength(200)
-  model?: string;
+  @MaxLength(100)
+  expectedRevision?: string;
 
   @IsString()
   @IsNotEmpty()
@@ -48,4 +57,8 @@ export class ChatRequestDto {
   @ValidateNested({ each: true })
   @Type(() => ChatInputDto)
   messages!: ChatInputDto[];
+}
+
+export class AttachmentMetadataDto {
+  @IsString() @MaxLength(4096) metadata!: string;
 }

@@ -1,355 +1,697 @@
 import { useEffect, useRef, useState } from 'react';
-import { Check, RefreshCw, Square } from 'lucide-react';
-import type {
-  GenerationMode,
-  ModelSelections,
-  ProviderModel,
-  ProviderSettings,
+import { Check, Cpu, Plus, RefreshCw, Trash2 } from 'lucide-react';
+import {
+  modelCapabilities,
+  modelReference,
+  officialOpenAI,
+  registryDraft,
+  registryPolicySchema,
+  type ConnectionInput,
+  type DiscoveredModel,
+  type ModelCapability,
+  type RegistryInput,
+  type RegistrySettings,
 } from '@aria/shared';
 import { desktop, errorMessage } from '../../services/desktop';
-import { generating, stopAllChats, useChatStore } from '../../stores/chatStore';
-import { useWorkspaceStore } from '../../stores/workspaceStore';
-import { refreshProvider } from '../../stores/providerStore';
-import { useLiveVoiceStore } from '../../stores/liveVoiceStore';
-import { Badge, Button, ErrorState, Field, Skeleton } from '../ui';
-import { ModelSelect, modeLabels } from './ModelSelect';
-const modes: GenerationMode[] = ['chat', 'image', 'speech', 'transcription', 'live'];
-const empty: ModelSelections = { chat: '', image: '', speech: '', transcription: '', live: '' };
+import { useChatStore } from '../../stores/chatStore';
+import {
+  installRegistrySettings,
+  refreshProvider,
+  useProviderStore,
+} from '../../stores/providerStore';
+import { Button, Field } from '../ui';
+
+const labels: Record<ModelCapability, string> = {
+  chat: 'Text streaming',
+  tools: 'Function calling',
+  vision: 'Vision',
+  image: 'Image generation',
+  'image-edit': 'Image editing',
+  speech: 'Speech',
+  transcription: 'Transcription',
+  live: 'Live Voice',
+  'web-search': 'Web Search',
+};
+const voices = registryPolicySchema.shape.live.unwrap().shape.voice.options;
+
 export function ModelSettings() {
-  const status = useChatStore((state) => state.status);
-  const active = useWorkspaceStore((state) => state.data.chat.messages.some(generating));
-  const live = useLiveVoiceStore((state) => state.phase !== 'idle');
-  const [settings, setSettings] = useState<ProviderSettings | null>(null);
-  const [baseUrl, setBaseUrl] = useState('https://api.openai.com/v1');
-  const [models, setModels] = useState<ModelSelections>(empty);
-  const [catalog, setCatalog] = useState<ProviderModel[] | null>(null);
-  const [systemPrompt, setSystemPrompt] = useState('');
-  const [key, setKey] = useState('');
-  const [removeKey, setRemoveKey] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState('');
-  const [feedback, setFeedback] = useState('');
-  const [verified, setVerified] = useState(false);
-  const [dirty, setDirty] = useState(false);
-  const [reload, setReload] = useState(0);
-  const sequence = useRef(0);
+  const { settings, loading, error } = useProviderStore();
   useEffect(() => {
-    let alive = true;
-    const request = ++sequence.current;
-    setError('');
-    void desktop()
-      .providerSettings()
-      .then(async (value) => {
-        if (!alive) return;
-        setSettings(value);
-        setBaseUrl(value.baseUrl);
-        setModels(value.models);
-        setSystemPrompt(value.systemPrompt);
-        if (value.keyConfigured) {
-          setLoading(true);
-          try {
-            const result = await desktop().providerModels();
-            if (alive && request === sequence.current) setCatalog(result);
-          } catch (failure) {
-            if (alive && request === sequence.current) setError(errorMessage(failure));
-          } finally {
-            if (alive && request === sequence.current) setLoading(false);
-          }
-        }
-      })
-      .catch((failure) => {
-        if (alive) setError(errorMessage(failure));
-      });
-    return () => {
-      alive = false;
-    };
-  }, [reload]);
-  const locked = busy || active || live || status.state === 'starting';
-  const managed = (field: keyof ProviderSettings['sources']) =>
-    settings?.sources[field] === 'environment';
-  const changed = () => {
-    setVerified(false);
-    setFeedback('');
-    setDirty(true);
+    void refreshProvider();
+  }, []);
+  return (
+    <section id="ai-models" className="settings-section" aria-labelledby="ai-models-heading">
+      <div className="settings-section-heading">
+        <h2 id="ai-models-heading">
+          <Cpu size={17} /> AI Models
+        </h2>
+        <p>The primary model answers in chat and chooses when to use an enabled model or tool.</p>
+      </div>
+      {settings ? (
+        <RegistryEditor key={settings.revision} settings={settings} />
+      ) : loading ? (
+        <p role="status">Loading model settings…</p>
+      ) : (
+        <Button size="sm" onClick={() => void refreshProvider()}>
+          Load model settings
+        </Button>
+      )}
+      {error && (
+        <p className="chat-response-error" role="alert">
+          {error}
+        </p>
+      )}
+    </section>
+  );
+}
+
+type CatalogState = {
+  models?: DiscoveredModel[];
+  busy?: boolean;
+  error?: string;
+  verified?: string[];
+};
+
+function RegistryEditor({ settings }: { settings: RegistrySettings }) {
+  const [draft, setDraft] = useState(() => registryDraft(settings));
+  const [catalogs, setCatalogs] = useState<Record<string, CatalogState>>({});
+  const [busy, setBusy] = useState(false);
+  const [feedback, setFeedback] = useState<{ error: boolean; text: string }>();
+  const catalogRevisions = useRef(new Map<string, number>());
+  const status = useChatStore((state) => state.status);
+
+  const editConnection = (connection: ConnectionInput, invalidate = false) => {
+    if (invalidate) {
+      catalogRevisions.current.set(
+        connection.id,
+        (catalogRevisions.current.get(connection.id) ?? 0) + 1,
+      );
+      setCatalogs((current) => ({ ...current, [connection.id]: {} }));
+    }
+    const enabled = new Set(
+      connection.models
+        .filter((model) => model.enabled)
+        .map((model) => modelReference(connection.id, model.id)),
+    );
+    setDraft((current) => ({
+      ...current,
+      connections: current.connections.map((item) =>
+        item.id === connection.id ? connection : item,
+      ),
+      primary:
+        current.primary?.startsWith(`${connection.id}:`) && !enabled.has(current.primary)
+          ? null
+          : current.primary,
+      live:
+        current.live?.model.startsWith(`${connection.id}:`) && !enabled.has(current.live.model)
+          ? null
+          : current.live,
+    }));
   };
-  const invalidate = () => {
-    ++sequence.current;
-    setCatalog(null);
-    setLoading(false);
-    setError('');
-    changed();
-  };
-  const operation = async (action: () => Promise<void>) => {
-    setBusy(true);
-    setError('');
-    setFeedback('');
+
+  const discover = async (connection: ConnectionInput) => {
+    const revision = (catalogRevisions.current.get(connection.id) ?? 0) + 1;
+    catalogRevisions.current.set(connection.id, revision);
+    setCatalogs((current) => ({
+      ...current,
+      [connection.id]: { ...current[connection.id], busy: true, error: undefined },
+    }));
     try {
-      await action();
-    } catch (failure) {
-      setError(errorMessage(failure));
+      const models = await desktop().discoverModels(connection);
+      if (catalogRevisions.current.get(connection.id) === revision)
+        setCatalogs((current) => ({
+          ...current,
+          [connection.id]: { ...current[connection.id], models, busy: false },
+        }));
+    } catch (error) {
+      if (catalogRevisions.current.get(connection.id) === revision)
+        setCatalogs((current) => ({ ...current, [connection.id]: { error: errorMessage(error) } }));
+    }
+  };
+
+  const verify = async (connection: ConnectionInput, id: string) => {
+    const revision = catalogRevisions.current.get(connection.id);
+    setCatalogs((current) => ({
+      ...current,
+      [connection.id]: { ...current[connection.id], busy: true, error: undefined },
+    }));
+    try {
+      await desktop().verifyModel(connection, id);
+      if (revision === catalogRevisions.current.get(connection.id))
+        setCatalogs((current) => ({
+          ...current,
+          [connection.id]: {
+            ...current[connection.id],
+            busy: false,
+            verified: [...(current[connection.id]?.verified ?? []), id],
+          },
+        }));
+    } catch (error) {
+      if (revision === catalogRevisions.current.get(connection.id))
+        setCatalogs((current) => ({
+          ...current,
+          [connection.id]: {
+            ...current[connection.id],
+            busy: false,
+            error: errorMessage(error),
+          },
+        }));
+    }
+  };
+
+  const apply = async (action: () => Promise<RegistrySettings>) => {
+    setBusy(true);
+    setFeedback(undefined);
+    try {
+      installRegistrySettings(await action());
+    } catch (error) {
+      setFeedback({ error: true, text: errorMessage(error) });
     } finally {
       setBusy(false);
     }
   };
-  const load = async () => {
-    const request = ++sequence.current;
-    setLoading(true);
-    setCatalog(null);
-    setError('');
-    try {
-      const result = await desktop().providerModels({
-        provider: 'openai',
-        baseUrl,
-        ...(key ? { apiKey: key } : {}),
-        removeKey,
-      });
-      if (request === sequence.current) setCatalog(result);
-    } catch (failure) {
-      if (request === sequence.current) setError(errorMessage(failure));
-    } finally {
-      if (request === sequence.current) setLoading(false);
-    }
-  };
+
+  const savedFor = (id: string) => settings.connections.find((item) => item.id === id);
+  const isVerified = (connection: ConnectionInput, id: string) =>
+    Boolean(
+      catalogs[connection.id]?.verified?.includes(id) ||
+      (!connection.apiKey &&
+        !connection.removeKey &&
+        savedFor(connection.id)?.baseUrl === connection.baseUrl &&
+        savedFor(connection.id)?.verified.includes(id)),
+    );
+  const enabled = draft.connections.flatMap((connection) =>
+    connection.models
+      .filter((model) => model.enabled)
+      .map((model) => {
+        const descriptor = catalogs[connection.id]?.models?.find((item) => item.id === model.id);
+        const capabilities =
+          descriptor?.source === 'unknown' ? model.declared : (descriptor?.capabilities ?? []);
+        return {
+          value: modelReference(connection.id, model.id),
+          label: `${connection.name} · ${model.id}`,
+          primary:
+            capabilities.includes('chat') &&
+            capabilities.includes('tools') &&
+            (descriptor?.source !== 'unknown' || isVerified(connection, model.id)),
+          voice: capabilities.includes('live'),
+        };
+      }),
+  );
+  const disabled = busy || Object.values(catalogs).some((catalog) => catalog.busy);
+
   return (
-    <section className="settings-section" aria-label="Model settings">
-      <div className="settings-section-heading spread">
-        <div>
-          <h2>Model connection</h2>
-          <p>Connect OpenAI and choose models available to your account.</p>
-        </div>
-        <Badge tone={verified ? 'success' : 'neutral'}>
-          {verified && status.state === 'ready'
-            ? 'Connection tested'
-            : status.state === 'starting'
-              ? 'Starting…'
-              : status.state === 'failed'
-                ? 'Service unavailable'
-                : status.configured ||
-                    (settings?.keyConfigured && Object.values(settings.models).some(Boolean))
-                  ? 'Configured'
-                  : 'Setup needed'}
-        </Badge>
-      </div>
-      {!settings && !error && <Skeleton />}
-      {error && (
-        <ErrorState message={error} retry={!settings ? () => setReload((v) => v + 1) : undefined} />
-      )}
-      {settings && (
-        <form
-          onSubmit={(event) => {
-            event.preventDefault();
-            if (locked) return;
-            void operation(async () => {
-              try {
-                const saved = await desktop().saveProviderSettings({
-                  provider: 'openai',
-                  baseUrl,
-                  model: models.chat,
-                  models,
-                  systemPrompt,
-                  ...(key ? { apiKey: key } : {}),
-                  removeKey,
-                });
-                setSettings(saved);
-                setModels(saved.models);
-                setBaseUrl(saved.baseUrl);
-                setSystemPrompt(saved.systemPrompt);
-                setRemoveKey(false);
-                setDirty(false);
-                setVerified(false);
-                setFeedback('Model settings saved.');
-                await refreshProvider();
-              } catch (failure) {
-                setCatalog(null);
-                ++sequence.current;
-                throw failure;
-              } finally {
-                setKey('');
-              }
-            });
-          }}
+    <div className="registry-editor">
+      <div className="registry-actions">
+        <Button
+          type="button"
+          size="sm"
+          variant="ghost"
+          disabled={busy || draft.connections.length >= 12}
+          onClick={() =>
+            setDraft((current) => ({
+              ...current,
+              connections: [
+                ...current.connections,
+                {
+                  id: crypto.randomUUID(),
+                  name: current.connections.length ? 'New connection' : 'OpenAI',
+                  baseUrl: officialOpenAI,
+                  webSearch: false,
+                  models: [],
+                },
+              ],
+            }))
+          }
         >
-          <Field label="Provider">
-            <select aria-label="Provider" defaultValue="openai" disabled={locked}>
-              <option value="openai">OpenAI</option>
-            </select>
-          </Field>
-          <Field
-            label={`Provider endpoint${managed('baseUrl') ? ' · managed by environment' : ''}`}
-          >
-            <input
-              type="url"
-              required
-              value={baseUrl}
-              maxLength={2000}
-              disabled={locked || managed('baseUrl')}
-              onChange={(event) => {
-                setBaseUrl(event.target.value);
-                invalidate();
-              }}
-            />
-          </Field>
-          <Field label={`API key${managed('apiKey') ? ' · managed by environment' : ''}`}>
-            <input
-              type="password"
-              autoComplete="off"
-              spellCheck={false}
-              value={key}
-              maxLength={16000}
-              placeholder={
-                settings.keyConfigured
-                  ? 'A key is configured · enter a new key to replace it'
-                  : 'Enter your OpenAI API key'
-              }
-              disabled={locked || managed('apiKey') || !settings.encryptionAvailable}
-              onChange={(event) => {
-                setKey(event.target.value);
-                setRemoveKey(false);
-                invalidate();
-              }}
-            />
-          </Field>
-          <p className="settings-help">
-            Saved keys are encrypted using your operating system and never included in conversation
-            data.
-          </p>
-          {!settings.encryptionAvailable && (
-            <p className="chat-response-error">
-              System encryption is unavailable. Unlock your credential store to save an API key, or
-              configure OPENAI_API_KEY in the environment.
-            </p>
-          )}
-          {settings.keyConfigured && !managed('apiKey') && (
-            <label className="settings-toggle">
-              <span>Remove saved API key when saving</span>
-              <input
-                type="checkbox"
-                checked={removeKey}
-                disabled={locked}
-                onChange={(event) => {
-                  setRemoveKey(event.target.checked);
-                  setKey('');
-                  invalidate();
-                }}
-              />
-            </label>
-          )}
+          <Plus size={15} /> Add connection
+        </Button>
+        {settings.environmentImportAvailable && (
           <Button
             type="button"
-            disabled={locked || loading || removeKey || (!key.trim() && !settings.keyConfigured)}
-            onClick={() => void load()}
+            size="sm"
+            variant="ghost"
+            disabled={disabled}
+            onClick={() => void apply(() => desktop().importRegistryEnvironment())}
           >
-            <RefreshCw size={14} />
-            {loading ? 'Loading models…' : catalog ? 'Refresh models' : 'Load models'}
+            Import environment settings
           </Button>
-          {catalog && catalog.length === 0 && (
-            <p className="settings-help" role="status">
-              This endpoint returned no available models. Check API-key permissions and try again.
-            </p>
-          )}
-          {!catalog && !loading && (
-            <p className="settings-help">
-              Load models after entering your endpoint and key. No model IDs need to be typed.
-            </p>
-          )}
-          <div className="model-defaults">
-            {modes.map((mode) => (
-              <Field
-                key={mode}
-                label={`${modeLabels[mode]} model${mode === 'chat' && managed('model') ? ' · managed by environment' : ''}`}
-              >
-                <ModelSelect
-                  mode={mode}
-                  models={catalog || []}
-                  value={models[mode]}
-                  disabled={locked || !catalog || loading || (mode === 'chat' && managed('model'))}
-                  onChange={(id) => {
-                    setModels((current) => ({ ...current, [mode]: id }));
-                    changed();
-                  }}
-                />
-              </Field>
-            ))}
-          </div>
-          <p className="settings-help">
-            Only fetched models can be selected. Model groups are suggestions; custom endpoints must
-            support the chosen operation. GPT-Live also requires a Chat model. Deprecated Speech API
-            models retire January 6, 2027.
-          </p>
-          <Field
-            label={`System instructions${managed('systemPrompt') ? ' · managed by environment' : ''}`}
+        )}
+      </div>
+      {!settings.encryptionAvailable && (
+        <p role="status">Unlock the system credential store to save new API keys.</p>
+      )}
+      {draft.connections.map((connection) => (
+        <ConnectionCard
+          key={connection.id}
+          connection={connection}
+          catalog={catalogs[connection.id] ?? {}}
+          saved={savedFor(connection.id)}
+          disabled={busy}
+          update={(next, invalidate) => editConnection(next, invalidate)}
+          discover={() => void discover(connection)}
+          verify={(id) => void verify(connection, id)}
+          verified={(id) => isVerified(connection, id)}
+          remove={() => {
+            catalogRevisions.current.set(
+              connection.id,
+              (catalogRevisions.current.get(connection.id) ?? 0) + 1,
+            );
+            setCatalogs((current) => ({ ...current, [connection.id]: {} }));
+            setDraft((current) => ({
+              ...current,
+              connections: current.connections.filter((item) => item.id !== connection.id),
+              primary: current.primary?.startsWith(`${connection.id}:`) ? null : current.primary,
+              live: current.live?.model.startsWith(`${connection.id}:`) ? null : current.live,
+            }));
+          }}
+        />
+      ))}
+      <div className="registry-settings-grid">
+        <Field label="Primary model">
+          <select
+            value={draft.primary ?? ''}
+            disabled={busy}
+            onChange={(event) => setDraft({ ...draft, primary: event.target.value || null })}
           >
-            <textarea
-              rows={3}
-              value={systemPrompt}
-              maxLength={16000}
-              placeholder="Leave blank to use Aria’s helpful assistant instructions."
-              disabled={locked || managed('systemPrompt')}
-              onChange={(event) => {
-                setSystemPrompt(event.target.value);
-                changed();
-              }}
-            />
-          </Field>
-          <div className="settings-provider-actions">
-            <Button
-              type="submit"
-              variant="primary"
-              disabled={
-                locked || loading || (!removeKey && Object.values(models).some(Boolean) && !catalog)
-              }
-            >
-              {busy ? 'Working…' : 'Save & reconnect'}
-            </Button>
-            <Button
-              type="button"
-              disabled={locked || dirty || !status.configured || status.state !== 'ready'}
-              onClick={() =>
-                void operation(async () => {
-                  await desktop().testProvider();
-                  setVerified(true);
-                  setFeedback('Your provider responded successfully.');
+            <option value="">Select a primary model</option>
+            {enabled
+              .filter((model) => model.primary || model.value === draft.primary)
+              .map((model) => (
+                <option key={model.value} value={model.value}>
+                  {model.label}
+                </option>
+              ))}
+          </select>
+        </Field>
+        <Field label="Live Voice model">
+          <select
+            value={draft.live?.model ?? ''}
+            disabled={busy}
+            onChange={(event) =>
+              setDraft({
+                ...draft,
+                live: event.target.value
+                  ? { model: event.target.value, voice: draft.live?.voice ?? 'marin' }
+                  : null,
+              })
+            }
+          >
+            <option value="">Off</option>
+            {enabled
+              .filter((model) => model.voice || model.value === draft.live?.model)
+              .map((model) => (
+                <option key={model.value} value={model.value}>
+                  {model.label}
+                </option>
+              ))}
+          </select>
+        </Field>
+        {draft.live && (
+          <Field label="Voice">
+            <select
+              value={draft.live.voice}
+              disabled={busy}
+              onChange={(event) =>
+                setDraft({
+                  ...draft,
+                  live: {
+                    model: draft.live!.model,
+                    voice: event.target.value as (typeof voices)[number],
+                  },
                 })
               }
             >
-              <Check size={14} />
-              Test connection
-            </Button>
-          </div>
-          <p className="settings-help">
-            Testing sends a short message using your saved Chat model.
-          </p>
-        </form>
-      )}
-      {(active || live) && (
-        <div className="notice">
-          <span>Stop current responses and end voice before changing the connection.</span>
-          <Button size="sm" onClick={() => void stopAllChats()}>
-            <Square size={12} />
-            Stop responses
-          </Button>
-        </div>
-      )}
-      {status.state === 'failed' && (
-        <div className="connection-detail">
-          <p>{status.error}</p>
-          <Button
-            size="sm"
-            disabled={locked}
-            onClick={() => void operation(() => desktop().restartChatService())}
+              {voices.map((voice) => (
+                <option key={voice}>{voice}</option>
+              ))}
+            </select>
+          </Field>
+        )}
+        <Field label="Execution preference">
+          <select
+            value={draft.preference}
+            disabled={busy}
+            onChange={(event) =>
+              setDraft({
+                ...draft,
+                preference: event.target.value as RegistryInput['preference'],
+              })
+            }
           >
-            <RefreshCw size={14} />
-            Restart chat service
+            <option value="balanced">Balanced</option>
+            <option value="cost">Lower cost</option>
+            <option value="latency">Lower latency</option>
+            <option value="quality">Higher quality</option>
+          </select>
+        </Field>
+      </div>
+      <label className="registry-checkbox">
+        <input
+          type="checkbox"
+          checked={draft.crossConnection}
+          disabled={busy}
+          onChange={(event) =>
+            setDraft({
+              ...draft,
+              crossConnection: event.target.checked,
+              crossConnectionAttachments: event.target.checked && draft.crossConnectionAttachments,
+            })
+          }
+        />
+        Allow delegated requests across connections
+      </label>
+      <label className="registry-checkbox">
+        <input
+          type="checkbox"
+          checked={draft.crossConnectionAttachments}
+          disabled={busy || !draft.crossConnection}
+          onChange={(event) =>
+            setDraft({ ...draft, crossConnectionAttachments: event.target.checked })
+          }
+        />
+        Allow attachments and their results across connections
+      </label>
+      <details className="registry-instructions">
+        <summary>System instructions</summary>
+        <Field label="Instructions">
+          <textarea
+            maxLength={16000}
+            value={draft.systemPrompt}
+            disabled={busy}
+            onChange={(event) => setDraft({ ...draft, systemPrompt: event.target.value })}
+          />
+        </Field>
+      </details>
+      <div className="registry-actions">
+        <Button
+          type="button"
+          variant="primary"
+          disabled={disabled || status.state !== 'ready'}
+          onClick={() => void apply(() => desktop().saveRegistry(draft))}
+        >
+          {busy ? 'Saving…' : 'Save AI Models'}
+        </Button>
+        {status.state === 'failed' && (
+          <Button
+            type="button"
+            size="sm"
+            disabled={busy}
+            onClick={() =>
+              void desktop()
+                .restartChatService()
+                .catch((error) => setFeedback({ error: true, text: errorMessage(error) }))
+            }
+          >
+            Restart service
           </Button>
-        </div>
-      )}
+        )}
+        {status.state === 'ready' && status.configured && draft.revision === status.revision && (
+          <span className="muted">
+            <Check size={14} /> Primary configured
+          </span>
+        )}
+      </div>
       {feedback && (
-        <p className="settings-feedback" role="status">
-          <Check size={14} />
-          {feedback}
+        <p
+          className={feedback.error ? 'chat-response-error' : 'muted'}
+          role={feedback.error ? 'alert' : 'status'}
+        >
+          {feedback.text}
         </p>
       )}
-    </section>
+    </div>
+  );
+}
+
+function ConnectionCard({
+  connection,
+  catalog,
+  saved,
+  disabled,
+  update,
+  discover,
+  verify,
+  verified,
+  remove,
+}: {
+  connection: ConnectionInput;
+  catalog: CatalogState;
+  saved?: RegistrySettings['connections'][number];
+  disabled: boolean;
+  update: (next: ConnectionInput, invalidate?: boolean) => void;
+  discover: () => void;
+  verify: (id: string) => void;
+  verified: (id: string) => boolean;
+  remove: () => void;
+}) {
+  const [filter, setFilter] = useState('');
+  const [limit, setLimit] = useState(25);
+  const [expanded, setExpanded] = useState<string>();
+  const descriptors = new Map(catalog.models?.map((model) => [model.id, model]));
+  const ids = [
+    ...new Set([...connection.models.map((model) => model.id), ...descriptors.keys()]),
+  ].filter((id) => id.toLowerCase().includes(filter.toLowerCase()));
+  const setModel = (model: ConnectionInput['models'][number]) =>
+    update({
+      ...connection,
+      models: [...connection.models.filter((row) => row.id !== model.id), model],
+    });
+  const official = connection.baseUrl.replace(/\/+$/, '') === officialOpenAI;
+  return (
+    <div className="registry-connection">
+      <div className="registry-connection-heading">
+        <strong>{connection.name || 'Connection'}</strong>
+        <span className="muted" role="status">
+          {catalog.models
+            ? 'Connected'
+            : catalog.error
+              ? 'Connection error'
+              : saved?.locked
+                ? 'Credential locked'
+                : saved?.keyConfigured
+                  ? 'Key saved'
+                  : 'Set up connection'}
+        </span>
+        <Button
+          type="button"
+          size="icon"
+          variant="ghost"
+          aria-label={`Remove ${connection.name}`}
+          disabled={disabled}
+          onClick={remove}
+        >
+          <Trash2 size={15} />
+        </Button>
+      </div>
+      <div className="registry-settings-grid">
+        <Field label="Connection name">
+          <input
+            value={connection.name}
+            maxLength={100}
+            disabled={disabled}
+            onChange={(event) => update({ ...connection, name: event.target.value })}
+          />
+        </Field>
+        <Field label="Provider endpoint">
+          <input
+            value={connection.baseUrl}
+            maxLength={2000}
+            disabled={disabled}
+            onChange={(event) =>
+              update({ ...connection, baseUrl: event.target.value, webSearch: false }, true)
+            }
+          />
+        </Field>
+        <Field label="API key">
+          <input
+            type="password"
+            autoComplete="off"
+            value={connection.apiKey ?? ''}
+            maxLength={16000}
+            disabled={disabled}
+            placeholder={
+              saved?.keyConfigured ? 'Saved in system credential store' : 'Enter an API key'
+            }
+            onChange={(event) =>
+              update({ ...connection, apiKey: event.target.value, removeKey: false }, true)
+            }
+          />
+        </Field>
+      </div>
+      <div className="registry-actions">
+        <Button type="button" size="sm" disabled={disabled || catalog.busy} onClick={discover}>
+          <RefreshCw size={14} /> {catalog.busy ? 'Contacting provider…' : 'Discover models'}
+        </Button>
+        {saved?.keyConfigured && (
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            disabled={disabled}
+            onClick={() =>
+              update({ ...connection, apiKey: '', removeKey: !connection.removeKey }, true)
+            }
+          >
+            {connection.removeKey ? 'Keep saved key' : 'Remove saved key'}
+          </Button>
+        )}
+      </div>
+      {official && (
+        <label className="registry-checkbox">
+          <input
+            type="checkbox"
+            checked={connection.webSearch}
+            disabled={disabled}
+            onChange={(event) => update({ ...connection, webSearch: event.target.checked })}
+          />
+          Allow OpenAI Web Search on this connection
+        </label>
+      )}
+      {catalog.error && (
+        <p className="chat-response-error" role="alert">
+          {catalog.error}
+        </p>
+      )}
+      {ids.length > 0 || filter ? (
+        <Field label="Filter models">
+          <input
+            type="search"
+            value={filter}
+            onChange={(event) => {
+              setLimit(25);
+              setFilter(event.target.value);
+            }}
+          />
+        </Field>
+      ) : null}
+      <ul className="registry-models">
+        {ids.slice(0, limit).map((id) => {
+          const model = connection.models.find((item) => item.id === id) ?? {
+            id,
+            enabled: false,
+            delegate: false,
+            declared: [],
+          };
+          const discovered = descriptors.get(id);
+          const unknown = discovered?.source === 'unknown';
+          const unsupported = discovered && !unknown && !discovered.capabilities.length;
+          const missing = Boolean(catalog.models && !discovered);
+          const capabilities = unknown ? model.declared : (discovered?.capabilities ?? []);
+          return (
+            <li key={id}>
+              <div className="registry-model-row">
+                <div>
+                  <strong>{id}</strong>
+                  <small>
+                    {missing
+                      ? 'Unavailable'
+                      : !discovered
+                        ? 'Refresh to check availability'
+                        : capabilities.length
+                          ? capabilities.map((capability) => labels[capability]).join(' · ')
+                          : unsupported
+                            ? 'No supported Aria operations'
+                            : 'Unknown capabilities'}
+                  </small>
+                  {discovered && (
+                    <small>
+                      {discovered.source === 'provider'
+                        ? 'Provider metadata'
+                        : discovered.source === 'documentation'
+                          ? 'OpenAI documentation'
+                          : capabilities.length
+                            ? 'Declared in Settings'
+                            : 'Provider catalog lists only the ID'}
+                    </small>
+                  )}
+                </div>
+                <label className="registry-checkbox">
+                  <input
+                    type="checkbox"
+                    aria-label={`Enable ${id}`}
+                    checked={model.enabled}
+                    disabled={disabled || (!model.enabled && !discovered)}
+                    onChange={(event) =>
+                      setModel({
+                        ...model,
+                        enabled: event.target.checked,
+                        delegate: event.target.checked,
+                      })
+                    }
+                  />{' '}
+                  Enabled
+                </label>
+                <label className="registry-checkbox">
+                  <input
+                    type="checkbox"
+                    aria-label={`Delegate to ${id}`}
+                    checked={model.delegate}
+                    disabled={disabled || !model.enabled}
+                    onChange={(event) => setModel({ ...model, delegate: event.target.checked })}
+                  />{' '}
+                  Delegation
+                </label>
+                {unknown && (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => setExpanded(expanded === id ? undefined : id)}
+                    aria-expanded={expanded === id}
+                  >
+                    Capabilities
+                  </Button>
+                )}
+              </div>
+              {expanded === id && unknown && (
+                <div className="registry-declarations">
+                  {modelCapabilities
+                    .filter(
+                      (capability) =>
+                        capability !== 'web-search' && (!official || capability !== 'live'),
+                    )
+                    .map((capability) => (
+                      <label key={capability} className="registry-checkbox">
+                        <input
+                          type="checkbox"
+                          disabled={disabled}
+                          checked={model.declared.includes(capability)}
+                          onChange={(event) =>
+                            setModel({
+                              ...model,
+                              declared: event.target.checked
+                                ? [...model.declared, capability]
+                                : model.declared.filter((item) => item !== capability),
+                            })
+                          }
+                        />
+                        {labels[capability]}
+                      </label>
+                    ))}
+                  {model.declared.includes('chat') && model.declared.includes('tools') && (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="ghost"
+                      disabled={disabled || catalog.busy}
+                      onClick={() => verify(id)}
+                    >
+                      {verified(id) ? 'Verify again' : 'Verify for primary'}
+                    </Button>
+                  )}
+                  {verified(id) && <span className="muted">Function calling verified</span>}
+                </div>
+              )}
+            </li>
+          );
+        })}
+      </ul>
+      {ids.length > limit && (
+        <Button type="button" size="sm" variant="ghost" onClick={() => setLimit(limit + 25)}>
+          Show more models
+        </Button>
+      )}
+    </div>
   );
 }

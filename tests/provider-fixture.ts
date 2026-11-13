@@ -1,25 +1,39 @@
 import http from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
 
+export const fixtureConnectionId = '10000000-0000-4000-8000-000000000001';
+export const fixtureRef = (id: string) => `${fixtureConnectionId}:${id}`;
+export const fixtureDescriptors: Record<string, Record<string, unknown>> = {
+  'test-model': { capabilities: ['chat', 'tools', 'vision'] },
+  'fixture-model': { capabilities: ['chat', 'tools', 'vision'] },
+  'gpt-6-luna': { capabilities: ['chat', 'tools', 'vision'] },
+  'gpt-image-2.6-flare': { capabilities: ['image', 'image-edit'], transport: 'inline-png' },
+  'tts-1': { capabilities: ['speech'], voices: ['alloy'], transport: 'speech-api' },
+  'gpt-realtime-2.1-mini': { capabilities: ['speech'], voices: ['marin'], transport: 'realtime' },
+  'gpt-transcribe': { capabilities: ['transcription'] },
+  'gpt-live-1': { capabilities: ['live'], voices: ['marin'] },
+  'unknown-model': {},
+};
+
 /** Test-only OpenAI-compatible server. Never imported by application builds. */
 export async function createProviderFixture() {
   const received: {
     path: string;
     authorization?: string;
-    body: { model: string; messages: { role: string; content: string }[]; stream: boolean };
+    body: {
+      model: string;
+      messages: { role: string; content: string }[];
+      stream: boolean;
+      tools?: unknown[];
+      tool_choice?: unknown;
+    };
   }[] = [];
   const mediaReceived: { path: string; body: string; authorization?: string }[] = [];
   const voiceReceived: Record<string, unknown>[] = [];
-  let models = [
-    'test-model',
-    'fixture-model',
-    'gpt-6-luna',
-    'gpt-image-2.6-flare',
-    'tts-1',
-    'gpt-realtime-2.1-mini',
-    'gpt-transcribe',
-    'gpt-live-1',
-  ];
+  let models = Object.keys(fixtureDescriptors);
+  const toolReplies = new Map<string, { name: string; input: unknown; provisional?: string }[]>();
+  const continuedReplies = new Map<string, { name: string; input: unknown }>();
+  let livePrompt = 'Hello from my microphone.';
   let catalogStatus = 200;
   let cancelled = 0;
   const png = Buffer.from(
@@ -56,7 +70,12 @@ export async function createProviderFixture() {
           catalogStatus === 200
             ? {
                 object: 'list',
-                data: models.map((id) => ({ id, object: 'model', owned_by: 'fixture' })),
+                data: models.map((id) => ({
+                  id,
+                  object: 'model',
+                  owned_by: 'fixture',
+                  ...fixtureDescriptors[id],
+                })),
               }
             : { error: { message: 'secret-catalog-error' } },
         ),
@@ -111,7 +130,57 @@ export async function createProviderFixture() {
     }
     const body = JSON.parse(input) as (typeof received)[number]['body'];
     received.push({ path: request.url, authorization: request.headers.authorization, body });
-    const prompt = body.messages.at(-1)?.content ?? '';
+    const last = body.messages.at(-1);
+    const prompt =
+      typeof last?.content === 'string' ? last.content : JSON.stringify(last?.content ?? '');
+    const configuredTool =
+      body.tool_choice &&
+      typeof body.tool_choice === 'object' &&
+      'function' in body.tool_choice &&
+      (body.tool_choice.function as { name: string }).name === 'verify_connection';
+    const userPrompt =
+      [...body.messages].reverse().find((item) => item.role === 'user')?.content ?? '';
+    const continuation = last?.role === 'tool' && continuedReplies.get(userPrompt);
+    if (continuation) continuedReplies.delete(userPrompt);
+    const script = configuredTool
+      ? { name: 'verify_connection', input: { ok: true } }
+      : body.tools?.length
+        ? continuation || toolReplies.get(prompt)?.shift()
+        : undefined;
+    if (script) {
+      response.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      for (const [delta, finish_reason] of [
+        [
+          { role: 'assistant', content: 'provisional' in script ? script.provisional || '' : '' },
+          null,
+        ],
+        [
+          {
+            tool_calls: [
+              {
+                index: 0,
+                id: 'tool-fixture-1',
+                type: 'function',
+                function: { name: script.name, arguments: JSON.stringify(script.input) },
+              },
+            ],
+          },
+          null,
+        ],
+        [{}, 'tool_calls'],
+      ])
+        response.write(
+          `data: ${JSON.stringify({
+            id: 'fixture-tool',
+            object: 'chat.completion.chunk',
+            created: 1,
+            model: body.model,
+            choices: [{ index: 0, delta, finish_reason }],
+          })}\n\n`,
+        );
+      response.end('data: [DONE]\n\n');
+      return;
+    }
     if (prompt.includes('[fail]')) {
       response.writeHead(401, { 'Content-Type': 'application/json' });
       response.end(
@@ -120,13 +189,16 @@ export async function createProviderFixture() {
       return;
     }
     response.writeHead(200, { 'Content-Type': 'text/event-stream' });
-    const answer = prompt.includes('[long]')
-      ? Array.from(
-          { length: 55 },
-          (_, index) =>
-            `Paragraph ${index + 1}. A useful explanation with enough detail to exercise the reading position.\n\n`,
-        ).join('')
-      : `Hello from the test provider, 🌙.\n\nHere is a **streamed response** to “${prompt}”.\n\n| Idea | Next step |\n| --- | --- |\n| A little clarity | Start a conversation |\n\n\`\`\`typescript\nconst greeting = 'Hello, Aria';\n\`\`\``;
+    const answer =
+      last?.role === 'tool'
+        ? `Result: ${prompt}`
+        : prompt.includes('[long]')
+          ? Array.from(
+              { length: 55 },
+              (_, index) =>
+                `Paragraph ${index + 1}. A useful explanation with enough detail to exercise the reading position.\n\n`,
+            ).join('')
+          : `Hello from the test provider, 🌙.\n\nHere is a **streamed response** to “${prompt}”.\n\n| Idea | Next step |\n| --- | --- |\n| A little clarity | Start a conversation |\n\n\`\`\`typescript\nconst greeting = 'Hello, Aria';\n\`\`\``;
     const chunks = answer.match(/[\s\S]{1,18}/gu) ?? [];
     let index = 0;
     const send = (delta: unknown, finish: string | null = null) =>
@@ -178,7 +250,7 @@ export async function createProviderFixture() {
           spoke = true;
           send({
             type: 'session.input_transcript.delta',
-            delta: 'Hello from my microphone.',
+            delta: livePrompt,
             start_ms: 0,
             end_ms: 300,
           });
@@ -189,6 +261,13 @@ export async function createProviderFixture() {
             end_ms: 500,
           });
           send({ type: 'session.output_audio.delta', delta: pcm.toString('base64') });
+          const delegation = {
+            type: 'session.delegation.created',
+            offset_ms: 300,
+            delegation: { id: 'fixture-delegation', target: 'client' },
+          };
+          send(delegation);
+          send(delegation);
         } else if (event.type === 'session.close') {
           send({ type: 'session.closed', usage: {} });
           ws.close();
@@ -208,6 +287,13 @@ export async function createProviderFixture() {
     voiceReceived,
     png,
     wav,
+    queueTool: (prompt: string, name: string, input: unknown, provisional?: string) =>
+      toolReplies.set(prompt, [...(toolReplies.get(prompt) ?? []), { name, input, provisional }]),
+    continueWithTool: (prompt: string, name: string, input: unknown) =>
+      continuedReplies.set(prompt, { name, input }),
+    setLivePrompt: (value: string) => {
+      livePrompt = value;
+    },
     setModels: (value: string[]) => {
       models = value;
     },

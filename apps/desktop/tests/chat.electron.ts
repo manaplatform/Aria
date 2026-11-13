@@ -4,6 +4,7 @@ import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createProviderFixture } from '../../../tests/provider-fixture';
+import type { ExecutionStep } from '@aria/shared';
 
 const root = path.resolve(__dirname, '..');
 const screenshots = path.join(root, '.artifacts/screenshots');
@@ -46,6 +47,11 @@ async function launch(
   await expect(page.getByRole('navigation', { name: 'Chat navigation' })).toBeVisible();
   await expect
     .poll(() => page.evaluate(() => window.aria!.chatStatus()), { timeout: 20000 })
+    .toMatchObject({ state: 'ready' });
+  if (configured && !(await page.evaluate(() => window.aria!.chatStatus())).configured)
+    await page.evaluate(() => window.aria!.importRegistryEnvironment());
+  await expect
+    .poll(() => page.evaluate(() => window.aria!.chatStatus()))
     .toMatchObject({ state: 'ready', configured: expectedConfiguration });
 }
 async function screenshot(name: string) {
@@ -150,7 +156,7 @@ test('streams through the managed NestJS API, renders Markdown, manages conversa
   await expect(page.locator('.from-assistant[data-status="stopped"]')).toHaveCount(1);
   await expect.poll(() => fixture.cancelled).toBeGreaterThan(cancellations);
   fixture.releaseSlow();
-  await page.getByRole('button', { name: 'Regenerate', exact: true }).click();
+  await page.getByRole('button', { name: 'Send again', exact: true }).click();
   await expect(page.locator('.from-assistant[data-status="completed"]')).toHaveCount(1);
   await expect(page.locator('.from-user')).toHaveCount(1);
   await page
@@ -187,10 +193,9 @@ test('shows real provider errors, supports explicit retry, and tests the connect
   expect(fixture.received).toHaveLength(count + 1);
   await expect(page.locator('.from-user')).toHaveCount(1);
   await page.getByRole('button', { name: 'Open settings', exact: true }).click();
-  await page.getByRole('button', { name: 'Test connection', exact: true }).click();
-  await expect(page.getByText('Your provider responded successfully.')).toBeVisible();
-  await expect(page.getByText('Connection tested', { exact: true })).toBeVisible();
-  expect(JSON.stringify(await page.evaluate(() => window.aria!.providerSettings()))).not.toContain(
+  await page.getByRole('button', { name: 'Discover models', exact: true }).click();
+  await expect(page.getByText('Connected', { exact: true })).toBeVisible();
+  expect(JSON.stringify(await page.evaluate(() => window.aria!.registrySettings()))).not.toContain(
     'test-only-key',
   );
   await page.getByRole('button', { name: 'Back to chat', exact: true }).click();
@@ -208,7 +213,7 @@ test('recovers from service crashes, preserves drafts, and supports narrow windo
   });
   await expect(page.locator('.from-assistant[data-status="interrupted"]')).toHaveCount(1);
   await page.getByRole('button', { name: 'Open settings', exact: true }).click();
-  await page.getByRole('button', { name: 'Restart chat service', exact: true }).click();
+  await page.getByRole('button', { name: 'Restart service', exact: true }).click();
   await expect
     .poll(() => page.evaluate(() => window.aria!.chatStatus()))
     .toMatchObject({ state: 'ready', configured: true });
@@ -247,41 +252,33 @@ test('development renderer uses the same managed backend and safe preload', asyn
 test('configures a provider in Settings using native encrypted storage and restores it on relaunch', async () => {
   await launch(false);
   await page.getByRole('button', { name: 'Open settings', exact: true }).click();
-  const settings = await page.evaluate(() => window.aria!.providerSettings());
+  const settings = await page.evaluate(() => window.aria!.registrySettings());
   if (!settings.encryptionAvailable) {
-    await expect(page.getByLabel('API key', { exact: true })).toBeDisabled();
-    await expect(page.getByText(/System encryption is unavailable/)).toBeVisible();
+    await expect(page.getByText(/Unlock the system credential store/)).toBeVisible();
     return;
   }
+  await page.getByRole('button', { name: 'Add connection' }).click();
   await page.getByLabel('Provider endpoint', { exact: true }).fill(fixture.baseUrl);
   await page.getByLabel('API key', { exact: true }).fill('test-only-key');
-  await page.getByRole('button', { name: 'Load models', exact: true }).click();
-  await expect(page.getByLabel('Chat model', { exact: true })).toBeEnabled();
-  await page.getByLabel('Chat model', { exact: true }).selectOption('fixture-model');
-  await page.getByLabel('Image model', { exact: true }).selectOption('gpt-image-2.6-flare');
-  await page.getByLabel('Speech model', { exact: true }).selectOption('gpt-realtime-2.1-mini');
-  await page.getByLabel('Transcribe model', { exact: true }).selectOption('gpt-transcribe');
-  await page.getByLabel('Live Voice model', { exact: true }).selectOption('gpt-live-1');
-  await page.getByLabel('System instructions', { exact: true }).fill('Give useful answers.');
-  await page.getByRole('button', { name: 'Save & reconnect', exact: true }).click();
-  await expect(page.getByText('Model settings saved.', { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Discover models' }).click();
+  await page.getByRole('checkbox', { name: 'Enable fixture-model' }).check();
+  await page
+    .getByRole('combobox', { name: 'Primary model' })
+    .selectOption({ label: 'OpenAI · fixture-model' });
+  await page.getByText('System instructions', { exact: true }).click();
+  await page.getByLabel('Instructions', { exact: true }).fill('Give useful answers.');
+  await page.getByRole('button', { name: 'Save AI Models', exact: true }).click();
+  await expect(page.getByText('Primary configured', { exact: true })).toBeVisible();
   await expect(page.getByLabel('API key', { exact: true })).toHaveValue('');
-  const saved = await fs.readFile(path.join(temporary, 'provider.json'), 'utf8');
+  const saved = await fs.readFile(path.join(temporary, 'provider-v2.json'), 'utf8');
   expect(saved).not.toContain('test-only-key');
-  expect(JSON.parse(saved).encryptedKey).toBeTruthy();
-  expect(JSON.parse(saved).models).toEqual({
-    chat: 'fixture-model',
-    image: 'gpt-image-2.6-flare',
-    speech: 'gpt-realtime-2.1-mini',
-    transcription: 'gpt-transcribe',
-    live: 'gpt-live-1',
-  });
+  expect(JSON.parse(saved).connections[0].encryptedKey).toBeTruthy();
   await page.getByRole('button', { name: 'Back to chat', exact: true }).click();
   await send('Use my saved provider');
   await expect(page.locator('.from-assistant[data-status="completed"]')).toHaveCount(1);
-  expect(fixture.received.at(-1)?.body.messages[0]).toEqual({
+  expect(fixture.received.at(-1)?.body.messages[0]).toMatchObject({
     role: 'system',
-    content: 'Give useful answers.',
+    content: expect.stringContaining('Give useful answers.'),
   });
   await app.close();
   await launch(false, false, true);
@@ -289,14 +286,96 @@ test('configures a provider in Settings using native encrypted storage and resto
   await expect(page.locator('.from-assistant[data-status="completed"]')).toHaveCount(2);
 });
 
-test('creates images, edits references, transcribes audio, exports speech, and restores media history', async () => {
+async function enableFixtureModels(ids: string[], voice = false) {
+  return page.evaluate(
+    async ({ ids, voice }) => {
+      const settings = await window.aria!.registrySettings();
+      const [saved] = settings.connections;
+      const { id, name, baseUrl, models, webSearch } = saved;
+      const connection = { id, name, baseUrl, models, webSearch };
+      const {
+        primary,
+        live,
+        systemPrompt,
+        preference,
+        revision,
+        crossConnection,
+        crossConnectionAttachments,
+      } = settings;
+      const enabled = new Map(connection.models.map((model) => [model.id, model]));
+      for (const id of ids) enabled.set(id, { id, enabled: true, delegate: true, declared: [] });
+      await window.aria!.saveRegistry({
+        primary,
+        systemPrompt,
+        preference,
+        revision,
+        crossConnection,
+        crossConnectionAttachments,
+        connections: [{ ...connection, models: [...enabled.values()] }],
+        live: voice ? { model: `${connection.id}:gpt-live-1`, voice: 'marin' } : live,
+      });
+      return connection.id;
+    },
+    { ids, voice },
+  );
+}
+function planned(
+  model: string,
+  capability: ExecutionStep['capability'],
+  output: ExecutionStep['output'],
+  overrides: Partial<ExecutionStep> = {},
+): ExecutionStep {
+  return {
+    id: 'step',
+    target: { kind: 'model', model },
+    capability,
+    output,
+    instructions: 'Use the requested capability.',
+    inputs: [],
+    dependsOn: [],
+    summary: 'Use the configured model',
+    ...overrides,
+  };
+}
+
+test('corrects a rejected chat-model target and creates a dancing panda with the selected image model', async () => {
   await launch();
-  await page.getByLabel('Creation mode', { exact: true }).selectOption('image');
-  await page.getByLabel('Image model', { exact: true }).selectOption('gpt-image-2.6-flare');
+  const id = await enableFixtureModels(['gpt-image-2.6-flare']);
+  const prompt = 'Make a panda image dancing';
+  const instructions = 'Create an image of a panda dancing.';
+  fixture.queueTool(prompt, 'execute_steps', {
+    steps: [planned(`${id}:fixture-model`, 'image', 'image', { instructions })],
+  });
+  fixture.continueWithTool(prompt, 'execute_steps', {
+    steps: [planned(`${id}:gpt-image-2.6-flare`, 'image', 'image', { instructions })],
+  });
+  const count = fixture.mediaReceived.length;
+  await send(prompt);
+  await expect(page.locator('.from-assistant[data-status="completed"]')).toHaveCount(1);
+  const image = page.locator('.from-assistant img');
+  await expect(image).toBeVisible();
+  await expect.poll(() => image.evaluate((node: HTMLImageElement) => node.naturalWidth)).toBe(1);
+  await expect(page.locator('.conductor-activity')).toContainText('gpt-image-2.6-flare');
+  expect(fixture.mediaReceived).toHaveLength(count + 1);
+  expect(JSON.parse(fixture.mediaReceived.at(-1)!.body)).toMatchObject({
+    model: 'gpt-image-2.6-flare',
+    prompt: instructions,
+  });
+  await expect(page.getByRole('alert')).toHaveCount(0);
+});
+
+test('creates and edits an image, transcribes audio, and restores artifacts and activity on relaunch', async () => {
+  await launch();
+  const id = await enableFixtureModels(['gpt-image-2.6-flare', 'gpt-transcribe', 'tts-1']);
+  expect(await page.getByRole('combobox').count()).toBe(0);
+  fixture.queueTool('A calm mountain', 'execute_steps', {
+    steps: [planned(`${id}:gpt-image-2.6-flare`, 'image', 'image')],
+  });
   await send('A calm mountain');
   const image = page.locator('.from-assistant img');
   await expect(image).toBeVisible();
   await expect.poll(() => image.evaluate((node: HTMLImageElement) => node.naturalWidth)).toBe(1);
+  await expect(page.getByText('Conductor activity', { exact: false })).toBeVisible();
   const exportPath = path.join(temporary, 'exported-image.png');
   await app.evaluate(({ dialog }, filePath) => {
     dialog.showSaveDialog = async () => ({ canceled: false, filePath });
@@ -312,70 +391,110 @@ test('creates images, edits references, transcribes audio, exports speech, and r
     })
     .toBe(true);
   await page.getByRole('button', { name: 'Use image', exact: true }).click();
+  const imageId = new URL((await image.getAttribute('src'))!).pathname.slice(1);
+  expect(imageId).toBeTruthy();
+  fixture.queueTool('Add a little snow', 'execute_steps', {
+    steps: [
+      planned(`${id}:gpt-image-2.6-flare`, 'image-edit', 'image', {
+        inputs: [{ kind: 'attachment', id: imageId }],
+      }),
+    ],
+  });
   await send('Add a little snow');
   await expect(page.locator('.from-assistant[data-status="completed"]')).toHaveCount(2);
   expect(fixture.mediaReceived.at(-1)?.path).toBe('/v1/images/edits');
-  await page.getByLabel('Creation mode', { exact: true }).selectOption('transcription');
-  await page.getByLabel('Transcribe model', { exact: true }).selectOption('gpt-transcribe');
+
   const recordingPath = path.join(temporary, 'recording.wav');
   await fs.writeFile(recordingPath, fixture.wav);
   await app.evaluate(({ dialog }, filePath) => {
     dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [filePath] });
   }, recordingPath);
-  await page.getByRole('button', { name: 'Audio file', exact: true }).click();
-  await page.getByRole('button', { name: 'Send message', exact: true }).click();
+  await page.getByRole('button', { name: 'Attach files', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Remove recording.wav' })).toBeVisible();
+  await expect
+    .poll(async () =>
+      page.evaluate(async () => {
+        const { data } = await window.aria!.load();
+        return data.chat.conversations.find(
+          (conversation) => conversation.id === data.chat.selectedId,
+        )?.attachments?.[0]?.id;
+      }),
+    )
+    .toBeTruthy();
+  const recording = await page.evaluate(async () => {
+    const { data } = await window.aria!.load();
+    return data.chat.conversations.find((conversation) => conversation.id === data.chat.selectedId)!
+      .attachments![0].id;
+  });
+  fixture.queueTool('Transcribe and read this', 'execute_steps', {
+    steps: [
+      planned(`${id}:gpt-transcribe`, 'transcription', 'text', {
+        id: 'transcript',
+        inputs: [{ kind: 'attachment', id: recording }],
+      }),
+      planned(`${id}:tts-1`, 'speech', 'audio', {
+        dependsOn: ['transcript'],
+        inputs: [{ kind: 'result', stepId: 'transcript' }],
+      }),
+    ],
+  });
+  await send('Transcribe and read this');
   await expect(page.locator('.from-assistant').last()).toContainText(
     'A transcript from the uploaded audio.',
   );
-  await page.getByLabel('Creation mode', { exact: true }).selectOption('speech');
-  await page.getByLabel('Speech model', { exact: true }).selectOption('tts-1');
-  await expect(page.getByLabel('Speech voice', { exact: true })).toHaveValue('alloy');
-  await send('A little clarity.');
   await expect(page.locator('.from-assistant audio')).toBeVisible();
-  await expect
-    .poll(() =>
-      page.locator('.from-assistant audio').evaluate((node: HTMLAudioElement) => node.readyState),
-    )
-    .toBeGreaterThanOrEqual(1);
-  await page.getByLabel('Speech model', { exact: true }).selectOption('gpt-realtime-2.1-mini');
-  await page.getByRole('button', { name: 'Regenerate', exact: true }).click();
-  await expect(page.locator('.from-assistant[data-status="completed"]')).toHaveCount(4);
-  expect(fixture.mediaReceived.at(-1)?.path).toBe('/v1/audio/speech');
-  expect(fixture.mediaReceived.at(-1)?.body).toContain('"model":"tts-1"');
   await app.close();
   await launch();
   await expect(page.locator('.from-assistant img')).toHaveCount(2);
   await expect(page.locator('.from-assistant audio')).toHaveCount(1);
-  await expect(page.getByRole('alert')).toHaveCount(0);
-  const saved = JSON.parse(await fs.readFile(path.join(temporary, 'aria-v3.json'), 'utf8'));
-  expect(saved.version).toBe(3);
-  expect(JSON.stringify(saved)).not.toContain('base64');
+  await expect(page.locator('.conductor-activity')).toHaveCount(3);
+  expect(await fs.readFile(path.join(temporary, 'aria-v3.json'), 'utf8')).not.toContain('base64');
 });
 
-test('cancels media generation and preserves the original model for explicit retry', async () => {
+test('cancels delegated generation and labels another billed attempt explicitly', async () => {
   await launch();
-  await page.getByLabel('Creation mode', { exact: true }).selectOption('image');
-  await page.getByLabel('Image model', { exact: true }).selectOption('gpt-image-2.6-flare');
+  const id = await enableFixtureModels(['gpt-image-2.6-flare']);
   const cancelled = fixture.cancelled;
-  await send('[slow] mountain');
+  const count = fixture.mediaReceived.length;
+  fixture.queueTool('Generate a mountain', 'execute_steps', {
+    steps: [
+      planned(`${id}:gpt-image-2.6-flare`, 'image', 'image', { instructions: '[slow] mountain' }),
+    ],
+  });
+  await send('Generate a mountain');
+  await expect.poll(() => fixture.mediaReceived.length).toBe(count + 1);
   await page.getByRole('button', { name: 'Stop response', exact: true }).click();
   await expect(page.locator('.from-assistant[data-status="stopped"]')).toHaveCount(1);
   await expect.poll(() => fixture.cancelled).toBeGreaterThan(cancelled);
-  await send('[fail] image request');
+
+  fixture.queueTool('Generate a harbor', 'execute_steps', {
+    steps: [
+      planned(`${id}:gpt-image-2.6-flare`, 'image', 'image', { instructions: '[fail] harbor' }),
+    ],
+  });
+  await send('Generate a harbor');
   await expect(page.locator('.from-assistant[data-status="failed"]')).toHaveCount(1);
   await expect(page.getByRole('alert')).not.toContainText('secret-response-text');
-  await page.getByRole('button', { name: 'Retry response', exact: true }).click();
-  await expect(page.locator('.from-assistant[data-status="failed"]')).toHaveCount(1);
+  await expect(page.getByRole('button', { name: 'Send again', exact: true })).toBeVisible();
 });
 
-test('uses a synthetic microphone for GPT-Live, saves captions and assistant audio, and releases the microphone on end', async () => {
+test('uses a synthetic microphone, delegates once into the primary, and preserves captions and audio', async () => {
   await launch(true, false, true, true);
-  await page.getByText('Live voice options', { exact: true }).click();
-  await page.getByLabel('Live Voice model', { exact: true }).selectOption('gpt-live-1');
-  await page.getByLabel('Voice backend model', { exact: true }).selectOption('gpt-6-luna');
+  const id = await enableFixtureModels(['gpt-live-1'], true);
+  const count = fixture.received.length;
+  fixture.queueTool('Hello from my microphone.', 'execute_steps', {
+    steps: [planned(`${id}:fixture-model`, 'chat', 'text')],
+  });
   await page.getByRole('button', { name: 'Start live voice conversation', exact: true }).click();
   await expect(page.getByText('Hello from my microphone.', { exact: true })).toBeVisible();
-  await expect(page.locator('.from-assistant .markdown')).toContainText('Hello from GPT-Live.');
+  await expect(page.locator('.from-assistant .markdown').first()).toContainText(
+    'Hello from GPT-Live.',
+  );
+  await expect(page.locator('.conductor-activity')).toBeVisible();
+  await expect.poll(() => fixture.received.length).toBe(count + 3);
+  expect(fixture.received.slice(count).every((item) => item.body.model === 'fixture-model')).toBe(
+    true,
+  );
   await page.getByRole('button', { name: 'Mute microphone', exact: true }).click();
   await expect(page.getByRole('button', { name: 'Unmute microphone', exact: true })).toBeVisible();
   await page.getByRole('button', { name: 'End voice conversation', exact: true }).click();
@@ -391,13 +510,9 @@ test('uses a synthetic microphone for GPT-Live, saves captions and assistant aud
   await expect(page.getByRole('alert')).toHaveCount(0);
   await app.close();
   await launch();
-  await expect(page.locator('.from-assistant .markdown')).toContainText('Hello from GPT-Live.');
-  const saved = JSON.parse(await fs.readFile(path.join(temporary, 'aria-v3.json'), 'utf8'));
-  expect(
-    saved.chat.messages.find((message: { role: string }) => message.role === 'user').assets,
-  ).toBeUndefined();
-  expect(
-    saved.chat.messages.find((message: { role: string }) => message.role === 'assistant').assets[0]
-      .name,
-  ).toBe('aria-live-replies.wav');
+  await expect(page.locator('.from-assistant .markdown').first()).toContainText(
+    'Hello from GPT-Live.',
+  );
+  await expect(page.locator('.from-assistant audio')).toBeVisible();
+  await expect(page.locator('.conductor-activity')).toBeVisible();
 });

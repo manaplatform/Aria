@@ -1,28 +1,15 @@
-import type { ChatEvent, LiveEvent, LiveRequest, MediaRequest } from '@aria/shared';
+import type { LiveEvent, LiveRequest } from '@aria/shared';
+import { conductorEventSchema } from './chat-protocol';
 import { z } from 'zod';
 import WebSocket from 'ws';
 import { ChatService } from './chat-service';
 import { MediaStorage, pcmWav } from './media-storage';
 const id = z.string().min(1).max(200);
-export const mediaRequestSchema = z
-  .object({
-    requestId: id,
-    conversationId: id,
-    assistantMessageId: id,
-    mode: z.enum(['image', 'speech', 'transcription']),
-    model: id,
-    prompt: z.string().max(32000),
-    voice: z.string().max(200).optional(),
-    assetIds: z.array(z.string().uuid()).max(4),
-  })
-  .strict();
 export const liveRequestSchema = z
   .object({
     sessionId: id,
     conversationId: id,
-    model: id,
-    chatModel: id,
-    voice: z.string().max(200),
+    assistantMessageId: id,
     messages: z
       .array(
         z.object({ role: z.enum(['user', 'assistant']), content: z.string().max(100000) }).strict(),
@@ -32,10 +19,6 @@ export const liveRequestSchema = z
   .strict()
   .refine((r) => r.messages.reduce((n, m) => n + m.content.length, 0) <= 100000);
 export class MediaService {
-  private requests = new Map<
-    string,
-    { controller: AbortController; conversationId: string; done: Promise<void>; stopped: boolean }
-  >();
   private live?: {
     request: LiveRequest;
     ws: WebSocket;
@@ -49,117 +32,16 @@ export class MediaService {
   constructor(
     private readonly chat: ChatService,
     private readonly storage: MediaStorage,
-    private readonly emit: (event: ChatEvent) => void,
     private readonly emitLive: (event: LiveEvent) => void,
   ) {}
   assertIdle() {
-    if (this.requests.size || this.live)
-      throw new Error('Stop active media and voice sessions before changing the connection.');
+    if (this.live) throw new Error('End Live Voice before continuing.');
   }
-  assertConversationIdle(conversationId: string) {
-    if (this.live || [...this.requests.values()].some((r) => r.conversationId === conversationId))
-      throw new Error('This conversation already has an operation in progress.');
-  }
-  submit(input: MediaRequest) {
-    const request = mediaRequestSchema.parse(input);
-    this.assertConversationIdle(request.conversationId);
-    if (this.requests.has(request.requestId)) throw new Error('This request is already running.');
-    const active = {
-      controller: new AbortController(),
-      conversationId: request.conversationId,
-      done: Promise.resolve(),
-      stopped: false,
-    };
-    this.requests.set(request.requestId, active);
-    let sequence = 0;
-    const send = (event: object) =>
-      this.emit({
-        requestId: request.requestId,
-        conversationId: request.conversationId,
-        assistantMessageId: request.assistantMessageId,
-        sequence: ++sequence,
-        ...event,
-      } as ChatEvent);
-    active.done = (async () => {
-      const timer = setTimeout(() => active.controller.abort(), 310000);
-      try {
-        send({ type: 'started' });
-        const form = new FormData();
-        form.set('mode', request.mode);
-        form.set('model', request.model);
-        form.set('prompt', request.prompt);
-        if (request.voice) form.set('voice', request.voice);
-        for (const assetId of request.assetIds) {
-          const { asset, bytes } = await this.storage.get(assetId);
-          form.append(
-            'files',
-            new Blob([new Uint8Array(bytes)], { type: asset.mimeType }),
-            asset.name,
-          );
-        }
-        const response = await this.chat.http('media/generate', {
-          method: 'POST',
-          body: form,
-          signal: active.controller.signal,
-        });
-        if (request.mode === 'transcription') {
-          const value = await response.json();
-          const text = z.string().min(1).max(100000).parse(value.text);
-          if (active.stopped) return;
-          send({ type: 'delta', text });
-          send({ type: 'completed' });
-        } else {
-          if (!response.body) throw new Error('The provider returned no media.');
-          const reader = response.body.getReader();
-          const chunks: Buffer[] = [];
-          let size = 0;
-          try {
-            while (true) {
-              const { done, value } = await reader.read();
-              if (done) break;
-              size += value.length;
-              if (size > 64_000_000) throw new Error('Generated media exceeds the 64 MB limit.');
-              chunks.push(Buffer.from(value));
-            }
-          } finally {
-            await reader.cancel().catch(() => undefined);
-          }
-          if (active.stopped) return;
-          const asset = await this.storage.put(
-            Buffer.concat(chunks),
-            request.mode === 'image' ? 'aria-image.png' : 'aria-speech.wav',
-            request.mode === 'image' ? 'image/png' : 'audio/wav',
-          );
-          if (!active.stopped) send({ type: 'completed', assets: [asset] });
-        }
-      } catch (error) {
-        if (!active.stopped)
-          send({
-            type: 'failed',
-            error:
-              error instanceof Error ? error.message.slice(0, 2000) : 'Media generation failed.',
-            interrupted: active.controller.signal.aborted,
-          });
-      } finally {
-        if (active.stopped) send({ type: 'stopped' });
-        clearTimeout(timer);
-        active.controller.abort();
-        this.requests.delete(request.requestId);
-      }
-    })();
-  }
-  async cancel(id: string) {
-    const request = this.requests.get(id);
-    if (request) {
-      request.stopped = true;
-      request.controller.abort();
-      await request.done;
-    }
-  }
+
   async close() {
-    await Promise.all([...this.requests.keys()].map((id) => this.cancel(id)));
     await this.endLive();
   }
+
   async startLive(input: LiveRequest): Promise<void> {
     this.assertIdle();
     const request = liveRequestSchema.parse(input);
@@ -182,6 +64,9 @@ export class MediaService {
     const envelope = { sessionId: request.sessionId, conversationId: request.conversationId };
     let transcriptSize = 0;
     let transcriptFragments = 0;
+    const transfer = new AbortController();
+    let conductorEvents = Promise.resolve();
+    const artifacts = new Map<string, string>();
     await new Promise<void>((resolve, reject) => {
       let settled = false;
       const timeout = setTimeout(() => {
@@ -191,7 +76,9 @@ export class MediaService {
         if (live.finishing) return;
         live.finishing = true;
         clearTimeout(timeout);
+        transfer.abort();
         ws.terminate();
+        await conductorEvents.catch(() => undefined);
         let asset;
         try {
           if (live.size)
@@ -218,9 +105,9 @@ export class MediaService {
         ws.send(
           JSON.stringify({
             type: 'start',
-            model: request.model,
-            chatModel: request.chatModel,
-            voice: request.voice,
+            sessionId: request.sessionId,
+            conversationId: request.conversationId,
+            assistantMessageId: request.assistantMessageId,
             messages: request.messages,
           }),
         ),
@@ -262,6 +149,52 @@ export class MediaService {
             if (++transcriptFragments > 20000 || transcriptSize > 100000)
               throw new Error('Transcript limit exceeded.');
             this.emitLive({ ...envelope, type: 'transcript', ...transcript });
+          } else if (event.type === 'conductor') {
+            const requestId = z.string().uuid().parse(event.requestId);
+            const parsed = conductorEventSchema.parse(event.event);
+            conductorEvents = conductorEvents.then(async () => {
+              if (transfer.signal.aborted) return;
+              if (parsed.type === 'artifact') {
+                try {
+                  const asset = await this.chat.importArtifact(
+                    requestId,
+                    parsed.artifact,
+                    transfer.signal,
+                  );
+                  artifacts.set(parsed.artifact.id, asset.id);
+                  this.emitLive({
+                    ...envelope,
+                    type: 'conductor',
+                    requestId,
+                    event: { type: 'asset', asset },
+                  });
+                } catch {
+                  this.emitLive({
+                    ...envelope,
+                    type: 'conductor',
+                    requestId,
+                    event: {
+                      type: 'failed',
+                      interrupted: false,
+                      error: 'The voice result could not be saved.',
+                    },
+                  });
+                }
+              } else {
+                if (parsed.type === 'activity' && parsed.activity.resultId) {
+                  const id = parsed.activity.resultId;
+                  parsed.activity.resultId = artifacts.get(id);
+                  artifacts.delete(id);
+                }
+                this.emitLive({ ...envelope, type: 'conductor', requestId, event: parsed });
+                if (
+                  parsed.type === 'completed' ||
+                  parsed.type === 'failed' ||
+                  parsed.type === 'stopped'
+                )
+                  void this.chat.releaseAssets(requestId);
+              }
+            });
           } else if (event.type === 'ended') void finish();
           else if (event.type === 'failed') void finish(z.string().max(2000).parse(event.error));
           else throw new Error('Invalid voice event.');

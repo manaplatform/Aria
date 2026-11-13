@@ -1,21 +1,24 @@
 import { Inject, Injectable, OnApplicationBootstrap, OnModuleDestroy } from '@nestjs/common';
 import { HttpAdapterHost } from '@nestjs/core';
-import { timingSafeEqual } from 'node:crypto';
+import { randomUUID, timingSafeEqual } from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
 import WebSocket, { WebSocketServer } from 'ws';
-import { connection, endpoint, ProvidersService } from '../providers/providers.service';
+import { endpoint } from '../providers/providers.service';
+import { ConfigurationError, ModelRegistry } from '../providers/model-registry.service';
+import { Conductor } from '../conductor/conductor.service';
+import type { ChatRequest, ConductorEvent } from '@aria/shared';
 import { plainToInstance } from 'class-transformer';
 import { validate } from 'class-validator';
 import { VoiceStartDto, VoiceControlDto } from './voice.dto';
-import { DEFAULT_SYSTEM_PROMPT } from '../ai/ai.service';
 
 @Injectable()
 export class VoiceService implements OnApplicationBootstrap, OnModuleDestroy {
-  private server = new WebSocketServer({ noServer: true, maxPayload: 200000 });
+  private server = new WebSocketServer({ noServer: true, maxPayload: 512_000 });
   private peers = new Set<WebSocket>();
   constructor(
     @Inject(HttpAdapterHost) private readonly host: HttpAdapterHost,
-    @Inject(ProvidersService) private readonly providers: ProvidersService,
+    @Inject(ModelRegistry) private readonly registry: ModelRegistry,
+    @Inject(Conductor) private readonly conductor: Conductor,
   ) {}
   onApplicationBootstrap() {
     this.host.httpAdapter
@@ -47,6 +50,12 @@ export class VoiceService implements OnApplicationBootstrap, OnModuleDestroy {
     let closing = false;
     let closed = false;
     let bytes = 0;
+    const abort = new AbortController();
+    const seenDelegations = new Set<string>();
+    const fragments: { text: string; end: number; role: 'user' | 'assistant' }[] = [];
+    let fragmentCharacters = 0;
+    let delegated = false;
+    let lastOffset = -1;
     const startedAt = Date.now();
     const timeout = setTimeout(
       () =>
@@ -73,6 +82,7 @@ export class VoiceService implements OnApplicationBootstrap, OnModuleDestroy {
       peer.close();
     };
     const cleanup = () => {
+      abort.abort();
       clearTimeout(timeout);
       clearTimeout(closeTimer);
       upstream?.terminate();
@@ -81,6 +91,7 @@ export class VoiceService implements OnApplicationBootstrap, OnModuleDestroy {
     const end = () => {
       if (closing || closed) return;
       closing = true;
+      abort.abort();
       if (!ready || upstream?.readyState !== WebSocket.OPEN) {
         fail('The voice session ended before it was ready.');
         return;
@@ -104,10 +115,100 @@ export class VoiceService implements OnApplicationBootstrap, OnModuleDestroy {
             return;
           }
           starting = true;
-          await this.providers.assertModel(event.model, undefined, 'live');
-          await this.providers.assertModel(event.chatModel, undefined, 'chat');
+          const configured = await this.registry.resolve(abort.signal, undefined, true);
+          const profile = configured.config.live;
+          const voiceModel = profile && configured.models.get(profile.model);
+          if (
+            !profile ||
+            !voiceModel ||
+            !voiceModel.capabilities.includes('live') ||
+            (voiceModel.voices && !voiceModel.voices.includes(profile.voice))
+          ) {
+            fail('Select an available Live Voice profile in Settings → AI Models.');
+            return;
+          }
           if (closed || peer.readyState !== WebSocket.OPEN) return;
-          const config = connection();
+          const config = voiceModel.connection;
+          const runDelegation = async (id: string, offset: number) => {
+            const reply = (text: string) => {
+              if (!closing && !closed && upstream?.readyState === WebSocket.OPEN)
+                upstream.send(
+                  JSON.stringify({
+                    type: 'session.commentary.append',
+                    event_id: randomUUID(),
+                    delegation_id: id,
+                    content: text.slice(0, 1500),
+                  }),
+                );
+            };
+            if (delegated) {
+              reply('Another request is still running. Ask again when it finishes.');
+              return;
+            }
+            delegated = true;
+            try {
+              // Transcript deltas can arrive just after the delegation marker.
+              await new Promise<void>((resolve) => setTimeout(resolve, 250));
+              if (abort.signal.aborted) return;
+              const turns: ChatRequest['messages'] = [];
+              for (const fragment of fragments
+                .filter((item) => item.end <= offset)
+                .sort((a, b) => a.end - b.end)) {
+                const turn = turns.at(-1);
+                if (turn?.role === fragment.role) turn.content += fragment.text;
+                else turns.push({ role: fragment.role, content: fragment.text });
+              }
+              const latest = fragments.filter(
+                (item) => item.role === 'user' && item.end > lastOffset && item.end <= offset,
+              );
+              if (
+                !latest
+                  .map((item) => item.text)
+                  .join('')
+                  .trim()
+              ) {
+                reply('I did not catch that request. Please repeat it.');
+                return;
+              }
+              lastOffset = offset;
+              while (turns.at(-1)?.role === 'assistant') turns.pop();
+              const messages = [...parsed.messages, ...turns]
+                .filter((turn) => turn.content.trim())
+                .slice(-41);
+              while (
+                messages.length > 1 &&
+                messages.reduce((n, turn) => n + turn.content.length, 0) > 100_000
+              )
+                messages.shift();
+              const requestId = randomUUID();
+              let terminal:
+                Extract<ConductorEvent, { type: 'completed' | 'failed' | 'stopped' }> | undefined;
+              const text = await this.conductor.run(
+                {
+                  requestId,
+                  conversationId: parsed.conversationId,
+                  assistantMessageId: parsed.assistantMessageId,
+                  messages,
+                },
+                abort.signal,
+                (event) => {
+                  if (
+                    event.type === 'completed' ||
+                    event.type === 'failed' ||
+                    event.type === 'stopped'
+                  )
+                    terminal = event;
+                  send({ type: 'conductor', requestId, event });
+                },
+                configured.config,
+              );
+              if (terminal?.type === 'failed') reply(text.trim() || terminal.error);
+              else if (terminal?.type === 'completed')
+                reply(text.trim() || 'The result is available in the conversation.');
+            } finally {
+              delegated = false;
+            }
+          };
           const url = new URL(endpoint(config.baseUrl, 'live/sessions'));
           url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
           upstream = new WebSocket(url, {
@@ -120,16 +221,18 @@ export class VoiceService implements OnApplicationBootstrap, OnModuleDestroy {
               JSON.stringify({
                 type: 'session.start',
                 session: {
-                  model: event.model,
+                  model: voiceModel.id,
                   store: false,
                   instructions:
-                    process.env.ARIA_SYSTEM_PROMPT ||
-                    'You are Aria. Speak clearly and naturally. Delegate questions requiring reasoning to your backend.',
+                    'You are Aria. Speak naturally and delegate user requests for information, reasoning, or action to the application. Report completed work only when the application confirms it.',
                   audio: {
                     format: { type: 'audio/pcm', rate: 24000 },
-                    output: { voice: event.voice },
+                    output: { voice: profile.voice },
                   },
-                  input: parsed.messages.map((m) => ({
+                  input: (voiceModel.connection.id === configured.primary.connection.id
+                    ? parsed.messages
+                    : []
+                  ).map((m) => ({
                     type: 'message',
                     role: m.role,
                     content: [
@@ -139,15 +242,7 @@ export class VoiceService implements OnApplicationBootstrap, OnModuleDestroy {
                       },
                     ],
                   })),
-                  delegation: {
-                    type: 'responses',
-                    responses: {
-                      model: event.chatModel,
-                      instructions: process.env.ARIA_SYSTEM_PROMPT || DEFAULT_SYSTEM_PROMPT,
-                      tool_choice: 'none',
-                      max_output_tokens: 4096,
-                    },
-                  },
+                  delegation: { type: 'client' },
                 },
               }),
             ),
@@ -175,15 +270,37 @@ export class VoiceService implements OnApplicationBootstrap, OnModuleDestroy {
                 Number.isFinite(item.end_ms) &&
                 item.start_ms >= 0 &&
                 item.end_ms >= item.start_ms
-              )
+              ) {
+                const role = item.type === 'session.input_transcript.delta' ? 'user' : 'assistant';
+                fragments.push({ role, text: item.delta, end: item.end_ms });
+                fragmentCharacters += item.delta.length;
+                while (fragmentCharacters > 40_000 || fragments.length > 1500)
+                  fragmentCharacters -= fragments.shift()!.text.length;
                 send({
                   type: 'transcript',
-                  role: item.type.includes('input_') ? 'user' : 'assistant',
+                  role,
                   text: item.delta,
                   startMs: item.start_ms,
                   endMs: item.end_ms,
                 });
-              else if (item.type === 'session.closed') {
+              } else if (
+                ready &&
+                !closing &&
+                item.type === 'session.delegation.created' &&
+                item.delegation?.target === 'client' &&
+                typeof item.delegation.id === 'string' &&
+                item.delegation.id.length <= 200 &&
+                Number.isFinite(item.offset_ms) &&
+                item.offset_ms >= 0
+              ) {
+                if (seenDelegations.has(item.delegation.id)) return;
+                if (seenDelegations.size >= 250) {
+                  fail('The voice session reached its delegation limit.');
+                  return;
+                }
+                seenDelegations.add(item.delegation.id);
+                void runDelegation(item.delegation.id, item.offset_ms).catch(() => fail());
+              } else if (item.type === 'session.closed') {
                 if (!closing) {
                   fail('The provider ended the voice session. Start a new session to continue.');
                   return;
@@ -245,8 +362,8 @@ export class VoiceService implements OnApplicationBootstrap, OnModuleDestroy {
             );
           else fail('Invalid voice control.');
         } else fail('Wait for the voice session to become ready.');
-      } catch {
-        fail();
+      } catch (error) {
+        fail(error instanceof ConfigurationError ? error.message : undefined);
       }
     });
     peer.on('error', () => fail());

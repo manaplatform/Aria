@@ -2,55 +2,102 @@ import {
   BadRequestException,
   Body,
   Controller,
+  Delete,
   Get,
   Inject,
+  NotFoundException,
+  Param,
   Post,
   Req,
   Res,
-  ServiceUnavailableException,
+  UploadedFiles,
   UseGuards,
+  UseInterceptors,
 } from '@nestjs/common';
+import { FilesInterceptor } from '@nestjs/platform-express';
 import type { Request, Response } from 'express';
-import type { ChatEvent } from '@aria/shared';
-import { AiService, providerError } from '../ai/ai.service';
-import { ChatRequestDto } from './chat.dto';
+import { artifactReferenceSchema, identifier } from '@aria/shared';
+import { Conductor } from '../conductor/conductor.service';
+import { RunAssets, RunError } from '../conductor/run-assets';
+import { ModelRegistry } from '../providers/model-registry.service';
+import { ChatRequestDto, AttachmentMetadataDto } from './chat.dto';
 import { LocalApiGuard } from './local-api.guard';
-import { ProvidersService } from '../providers/providers.service';
 
 @Controller('chat')
 @UseGuards(LocalApiGuard)
 export class ChatController {
   constructor(
-    @Inject(AiService) private readonly ai: AiService,
-    @Inject(ProvidersService) private readonly providers: ProvidersService,
+    @Inject(ModelRegistry) private readonly registry: ModelRegistry,
+    @Inject(Conductor) private readonly conductor: Conductor,
+    @Inject(RunAssets) private readonly assets: RunAssets,
   ) {}
 
   @Get('capabilities')
   capabilities() {
-    return this.ai.capabilities();
+    return this.registry.status();
+  }
+
+  @Post(':requestId/attachments')
+  @UseInterceptors(
+    FilesInterceptor('files', 4, {
+      limits: { fileSize: 25_000_000, files: 4, fields: 1, fieldSize: 4096 },
+    }),
+  )
+  stage(
+    @Param('requestId') requestId: string,
+    @Body() input: AttachmentMetadataDto,
+    @UploadedFiles() files: Express.Multer.File[],
+  ) {
+    try {
+      identifier.parse(requestId);
+      const metadata: unknown = JSON.parse(input.metadata);
+      if (!Array.isArray(metadata) || metadata.length !== files.length) throw new Error();
+      this.assets.stage(
+        requestId,
+        files.map((file, index) => {
+          const item = artifactReferenceSchema.parse(metadata[index]);
+          if (item.size !== file.size || item.mimeType !== file.mimetype) throw new Error();
+          return { ...item, bytes: file.buffer };
+        }),
+      );
+      return { staged: true };
+    } catch (error) {
+      throw new BadRequestException(
+        error instanceof RunError ? error.message : 'Invalid attachment metadata.',
+      );
+    }
+  }
+
+  @Get(':requestId/artifacts/:artifactId')
+  artifact(
+    @Param('requestId') requestId: string,
+    @Param('artifactId') artifactId: string,
+    @Res() response: Response,
+  ) {
+    const artifact = this.assets.get(requestId, artifactId);
+    if (!artifact) throw new NotFoundException('This artifact is no longer available.');
+    response.setHeader('Cache-Control', 'no-store');
+    response.setHeader('Content-Type', artifact.mimeType);
+    response.send(artifact.bytes);
+  }
+
+  @Delete(':requestId/assets')
+  release(@Param('requestId') requestId: string) {
+    this.assets.release(requestId);
+    return { released: true };
   }
 
   @Post('stream')
-  async stream(
-    @Body() input: ChatRequestDto,
-    @Req() request: Request,
-    @Res() response: Response,
-  ): Promise<void> {
+  async stream(@Body() input: ChatRequestDto, @Req() request: Request, @Res() response: Response) {
     if (
       input.messages.at(-1)?.role !== 'user' ||
       input.messages.some((message) => !message.content.trim()) ||
-      input.messages.reduce((sum, message) => sum + message.content.length, 0) > 100000
+      input.messages.reduce((sum, message) => sum + message.content.length, 0) > 100_000
     )
       throw new BadRequestException(
         'Provide a user message and at most 100,000 characters of context.',
       );
-    if (!process.env.OPENAI_API_KEY?.trim() || !(input.model || this.ai.capabilities().model))
-      throw new ServiceUnavailableException(
-        'Configure an API key and model in Settings to start chatting.',
-      );
-
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 120000);
     const disconnect = () => {
       if (!response.writableEnded) controller.abort();
     };
@@ -61,68 +108,27 @@ export class ChatController {
     response.setHeader('X-Accel-Buffering', 'no');
     response.flushHeaders();
     let sequence = 0;
-    const send = (
-      payload:
-        | Omit<Extract<ChatEvent, { type: 'delta' }>, keyof ChatRequestDto | 'sequence'>
-        | { type: 'started' | 'completed' }
-        | { type: 'failed'; error: string; interrupted: boolean },
-    ) => {
-      if (response.destroyed || response.writableEnded) return;
-      const event = {
-        requestId: input.requestId,
-        conversationId: input.conversationId,
-        assistantMessageId: input.assistantMessageId,
-        sequence: ++sequence,
-        ...payload,
-      };
-      response.write(`data: ${JSON.stringify(event)}\n\n`);
-    };
     const heartbeat = setInterval(() => {
       if (!response.destroyed) response.write(': heartbeat\n\n');
     }, 15000);
     try {
-      send({ type: 'started' });
-      const model = input.model || this.ai.capabilities().model;
-      await this.providers.assertModel(model, controller.signal, 'chat');
-      const result = this.ai.generate(input.messages, controller.signal, model);
-      let failed = false;
-      let hasText = false;
-      for await (const part of result.stream) {
-        if (controller.signal.aborted) break;
-        if (part.type === 'text-delta') {
-          hasText ||= Boolean(part.text);
-          send({ type: 'delta', text: part.text });
-        }
-        if (part.type === 'error') {
-          failed = true;
-          send({ type: 'failed', error: providerError(part.error), interrupted: false });
-          break;
-        }
-      }
-      if (!failed) {
-        if (controller.signal.aborted)
-          send({
-            type: 'failed',
-            error: 'The response was interrupted. Please retry.',
-            interrupted: true,
-          });
-        else if (!hasText)
-          send({
-            type: 'failed',
-            error:
-              'The provider returned no text. Check that your selected model supports text chat, then retry.',
-            interrupted: false,
-          });
-        else send({ type: 'completed' });
-      }
-    } catch (error) {
-      send({ type: 'failed', error: providerError(error), interrupted: controller.signal.aborted });
+      await this.conductor.run(input, controller.signal, (event) => {
+        if (!response.destroyed && !response.writableEnded)
+          response.write(
+            `data: ${JSON.stringify({
+              requestId: input.requestId,
+              conversationId: input.conversationId,
+              assistantMessageId: input.assistantMessageId,
+              sequence: ++sequence,
+              ...event,
+            })}\n\n`,
+          );
+      });
     } finally {
-      controller.abort();
-      clearTimeout(timeout);
       clearInterval(heartbeat);
-      request.removeListener('aborted', disconnect);
-      response.removeListener('close', disconnect);
+      controller.abort();
+      request.off('aborted', disconnect);
+      response.off('close', disconnect);
       response.end();
     }
   }

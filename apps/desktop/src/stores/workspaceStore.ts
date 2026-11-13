@@ -239,12 +239,13 @@ export function flushPersistence(): Promise<void> {
     saveTimer = undefined;
   }
   persistenceQueue = persistenceQueue.then(async () => {
-    if (!dirty || !window.aria) return;
+    const bridge = typeof window === 'undefined' ? undefined : window.aria;
+    if (!dirty || !bridge) return;
     const data = useWorkspaceStore.getState().data;
     dirty = false;
     useWorkspaceStore.setState({ saving: true });
     try {
-      await desktop().save(data);
+      await bridge.save(data);
       useWorkspaceStore.setState({ saving: false, saveError: null });
     } catch (error) {
       dirty = true;
@@ -256,6 +257,7 @@ export function flushPersistence(): Promise<void> {
 useWorkspaceStore.subscribe((state, previous) => {
   if (!state.ready || state.data === previous.data) return;
   dirty = true;
+  if (typeof window === 'undefined' || !window.aria) return;
   // Continuous streaming must not postpone persistence until the response ends.
   checkpointTimer ??= setTimeout(() => {
     void flushPersistence();

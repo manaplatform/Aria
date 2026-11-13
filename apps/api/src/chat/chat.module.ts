@@ -1,7 +1,7 @@
 import { Module } from '@nestjs/common';
-import { AiModule } from '../ai/ai.module';
+import { ConductorModule } from '../conductor/conductor.module';
 import { ChatController } from './chat.controller';
 import { ProvidersModule } from '../providers/providers.module';
 
-@Module({ imports: [AiModule, ProvidersModule], controllers: [ChatController] })
+@Module({ imports: [ConductorModule, ProvidersModule], controllers: [ChatController] })
 export class ChatModule {}

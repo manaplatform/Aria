@@ -16,6 +16,7 @@ export function MediaPreview({
   return (
     <figure className="media-preview">
       {!error &&
+        asset.mimeType !== 'text/plain' &&
         (asset.mimeType.startsWith('image/') ? (
           <img
             src={source}
@@ -59,7 +60,7 @@ export function MediaPreview({
             variant="ghost"
             onClick={() => {
               setChatAttachments([asset]);
-              window.dispatchEvent(new Event('aria:edit-image'));
+              window.dispatchEvent(new Event('aria:focus-chat'));
             }}
           >
             <ImagePlus size={13} />

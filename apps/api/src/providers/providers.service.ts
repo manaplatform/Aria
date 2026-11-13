@@ -1,19 +1,13 @@
 import { BadGatewayException, BadRequestException, Injectable } from '@nestjs/common';
 import { createHash } from 'node:crypto';
-import type { GenerationMode, ProviderModel } from '@aria/shared';
+import { modelCapabilitySchema, type DiscoveredModel } from '@aria/shared';
+import { documentedModel } from './openai-catalog';
 import { providerError } from '../ai/ai.service';
 
 export interface Connection {
   provider: 'openai';
   baseUrl: string;
   apiKey: string;
-}
-export function connection(): Connection {
-  return {
-    provider: 'openai',
-    baseUrl: process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1',
-    apiKey: process.env.OPENAI_API_KEY?.trim() || '',
-  };
 }
 export function endpoint(base: string, route: string): string {
   const url = new URL(base);
@@ -48,33 +42,54 @@ export async function readBounded(response: Response, limit: number): Promise<Bu
     await reader.cancel().catch(() => undefined);
   }
 }
-export function describeModel(id: string, shutdownDate?: string): ProviderModel {
-  let modes: GenerationMode[] = [];
-  if (/^(gpt-image|dall-e)/i.test(id)) modes = ['image'];
-  else if (/^(tts-|.*-tts(?:-|$))/i.test(id)) modes = ['speech'];
-  else if (/realtime/i.test(id)) modes = ['speech'];
-  else if (/^gpt-live(?:-|$)/i.test(id) && !/transcri|translat/i.test(id)) modes = ['live'];
-  else if (/transcrib|^whisper/i.test(id) && !/live/i.test(id)) modes = ['transcription'];
-  else if (
-    !/embed|moderation|^sora|^gpt-live|translat|transcri/i.test(id) &&
-    /^(gpt-|chatgpt-|o\d|ft:)/i.test(id)
-  )
-    modes = ['chat'];
+function describeModel(item: Record<string, unknown>, baseUrl: string): DiscoveredModel {
+  const id = item.id as string;
+  const official = new URL(baseUrl).origin === 'https://api.openai.com';
+  const documented = official ? documentedModel(id) : undefined;
+  const raw = Array.isArray(item.capabilities) ? item.capabilities : undefined;
+  const capabilities = raw?.slice(0, 32).flatMap((value) => {
+    const capability = modelCapabilitySchema.safeParse(value);
+    return capability.success && (capability.data !== 'web-search' || official)
+      ? [capability.data]
+      : [];
+  });
+  if (!capabilities) return documented ?? { id, capabilities: [], source: 'unknown' };
+  const transport = item.transport;
   return {
+    ...documented,
     id,
-    modes,
-    ...(shutdownDate ? { shutdownDate } : {}),
-    ...(/^(tts-|.*-tts(?:-|$)|whisper)/i.test(id) ? { deprecated: true } : {}),
+    capabilities: [...new Set(capabilities)],
+    source: 'provider',
+    ...(['realtime', 'speech-api', 'inline-png', 'base64-image'].includes(String(transport))
+      ? { transport: transport as DiscoveredModel['transport'] }
+      : {}),
+    ...(Array.isArray(item.voices)
+      ? {
+          voices: item.voices
+            .slice(0, 24)
+            .filter(
+              (voice): voice is string =>
+                typeof voice === 'string' && /^[a-zA-Z0-9_-]{1,40}$/.test(voice),
+            ),
+        }
+      : {}),
+    ...Object.fromEntries(
+      ['contextTokens', 'inputCost', 'outputCost'].flatMap((key) =>
+        typeof item[key] === 'number' && Number.isFinite(item[key]) && item[key] >= 0
+          ? [[key, item[key]]]
+          : [],
+      ),
+    ),
   };
 }
 @Injectable()
 export class ProvidersService {
-  private cache = new Map<string, { at: number; models: ProviderModel[] }>();
-  async list(
-    config: Connection = connection(),
+  private cache = new Map<string, { at: number; models: DiscoveredModel[] }>();
+  async discover(
+    config: Connection,
     refresh = false,
     signal?: AbortSignal,
-  ): Promise<ProviderModel[]> {
+  ): Promise<DiscoveredModel[]> {
     if (config.provider !== 'openai') throw new BadRequestException('Select a supported provider.');
     if (!config.apiKey) throw new BadRequestException('Enter an API key before loading models.');
     const url = endpoint(config.baseUrl, 'models');
@@ -94,12 +109,12 @@ export class ProvidersService {
         throw { statusCode: response.status };
       }
       const body = JSON.parse((await readBounded(response, 2_000_000)).toString()) as {
-        data?: { id?: unknown; shutdown_date?: unknown }[];
+        data?: Record<string, unknown>[];
       };
       if (!Array.isArray(body.data) || body.data.length > 10000)
         throw new Error('Invalid catalog.');
       const ids = new Set<string>();
-      const models: ProviderModel[] = [];
+      const models: DiscoveredModel[] = [];
       for (const item of body.data) {
         if (typeof item?.id !== 'string' || !item.id.trim() || item.id.length > 200)
           throw new Error('Invalid model.');
@@ -110,7 +125,7 @@ export class ProvidersService {
           date <= new Date().toISOString().slice(0, 10)
         )
           continue;
-        if (!ids.has(item.id)) models.push(describeModel(item.id, date));
+        if (!ids.has(item.id)) models.push(describeModel(item, config.baseUrl));
         ids.add(item.id);
       }
       models.sort((a, b) => a.id.localeCompare(b.id));
@@ -121,17 +136,5 @@ export class ProvidersService {
       this.cache.delete(key);
       throw new BadGatewayException(providerError(error));
     }
-  }
-  async assertModel(model: string, signal?: AbortSignal, mode?: GenerationMode): Promise<void> {
-    if (
-      !model ||
-      !(await this.list(connection(), false, signal)).some(
-        (item) =>
-          item.id === model && (!mode || item.modes.length === 0 || item.modes.includes(mode)),
-      )
-    )
-      throw new BadRequestException(
-        'The selected model is unavailable. Refresh models and select a replacement.',
-      );
   }
 }

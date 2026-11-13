@@ -47,6 +47,11 @@ it('uses the native Responses protocol for official OpenAI reasoning models', as
   const result = new AiService().generate(
     [{ role: 'user', content: 'Reply OK' }],
     new AbortController().signal,
+    {
+      id: 'gpt-6-luna',
+      connection: { baseUrl: 'https://api.openai.com/v1', apiKey: 'test-only-key' },
+    },
+    'Be concise.',
   );
   const parts = [];
   for await (const part of result.stream) parts.push(part);

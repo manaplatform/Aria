@@ -11,21 +11,17 @@ pnpm install
 pnpm dev:desktop
 ```
 
-Aria opens directly into chat. In **Settings → Model connection**, select **OpenAI**, enter your API key, and choose **Load models**. Select defaults from the fetched model dropdowns, then choose **Save & reconnect**. Custom OpenAI-compatible endpoints remain supported. Use **Test connection** to send a short provider probe. A configured key/model is distinguished from a tested connection.
+Aria opens directly into chat. In **Settings → AI Models**, add a connection, enter its endpoint and key, and choose **Discover models**. Enable models you want to use, select a primary that supports text streaming and function calling, and save. Electron manages the local NestJS service.
 
-Electron starts and stops the NestJS API automatically. You do not need to create a project or launch a server separately. The built desktop runs its staged API using Electron’s embedded Node runtime.
+## AI Models and Conductor
 
-API keys saved in Settings are encrypted in the main process using the operating system’s credential protection. Encryption failures never fall back to plaintext storage. Keys are not returned by the settings API or included in conversation data.
+The primary model answers ordinary questions directly. It can also call tools, delegate to enabled models, and combine their results into a reply. Every model belongs to the same registry. AI Models controls provider connections, delegation, execution preferences, privacy, and the Live Voice profile.
 
-## Configuration
+Aria uses the native Responses API for the official OpenAI endpoint and Chat Completions for compatible endpoints. Models must appear in the connected account’s catalog. Discovery combines provider metadata with exact documented OpenAI IDs, aliases, and snapshots, including their supported operations and protocol options. Known models whose APIs Aria does not implement display **No supported Aria operations**. Compatible endpoints that list only IDs can use explicit capability declarations in Settings. Run **Verify for primary** to confirm streaming function calling before selecting a model with declared capabilities. A provider can still reject an operation at execution time.
 
-Settings supports the OpenAI provider, custom endpoint, API key, system instructions, and separate Chat, Image, Speech, Transcribe, and Live Voice model defaults. The default endpoint is `https://api.openai.com/v1`. Models are fetched from the endpoint’s authenticated `/models` API; IDs cannot be entered manually. New defaults stay unset until selected. Recognized model families are grouped by operation; unclassified IDs appear under **Other models**. Catalog membership is checked before generation, and a disappeared model requires reselection.
+Settings encrypts API keys through Electron’s operating-system credential storage. Existing desktop provider settings migrate from `provider.json` to `provider-v2.json`, including the encrypted key, primary candidate, media candidates, and Live Voice choice. Open AI Models to repair a missing model or verify an unknown capability. If you configured desktop through the environment, choose **Import environment settings** once. Afterward, manage model selection in Settings.
 
-Official OpenAI endpoints use the native Responses API, including support for reasoning models such as GPT-6 Luna. Other endpoints use the OpenAI-compatible Chat Completions adapter.
-
-Nonempty environment variables override saved settings: `OPENAI_API_KEY`, `OPENAI_MODEL` (the Chat default), `OPENAI_BASE_URL`, and `ARIA_SYSTEM_PROMPT`. Media defaults are configured in Settings. Development reads the repository’s `.env`; `.env.example` documents the optional variables. Leave them blank to configure Aria through Settings. Changing backend source requires restarting the desktop development command to restage the API.
-
-No production provider credentials are included. Automated tests use an explicitly local fixture provider; a live-provider smoke test requires your own configured credentials.
+By default, delegation uses the primary connection. Settings lets you allow delegation across connections and separately authorize attachment transfer. Enable **OpenAI Web Search** on an eligible OpenAI connection to use hosted research and source links. A search sends a query to the model chosen for that tool and can incur provider charges. Failed operations identify the affected capability and keep any valid partial results.
 
 ## Conversations
 
@@ -35,26 +31,22 @@ No production provider credentials are included. Automated tests use an explicit
 - Use Cmd/Ctrl+Shift+O for New Chat, Cmd/Ctrl+K for search, and Cmd/Ctrl+L to focus the composer.
 - Choose dark, light, or system appearance. Conversations, profile name, and sidebar preference stay on this device.
 
-The provider receives the newest user message and up to 20 recent completed turns, bounded to 100,000 characters. Full local history remains intact. Interrupted streams retain their partial text and require explicit retry; restarting the service never replays a message automatically. Media inputs and outputs are excluded from the text-chat context; their prompts, selected models, and files remain in local history.
+The primary receives the latest message and up to 20 completed prior turns, bounded to 100,000 characters. The expanded activity panel shows delegated models, tools, status, and sources. Aria retains partial replies on interruption. **Retry response** uses the same configuration when the service confirmed that no delegated provider operation started. **Send again** starts a new attempt with current settings. Service restarts never replay a turn.
 
-## Images, speech, transcription, and live voice
+## Attachments and Live Voice
 
-Use the composer’s mode and model selectors to switch operations. Quick model changes affect subsequent requests without replacing Settings defaults. Model discovery does not verify every capability of a custom server: it must implement the corresponding OpenAI-compatible API, and unsupported operations produce an error without changing endpoints or models.
+Use **Attach files** to add up to four supported files. Ask for the operation in the prompt.
 
-- **Image:** generate one PNG from a prompt, or attach up to four PNG/JPEG/WebP references (20 MB each) to edit. **Use image** reuses a generated image as a reference. Mask editing is not included.
-- **Speech:** type up to 4,096 characters, select a model/voice, and generate playable/downloadable WAV audio. Speech API models use `/audio/speech`; Realtime models use the documented audio response workflow. `marin` is the initial voice where supported; legacy `tts-*` models initially use `alloy`. The older Speech API model families are [scheduled to retire January 6, 2027](https://developers.openai.com/api/docs/deprecations#2026-10-01-text-to-speech-models).
-- **Transcribe:** attach one FLAC, MP3, MP4/M4A, MPEG/MPGA, OGG, WAV, or WebM audio file up to 25 MB. Its transcript is saved in the conversation.
-- **Live Voice:** open **Live voice options**, choose a GPT-Live model and Chat backend model, then start the microphone session. Hands-free voice includes captions, interruption, mute, and end controls. Starting requires microphone permission. Switching conversations, leaving chat, or closing the app ends the session. No automatic reconnection occurs.
+- **Images and vision** support PNG, JPEG, or WebP inputs up to 20 MB each. Ask for a description or an edit, or generate an image from text. **Use image** attaches a generated image to the next message.
+- **Transcription and speech** support one FLAC, MP3, MP4/M4A, MPEG/MPGA, OGG, WAV, or WebM recording up to 25 MB per transcription step. Speech returns playable WAV audio.
+- **Text files** support UTF-8 inputs up to 1 MB. Conductor can read a bounded excerpt and create downloadable plain text, Markdown, CSV, TSV, or JSON.
+- **Live Voice** uses the profile in AI Models. Start the microphone from chat. GPT-Live handles the spoken interaction and forwards delegated requests to the same primary through Conductor. Leaving chat, switching conversations, or closing Aria ends the session and cancels delegated work. The app stores timestamped captions and assistant audio locally. Microphone input is transient. [GPT-Live client delegation](https://developers.openai.com/api/docs/guides/live-delegation#configure-client-delegation)
 
-Live voice uses [OpenAI GPT-Live](https://developers.openai.com/api/docs/guides/live) with Responses delegation and no enabled tools. Local history retains transcript fragments/timestamps and the assistant’s generated audio, without saving microphone recordings. The provider session uses `store: false`. Provider billing/data policies still apply to content sent for generation.
-
-Media is saved separately under the application-data `media/` directory and exposed through opaque local asset URLs. Download uses a native save dialog. Generated files have a 64 MB local bound; requests have a five-minute bound. Deleting a conversation removes its associated media after history saves successfully, retaining any files reused elsewhere. Stop and explicit retry are available; retries retain the original operation, model, options, and references.
-
-Video generation is deferred because OpenAI [retired the Videos API](https://developers.openai.com/api/docs/deprecations#2026-03-24-sora-2-video-generation-models-and-videos-api). Voice cloning and microphone recording are not included.
+Use **Download** to export an artifact through the system save dialog. Each run can produce up to four artifacts totaling 64 MB. The five-minute run limit covers orchestration and generation. Deleting a conversation prunes files no longer referenced by history or drafts.
 
 ## Legacy workspace
 
-**Settings → Advanced → Open legacy workspace** retains existing projects, file browsing, drafts, manual tasks/plans, and clearly labelled sample workflows. These screens live under `/advanced/*` and provide **Return to chat**. Real coding execution and orchestration remain unavailable, as before.
+**Settings → Advanced → Open legacy workspace** retains existing projects, file browsing, drafts, manual tasks/plans, and clearly labelled sample workflows. These screens live under `/advanced/*` and provide **Return to chat**. The advanced screens retain their local and sample workflows. Conductor runs in the main chat.
 
 Existing `workspace-v1.json` and `aria-v2.json` data migrate to `aria-v3.json` in Electron’s application-data directory. The original remains untouched. Legacy records stay separate from chat history. Writes remain atomic, debounced, and serialized, with close-time flushing and visible save errors. Conversation JSON is bounded to 8 MB, 500 chat conversations, 20,000 messages, and 100,000 characters per message; history is never silently evicted.
 
@@ -76,6 +68,6 @@ pnpm --filter @aria/desktop exec electron .
 
 Electron tests cover production and development startup, managed service streaming/cancellation/restart, encrypted settings, conversation management/persistence, responsive navigation, fetched model selection, image editing, transcription, media export/persistence/cancellation, synthetic-microphone GPT-Live, and legacy behavior. Commercial-provider generation and physical-microphone acceptance must be checked separately. They use temporary application-data directories and a local provider fixture. Screenshots are written to `apps/desktop/.artifacts/screenshots/`. CI runs checks on macOS and Windows; installer packaging, signing, and auto-update are separate work.
 
-The optional standalone API remains available through `pnpm dev:api`. It binds to loopback, defaults to port 3000, and preserves `GET /health`. Chat endpoints require `ARIA_INTERNAL_TOKEN`; the desktop generates its own private token and ephemeral port automatically.
+The standalone API runs with `pnpm dev:api`, binds to loopback, and defaults to port 3000. Configure its primary with `OPENAI_MODEL`, `OPENAI_API_KEY`, and optional `OPENAI_BASE_URL`. For ID-only compatible catalogs, `ARIA_MODEL_CAPABILITIES=chat,tools` explicitly declares standalone primary support. `GET /health` is unchanged. Private endpoints require `ARIA_INTERNAL_TOKEN`. `POST /chat/stream` uses the configured primary and rejects a request-level `model` field.
 
 See [frontend architecture](docs/frontend-architecture.md) for process boundaries, persistence, and transport behavior.
