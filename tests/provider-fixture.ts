@@ -32,7 +32,9 @@ export async function createProviderFixture() {
   const voiceReceived: Record<string, unknown>[] = [];
   let models = Object.keys(fixtureDescriptors);
   const toolReplies = new Map<string, { name: string; input: unknown; provisional?: string }[]>();
-  const continuedReplies = new Map<string, { name: string; input: unknown }>();
+  type ToolReply = { name: string; input: unknown };
+  const continuedReplies = new Map<string, ToolReply>();
+  const toolResultReplies = new Map<string, (result: unknown) => ToolReply | undefined>();
   let livePrompt = 'Hello from my microphone.';
   let catalogStatus = 200;
   let cancelled = 0;
@@ -145,7 +147,9 @@ export async function createProviderFixture() {
     const script = configuredTool
       ? { name: 'verify_connection', input: { ok: true } }
       : body.tools?.length
-        ? continuation || toolReplies.get(prompt)?.shift()
+        ? continuation ||
+          (last?.role === 'tool' && toolResultReplies.get(userPrompt)?.(JSON.parse(prompt))) ||
+          toolReplies.get(prompt)?.shift()
         : undefined;
     if (script) {
       response.writeHead(200, { 'Content-Type': 'text/event-stream' });
@@ -291,6 +295,8 @@ export async function createProviderFixture() {
       toolReplies.set(prompt, [...(toolReplies.get(prompt) ?? []), { name, input, provisional }]),
     continueWithTool: (prompt: string, name: string, input: unknown) =>
       continuedReplies.set(prompt, { name, input }),
+    onToolResult: (prompt: string, handler: (result: unknown) => ToolReply | undefined) =>
+      toolResultReplies.set(prompt, handler),
     setLivePrompt: (value: string) => {
       livePrompt = value;
     },

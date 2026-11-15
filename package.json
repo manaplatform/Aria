@@ -10,6 +10,7 @@
     "typecheck": "pnpm --recursive --sort run typecheck",
     "lint": "pnpm --filter @aria/desktop lint",
     "test": "pnpm --recursive --sort --if-present run test",
+    "licenses:check": "node apps/desktop/scripts/third-party.cjs",
     "test:electron": "pnpm --filter @aria/desktop build && pnpm --filter @aria/desktop test:electron"
   },
   "devDependencies": {

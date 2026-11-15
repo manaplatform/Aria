@@ -1,10 +1,11 @@
 import { Link } from 'react-router-dom';
-import { Activity, RotateCcw } from 'lucide-react';
+import { Activity, ExternalLink, RotateCcw } from 'lucide-react';
 import type { ChatMessage as Message } from '@aria/shared';
 import { generating, regenerateChat, useChatStore } from '../../stores/chatStore';
 import { AriaMark } from '../layout/AriaMark';
 import { Button, CopyButton } from '../ui';
 import { openExternal } from '../../services/desktop';
+import { openResearchSource } from '../../stores/browserStore';
 import MarkdownRenderer from './MarkdownRenderer';
 import { MediaPreview } from './MediaPreview';
 
@@ -27,6 +28,8 @@ export function ChatMessage({
       message.activity?.flatMap((item) => item.sources ?? []).map((source) => [source.url, source]),
     ).values(),
   ];
+  const research =
+    message.activity?.some(({ capability }) => /^web[-_]|^browser_/.test(capability)) ?? false;
   const activeStep = message.activity?.find((step) => step.status === 'running');
 
   return (
@@ -50,7 +53,7 @@ export function ChatMessage({
         {message.role === 'user' ? (
           <div className="user-message-text">{message.content}</div>
         ) : message.content ? (
-          <MarkdownRenderer content={message.content} sources={sources} />
+          <MarkdownRenderer content={message.content} sources={sources} research={research} />
         ) : busy ? (
           <div className="thinking-indicator" aria-label="Waiting for response">
             <i />
@@ -87,14 +90,24 @@ export function ChatMessage({
         <nav className="conductor-sources" aria-label="Research sources">
           <span>Sources</span>
           {sources.map((source) => (
-            <Button
-              key={source.url}
-              variant="ghost"
-              size="sm"
-              onClick={() => void openExternal(source.url)}
-            >
-              {source.title}
-            </Button>
+            <span className="source-link-actions" key={source.url}>
+              <Button
+                variant="ghost"
+                size="sm"
+                title={source.domain || source.url}
+                onClick={() => void openResearchSource(source.url)}
+              >
+                {source.title}
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                aria-label={`Open externally: ${source.title}`}
+                onClick={() => void openExternal(source.url)}
+              >
+                <ExternalLink size={13} />
+              </Button>
+            </span>
           ))}
         </nav>
       ) : null}

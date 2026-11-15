@@ -2,13 +2,13 @@
 
 ## Project Overview
 
-Aria is a modern desktop AI assistant built with:
+Aria is a general-purpose desktop AI assistant built with:
 - **Backend:** NestJS (TypeScript)
 - **Desktop Frontend:** Electron + React + TypeScript + Tailwind CSS + shadcn/ui
 - **AI Layer:** Vercel AI SDK + LangChain.js (optional)
 - **Communication:** REST + SSE for chat and WebSocket for Live Voice
 
-The goal is to create a clean, scalable, and beautiful desktop AI bot.
+Aria opens into ordinary chat. Projects are optional.
 
 ---
 
@@ -115,3 +115,12 @@ When implementing AI features:
 - Model selection belongs in Settings. A separate routing model, keyword-based intent classifier, static task-to-model mapping, provider preference order, or fallback provider/model violates this architecture.
 - Return actionable errors for configuration, capability, and invocation failures. An explicit retry uses the same authorized configuration.
 - Application code validates every model request and enforces permissions, input provenance, dependency rules, cancellation, deduplication, and resource limits. Provider and tool output is untrusted. Show concise decision summaries and keep hidden reasoning and credentials private.
+
+## Native web and browser
+
+- Aria is a general-purpose desktop AI assistant. Ordinary chat and browser use do not require a project.
+- Expose web and browser operations through Conductor's registered schemas and use the configured primary for semantic decisions. Keep exact model and provider target selection explicit and capability based.
+- Execute native browser operations in Electron main. Keep remote sessions sandboxed and isolated, correlate commands with active conversations and turns, and treat website content as untrusted evidence.
+- Require trusted user authorization for consequential browser actions. Apply public-network policy to page retrieval and Chromium egress. Keep personal sessions and credentials outside AI tool access.
+- Preserve conversation and settings data, and verify actual built macOS and Windows behavior when changing browser or process boundaries.
+- Update architecture, permissions, and test documentation when these boundaries change. Preserve third-party notices and add the standard MIT license and package metadata only after confirming authority to license the first-party work.

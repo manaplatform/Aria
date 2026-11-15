@@ -3,6 +3,7 @@ import { useLocation, useNavigate } from 'react-router-dom';
 import { ArrowLeft, ArrowUpRight, Check, Monitor, Moon, Sun, UserRound } from 'lucide-react';
 import { useWorkspaceStore } from '../../stores/workspaceStore';
 import { Button, Field } from '../ui';
+import { WebBrowserSettings } from './WebBrowserSettings';
 import { ModelSettings } from './ModelSettings';
 
 export default function SettingsView() {
@@ -12,7 +13,8 @@ export default function SettingsView() {
   const navigate = useNavigate();
   const { hash } = useLocation();
   useEffect(() => {
-    if (hash === '#ai-models') document.getElementById('ai-models')?.scrollIntoView?.();
+    if (hash === '#ai-models' || hash === '#web-browser')
+      document.getElementById(hash.slice(1))?.scrollIntoView?.();
   }, [hash]);
   const modifier = window.aria?.platform === 'darwin' ? '⌘' : 'Ctrl';
   return (
@@ -53,6 +55,7 @@ export default function SettingsView() {
           </div>
         </section>
         <ModelSettings />
+        <WebBrowserSettings />
         <section className="settings-section">
           <div className="settings-section-heading">
             <h2>

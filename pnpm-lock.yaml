@@ -47,6 +47,9 @@ importers:
       dotenv:
         specifier: ^16.4.7
         version: 16.6.1
+      parse5:
+        specifier: 8.1.1
+        version: 8.1.1
       reflect-metadata:
         specifier: ^0.2.2
         version: 0.2.2
@@ -56,6 +59,9 @@ importers:
       ws:
         specifier: ^8.22.2
         version: 8.22.2
+      zod:
+        specifier: 4.6.7
+        version: 4.6.7
     devDependencies:
       '@types/express':
         specifier: ^5.0.6
@@ -176,8 +182,8 @@ importers:
         specifier: ^7.0.3
         version: 7.0.3
       electron:
-        specifier: ^45.2.3
-        version: 45.2.3
+        specifier: ^45.3.2
+        version: 45.3.2
       eslint:
         specifier: ^9
         version: 9.39.5(jiti@2.7.0)
@@ -217,6 +223,9 @@ importers:
 
   packages/shared:
     dependencies:
+      ipaddr.js:
+        specifier: 2.3.0
+        version: 2.3.0
       zod:
         specifier: ^4.6.7
         version: 4.6.7
@@ -1849,8 +1858,8 @@ packages:
   electron-to-chromium@1.5.479:
     resolution: {integrity: sha512-uAJdJQ7vHa4TvPfzt1TOqoRgHmav5gwmqHMPLxBH6m8Cbj5R9/z/rygTOQiZ8pe5g0ZAEogga1bP6HoKcOzx/Q==}
 
-  electron@45.2.3:
-    resolution: {integrity: sha512-Vurzu5UOA5nTGT4LqIwXD16QFGrOZdiXxF+1UP4KNsAOo/YtDcT3/u0jhP4WSwNJ0iLrLDi85hzBJ0arnGDhyw==}
+  electron@45.3.2:
+    resolution: {integrity: sha512-bPO0MMvJCdKdPfXgd3ES8zupu+ocr6XmSuRGwyZazTiigTz8jE7rwukSkck0iomS6UZeFuCwzu0uanMD/D34uw==}
     engines: {node: '>= 22.12.0'}
     hasBin: true
 
@@ -2203,6 +2212,10 @@ packages:
   ipaddr.js@1.9.1:
     resolution: {integrity: sha512-0KI/607xoxSToH7GjN1FfSbLoU0+btTicjsQSWQlh/hZykN8KpmMf7uYwPW3R+akZ6R/w18ZlXSHBYXiYUPO3g==}
     engines: {node: '>= 0.10'}
+
+  ipaddr.js@2.3.0:
+    resolution: {integrity: sha512-Zv/pA+ciVFbCSBBjGfaKUya/CcGmUHzTydLMaTwrUUEM2DIEO3iZvueGxmacvmN50fGpGVKeTXpb2LcYQxeVdg==}
+    engines: {node: '>= 10'}
 
   is-alphabetical@2.0.1:
     resolution: {integrity: sha512-FWyyY60MeTNyeSRpkM2Iry0G9hpr7/9kD40mD/cGQEuilcZYS4okz8SN2Q6rLCJ8gbCt6fN+rC+6tMGS99LaxQ==}
@@ -5058,7 +5071,7 @@ snapshots:
 
   electron-to-chromium@1.5.479: {}
 
-  electron@45.2.3:
+  electron@45.3.2:
     dependencies:
       '@electron-internal/extract-zip': 1.0.8
       '@electron/get': 5.1.0
@@ -5480,6 +5493,8 @@ snapshots:
   inline-style-parser@0.2.9: {}
 
   ipaddr.js@1.9.1: {}
+
+  ipaddr.js@2.3.0: {}
 
   is-alphabetical@2.0.1: {}
 

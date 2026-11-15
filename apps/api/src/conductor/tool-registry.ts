@@ -42,7 +42,12 @@ export const modelOutputs = {
 } as const;
 
 type StepInputs = { text: string[]; files: RunFile[] };
-export type StepValue = { text?: string; file?: RunFile; sources?: ConductorSource[] };
+export type StepValue = {
+  text?: string;
+  file?: RunFile;
+  sources?: ConductorSource[];
+  data?: Record<string, unknown>;
+};
 
 @Injectable()
 export class ToolRegistry {

@@ -80,6 +80,8 @@ export class AiService {
       const parsed = sourceSchema.safeParse({
         url: source.url,
         title: source.title?.slice(0, 300) || source.url.slice(0, 300),
+        provenance: 'hosted',
+        retrievedAt: new Date().toISOString(),
       });
       return parsed.success ? [parsed.data] : [];
     });

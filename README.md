@@ -71,3 +71,11 @@ Electron tests cover production and development startup, managed service streami
 The standalone API runs with `pnpm dev:api`, binds to loopback, and defaults to port 3000. Configure its primary with `OPENAI_MODEL`, `OPENAI_API_KEY`, and optional `OPENAI_BASE_URL`. For ID-only compatible catalogs, `ARIA_MODEL_CAPABILITIES=chat,tools` explicitly declares standalone primary support. `GET /health` is unchanged. Private endpoints require `ARIA_INTERNAL_TOKEN`. `POST /chat/stream` uses the configured primary and rejects a request-level `model` field.
 
 See [frontend architecture](docs/frontend-architecture.md) for process boundaries, persistence, and transport behavior.
+
+## Web & Browser
+
+Chat can use OpenAI-hosted search, independently configured Brave Search, and public page retrieval. Enable Brave in **Settings → Web & Browser** and enter a key from a plan that permits your use of the search results. Brave receives the query and search preferences. Aria keeps Brave discovery results in memory for the turn and checks publisher pages for durable citations. Choose **Chat**, **Split**, or **Browser** in the chat header. Source links open in Aria, with a separate action to open them externally.
+
+AI browser access is off by default. When enabled, the configured primary model can use AI tabs owned by that conversation. Personal tabs can share a previewed link or selection with a chat draft. For supported actions that change a page or submit a form, confirm the action in Aria's native dialog. Use a Personal tab for sign-ins, payments, uploads, or forms Aria cannot verify. Chromium tabs and public page tools block local and private network destinations. History, persistent cookies, and tab restore are independent settings.
+
+See [web and browser security](docs/web-browser-security.md) and [third-party notices](THIRD_PARTY_NOTICES.md). The first-party MIT license is pending confirmation of the legal copyright holder and authority to license the existing contributions.

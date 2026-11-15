@@ -1,7 +1,12 @@
 import { createHash } from 'node:crypto';
+import { z } from 'zod';
 import { HttpException } from '@nestjs/common';
 import {
   conductorLimits,
+  browserOps,
+  localWebToolIds,
+  researchToolArgs,
+  type ResearchToolId,
   type ArtifactReference,
   type ConductorActivity,
   type ConductorEvent,
@@ -14,6 +19,7 @@ import {
   type ResolvedModel,
 } from '../providers/model-registry.service';
 import { RunError, type RunAssets, type RunAttachment } from './run-assets';
+import type { ResearchRun } from '../web/web.service';
 import { modelOutputs, toolOutputs, type StepValue, type ToolRegistry } from './tool-registry';
 
 type Registry = Awaited<ReturnType<ModelRegistry['resolve']>>;
@@ -27,6 +33,7 @@ type Planned = {
   model?: ResolvedModel;
   attachmentDerived: boolean;
   startedAt?: number;
+  researchOp?: ResearchToolId;
 };
 type Capability = ExecutionStep['capability'];
 
@@ -36,6 +43,8 @@ export class ExecutionEngine {
   private readonly dispatched = new Set<string>();
   private readonly failedCapabilities = new Set<Capability>();
   private searches = 0;
+  private fetches = 0;
+  private screenshots = 0;
   private receivedAttachmentContent = false;
   billableChildStarted = false;
   unavailable = false;
@@ -49,13 +58,17 @@ export class ExecutionEngine {
     private readonly tools: ToolRegistry,
     private readonly emit: (event: ConductorEvent) => void,
     private readonly signal: AbortSignal,
+    private readonly research: ResearchRun,
   ) {}
 
   private eligible(model: ResolvedModel, capability: Capability, hosted = false) {
     return (
       model.delegate &&
       model.capabilities.some((value) => value === capability) &&
-      (!hosted || (model.connection.webSearch && officialConnection(model.connection.baseUrl)))
+      (!hosted ||
+        (this.research.policy.enabled &&
+          model.connection.webSearch &&
+          officialConnection(model.connection.baseUrl)))
     );
   }
 
@@ -63,14 +76,64 @@ export class ExecutionEngine {
     if (capability === 'create-file') return true;
     if (capability === 'read-file')
       return [...this.attachments.values()].some((file) => file.mimeType === 'text/plain');
+    if (capability === 'web-search' && this.research.independent) return true;
+    if (localWebToolIds.some((id) => id === capability))
+      return this.webAllowed(capability as ResearchToolId);
     return [...this.registry.models.values()].some((model) =>
       this.eligible(model, capability, capability === 'web-search'),
     );
   }
 
+  private webAllowed(op: ResearchToolId) {
+    if (op === 'web_search') return this.research.independent;
+    return (
+      this.research.policy.enabled &&
+      (!browserOps.some((browserOp) => browserOp === op) || this.research.native)
+    );
+  }
+
+  private researchDescriptors() {
+    const targets = this.research.searchTargets;
+    const descriptors = (Object.keys(researchToolArgs) as ResearchToolId[])
+      .filter((op) => op !== 'web_search' && this.webAllowed(op))
+      .map((op) => ({
+        capability: op as Capability,
+        output: op === 'browser_screenshot' ? 'image' : op === 'web_read' ? 'text' : 'data',
+        target: {
+          kind: 'tool',
+          tool: op,
+          model: null,
+          searchConnectionId: undefined as string | undefined,
+        },
+        args: z.toJSONSchema(researchToolArgs[op], { unrepresentable: 'any' }),
+        authorization: ['browser_click', 'browser_type', 'browser_submit'].includes(op)
+          ? 'approval when required'
+          : 'user settings',
+      }));
+    return [
+      ...descriptors,
+      ...targets.map(({ id, name, options }) => ({
+        capability: 'web-search' as const,
+        output: 'data',
+        target: { kind: 'tool', tool: 'web_search' as const, model: null, searchConnectionId: id },
+        args: z.toJSONSchema(
+          researchToolArgs.web_search.pick({
+            query: true,
+            ...(options.includes('language') && { language: true }),
+            ...(options.includes('country') && { country: true }),
+            ...(options.includes('freshness') && { freshness: true }),
+            ...(options.includes('cursor') && { cursor: true }),
+          }),
+        ),
+        provider: name,
+        authorization: 'user settings',
+      })),
+    ];
+  }
+
   descriptors() {
     const models = [...this.registry.models.values()].filter((model) => model.delegate);
-    return models.flatMap((model) => {
+    const delegates = models.flatMap((model) => {
       const capabilities = model.capabilities.filter(
         (capability) =>
           Object.hasOwn(modelOutputs, capability) ||
@@ -102,6 +165,10 @@ export class ExecutionEngine {
           ]
         : [];
     });
+    const research = this.researchDescriptors();
+    return research.length
+      ? [...delegates, { name: 'Web & Browser', operations: research }]
+      : delegates;
   }
 
   get requiresSettings() {
@@ -141,7 +208,7 @@ export class ExecutionEngine {
       activity: {
         stepId: item.step.id,
         capability: item.step.capability,
-        summary: item.step.summary,
+        summary: item.researchOp ? item.researchOp.replaceAll('_', ' ') : item.step.summary,
         target: item.model
           ? `${item.model.connection.name} / ${item.model.id}`
           : item.step.target.kind === 'tool'
@@ -164,7 +231,13 @@ export class ExecutionEngine {
     if (batch.size !== steps.length || steps.some((step) => this.planned.has(step.id)))
       throw new RunError('Each execution step must have a unique ID.');
     const searchCount = steps.filter((step) => step.capability === 'web-search').length;
-    if (this.searches + searchCount > conductorLimits.searches)
+    const fetchCount = steps.filter((step) => step.capability === 'web_fetch').length;
+    const screenshotCount = steps.filter((step) => step.capability === 'browser_screenshot').length;
+    if (this.fetches + fetchCount > this.research.policy.fetches)
+      throw new RunError('The turn reached its page fetch limit.');
+    if (this.screenshots + screenshotCount > this.research.policy.screenshots)
+      throw new RunError('The turn reached its screenshot limit.');
+    if (this.searches + searchCount > this.research.policy.searches)
       throw new RunError('The turn reached its search limit.');
     const checked = new Map<string, Planned>();
     const visiting = new Set<string>();
@@ -183,26 +256,63 @@ export class ExecutionEngine {
           'That capability already failed in this turn. Explain the result to the user.',
         );
       const model = step.target.model ? this.registry.models.get(step.target.model) : undefined;
+      const target = step.target;
+      const researchOp =
+        target.kind === 'tool' &&
+        (Boolean(target.searchConnectionId) || localWebToolIds.some((id) => id === target.tool))
+          ? (target.tool as ResearchToolId)
+          : undefined;
       if (step.target.kind === 'model') {
+        if (step.args)
+          throw new RunError('This model operation does not accept structured tool arguments.');
         if (!model || !this.eligible(model, step.capability)) this.rejectTarget(step.capability);
         if (modelOutputs[step.capability as keyof typeof modelOutputs] !== step.output)
           throw new RunError('The selected output does not match the capability.');
+      } else if (researchOp) {
+        const descriptor = this.researchDescriptors().find(
+          ({ target: candidate }) =>
+            candidate.tool === researchOp &&
+            candidate.searchConnectionId ===
+              (target.kind === 'tool' ? target.searchConnectionId : undefined),
+        );
+        if (
+          !descriptor ||
+          step.target.model !== null ||
+          step.target.searchConnectionId !== descriptor.target.searchConnectionId ||
+          step.capability !== descriptor.capability ||
+          step.output !== descriptor.output
+        )
+          throw new RunError(
+            'This web operation is not available for the selected target. Check Web & Browser settings.',
+          );
+        if (
+          step.inputs.length ||
+          Buffer.byteLength(JSON.stringify(step.args ?? {})) > 12_000 ||
+          !researchToolArgs[researchOp].safeParse(step.args).success
+        )
+          throw new RunError('The arguments do not match the listed web operation.');
       } else {
-        const tool = toolOutputs[step.target.tool];
-        if (tool.capability !== step.capability || tool.output !== step.output)
+        const tool = toolOutputs[step.target.tool as keyof typeof toolOutputs];
+        if (
+          !tool ||
+          step.args ||
+          tool.capability !== step.capability ||
+          tool.output !== step.output
+        )
           throw new RunError('The selected tool does not provide this capability or output.');
         if (
           step.target.tool === 'web_search' &&
           (!model || !this.eligible(model, step.capability, true))
-        ) {
+        )
           this.rejectTarget(step.capability);
-        }
         if (step.target.tool !== 'web_search' && step.target.model !== null)
           throw new RunError('This local tool does not use a backing model.');
       }
       const attachmentDerived =
         dependencies.some((item) => item.attachmentDerived) ||
         step.inputs.some((input) => input.kind === 'attachment');
+      if (researchOp && (attachmentDerived || this.receivedAttachmentContent))
+        throw new RunError('Web tools cannot receive attachment contents.');
       if (
         model &&
         (attachmentDerived || this.receivedAttachmentContent) &&
@@ -216,12 +326,22 @@ export class ExecutionEngine {
         if (input.kind === 'result' && !step.dependsOn.includes(input.stepId))
           throw new RunError('Add referenced results to the step dependencies.');
       }
-      const item = { step, model, attachmentDerived };
+      const item = {
+        step,
+        model,
+        attachmentDerived: attachmentDerived || researchOp === 'browser_screenshot',
+        researchOp,
+      };
       checked.set(id, item);
       visiting.delete(id);
       return item;
     };
-    return { items: steps.map((step) => resolve(step.id)), searchCount };
+    return {
+      items: steps.map((step) => resolve(step.id)),
+      searchCount,
+      fetchCount,
+      screenshotCount,
+    };
   }
 
   async execute(steps: ExecutionStep[]) {
@@ -234,7 +354,9 @@ export class ExecutionEngine {
         error instanceof RunError ? error.message : 'The execution request was rejected.';
       throw error;
     }
-    const { items, searchCount } = validated;
+    const { items, searchCount, fetchCount, screenshotCount } = validated;
+    this.fetches += fetchCount;
+    this.screenshots += screenshotCount;
     this.searches += searchCount;
     for (const item of items) {
       this.planned.set(item.step.id, item);
@@ -264,6 +386,7 @@ export class ExecutionEngine {
         status: result.status,
         error: result.error,
         text: result.text,
+        data: result.data,
         artifact: result.artifact,
         sources: result.sources,
       };
@@ -271,7 +394,7 @@ export class ExecutionEngine {
   }
 
   private async runStep(item: Planned): Promise<Outcome> {
-    const { step, model } = item;
+    const { step, model, researchOp } = item;
     if (this.signal.aborted) return { status: 'cancelled' };
     if (step.dependsOn.some((id) => this.results.get(id)?.status !== 'completed'))
       return { status: 'blocked', error: 'A prerequisite did not complete.' };
@@ -288,17 +411,30 @@ export class ExecutionEngine {
     }
     if (text.reduce((sum, item) => sum + item.length, 0) > 32_000)
       return { status: 'failed', error: 'The supplied text exceeds the step input limit.' };
+    const args = researchOp ? researchToolArgs[researchOp].parse(step.args) : undefined;
+    const snapshot =
+      researchOp &&
+      ['browser_get_page', 'browser_get_tabs', 'browser_extract', 'browser_scroll'].includes(
+        researchOp,
+      );
     const fingerprint = createHash('sha256')
-      .update(JSON.stringify([step.target, step.capability, step.instructions, step.inputs]))
+      .update(
+        JSON.stringify([step.target, step.capability, args ?? step.instructions, step.inputs]),
+      )
       .digest('hex');
-    if (this.dispatched.has(fingerprint))
+    // A fresh observation may be needed after the page changes.
+    if (!snapshot && this.dispatched.has(fingerprint))
       return { status: 'blocked', error: 'This operation already ran.' };
-    this.dispatched.add(fingerprint);
+    if (!snapshot) this.dispatched.add(fingerprint);
     item.startedAt = Date.now();
     this.activity(item, 'running');
-    if (model) this.billableChildStarted = true;
+    if (model || researchOp === 'web_search' || researchOp?.startsWith('browser_'))
+      this.billableChildStarted = true;
     try {
-      const value = await this.tools.invoke(step, { files, text }, this.signal, model);
+      const value = researchOp
+        ? await this.research.invoke(researchOp, args!, step, this.signal)
+        : await this.tools.invoke(step, { files, text }, this.signal, model);
+      if (!researchOp && value.sources) this.research.observeSources(value.sources, step.id);
       this.signal.throwIfAborted();
       if (step.output === 'sources' && (!value.text?.trim() || !value.sources?.length))
         throw new RunError('Web search returned no usable sourced results.');
@@ -312,11 +448,11 @@ export class ExecutionEngine {
       };
     } catch (error) {
       if (this.signal.aborted) return { status: 'cancelled' };
-      this.failedCapabilities.add(step.capability);
       const message =
         error instanceof RunError || error instanceof HttpException
           ? error.message
           : providerError(error);
+      if (!researchOp || researchOp === 'web_search') this.failedCapabilities.add(step.capability);
       return { status: 'failed', error: message.slice(0, 400) };
     }
   }

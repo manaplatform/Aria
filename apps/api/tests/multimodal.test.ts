@@ -677,7 +677,7 @@ it('searches with the explicitly chosen OpenAI model and feeds sourced results i
       type: 'activity',
       activity: expect.objectContaining({
         stepId: 'research',
-        sources: [{ url: source, title: 'Study' }],
+        sources: [expect.objectContaining({ url: source, title: 'Study', provenance: 'hosted' })],
       }),
     }),
   );

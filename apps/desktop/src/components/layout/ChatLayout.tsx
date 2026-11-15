@@ -1,9 +1,11 @@
 import { useEffect, useState } from 'react';
 import { useLocation, useNavigate, Outlet } from 'react-router-dom';
-import { PanelLeftOpen, Search, Sparkles } from 'lucide-react';
+import { Globe2, PanelLeftOpen, Search, Sparkles } from 'lucide-react';
 import { useWorkspaceStore, flushPersistence } from '../../stores/workspaceStore';
 import { selectChat, useChatStore } from '../../stores/chatStore';
 import { AppSidebar } from './AppSidebar';
+import { BrowserPane, useBrowserSlot } from '../browser/BrowserPane';
+import { connectBrowser, setBrowserMode, useBrowserStore } from '../../stores/browserStore';
 import { Button, ErrorState, IconButton, Modal, Toast } from '../ui';
 
 export default function ChatLayout() {
@@ -16,10 +18,15 @@ export default function ChatLayout() {
   const [drawer, setDrawer] = useState(false);
   const location = useLocation();
   const navigate = useNavigate();
+  const browserMode = useBrowserStore((state) => state.mode);
+  const showBrowser = browserMode !== 'chat' && location.pathname === '/chat';
+  const slot = useBrowserSlot(chat.selectedId, showBrowser && !drawer);
+  useEffect(connectBrowser, []);
   const conversation = chat.conversations.find((item) => item.id === chat.selectedId);
   const newChat = () => {
     selectChat(null);
     navigate('/chat');
+    if (useBrowserStore.getState().mode === 'browser') setBrowserMode('split');
     setDrawer(false);
     requestAnimationFrame(() => window.dispatchEvent(new Event('aria:focus-chat')));
   };
@@ -52,6 +59,7 @@ export default function ChatLayout() {
       if (event.key.toLowerCase() === 'l') {
         event.preventDefault();
         navigate('/chat');
+        if (useBrowserStore.getState().mode === 'browser') setBrowserMode('split');
         requestAnimationFrame(() => window.dispatchEvent(new Event('aria:focus-chat')));
       }
     };
@@ -89,6 +97,26 @@ export default function ChatLayout() {
             </span>
           </div>
           <div className="row">
+            {location.pathname === '/chat' && window.aria?.browserLayout && (
+              <div
+                className="browser-mode-controls"
+                role="group"
+                aria-label="Chat and browser layout"
+              >
+                {(['chat', 'split', 'browser'] as const).map((mode) => (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    key={mode}
+                    aria-pressed={browserMode === mode}
+                    onClick={() => setBrowserMode(mode)}
+                  >
+                    {mode === 'browser' && <Globe2 size={14} />}
+                    {mode === 'chat' ? 'Chat' : mode === 'split' ? 'Split' : 'Browser'}
+                  </Button>
+                ))}
+              </div>
+            )}
             <IconButton
               label="Find a conversation"
               onClick={() => {
@@ -113,7 +141,12 @@ export default function ChatLayout() {
             retry={() => void flushPersistence()}
           />
         )}
-        <Outlet />
+        <div className={`chat-browser-workspace ${showBrowser ? browserMode : 'chat'}`}>
+          <div className="chat-outlet" hidden={showBrowser && browserMode === 'browser'}>
+            <Outlet />
+          </div>
+          {showBrowser && <BrowserPane slot={slot} />}
+        </div>
       </main>
       <Modal
         open={narrow && drawer}

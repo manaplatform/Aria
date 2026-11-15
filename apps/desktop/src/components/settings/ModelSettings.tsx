@@ -406,11 +406,13 @@ function RegistryEditor({ settings }: { settings: RegistrySettings }) {
             Restart service
           </Button>
         )}
-        {status.state === 'ready' && status.configured && draft.revision === status.revision && (
-          <span className="muted">
-            <Check size={14} /> Primary configured
-          </span>
-        )}
+        {status.state === 'ready' &&
+          status.configured &&
+          draft.revision === (status.registryRevision ?? status.revision) && (
+            <span className="muted">
+              <Check size={14} /> Primary configured
+            </span>
+          )}
       </div>
       {feedback && (
         <p
