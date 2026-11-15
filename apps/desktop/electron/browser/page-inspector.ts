@@ -13,7 +13,8 @@ type Command = {
     | 'plan'
     | 'submit'
     | 'selected'
-    | 'screenshot';
+    | 'screenshot'
+    | 'search-results';
   documentId: string;
   ids?: string[];
   elementId?: string;
@@ -45,6 +46,11 @@ const resultSchema = z.strictObject({
   action: z.string().max(2000).optional(),
   body: z.string().max(12_000).optional(),
   sensitive: z.boolean().optional(),
+  results: z
+    .array(z.strictObject({ url: z.string().max(2000), title: z.string().max(300) }))
+    .max(8)
+    .optional(),
+  searchEmpty: z.boolean().optional(),
 });
 
 function execute(command: Command) {
@@ -116,6 +122,33 @@ function execute(command: Command) {
       ? item.node
       : undefined;
   };
+  if (command.op === 'search-results') {
+    const results: { url: string; title: string }[] = [];
+    for (const anchor of document.querySelectorAll<HTMLAnchorElement>(
+      '[data-type="web"] .result-content a[href]',
+    )) {
+      if (
+        !visible(anchor) ||
+        anchor.href.length > 2000 ||
+        !['http:', 'https:'].includes(anchor.protocol)
+      )
+        continue;
+      const title = anchor.innerText
+        .split('\n')
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .at(-1);
+      if (!title || results.some((result) => result.url === anchor.href)) continue;
+      results.push({ url: anchor.href, title: title.slice(0, 300) });
+      if (results.length === 8) break;
+    }
+    const searchEmpty = [...document.querySelectorAll('h1, h2, [role="heading"]')].some(
+      (heading) =>
+        /^no (?:search )?results(?: found)?[.!]?$/i.test(heading.textContent?.trim() ?? '') &&
+        visible(heading),
+    );
+    return { results, searchEmpty };
+  }
   if (command.op === 'selected')
     return { selected: window.getSelection()?.toString().slice(0, 4000) || '' };
   if (command.op === 'screenshot')

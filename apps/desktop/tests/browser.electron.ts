@@ -52,7 +52,33 @@ test('browses from ordinary chat through the managed private port and keeps priv
     app = await electron.launch({ args: [root], env });
     // Route just one public fixture hostname after normal validation. The app has no fixture bypass.
     await app.evaluate(
-      (_electron, { host, ip, port }) => {
+      ({ session }, { host, ip, port }) => {
+        const fromPartition = session.fromPartition.bind(session);
+        session.fromPartition = (name, options) => {
+          const profile = fromPartition(name, options);
+          if (name.startsWith('aria-ai-')) {
+            profile.protocol.handle('https', (request) => {
+              const address = new URL(request.url);
+              if (
+                address.origin === 'https://search.brave.com' &&
+                address.pathname === '/search' &&
+                address.searchParams.get('q') === 'semaphore definition'
+              ) {
+                return new Response(
+                  '<title>Aria search fixture</title><main>' +
+                    '<div data-type="ad"><div class="result-content"><a href="https://example.com/ad">Ad</a></div></div>' +
+                    '<div data-type="web"><div class="result-content">' +
+                    '<a href="http://' +
+                    host +
+                    '/study">Aria research fixture</a></div></div></main>',
+                  { headers: { 'Content-Type': 'text/html' } },
+                );
+              }
+              return profile.fetch(request, { bypassCustomProtocolHandlers: true });
+            });
+          }
+          return profile;
+        };
         const dns = process.getBuiltinModule('node:dns/promises');
         const http = process.getBuiltinModule('node:http');
         if (!dns || !http) throw new Error('Node modules are unavailable.');
@@ -89,8 +115,8 @@ test('browses from ordinary chat through the managed private port and keeps priv
     await page.evaluate(() => window.aria!.importRegistryEnvironment());
     await page.evaluate(async () => {
       const settings = await window.aria!.webSettings();
-      const { hasKey, warning, ...policy } = settings;
-      if (hasKey || warning) throw new Error('Expected fresh web settings.');
+      const { warning, ...policy } = settings;
+      if (warning) throw new Error('Expected fresh web settings.');
       await window.aria!.saveWebSettings({
         ...policy,
         aiBrowser: true,
@@ -209,6 +235,65 @@ test('browses from ordinary chat through the managed private port and keeps priv
     const state = await page.evaluate(() => window.aria!.browserState());
     expect(state.history.some(({ url }) => url.includes('127.0.0.1'))).toBe(false);
     expect(state.history.some((entry) => entry.url === url)).toBe(true);
+
+    const lookup = 'Look up what semaphore means.';
+    const tool = (
+      tool: 'web_search' | 'web_fetch',
+      args: Record<string, unknown>,
+      dependsOn: string[] = [],
+    ): ExecutionStep => ({
+      id: tool,
+      capability: tool === 'web_search' ? 'web-search' : tool,
+      target: { kind: 'tool', tool, model: null },
+      args,
+      dependsOn,
+      inputs: [],
+      instructions: tool,
+      summary: tool,
+      output: 'data',
+    });
+    const searchResults: string[] = [];
+    provider.queueTool(lookup, 'execute_steps', {
+      steps: [step('guess', 'browser_open', { url: 'https://example.com/guessed' })],
+    });
+    provider.onToolResult(lookup, (result) => {
+      if (!Array.isArray(result)) return;
+      const step = result[0];
+      if (step.id === 'guess' && step.status === 'failed') {
+        searchResults.push(step.error);
+        return {
+          name: 'execute_steps',
+          input: { steps: [tool('web_search', { query: 'semaphore definition' })] },
+        };
+      }
+      if (
+        step.id === 'web_search' &&
+        step.status === 'completed' &&
+        step.data.results?.length === 1
+      ) {
+        searchResults.push(step.data.results[0].url);
+        return {
+          name: 'execute_steps',
+          input: {
+            steps: [tool('web_fetch', { sourceId: step.data.results[0].sourceId }, ['web_search'])],
+          },
+        };
+      }
+      if (step.id === 'web_fetch' && step.status === 'completed')
+        searchResults.push(step.data.preview);
+    });
+    await page.getByRole('textbox', { name: 'Message Aria' }).fill(lookup);
+    await page.getByRole('button', { name: 'Send message', exact: true }).click();
+    await expect
+      .poll(() => searchResults)
+      .toEqual([
+        expect.stringContaining('web_search with a query first'),
+        url,
+        expect.stringContaining('42 measurements'),
+      ]);
+    expect((await page.evaluate(() => window.aria!.browserState())).tabs).toHaveLength(
+      state.tabs.length,
+    );
   } finally {
     await app?.close();
     site.closeAllConnections();

@@ -9,7 +9,8 @@ import {
   type Rectangle,
 } from 'electron';
 import {
-  browserToolArgs,
+  browserBridgeArgs,
+  browserSearchUrl,
   publicWebUrl,
   webUrlSchema,
   type BrowserCommand,
@@ -35,6 +36,7 @@ class BrowserError extends Error {
 type Tab = {
   state: BrowserTab;
   owner?: string;
+  background: boolean;
   documentId: string;
   runId?: string;
   view: WebContentsView;
@@ -76,6 +78,7 @@ export class BrowserController {
     selected: -1,
   };
   private pending = 0;
+  private pendingResearch = 0;
   private restoreGeneration = 0;
   private privacyEpoch = 0;
   private readonly aiSelected = new Map<string, string>();
@@ -171,7 +174,7 @@ export class BrowserController {
 
   state(): BrowserState {
     const tabs = [...this.tabs.values()].filter(
-      (tab) => !tab.owner || tab.owner === this.conversationId,
+      (tab) => !tab.background && (!tab.owner || tab.owner === this.conversationId),
     );
     return {
       tabs: tabs.map((tab) => ({ ...tab.state })),
@@ -298,7 +301,7 @@ export class BrowserController {
     return pending;
   }
 
-  private async create(owner?: string) {
+  private async create(owner?: string, background = false) {
     const window = this.window;
     const epoch = this.privacyEpoch;
     if (
@@ -308,15 +311,27 @@ export class BrowserController {
       (owner && !this.policy().aiBrowser)
     )
       throw new BrowserError('UNAVAILABLE', 'Browser access is disabled in Settings.');
-    const count = [...this.tabs.values()].filter((tab) => !!tab.owner === !!owner).length;
-    if (count + this.pending >= (owner ? 4 : 12))
-      throw new BrowserError('TAB_LIMIT', 'Close a browser tab before opening another.');
-    this.pending++;
+    const count = [...this.tabs.values()].filter(
+      (tab) => tab.background === background && !!tab.owner === !!owner,
+    ).length;
+    if (background) {
+      if (count + this.pendingResearch >= 3)
+        throw new BrowserError(
+          'TAB_LIMIT',
+          'Aria is already reading several pages. Try again shortly.',
+        );
+      this.pendingResearch++;
+    } else {
+      if (count + this.pending >= (owner ? 4 : 12))
+        throw new BrowserError('TAB_LIMIT', 'Close a browser tab before opening another.');
+      this.pending++;
+    }
     let profile: BrowserSessionPolicy;
     try {
       profile = await this.profile(owner);
     } finally {
-      this.pending--;
+      if (background) this.pendingResearch--;
+      else this.pending--;
     }
     if (
       window !== this.window ||
@@ -342,6 +357,7 @@ export class BrowserController {
     const tab: Tab = {
       view,
       owner,
+      background,
       profile,
       documentId: randomUUID(),
       queue: Promise.resolve(),
@@ -590,9 +606,7 @@ export class BrowserController {
         'SEARCH_DISABLED',
         'Enable address bar search in Settings → Web & Browser.',
       );
-    const url = new URL('https://search.brave.com/search');
-    url.searchParams.set('q', input);
-    return url.href;
+    return browserSearchUrl(input);
   }
 
   private async navigate(tab: Tab, url: string, signal?: AbortSignal) {
@@ -661,7 +675,7 @@ export class BrowserController {
     }
     if (!('tabId' in command)) return;
     const tab = this.tabs.get(command.tabId);
-    if (!tab || (tab.owner && tab.owner !== this.conversationId)) return;
+    if (!tab || tab.background || (tab.owner && tab.owner !== this.conversationId)) return;
     if (command.kind === 'close') {
       this.closeTab(tab);
       this.persist();
@@ -741,7 +755,7 @@ export class BrowserController {
     signal.throwIfAborted();
     if (!this.policy().enabled || !this.policy().aiBrowser)
       throw new BrowserError('UNAVAILABLE', 'AI browsing is disabled in Settings.');
-    const args = browserToolArgs[request.op].parse(request.args) as {
+    const args = browserBridgeArgs[request.op].parse(request.args) as {
       tabId?: string;
       documentId?: string;
       url?: string;
@@ -765,10 +779,61 @@ export class BrowserController {
       };
     };
     const owner = request.conversationId;
+    if (request.op === 'web_search' || request.op === 'web_fetch') {
+      const searching = request.op === 'web_search';
+      const url = searching ? browserSearchUrl(args.query!) : args.url!;
+      const tab = await this.create(owner, true);
+      try {
+        const active = AbortSignal.any([signal, tab.lifetime.signal, AbortSignal.timeout(20_000)]);
+        await this.navigate(tab, url, active);
+        active.throwIfAborted();
+        const contents = tab.view.webContents;
+        const documentId = tab.documentId;
+        const page = new URL(contents.getURL());
+        if (
+          searching &&
+          (page.origin !== 'https://search.brave.com' || page.pathname !== '/search')
+        )
+          throw new BrowserError(
+            'SEARCH_UNAVAILABLE',
+            'The search page was unavailable. Try the query in a Personal tab.',
+          );
+        const evidence = await whenActive(
+          inspectPage(contents, {
+            op: searching ? 'search-results' : 'extract',
+            documentId,
+          }),
+          active,
+        );
+        if (tab.documentId !== documentId)
+          throw new BrowserError(
+            'STALE_PAGE',
+            'The page changed while Aria was reading it. Try again.',
+          );
+        if (!searching) return output({ text: evidence.text ?? '' }, tab);
+        if (!evidence.results?.length && !evidence.searchEmpty)
+          throw new BrowserError(
+            'SEARCH_UNAVAILABLE',
+            'Aria could not read the search results. Try the query in a Personal tab.',
+          );
+        const results = [];
+        let remaining = 9_000;
+        for (const result of evidence.results ?? []) {
+          if (!webUrlSchema.safeParse(result.url).success) continue;
+          if (new URL(result.url).origin === page.origin) continue;
+          remaining -= JSON.stringify(result).length + 8;
+          if (remaining < 0) break;
+          results.push(result);
+        }
+        return output({ results });
+      } finally {
+        this.closeTab(tab);
+      }
+    }
     if (request.op === 'browser_get_tabs')
       return output({
         tabs: [...this.tabs.values()]
-          .filter((tab) => tab.owner === owner)
+          .filter((tab) => tab.owner === owner && !tab.background)
           .map((tab) => ({ tabId: tab.state.id, url: tab.state.url, title: tab.state.title })),
       });
     if (request.op === 'browser_open') {
@@ -788,7 +853,7 @@ export class BrowserController {
       return output({ tabId: tab.state.id, url: tab.state.url }, tab);
     }
     const tab = args.tabId && this.tabs.get(args.tabId);
-    if (!tab || tab.owner !== owner || tab.state.crashed)
+    if (!tab || tab.background || tab.owner !== owner || tab.state.crashed)
       throw new BrowserError('TAB_UNAVAILABLE', 'The tab is unavailable in this conversation.');
     const active = AbortSignal.any([signal, tab.lifetime.signal]);
     const work = tab.queue.then(async () => {

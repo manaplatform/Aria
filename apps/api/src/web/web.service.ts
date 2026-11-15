@@ -1,11 +1,11 @@
 import { Inject, Injectable } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import {
-  browserOps,
+  browserSearchResultsSchema,
   defaultWebPolicy,
   runtimeWebSchema,
   sourceSchema,
-  type BrowserOp,
+  type BrowserBridgeOp,
   type ChatRequest,
   type ConductorSource,
   type ExecutionStep,
@@ -13,11 +13,7 @@ import {
   type RuntimeWeb,
 } from '@aria/shared';
 import { RunError, type RunFile } from '../conductor/run-assets';
-import type { SearchAdapter } from './brave.adapter';
-import { searchRegistry } from './search-registry';
 import { BrowserPortClient } from './browser-port.client';
-import { publicFetch } from './public-fetch';
-import { readableDocument } from './readable-document';
 
 type ResearchResult = {
   text?: string;
@@ -26,7 +22,6 @@ type ResearchResult = {
   data?: Record<string, unknown>;
 };
 type ResearchContext = Pick<ChatRequest, 'requestId' | 'conversationId' | 'messages'>;
-type SearchArgs = Parameters<SearchAdapter['search']>[0];
 type Document = { producer: string; text: string; source: ConductorSource };
 
 function normalized(url: string) {
@@ -56,25 +51,13 @@ export class WebService {
 export class ResearchRun {
   private readonly sources = new Map<string, { url: string; producer: string }>();
   private readonly documents = new Map<string, Document>();
-  private readonly fetches = new Map<string, ReturnType<typeof publicFetch>>();
-  private readonly cursor = new Map<string, { page: number; key: string; producer: string }>();
-  private readonly searches = new Map<string, ReturnType<SearchAdapter['search']>>();
   private readonly browserRefs = new Map<string, Set<string>>();
-  private readonly adapters: Map<string, SearchAdapter>;
   constructor(
     private readonly request: ResearchContext,
     readonly policy: RuntimeWeb,
     private readonly browser?: BrowserPortClient,
-  ) {
-    this.adapters = searchRegistry(policy);
-  }
+  ) {}
 
-  get independent() {
-    return this.adapters.size > 0;
-  }
-  get searchTargets() {
-    return [...this.adapters.values()].map(({ id, name, options }) => ({ id, name, options }));
-  }
   get native() {
     return this.policy.enabled && this.policy.aiBrowser && !!this.browser;
   }
@@ -112,49 +95,42 @@ export class ResearchRun {
       }
     }
     throw new RunError(
-      'Use a URL from the latest user message or a source from a declared dependency.',
+      'Use the user’s URL or a source from a declared dependency. If you only have a topic or question, run web_search with a query first.',
     );
   }
 
-  private async search(
-    args: SearchArgs,
+  private async browse(
+    op: BrowserBridgeOp,
+    args: Record<string, unknown>,
     step: ExecutionStep,
     signal: AbortSignal,
-  ): Promise<ResearchResult> {
-    const adapter =
-      step.target.kind === 'tool' && step.target.searchConnectionId
-        ? this.adapters.get(step.target.searchConnectionId)
-        : undefined;
-    if (!adapter)
-      throw new RunError('Enable the selected search provider in Settings → Web & Browser.');
-    for (const key of ['language', 'country', 'freshness', 'cursor'] as const)
-      if (args[key] !== undefined && !adapter.options.includes(key))
-        throw new RunError(`${adapter.name} does not support the requested ${key} option.`);
-    const options = {
-      ...args,
-      language:
-        args.language ?? (adapter.options.includes('language') ? this.policy.language : undefined),
-      country:
-        args.country ?? (adapter.options.includes('country') ? this.policy.country : undefined),
-      cursor: undefined,
-    };
-    const key = JSON.stringify([adapter.id, options]);
-    const cursor = args.cursor ? this.cursor.get(args.cursor) : undefined;
-    if (args.cursor && (!cursor || cursor.key !== key || !step.dependsOn.includes(cursor.producer)))
-      throw new RunError('The search cursor does not match this query and its dependencies.');
-    const page = cursor?.page ?? 0;
-    const cacheKey = JSON.stringify([key, page]);
-    const pending = this.searches.get(cacheKey) ?? adapter.search(options, page, signal);
-    this.searches.set(cacheKey, pending);
-    const response = await pending;
-    const results = response.urls.map((url) => {
-      const sourceId = randomUUID();
-      this.sources.set(sourceId, { url, producer: step.id });
-      return { sourceId, url };
+  ) {
+    if (!this.native || !this.browser)
+      throw new RunError('Allow Aria to search and browse in Settings → Web & Browser.');
+    const result = await this.browser.invoke(
+      {
+        requestId: this.request.requestId,
+        conversationId: this.request.conversationId,
+        stepId: step.id,
+        op,
+        args,
+      },
+      signal,
+    );
+    if (!result.ok) throw new RunError(result.message);
+    return result;
+  }
+
+  private pageSource(url: string, title?: string) {
+    return sourceSchema.parse({
+      id: randomUUID(),
+      url,
+      title: title || url.slice(0, 300),
+      domain: new URL(url).hostname,
+      retrievedAt: new Date().toISOString(),
+      provenance: 'browser',
+      contentType: 'text/html',
     });
-    const nextCursor = response.next ? randomUUID() : undefined;
-    if (nextCursor) this.cursor.set(nextCursor, { key, producer: step.id, page: page + 1 });
-    return { data: { status: results.length ? 'results' : 'no_results', results, nextCursor } };
   }
 
   async invoke(
@@ -164,32 +140,34 @@ export class ResearchRun {
     signal: AbortSignal,
   ): Promise<ResearchResult> {
     try {
-      if (op === 'web_search') return await this.search(args as SearchArgs, step, signal);
+      if (op === 'web_search') {
+        const response = await this.browse(op, args, step, signal);
+        const { results } = browserSearchResultsSchema.parse(JSON.parse(response.text));
+        const seen = new Set<string>();
+        const links = results.flatMap(({ url: raw, title }) => {
+          const url = normalized(raw);
+          if (seen.has(url)) return [];
+          seen.add(url);
+          const sourceId = randomUUID();
+          this.sources.set(sourceId, { url, producer: step.id });
+          return [{ sourceId, url, title }];
+        });
+        return { data: { status: links.length ? 'results' : 'no_results', results: links } };
+      }
       if (op === 'web_fetch') {
         const url = this.destination(args, step.dependsOn);
-        const pending = this.fetches.get(url) ?? publicFetch(url, signal);
-        this.fetches.set(url, pending);
-        const result = await pending;
-        const read = readableDocument(result.body, result.mime);
-        if (!read.text) throw new RunError('The page contained no readable text.');
-        const source = sourceSchema.parse({
-          id: randomUUID(),
-          url: result.url,
-          title: read.title || new URL(result.url).hostname,
-          domain: new URL(result.url).hostname,
-          publisher: 'publisher' in read ? read.publisher : undefined,
-          publishedAt: 'publishedAt' in read ? read.publishedAt : undefined,
-          retrievedAt: new Date().toISOString(),
-          provenance: 'publisher',
-          contentType: result.mime,
-        });
+        const result = await this.browse(op, { url }, step, signal);
+        const page: unknown = JSON.parse(result.text);
+        const text =
+          page && typeof page === 'object' && 'text' in page && typeof page.text === 'string'
+            ? page.text
+            : '';
+        if (!result.url || !text.trim()) throw new RunError('The page contained no readable text.');
+        const source = this.pageSource(result.url, result.title);
         this.observeSources([source], step.id);
         const documentId = randomUUID();
-        this.documents.set(documentId, { producer: step.id, text: read.text, source });
-        return {
-          data: { documentId, source, preview: read.text.slice(0, 1000) },
-          sources: [source],
-        };
+        this.documents.set(documentId, { producer: step.id, text, source });
+        return { data: { documentId, source, preview: text.slice(0, 1000) }, sources: [source] };
       }
       if (op === 'web_read' || op === 'web_find') {
         const entry = this.documents.get(String(args.documentId));
@@ -208,8 +186,6 @@ export class ResearchRun {
         }
         return { data: { matches, source: entry.source }, sources: [entry.source] };
       }
-      if (!this.native || !this.browser || !browserOps.includes(op as BrowserOp))
-        throw new RunError('Enable AI browsing in Settings → Web & Browser.');
       for (const id of [args.tabId, args.documentId, args.elementId].filter(
         (value): value is string => typeof value === 'string',
       )) {
@@ -225,34 +201,13 @@ export class ResearchRun {
           ...(args.tabId ? { tabId: args.tabId } : {}),
           url: this.destination(args, step.dependsOn),
         };
-      const result = await this.browser.invoke(
-        {
-          requestId: this.request.requestId,
-          conversationId: this.request.conversationId,
-          stepId: step.id,
-          op: op as BrowserOp,
-          args: browserArgs,
-        },
-        signal,
-      );
-      if (!result.ok) throw new RunError(`${result.code}: ${result.message}`);
+      const result = await this.browse(op, browserArgs, step, signal);
       const json = JSON.parse(result.text) as Record<string, unknown>;
       this.observeBrowserRefs(json, step.id);
       let sources: ConductorSource[] | undefined;
       if (op === 'browser_extract' && result.url) {
-        const source = sourceSchema.safeParse({
-          id: randomUUID(),
-          url: result.url,
-          title: result.title || result.url.slice(0, 300),
-          domain: new URL(result.url).hostname,
-          retrievedAt: new Date().toISOString(),
-          provenance: 'browser',
-          contentType: 'text/html',
-        });
-        if (source.success) {
-          sources = [source.data];
-          this.observeSources(sources, step.id);
-        }
+        sources = [this.pageSource(result.url, result.title)];
+        this.observeSources(sources, step.id);
       }
       if (Array.isArray(json.elements))
         for (const item of json.elements) {

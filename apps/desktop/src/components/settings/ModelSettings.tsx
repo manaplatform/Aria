@@ -539,17 +539,6 @@ function ConnectionCard({
           </Button>
         )}
       </div>
-      {official && (
-        <label className="registry-checkbox">
-          <input
-            type="checkbox"
-            checked={connection.webSearch}
-            disabled={disabled}
-            onChange={(event) => update({ ...connection, webSearch: event.target.checked })}
-          />
-          Allow OpenAI Web Search on this connection
-        </label>
-      )}
       {catalog.error && (
         <p className="chat-response-error" role="alert">
           {catalog.error}

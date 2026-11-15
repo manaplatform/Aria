@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { webDestination, webReference, webUrlSchema } from './web.js';
+import { webDestination, webReference, webUrlSchema, webSearchArgs } from './web.js';
 
 const tab = { tabId: webReference };
 const page = { ...tab, documentId: webReference };
@@ -31,6 +31,13 @@ export const browserToolArgs = {
 } as const;
 export const browserOps = Object.keys(browserToolArgs) as [BrowserOp, ...BrowserOp[]];
 export type BrowserOp = keyof typeof browserToolArgs;
+export const browserBridgeArgs = {
+  ...browserToolArgs,
+  web_search: webSearchArgs,
+  web_fetch: z.strictObject({ url: webUrlSchema }),
+} as const;
+export type BrowserBridgeOp = keyof typeof browserBridgeArgs;
+const bridgeOps = [...browserOps, 'web_search', 'web_fetch'] as const;
 export const browserRequestSchema = z.strictObject({
   v: z.literal(1),
   generation: webReference,
@@ -39,7 +46,7 @@ export const browserRequestSchema = z.strictObject({
   conversationId: z.string().min(1).max(200),
   stepId: z.string().min(1).max(64),
   deadline: z.number().int().positive(),
-  op: z.enum(browserOps),
+  op: z.enum(bridgeOps),
   args: z.record(z.string(), z.unknown()),
 });
 export const browserResponseSchema = z.strictObject({
@@ -49,7 +56,7 @@ export const browserResponseSchema = z.strictObject({
   requestId: z.string(),
   conversationId: z.string(),
   stepId: z.string(),
-  op: z.enum(browserOps),
+  op: z.enum(bridgeOps),
   result: z.discriminatedUnion('ok', [
     z.strictObject({
       ok: z.literal(true),

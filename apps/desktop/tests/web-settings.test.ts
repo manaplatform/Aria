@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -5,36 +6,31 @@ import { defaultWebPolicy } from '@aria/shared';
 import { expect, it } from 'vitest';
 import { WebSettingsStorage } from '../electron/web-settings-storage';
 
-it('persists encrypted credentials separately and never includes them in the settings sent to the renderer', async () => {
+it('removes old search API credentials while preserving browser access and history preferences', async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'aria-web-settings-'));
-  const cipher = {
-    available: async () => true,
-    encrypt: async (value: string) => Buffer.from(value.split('').reverse().join('')),
-    decrypt: async (value: Buffer) => ({ result: value.toString().split('').reverse().join('') }),
-  };
+  const file = path.join(directory, 'web-settings-v1.json');
   try {
-    const storage = new WebSettingsStorage(directory, cipher);
-    await storage.load();
-    expect(storage.get()).toMatchObject({ braveEnabled: false, aiBrowser: false, hasKey: false });
-    const { enabled, ...policy } = defaultWebPolicy;
-    await expect(storage.save({ ...policy, enabled, braveEnabled: true })).rejects.toThrow(
-      /API key/,
+    await fs.writeFile(
+      file,
+      JSON.stringify({
+        ...defaultWebPolicy,
+        version: 1,
+        revision: randomUUID(),
+        aiBrowser: true,
+        history: true,
+        braveEnabled: true,
+        encryptedKey: 'old-encrypted-key',
+        language: 'en',
+      }),
     );
-    const settings = await storage.save({
-      ...policy,
-      enabled,
-      braveEnabled: true,
-      apiKey: 'test-brave-key',
-    });
-    expect(settings).toMatchObject({ braveEnabled: true, hasKey: true });
-    expect(JSON.stringify(settings)).not.toContain('test-brave-key');
-    const stored = await fs.readFile(path.join(directory, 'web-settings-v1.json'), 'utf8');
-    expect(stored).not.toContain('test-brave-key');
-    const reloaded = new WebSettingsStorage(directory, cipher);
-    await reloaded.load();
-    expect((await reloaded.runtime()).braveKey).toBe('test-brave-key');
-    await reloaded.save({ ...policy, enabled, apiKey: null });
-    expect(reloaded.get().hasKey).toBe(false);
+    const storage = new WebSettingsStorage(directory);
+    await storage.load();
+    expect(storage.get()).toMatchObject({ aiBrowser: true, history: true });
+    expect(await storage.runtime()).not.toHaveProperty('braveKey');
+    const stored = JSON.parse(await fs.readFile(file, 'utf8'));
+    expect(stored).toMatchObject({ aiBrowser: true, history: true });
+    expect(stored).not.toHaveProperty('encryptedKey');
+    expect(stored).not.toHaveProperty('braveEnabled');
   } finally {
     await fs.rm(directory, { recursive: true, force: true });
   }

@@ -54,12 +54,7 @@ export const executionStepSchema = z
         .object({
           kind: z.literal('tool'),
           tool: z.enum(toolIds),
-          model: modelRefSchema
-            .nullable()
-            .describe(
-              'Copy the listed backing model reference for web_search; use null for local tools.',
-            ),
-          searchConnectionId: identifier.optional(),
+          model: modelRefSchema.nullable().describe('Use null for local tools.'),
         })
         .strict(),
     ]),

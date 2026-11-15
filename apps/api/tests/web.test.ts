@@ -2,14 +2,13 @@ import { afterEach, expect, it, vi } from 'vitest';
 import {
   defaultWebPolicy,
   publicAddress,
+  publicWebUrl,
   resolvePublicAddress,
   type ExecutionStep,
 } from '@aria/shared';
 import { randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
-import { braveAdapter } from '../src/web/brave.adapter';
-import { publicFetch } from '../src/web/public-fetch';
-import { readableDocument } from '../src/web/readable-document';
+import type { BrowserPortClient } from '../src/web/browser-port.client';
 const { ResearchRun } = createRequire(import.meta.url)(
   '../dist/web/web.service.js',
 ) as typeof import('../src/web/web.service');
@@ -20,7 +19,6 @@ const target = {
   kind: 'tool',
   tool: 'web_search',
   model: null,
-  searchConnectionId: 'brave',
 } as const;
 
 function searchStep(id: string, dependsOn: string[] = []): ExecutionStep {
@@ -36,84 +34,70 @@ function searchStep(id: string, dependsOn: string[] = []): ExecutionStep {
   };
 }
 
-it('keeps Brave results run-scoped and binds pagination to the original request and dependency', async () => {
-  const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
-    Response.json({
-      query: { more_results_available: true },
-      web: {
+it('routes query-only research and subsequent reads through the browser without calling an API', async () => {
+  const fetch = vi.spyOn(globalThis, 'fetch');
+  const invoke = vi
+    .fn()
+    .mockResolvedValueOnce({
+      ok: true,
+      text: JSON.stringify({
         results: [
-          { url: 'https://example.com/a#section', description: 'Do not store me' },
-          { url: 'https://example.com/a' },
-          { url: 'file:///etc/passwd' },
+          { url: 'https://example.com/a#article', title: 'Example' },
+          { url: 'https://example.com/a', title: 'Duplicate' },
         ],
-      },
-    }),
-  );
+      }),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      url: 'https://example.com/a',
+      title: 'Example',
+      text: JSON.stringify({ text: 'Browser evidence.' }),
+    });
   const run = new ResearchRun(
     {
       requestId: randomUUID(),
       conversationId: 'test',
-      messages: [{ role: 'user', content: 'What is new?' }],
+      messages: [{ role: 'user', content: 'Look up the term semaphore.' }],
     },
-    { ...defaultWebPolicy, braveEnabled: true, braveKey: 'brave-key', country: 'DE' },
+    { ...defaultWebPolicy, aiBrowser: true },
+    { invoke } as unknown as BrowserPortClient,
   );
-  const args = { query: 'current news', language: 'de', freshness: 'week' };
-  const result = await run.invoke('web_search', args, searchStep('search'), signal);
-  expect(result.sources).toBeUndefined();
-  expect(result.data).toMatchObject({
-    results: [{ sourceId: expect.any(String), url: 'https://example.com/a' }],
-  });
-  expect(JSON.stringify(result)).not.toContain('Do not store me');
-  const cursor = String(result.data?.nextCursor);
-  await expect(
-    run.invoke('web_search', { ...args, cursor }, searchStep('bad'), signal),
-  ).rejects.toThrow(/dependencies/);
-  await expect(
-    run.invoke(
-      'web_search',
-      { ...args, query: 'different', cursor },
-      searchStep('bad', ['search']),
-      signal,
-    ),
-  ).rejects.toThrow();
-  fetch.mockResolvedValueOnce(Response.json({ web: { results: [] } }));
-  const next = await run.invoke(
+  const result = await run.invoke(
     'web_search',
-    { ...args, cursor },
-    searchStep('next', ['search']),
+    { query: 'semaphore' },
+    searchStep('search'),
     signal,
   );
-  expect(next.data).toMatchObject({ status: 'no_results', results: [] });
-  const call = fetch.mock.calls[1];
-  const url = new URL(String(call[0]));
-  expect(url.origin).toBe('https://api.search.brave.com');
-  expect(Object.fromEntries(url.searchParams)).toMatchObject({
-    q: 'current news',
-    offset: '1',
-    search_lang: 'de',
-    country: 'DE',
-    freshness: 'pw',
-  });
-  expect(call[1]).toMatchObject({
-    redirect: 'error',
-    headers: { 'X-Subscription-Token': 'brave-key' },
-  });
-});
-
-it('retries a transient Brave response on the same endpoint and reports key failures without retry', async () => {
-  const fetch = vi
-    .spyOn(globalThis, 'fetch')
-    .mockResolvedValueOnce(new Response(null, { status: 503 }))
-    .mockResolvedValueOnce(Response.json({ web: { results: [] } }))
-    .mockResolvedValueOnce(new Response('private response', { status: 401 }));
-  const adapter = braveAdapter('test');
-  await expect(adapter.search({ query: 'weather' }, 0, signal)).resolves.toEqual({
-    urls: [],
-    next: false,
-  });
-  await expect(adapter.search({ query: 'weather' }, 0, signal)).rejects.toThrow(/rejected the key/);
-  expect(fetch).toHaveBeenCalledTimes(3);
-  expect(new Set(fetch.mock.calls.map(([url]) => String(url))).size).toBe(1);
+  expect(invoke).toHaveBeenCalledWith(
+    expect.objectContaining({ op: 'web_search', args: { query: 'semaphore' } }),
+    signal,
+  );
+  expect(result.sources).toBeUndefined();
+  const results = result.data?.results as { sourceId: string }[];
+  expect(results).toEqual([
+    { sourceId: expect.any(String), url: 'https://example.com/a', title: 'Example' },
+  ]);
+  const readStep: ExecutionStep = {
+    ...searchStep('read'),
+    capability: 'web_fetch',
+    target: { kind: 'tool', tool: 'web_fetch', model: null },
+  };
+  await expect(
+    run.invoke('web_fetch', { sourceId: results[0].sourceId }, readStep, signal),
+  ).rejects.toThrow(/dependency/);
+  const document = await run.invoke(
+    'web_fetch',
+    { sourceId: results[0].sourceId },
+    { ...readStep, dependsOn: ['search'] },
+    signal,
+  );
+  expect(invoke).toHaveBeenLastCalledWith(
+    expect.objectContaining({ op: 'web_fetch', args: { url: 'https://example.com/a' } }),
+    signal,
+  );
+  expect(document.sources).toMatchObject([{ url: 'https://example.com/a', provenance: 'browser' }]);
+  expect(document.data?.preview).toBe('Browser evidence.');
+  expect(fetch).not.toHaveBeenCalled();
 });
 
 it('rejects nonpublic and mixed DNS destinations before a website connection', async () => {
@@ -137,23 +121,8 @@ it('rejects nonpublic and mixed DNS destinations before a website connection', a
       { family: 6, address: '::1' },
     ]),
   ).rejects.toThrow(/private/);
-  await expect(publicFetch('http://127.0.0.1/', signal)).rejects.toThrow(/private/);
-  await expect(publicFetch('http://2130706433/', signal)).rejects.toThrow(/private/);
-});
-
-it('extracts publisher metadata and readable text without exposing scripts, hidden content or fields', () => {
-  const document = readableDocument(
-    '<title>Study</title><meta property="og:site_name" content="Publisher"><meta property="article:published_time" content="2026-10-12">' +
-      '<main><h1>Research</h1><p>Verified example.</p><script>forbiddenScript()</script><form>secret value</form>' +
-      '<div style="display:none">hidden text</div></main>',
-    'text/html',
-  );
-  expect(document).toMatchObject({
-    title: 'Study',
-    publisher: 'Publisher',
-    publishedAt: '2026-10-12T00:00:00.000Z',
-  });
-  expect(document.text).toBe('Research\nVerified example.');
+  expect(() => publicWebUrl('http://127.0.0.1/')).toThrow(/private/);
+  expect(() => publicWebUrl('http://2130706433/')).toThrow(/private/);
 });
 
 it('ignores mismatched browser replies and cancels local waits without accepting stale results', async () => {
@@ -235,5 +204,5 @@ it('does not treat links in a quoted website selection as destinations supplied 
   };
   await expect(
     run.invoke('web_fetch', { url: 'https://example.com/' }, step, AbortSignal.timeout(2000)),
-  ).rejects.toThrow(/latest user message or a source/);
+  ).rejects.toThrow(/run web_search with a query first/);
 });

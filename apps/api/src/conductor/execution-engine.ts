@@ -3,7 +3,6 @@ import { z } from 'zod';
 import { HttpException } from '@nestjs/common';
 import {
   conductorLimits,
-  browserOps,
   localWebToolIds,
   researchToolArgs,
   type ResearchToolId,
@@ -13,11 +12,7 @@ import {
   type ExecutionStep,
 } from '@aria/shared';
 import { providerError } from '../ai/ai.service';
-import {
-  officialConnection,
-  type ModelRegistry,
-  type ResolvedModel,
-} from '../providers/model-registry.service';
+import { type ModelRegistry, type ResolvedModel } from '../providers/model-registry.service';
 import { RunError, type RunAssets, type RunAttachment } from './run-assets';
 import type { ResearchRun } from '../web/web.service';
 import { modelOutputs, toolOutputs, type StepValue, type ToolRegistry } from './tool-registry';
@@ -61,83 +56,43 @@ export class ExecutionEngine {
     private readonly research: ResearchRun,
   ) {}
 
-  private eligible(model: ResolvedModel, capability: Capability, hosted = false) {
-    return (
-      model.delegate &&
-      model.capabilities.some((value) => value === capability) &&
-      (!hosted ||
-        (this.research.policy.enabled &&
-          model.connection.webSearch &&
-          officialConnection(model.connection.baseUrl)))
-    );
+  private eligible(model: ResolvedModel, capability: Capability) {
+    return model.delegate && model.capabilities.some((value) => value === capability);
   }
 
   canRun(capability: Capability) {
     if (capability === 'create-file') return true;
     if (capability === 'read-file')
       return [...this.attachments.values()].some((file) => file.mimeType === 'text/plain');
-    if (capability === 'web-search' && this.research.independent) return true;
-    if (localWebToolIds.some((id) => id === capability))
-      return this.webAllowed(capability as ResearchToolId);
-    return [...this.registry.models.values()].some((model) =>
-      this.eligible(model, capability, capability === 'web-search'),
-    );
-  }
-
-  private webAllowed(op: ResearchToolId) {
-    if (op === 'web_search') return this.research.independent;
-    return (
-      this.research.policy.enabled &&
-      (!browserOps.some((browserOp) => browserOp === op) || this.research.native)
-    );
+    if (capability === 'web-search' || localWebToolIds.some((id) => id === capability))
+      return this.research.native;
+    return [...this.registry.models.values()].some((model) => this.eligible(model, capability));
   }
 
   private researchDescriptors() {
-    const targets = this.research.searchTargets;
-    const descriptors = (Object.keys(researchToolArgs) as ResearchToolId[])
-      .filter((op) => op !== 'web_search' && this.webAllowed(op))
-      .map((op) => ({
-        capability: op as Capability,
-        output: op === 'browser_screenshot' ? 'image' : op === 'web_read' ? 'text' : 'data',
-        target: {
-          kind: 'tool',
-          tool: op,
-          model: null,
-          searchConnectionId: undefined as string | undefined,
-        },
-        args: z.toJSONSchema(researchToolArgs[op], { unrepresentable: 'any' }),
-        authorization: ['browser_click', 'browser_type', 'browser_submit'].includes(op)
-          ? 'approval when required'
-          : 'user settings',
-      }));
-    return [
-      ...descriptors,
-      ...targets.map(({ id, name, options }) => ({
-        capability: 'web-search' as const,
-        output: 'data',
-        target: { kind: 'tool', tool: 'web_search' as const, model: null, searchConnectionId: id },
-        args: z.toJSONSchema(
-          researchToolArgs.web_search.pick({
-            query: true,
-            ...(options.includes('language') && { language: true }),
-            ...(options.includes('country') && { country: true }),
-            ...(options.includes('freshness') && { freshness: true }),
-            ...(options.includes('cursor') && { cursor: true }),
-          }),
-        ),
-        provider: name,
-        authorization: 'user settings',
-      })),
-    ];
+    if (!this.research.native) return [];
+    return (Object.keys(researchToolArgs) as ResearchToolId[]).map((op) => ({
+      capability: (op === 'web_search' ? 'web-search' : op) as Capability,
+      output: op === 'browser_screenshot' ? 'image' : op === 'web_read' ? 'text' : 'data',
+      target: { kind: 'tool', tool: op, model: null },
+      args: z.toJSONSchema(researchToolArgs[op], { unrepresentable: 'any' }),
+      description:
+        op === 'web_search'
+          ? 'Search the public web in Aria’s browser using a query. No URL is required.'
+          : op === 'web_fetch'
+            ? 'Read a page in Aria’s browser using a search result sourceId or a URL supplied by the user.'
+            : undefined,
+      authorization: ['browser_click', 'browser_type', 'browser_submit'].includes(op)
+        ? 'approval when required'
+        : 'user settings',
+    }));
   }
 
   descriptors() {
     const models = [...this.registry.models.values()].filter((model) => model.delegate);
     const delegates = models.flatMap((model) => {
-      const capabilities = model.capabilities.filter(
-        (capability) =>
-          Object.hasOwn(modelOutputs, capability) ||
-          (capability === 'web-search' && this.eligible(model, capability, true)),
+      const capabilities = model.capabilities.filter((capability) =>
+        Object.hasOwn(modelOutputs, capability),
       );
       return capabilities.length
         ? [
@@ -146,14 +101,8 @@ export class ExecutionEngine {
               connection: model.connection.name,
               operations: capabilities.map((capability) => ({
                 capability,
-                output:
-                  capability === 'web-search'
-                    ? toolOutputs.web_search.output
-                    : modelOutputs[capability as keyof typeof modelOutputs],
-                target:
-                  capability === 'web-search'
-                    ? { kind: 'tool', tool: 'web_search', model: model.ref }
-                    : { kind: 'model', model: model.ref },
+                output: modelOutputs[capability as keyof typeof modelOutputs],
+                target: { kind: 'model', model: model.ref },
               })),
               contextTokens: model.contextTokens,
               inputCost: model.inputCost,
@@ -169,6 +118,12 @@ export class ExecutionEngine {
     return research.length
       ? [...delegates, { name: 'Web & Browser', operations: research }]
       : delegates;
+  }
+
+  get webError() {
+    for (const [id, result] of this.results) {
+      if (this.planned.get(id)?.researchOp && result.status === 'failed') return result.error;
+    }
   }
 
   get requiresSettings() {
@@ -258,8 +213,7 @@ export class ExecutionEngine {
       const model = step.target.model ? this.registry.models.get(step.target.model) : undefined;
       const target = step.target;
       const researchOp =
-        target.kind === 'tool' &&
-        (Boolean(target.searchConnectionId) || localWebToolIds.some((id) => id === target.tool))
+        target.kind === 'tool' && Object.hasOwn(researchToolArgs, target.tool)
           ? (target.tool as ResearchToolId)
           : undefined;
       if (step.target.kind === 'model') {
@@ -270,15 +224,11 @@ export class ExecutionEngine {
           throw new RunError('The selected output does not match the capability.');
       } else if (researchOp) {
         const descriptor = this.researchDescriptors().find(
-          ({ target: candidate }) =>
-            candidate.tool === researchOp &&
-            candidate.searchConnectionId ===
-              (target.kind === 'tool' ? target.searchConnectionId : undefined),
+          ({ target }) => target.tool === researchOp,
         );
         if (
           !descriptor ||
           step.target.model !== null ||
-          step.target.searchConnectionId !== descriptor.target.searchConnectionId ||
           step.capability !== descriptor.capability ||
           step.output !== descriptor.output
         )
@@ -300,12 +250,7 @@ export class ExecutionEngine {
           tool.output !== step.output
         )
           throw new RunError('The selected tool does not provide this capability or output.');
-        if (
-          step.target.tool === 'web_search' &&
-          (!model || !this.eligible(model, step.capability, true))
-        )
-          this.rejectTarget(step.capability);
-        if (step.target.tool !== 'web_search' && step.target.model !== null)
+        if (step.target.model !== null)
           throw new RunError('This local tool does not use a backing model.');
       }
       const attachmentDerived =
@@ -428,13 +373,11 @@ export class ExecutionEngine {
     if (!snapshot) this.dispatched.add(fingerprint);
     item.startedAt = Date.now();
     this.activity(item, 'running');
-    if (model || researchOp === 'web_search' || researchOp?.startsWith('browser_'))
-      this.billableChildStarted = true;
+    if (model || researchOp?.startsWith('browser_')) this.billableChildStarted = true;
     try {
       const value = researchOp
         ? await this.research.invoke(researchOp, args!, step, this.signal)
         : await this.tools.invoke(step, { files, text }, this.signal, model);
-      if (!researchOp && value.sources) this.research.observeSources(value.sources, step.id);
       this.signal.throwIfAborted();
       if (step.output === 'sources' && (!value.text?.trim() || !value.sources?.length))
         throw new RunError('Web search returned no usable sourced results.');
@@ -452,7 +395,7 @@ export class ExecutionEngine {
         error instanceof RunError || error instanceof HttpException
           ? error.message
           : providerError(error);
-      if (!researchOp || researchOp === 'web_search') this.failedCapabilities.add(step.capability);
+      if (!researchOp) this.failedCapabilities.add(step.capability);
       return { status: 'failed', error: message.slice(0, 400) };
     }
   }

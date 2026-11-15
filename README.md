@@ -21,7 +21,7 @@ Aria uses the native Responses API for the official OpenAI endpoint and Chat Com
 
 Settings encrypts API keys through Electron’s operating-system credential storage. Existing desktop provider settings migrate from `provider.json` to `provider-v2.json`, including the encrypted key, primary candidate, media candidates, and Live Voice choice. Open AI Models to repair a missing model or verify an unknown capability. If you configured desktop through the environment, choose **Import environment settings** once. Afterward, manage model selection in Settings.
 
-By default, delegation uses the primary connection. Settings lets you allow delegation across connections and separately authorize attachment transfer. Enable **OpenAI Web Search** on an eligible OpenAI connection to use hosted research and source links. A search sends a query to the model chosen for that tool and can incur provider charges. Failed operations identify the affected capability and keep any valid partial results.
+By default, delegation uses the primary connection. Settings lets you allow delegation across connections and separately authorize attachment transfer. Failed operations identify the affected capability and keep any valid partial results.
 
 ## Conversations
 
@@ -74,7 +74,7 @@ See [frontend architecture](docs/frontend-architecture.md) for process boundarie
 
 ## Web & Browser
 
-Chat can use OpenAI-hosted search, independently configured Brave Search, and public page retrieval. Enable Brave in **Settings → Web & Browser** and enter a key from a plan that permits your use of the search results. Brave receives the query and search preferences. Aria keeps Brave discovery results in memory for the turn and checks publisher pages for durable citations. Choose **Chat**, **Split**, or **Browser** in the chat header. Source links open in Aria, with a separate action to open them externally.
+Enable **Allow Aria to search and browse** in **Settings → Web & Browser**. Aria opens the Brave search website in an isolated Chromium view and reads publisher pages in the browser for citations. Ask Aria to look up a topic or term. A query is enough and Brave receives it as a normal website search. Web research does not require a search API key. Choose **Chat**, **Split**, or **Browser** in the chat header. Source links open in Aria, with a separate action to open them externally.
 
 AI browser access is off by default. When enabled, the configured primary model can use AI tabs owned by that conversation. Personal tabs can share a previewed link or selection with a chat draft. For supported actions that change a page or submit a form, confirm the action in Aria's native dialog. Use a Personal tab for sign-ins, payments, uploads, or forms Aria cannot verify. Chromium tabs and public page tools block local and private network destinations. History, persistent cookies, and tab restore are independent settings.
 

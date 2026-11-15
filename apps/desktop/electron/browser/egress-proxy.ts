@@ -8,8 +8,11 @@ export class BrowserProxy {
   private readonly server = http.createServer(
     { maxHeaderSize: 16_384, headersTimeout: 10_000 },
     (req, res) => {
+      req.on('error', () => res.destroy());
+      res.on('error', () => req.destroy());
       void this.forward(req, res).catch(() => {
-        if (!res.headersSent) res.writeHead(403).end('Destination not available.');
+        if (!res.destroyed && !res.headersSent)
+          res.writeHead(403).end('Destination not available.');
         else res.destroy();
       });
     },
@@ -18,13 +21,16 @@ export class BrowserProxy {
   constructor() {
     this.server.maxConnections = 128;
     this.server.requestTimeout = 30_000;
+    this.server.on('clientError', (_error, socket) => socket.destroy());
     this.server.on('connection', (socket) => {
+      // CONNECT detaches Node's HTTP listeners. Keep the socket covered during DNS and tunneling.
+      socket.on('error', () => socket.destroy());
       this.sockets.add(socket);
       socket.once('close', () => this.sockets.delete(socket));
     });
     this.server.on('connect', (request, client, head) => {
       void this.tunnel(request.url ?? '', client as net.Socket, head).catch(() => {
-        client.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
+        if (!client.destroyed) client.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
       });
     });
   }
@@ -109,15 +115,24 @@ export class BrowserProxy {
         timeout: 20_000,
       },
       (reply) => {
-        res.writeHead(reply.statusCode ?? 502, reply.headers);
-        reply.pipe(res);
         reply.on('error', () => res.destroy());
+        if (res.destroyed) {
+          reply.destroy();
+          return;
+        }
+        try {
+          res.writeHead(reply.statusCode ?? 502, reply.headers);
+          reply.pipe(res);
+        } catch {
+          reply.destroy();
+          res.destroy();
+        }
       },
     );
     res.once('close', () => outgoing.destroy());
     outgoing.on('timeout', () => outgoing.destroy());
     outgoing.on('error', () => {
-      if (!res.headersSent) res.writeHead(502).end();
+      if (!res.destroyed && !res.headersSent) res.writeHead(502).end();
       else res.destroy();
     });
     req.pipe(outgoing);

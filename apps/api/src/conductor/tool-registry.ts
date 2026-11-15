@@ -30,7 +30,6 @@ export const conductorTools: ToolSet = {
 export const toolOutputs = {
   read_attachment: { capability: 'read-file', output: 'text' },
   create_text_artifact: { capability: 'create-file', output: 'file' },
-  web_search: { capability: 'web-search', output: 'sources' },
 } as const;
 export const modelOutputs = {
   chat: 'text',
@@ -90,10 +89,6 @@ export class ToolRegistry {
             file: { name, mimeType: 'text/plain', bytes: Buffer.from(input.text.join('\n')) },
           };
         }
-        case 'web_search':
-          if (!model || input.files.length || text.length > 8000)
-            throw new RunError('Provide a bounded text query and an eligible web search model.');
-          return this.ai.search(model, text, signal);
       }
     }
     if (!model) throw new RunError('The selected model is unavailable.');

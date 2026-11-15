@@ -1,14 +1,12 @@
 import { useEffect, useState } from 'react';
-import { Link } from 'react-router-dom';
-import { webPolicySchema, type WebSettings, type WebSettingsInput } from '@aria/shared';
+import { webPolicySchema, type WebSettings } from '@aria/shared';
 import { Button, Field } from '../ui';
 import { browserCommand, useBrowserStore } from '../../stores/browserStore';
 import { errorMessage } from '../../services/desktop';
 
 const toggles = [
   ['enabled', 'Web access'],
-  ['braveEnabled', 'Brave Search API'],
-  ['aiBrowser', 'Allow Aria to browse in AI tabs'],
+  ['aiBrowser', 'Allow Aria to search and browse'],
   ['addressSearch', 'Search Brave from the address bar'],
   ['persistentSiteData', 'Keep personal cookies and site data'],
   ['history', 'Save personal browsing history'],
@@ -17,8 +15,6 @@ const toggles = [
 
 export function WebBrowserSettings() {
   const [settings, setSettings] = useState<WebSettings>();
-  const [key, setKey] = useState('');
-  const [remove, setRemove] = useState(false);
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState('');
   const permissions = useBrowserStore((state) => state.state.permissions);
@@ -43,13 +39,7 @@ export function WebBrowserSettings() {
     setStatus('');
     try {
       const policy = webPolicySchema.strip().parse(settings);
-      const input: WebSettingsInput = {
-        ...policy,
-        ...(key.trim() ? { apiKey: key.trim() } : remove ? { apiKey: null } : {}),
-      };
-      setSettings(await window.aria!.saveWebSettings(input));
-      setKey('');
-      setRemove(false);
+      setSettings(await window.aria!.saveWebSettings(policy));
       setStatus('Web & Browser settings saved.');
     } catch (error) {
       setStatus(errorMessage(error));
@@ -75,53 +65,10 @@ export function WebBrowserSettings() {
         </label>
       ))}
       <p className="muted">
-        Manage OpenAI-hosted search in <Link to="/settings#ai-models">AI Models</Link>. Brave
-        searches send your query to Brave and may incur charges.
+        Aria searches through the Brave website in its browser. Search queries are sent to Brave and
+        no search API key is required.
       </p>
-      <Field label="Brave Search API key">
-        <input
-          type="password"
-          autoComplete="off"
-          maxLength={1000}
-          value={key}
-          placeholder={settings.hasKey && !remove ? 'API key saved' : 'Enter API key'}
-          onChange={(event) => setKey(event.target.value)}
-        />
-      </Field>
-      {settings.hasKey && (
-        <Button
-          size="sm"
-          disabled={busy || remove}
-          onClick={() => {
-            setRemove(true);
-            setKey('');
-            setSettings({ ...settings, braveEnabled: false });
-          }}
-        >
-          {remove ? 'Key will be removed on save' : 'Remove saved key'}
-        </Button>
-      )}
       <div className="web-settings-grid">
-        <Field label="Search language">
-          <input
-            value={settings.language ?? ''}
-            maxLength={2}
-            placeholder="en"
-            onChange={(event) =>
-              setSettings({ ...settings, language: event.target.value.toLowerCase() || undefined })
-            }
-          />
-        </Field>
-        <Field label="Search country">
-          <input
-            value={settings.country ?? ''}
-            maxLength={2}
-            placeholder="US"
-            onChange={(event) =>
-              setSettings({ ...settings, country: event.target.value.toUpperCase() || undefined })
-            }
-          />
-        </Field>
         {(
           [
             ['searches', 'Searches per turn', 2],

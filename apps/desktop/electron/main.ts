@@ -245,9 +245,7 @@ function registerIpc(): void {
     const parsed = webSettingsInputSchema.parse(input);
     const previous = webSettings.get();
     const immediate =
-      (previous.enabled && !parsed.enabled) ||
-      (previous.aiBrowser && !parsed.aiBrowser) ||
-      (previous.braveEnabled && !parsed.braveEnabled);
+      (previous.enabled && !parsed.enabled) || (previous.aiBrowser && !parsed.aiBrowser);
     if (configuring) throw new Error('Wait for settings to finish saving.');
     if (!immediate) {
       chat.assertIdle();
@@ -537,7 +535,7 @@ app
       decrypt: (value: Buffer) => safeStorage.decryptStringAsync(value),
     };
     provider = new ProviderStorage(directory, cipher);
-    webSettings = new WebSettingsStorage(directory, cipher);
+    webSettings = new WebSettingsStorage(directory);
     await webSettings.load();
     browser = new BrowserController(directory, () => webSettings.get());
     await browser.load();
