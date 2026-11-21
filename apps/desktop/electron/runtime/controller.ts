@@ -118,18 +118,35 @@ export class DesktopRuntime {
   }
 
   async configure(value: RuntimeSettings) {
-    const next = runtimeSettingsSchema.parse(value);
     const previous = this.store.settings;
+    const parsed = runtimeSettingsSchema.parse(value);
+    const next = 'embeddingTarget' in parsed
+      ? parsed
+      : { ...parsed, embeddingTarget: previous.embeddingTarget };
     if (
       next.embeddingTarget &&
-      JSON.stringify(next.embeddingTarget) !== JSON.stringify(previous.embeddingTarget)
-    ) {
-      const remote = RemoteEmbeddings.resolve(await this.resolveRegistry(), next.embeddingTarget);
-      await remote.embed(['Aria synthetic embedding verification'], AbortSignal.timeout(18000));
-    }
+      (next.embeddingTarget.connectionId !== previous.embeddingTarget?.connectionId ||
+        next.embeddingTarget.model !== previous.embeddingTarget?.model)
+    )
+      await this.verifyEmbeddingTarget(next.embeddingTarget);
     if (previous.engineSocket !== next.engineSocket) await this.sweep(true);
     this.store.settings = next;
     await this.expireArtifacts();
+  }
+
+  async saveEmbeddingTarget(target: RuntimeSettings['embeddingTarget']) {
+    if (target) await this.verifyEmbeddingTarget(target);
+    const settings = { ...this.store.settings, embeddingTarget: target };
+    this.store.settings = settings;
+    return settings;
+  }
+
+  private async verifyEmbeddingTarget(target: NonNullable<RuntimeSettings['embeddingTarget']>) {
+    const remote = RemoteEmbeddings.resolve(await this.resolveRegistry(), target);
+    await remote.embed(
+      ['Aria embedding test.', 'Synthetic input for vector search.'],
+      this.stopping.signal,
+    );
   }
 
   private sandbox() {

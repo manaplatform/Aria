@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { closeSync, mkdirSync, openSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync } from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { types } from 'node:util';
@@ -25,21 +25,28 @@ export function digest(bytes: string | Buffer) {
   return createHash('sha256').update(bytes).digest('hex');
 }
 
+const desktopGrantFields = ['id', 'displayKey', 'label', 'provider'] as const;
+export type LocalDesktopGrant = Record<(typeof desktopGrantFields)[number], string>;
+
 export class RuntimeStore {
   private database?: DatabaseSync;
 
   constructor(private readonly directory: string) {}
 
+  private get databaseFile() {
+    return path.join(this.directory, 'runtime.sqlite');
+  }
+
   get db() {
     if (this.database) return this.database;
     mkdirSync(this.directory, { recursive: true, mode: 0o700 });
-    const databaseFile = path.join(this.directory, 'runtime.sqlite');
+    const databaseFile = this.databaseFile;
     closeSync(openSync(databaseFile, 'a', 0o600));
     const db = new DatabaseSync(databaseFile);
     try {
       db.exec('PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 2000; PRAGMA journal_mode = WAL;');
       const version = Number(db.prepare('PRAGMA user_version').get()?.user_version);
-      if (version > 6) throw new Error('This runtime profile requires a newer version of Aria.');
+      if (version > 7) throw new Error('This runtime profile requires a newer version of Aria.');
       if (version === 0) {
         db.exec(`
           BEGIN IMMEDIATE;
@@ -197,6 +204,17 @@ export class RuntimeStore {
           COMMIT;
         `);
       }
+      if (version < 7) {
+        db.exec(`
+          BEGIN IMMEDIATE;
+          CREATE TABLE local_desktop_grant (
+            slot INTEGER PRIMARY KEY CHECK (slot = 1), id TEXT NOT NULL,
+            displayKey TEXT NOT NULL, label TEXT NOT NULL, provider TEXT NOT NULL
+          );
+          PRAGMA user_version = 7;
+          COMMIT;
+        `);
+      }
       db.exec(`
         DELETE FROM program_results WHERE expires <= unixepoch() * 1000;
         DELETE FROM provider_checkpoints WHERE expires <= unixepoch() * 1000;
@@ -218,6 +236,26 @@ export class RuntimeStore {
       db.close();
       throw error;
     }
+  }
+
+  localDesktopGrant(): LocalDesktopGrant | undefined {
+    if (!this.database && !existsSync(this.databaseFile)) return undefined;
+    const row = this.db
+      .prepare('SELECT id, displayKey, label, provider FROM local_desktop_grant')
+      .get();
+    if (row && desktopGrantFields.every((key) => typeof row[key] === 'string' && row[key]))
+      return row as LocalDesktopGrant;
+  }
+
+  saveLocalDesktopGrant(grant: LocalDesktopGrant) {
+    this.db
+      .prepare('INSERT OR REPLACE INTO local_desktop_grant VALUES (1, ?, ?, ?, ?)')
+      .run(grant.id, grant.displayKey, grant.label, grant.provider);
+  }
+
+  revokeLocalDesktopGrant() {
+    if (!this.database && !existsSync(this.databaseFile)) return;
+    this.db.prepare('DELETE FROM local_desktop_grant').run();
   }
 
   get settings(): RuntimeSettings {

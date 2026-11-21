@@ -4,6 +4,7 @@ import {
   clipboard,
   dialog,
   ipcMain,
+  powerMonitor,
   screen,
   shell,
   safeStorage,
@@ -97,6 +98,7 @@ let executionRuntime: DesktopRuntime;
 let computerRuntime: ComputerRuntime;
 let virtualComputer: VirtualComputer;
 let localComputer: LocalComputer;
+let localSelection: AbortController | undefined;
 let media: MediaService;
 let saving = Promise.resolve();
 let configuring = false;
@@ -167,6 +169,19 @@ async function changeRegistry<T>(save: () => Promise<T>) {
     configuring = false;
   }
 }
+
+async function changeRuntimeSettings<T>(save: () => Promise<T>) {
+  if (configuring) throw new Error('Wait for settings to finish saving.');
+  chat.assertIdle();
+  media.assertIdle();
+  configuring = true;
+  try {
+    return await save();
+  } finally {
+    configuring = false;
+  }
+}
+
 function nativeProof(registry: RuntimeRegistry, image = false) {
   for (const connection of registry.connections) {
     const model = connection.models.find(
@@ -382,62 +397,66 @@ function registerIpc(): void {
     changeCapabilities(() => virtualComputer.verify(AbortSignal.timeout(30_000))),
   );
   handle('aria:local-computer-supported', () => localComputer.supported());
+  handle('aria:local-desktop-access', (value) => {
+    const requestPermission = z.boolean().default(false).parse(value);
+    if (requestPermission && !mainWindow?.isFocused())
+      throw new Error('Focus Aria before requesting desktop permissions.');
+    return localComputer.access(AbortSignal.timeout(10_000), requestPermission);
+  });
   handle('aria:select-local-computer', async (value, rawTarget, rawStanding) => {
-    const owner = identifier.parse(value);
     const target = z.enum(['window', 'screen']).default('window').parse(rawTarget);
     const standing = target === 'screen' && z.boolean().default(false).parse(rawStanding);
-    const checkForeground = () => {
+    const owner = standing ? identifier.nullable().parse(value) ?? '' : identifier.parse(value);
+    const window = mainWindow;
+    if (!window?.isFocused()) throw new Error('Focus Aria before selecting desktop access.');
+    if (localSelection || configuring) throw new Error('Wait for the current settings change.');
+    const selection = new AbortController();
+    localSelection = selection;
+    const checkSelection = () => {
+      selection.signal.throwIfAborted();
       const active = browser.activeConversation();
       if (
-        initial.data.chat.selectedId !== owner ||
-        (active !== null && active !== owner) ||
-        !mainWindow ||
-        mainWindow.isDestroyed() ||
-        mainWindow.isMinimized()
+        mainWindow !== window || window.isDestroyed() || window.isMinimized() ||
+        (!standing && (initial.data.chat.selectedId !== owner || (active !== null && active !== owner)))
       )
-        throw new Error('Open the conversation that will use the local desktop.');
+        throw new Error('Keep Aria open and select the conversation that will use the local desktop.');
     };
-    checkForeground();
-    let display: Awaited<ReturnType<typeof chooseDisplay>>;
-    let standingProvider: string | undefined;
-    if (target === 'screen') {
-      if (!mainWindow?.isFocused()) throw new Error('Focus Aria before selecting a display.');
-      let detail = 'Aria can ask to share screenshots, open a supported app, or move and click the mouse on this display. Each action requires your approval.';
-      if (standing) {
-        const identity = chat.runtimeIdentity();
-        if (!identity || !chat.getStatus().configured)
-          throw new Error('Configure a primary model before allowing ongoing display access.');
-        standingProvider = identity.key;
-        detail = `Allow this chat to send screenshots to ${identity.model} at ${new URL(identity.endpoint).origin} and use the display’s supported controls until you click Revoke or quit Aria.`;
+    try {
+      checkSelection();
+      let display: Awaited<ReturnType<typeof chooseDisplay>>;
+      let standingProvider: string | undefined;
+      if (target === 'screen') {
+        let detail = 'Aria can ask to share screenshots, open a supported app, or use the mouse on this display. Each action requires your approval.';
+        if (standing) {
+          const identity = chat.runtimeIdentity();
+          if (!identity || !chat.getStatus().configured)
+            throw new Error('Configure a primary model before allowing ongoing display access.');
+          standingProvider = identity.key;
+          detail = `Allow Aria to send screenshots of the selected display to ${identity.model} at ${new URL(identity.endpoint).origin} and use its mouse controls and supported app launches from any active chat. Access continues after restart until you click Revoke.`;
+        }
+        display = await chooseDisplay(window, 'Select a full screen', detail, true);
+        if (!display || selection.signal.aborted) return false;
       }
-      display = await chooseDisplay(
-        mainWindow,
-        'Select a full screen',
-        detail,
-        true,
-      );
-      if (!display) return false;
+      return await changeCapabilities(async () => {
+        checkSelection();
+        const signal = AbortSignal.any([selection.signal, AbortSignal.timeout(85_000)]);
+        if (display) await localComputer.prepareScreen(owner, display, signal, standingProvider, checkSelection);
+        else await localComputer.prepare(owner, signal, checkSelection);
+        await computerRuntime.closeLocalSessions();
+      }, async () => true);
+    } finally {
+      if (localSelection === selection) localSelection = undefined;
     }
-    return changeCapabilities(async () => {
-      checkForeground();
-      const signal = AbortSignal.timeout(85_000);
-      if (display) await localComputer.prepareScreen(owner, display, signal, standingProvider);
-      else await localComputer.prepare(owner, signal);
-      await computerRuntime.closeLocalSessions();
-      try {
-        checkForeground();
-      } catch (error) {
-        localComputer.revoke();
-        throw error;
-      }
-    }, async () => true);
   });
-  handle('aria:revoke-local-computer', () =>
-    changeCapabilities(async () => {
-      localComputer.revoke();
+  handle('aria:revoke-local-computer', async () => {
+    localSelection?.abort();
+    localComputer.revoke();
+    if (configuring) {
       await computerRuntime.closeLocalSessions();
-    }, async () => undefined),
-  );
+      return;
+    }
+    await changeCapabilities(() => computerRuntime.closeLocalSessions(), async () => undefined);
+  });
   handle('aria:web-settings', () => webSettings.get());
   handle('aria:save-web-settings', async (input) => {
     const parsed = webSettingsInputSchema.parse(input);
@@ -599,18 +618,23 @@ function registerIpc(): void {
   });
   handle('aria:execution-history', () => executionRuntime.history());
   handle('aria:runtime-settings', () => executionRuntime.settings());
-  handle('aria:save-runtime-settings', async (value) => {
-    chat.assertIdle();
-    media.assertIdle();
-    const current = executionRuntime.settings();
-    const next = runtimeSettingsSchema.parse(value);
-    await executionRuntime.configure(next);
-    if (current.engineSocket !== next.engineSocket || current.desktopImage !== next.desktopImage) {
-      await computerRuntime.shutdown();
-      await chat.restart();
-    }
-    return executionRuntime.settings();
-  });
+  handle('aria:save-runtime-settings', (value) =>
+    changeRuntimeSettings(async () => {
+      const current = executionRuntime.settings();
+      const next = runtimeSettingsSchema.parse(value);
+      await executionRuntime.configure(next);
+      if (current.engineSocket !== next.engineSocket || current.desktopImage !== next.desktopImage) {
+        await computerRuntime.shutdown();
+        await chat.restart();
+      }
+      return executionRuntime.settings();
+    }),
+  );
+  handle('aria:save-embedding-target', (value) =>
+    changeRuntimeSettings(() =>
+      executionRuntime.saveEmbeddingTarget(runtimeSettingsSchema.shape.embeddingTarget.parse(value)),
+    ),
+  );
   const nativeRuntimeModes = async () => runtimePolicy(await provider.resolve()).nativeRuntime ?? [];
   handle('aria:native-runtime-modes', nativeRuntimeModes);
   handle('aria:set-native-runtime', (raw, enabled) => {
@@ -1017,8 +1041,10 @@ app
     browser = new BrowserController(directory, () => webSettings.get(), approve);
     await browser.load();
     virtualComputer = new VirtualComputer(() => executionRuntime.settings(), directory);
-    localComputer = new LocalComputer(() => chat.executionIdentity());
-    screen.on('display-removed', (_event, display) => localComputer.disconnectDisplay(display.id));
+    localComputer = new LocalComputer(executionRuntime.store, () => chat.executionIdentity());
+    screen.on('display-removed', (_event, display) => {
+      if (localComputer.disconnectDisplay(display.id)) void computerRuntime.closeLocalSessions();
+    });
     computerRuntime = new ComputerRuntime(
       executionRuntime.store,
       [
@@ -1068,6 +1094,32 @@ app
       },
       () => executionRuntime.settings(),
     );
+    let locked = false;
+    let sleeping = false;
+    const updateDesktopAvailability = () => {
+      const suspended = locked || sleeping;
+      localComputer.setSuspended(suspended);
+      if (suspended) {
+        localSelection?.abort();
+        void computerRuntime.closeLocalSessions();
+      }
+    };
+    powerMonitor.on('lock-screen', () => {
+      locked = true;
+      updateDesktopAvailability();
+    });
+    powerMonitor.on('unlock-screen', () => {
+      locked = false;
+      updateDesktopAvailability();
+    });
+    powerMonitor.on('suspend', () => {
+      sleeping = true;
+      updateDesktopAvailability();
+    });
+    powerMonitor.on('resume', () => {
+      sleeping = false;
+      updateDesktopAvailability();
+    });
     chat = new ChatService(
       provider,
       (env) =>
@@ -1129,7 +1181,7 @@ app
           desktopRuntime: true,
           computerBrowser: browser.computerAvailable(),
           computerVirtual: virtualComputer.ready(),
-          computerLocal: localComputer.ready(),
+          computerLocal: localComputer.configured(),
         }),
         artifact: (id, conversation, request) =>
           executionRuntime.resolveArtifact(id, conversation, request),
@@ -1198,7 +1250,7 @@ app.on('before-quit', (event) => {
       .close()
       .then(() => chat.close())
       .then(() => computerRuntime.shutdown())
-      .then(() => localComputer.revoke())
+      .then(() => localComputer.reset())
       .then(() => executionRuntime.close())
       .finally(() => {
         browser.close();

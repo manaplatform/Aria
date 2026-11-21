@@ -8,31 +8,37 @@ import { ComputerRuntime } from '../electron/runtime/computer';
 import { LocalComputer } from '../electron/runtime/local-computer';
 import { RuntimeStore } from '../electron/runtime/store';
 
-const { openPath, capture, frame, nativeCommand, display } = vi.hoisted(() => {
-  const bytes = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
-  const thumbnail = {
-    isEmpty: () => false,
-    toPNG: () => bytes,
-    getSize: () => ({ width: 8, height: 6 }),
-  };
-  return {
-    frame: bytes,
-    openPath: vi.fn<(_: string) => Promise<string>>(async () => ''),
-    capture: vi.fn(async () => [{ display_id: '12', thumbnail }]),
-    nativeCommand: vi.fn<(input: Record<string, unknown>) => Record<string, unknown>>(() => ({})),
-    display: {
-      id: 12,
-      size: { width: 800, height: 600 },
-      bounds: { x: -800, y: 0, width: 800, height: 600 },
-      scaleFactor: 1,
-      rotation: 0,
-    },
-  };
-});
+const { openPath, capture, frame, nativeCommand, display, screenPermission, displays } = vi.hoisted(
+  () => {
+    const bytes = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+    const thumbnail = {
+      isEmpty: () => false,
+      toPNG: () => bytes,
+      getSize: () => ({ width: 8, height: 6 }),
+    };
+    return {
+      frame: bytes,
+      openPath: vi.fn<(_: string) => Promise<string>>(async () => ''),
+      capture: vi.fn(async () => [{ display_id: '12', thumbnail }]),
+      nativeCommand: vi.fn<(input: Record<string, unknown>) => Record<string, unknown>>(() => ({})),
+      screenPermission: vi.fn(() => 'granted'),
+      displays: vi.fn(),
+      display: {
+        id: 12,
+        size: { width: 800, height: 600 },
+        bounds: { x: -800, y: 0, width: 800, height: 600 },
+        scaleFactor: 1,
+        rotation: 0,
+      },
+    };
+  },
+);
 vi.mock('node:fs', async (actual) => {
   const fs = await actual<typeof import('node:fs')>();
   const existsSync = (file: Parameters<typeof fs.existsSync>[0]) =>
-    String(file).endsWith('/aria-macos-computer') || fs.existsSync(file);
+    String(file).endsWith('aria-macos-computer') ||
+    String(file).endsWith('Aria.Computer.exe') ||
+    fs.existsSync(file);
   return {
     ...fs,
     existsSync,
@@ -61,27 +67,48 @@ vi.mock('node:child_process', async (actual) => {
 vi.mock('electron', () => ({
   app: { getPath: () => '/home/fixture' },
   shell: { openPath },
-  screen: { getAllDisplays: () => [display] },
-  nativeImage: { createFromBuffer: () => ({ isEmpty: () => true }) },
-  systemPreferences: { getMediaAccessStatus: () => 'granted' },
+  screen: {
+    getAllDisplays: () => displays() ?? [display],
+    dipToScreenRect: (_window: unknown, bounds: typeof display.bounds) => bounds,
+  },
+  nativeImage: {
+    createFromBuffer: (bytes: Buffer) => ({
+      isEmpty: () => false,
+      getSize: () => ({ width: 8, height: 6 }),
+      crop: () => ({ isEmpty: () => false, toPNG: () => bytes }),
+    }),
+  },
+  systemPreferences: { getMediaAccessStatus: screenPermission },
   desktopCapturer: { getSources: capture },
 }));
 
 async function localScreen() {
   const directory = await mkdtemp(path.join(tmpdir(), 'aria-local-screen-'));
-  const store = new RuntimeStore(directory);
-  let identity = 'fixture';
-  const driver = new LocalComputer(() => identity);
   const approve = vi.fn<(_: string, detail: string) => Promise<boolean>>(async () => false);
-  const runtime = new ComputerRuntime(
-    store,
-    [driver],
-    () => identity,
-    (owner) => owner === 'chat',
-    approve,
-    () => undefined,
-    { read: vi.fn(), adopt: vi.fn(), script: vi.fn() },
-  );
+  let identity = 'fixture';
+  let foreground = 'chat';
+  let store: RuntimeStore;
+  let driver: LocalComputer;
+  let runtime: ComputerRuntime;
+  const launch = () => {
+    store = new RuntimeStore(directory);
+    driver = new LocalComputer(store, () => identity);
+    runtime = new ComputerRuntime(
+      store,
+      [driver],
+      () => identity,
+      (owner) => owner === foreground,
+      approve,
+      () => undefined,
+      { read: vi.fn(), adopt: vi.fn(), script: vi.fn() },
+    );
+  };
+  const shutdown = async () => {
+    await runtime.shutdown();
+    driver.reset();
+    store.close();
+  };
+  launch();
   const signal = AbortSignal.timeout(5000);
   const primary = {
     connectionId: randomUUID(),
@@ -111,17 +138,32 @@ async function localScreen() {
     );
 
   return {
-    driver,
-    runtime,
+    get driver() {
+      return driver;
+    },
+    get runtime() {
+      return runtime;
+    },
+    get store() {
+      return store;
+    },
     dispatch,
     signal,
     approve,
     setIdentity(value: string) {
       identity = value;
     },
+    selectChat(owner: string) {
+      const previous = foreground;
+      foreground = owner;
+      runtime.leave(previous);
+    },
+    async restart() {
+      await shutdown();
+      launch();
+    },
     async close() {
-      await runtime.shutdown();
-      store.close();
+      await shutdown();
       await rm(directory, { recursive: true, force: true });
     },
   };
@@ -133,12 +175,12 @@ it('shares only the approved display and requests separate permission to open it
     expect(driver.ready()).toBe(false);
     await expect(
       driver.prepareScreen('chat', { id: 99, label: 'Other display' }, signal),
-    ).rejects.toThrow('could not be captured');
+    ).rejects.toThrow('disconnected');
     await driver.prepareScreen('chat', { id: 12, label: 'Display 1' }, signal);
     await expect(dispatch('computer.inspect', {}, 'other')).resolves.toMatchObject({
       data: {
         environments: expect.arrayContaining([
-          { environment: 'local-desktop', available: false, actions: [] },
+          expect.objectContaining({ environment: 'local-desktop', available: false, actions: [] }),
         ]),
       },
     });
@@ -203,52 +245,130 @@ it('shares only the approved display and requests separate permission to open it
   }
 });
 
-it('keeps explicit standing access across sessions and binds it to the chat and primary', async () => {
-  const { driver, runtime, dispatch, signal, approve, setIdentity, close } = await localScreen();
-  try {
-    await driver.prepareScreen('chat', { id: 12, label: 'Display 1' }, signal, 'fixture');
-    const open = () => dispatch('computer.open', { environment: 'local-desktop', mode: 'aria' });
-    const sessionId = String((await open()).data?.sessionId);
-    await expect(
-      dispatch('computer.observe', { sessionId, format: 'image' }),
-    ).resolves.toHaveProperty('computerImage');
-    expect(approve).not.toHaveBeenCalled();
-    await dispatch('computer.close', { sessionId });
-    const next = String((await open()).data?.sessionId);
-    expect(next).not.toBe(sessionId);
-    const observation = await dispatch('computer.observe', {
-      sessionId: next,
-      format: 'structured',
-    });
-    await expect(
-      dispatch('computer.act', {
-        sessionId: next,
-        observationId: (observation.data?.observation as { id: string }).id,
-        actions: [{ type: 'open_file_manager' }],
-      }),
-    ).resolves.toMatchObject({ data: { outcomes: [{ status: 'submitted' }] } });
-    expect(approve).not.toHaveBeenCalled();
-    setIdentity('different-primary');
-    await expect(
-      dispatch('computer.observe', { sessionId: next, format: 'image' }),
-    ).rejects.toMatchObject({ code: 'PERMISSION_DENIED' });
-    setIdentity('fixture');
-    driver.revoke();
-    expect(driver.ready()).toBe(false);
-    expect(await runtime.preview('chat', next)).toBeUndefined();
-  } finally {
-    await close();
-  }
-});
+const supportsScreenMouse = process.platform === 'darwin' || process.platform === 'win32';
 
-it.runIf(process.platform === 'darwin')(
-  'launches only Messages and binds approved pointer input to an image',
+it.runIf(supportsScreenMouse)(
+  'restores the display grant across app launches and chats',
+  async () => {
+    const fixture = await localScreen();
+    const { approve, dispatch, signal } = fixture;
+    const firstDisplay = { id: 12, label: 'Display 1' };
+    const secondDisplay = { ...display, id: 34, bounds: { ...display.bounds, x: 0 } };
+    nativeCommand.mockImplementation((input) => {
+      if (input.operation === 'screen_probe') {
+        return {
+          approved: true,
+          accessibility: true,
+          displayKey: input.displayId === 12 ? 'first' : 'second',
+        };
+      }
+      return { submitted: true };
+    });
+    const open = (chat = 'chat') =>
+      dispatch('computer.open', { environment: 'local-desktop', mode: 'aria' }, chat);
+    try {
+      await fixture.driver.prepareScreen('', firstDisplay, signal, 'fixture');
+      const sessionId = String((await open()).data?.sessionId);
+      await expect(
+        dispatch('computer.observe', { sessionId, format: 'image' }),
+      ).resolves.toHaveProperty('computerImage');
+
+      await fixture.restart();
+      fixture.selectChat('other');
+      const next = String((await open('other')).data?.sessionId);
+      expect(next).not.toBe(sessionId);
+      await expect(
+        dispatch('computer.observe', { sessionId, format: 'image' }, 'other'),
+      ).rejects.toMatchObject({ code: 'CAPABILITY_UNAVAILABLE' });
+      await expect(
+        dispatch('computer.observe', { sessionId: next, format: 'image' }, 'other'),
+      ).resolves.toHaveProperty('computerImage');
+      expect(approve).not.toHaveBeenCalled();
+
+      fixture.setIdentity('different-primary');
+      await expect(
+        dispatch('computer.observe', { sessionId: next, format: 'image' }, 'other'),
+      ).rejects.toMatchObject({ code: 'PERMISSION_DENIED' });
+      await expect(fixture.driver.access(signal)).resolves.toMatchObject({
+        state: 'primary-changed',
+      });
+      fixture.setIdentity('fixture');
+
+      displays.mockReturnValueOnce([secondDisplay]);
+      await expect(fixture.driver.access(signal)).resolves.toMatchObject({ state: 'unavailable' });
+      await expect(fixture.driver.access(signal)).resolves.toMatchObject({ state: 'ready' });
+      if (process.platform === 'darwin') {
+        screenPermission.mockReturnValue('denied');
+        await expect(fixture.driver.access(signal)).resolves.toMatchObject({
+          state: 'screen-permission',
+        });
+        screenPermission.mockReset();
+      }
+
+      const originalGrant = fixture.store.localDesktopGrant();
+      await expect(
+        fixture.driver.prepareScreen('', { id: 99, label: 'Unplugged' }, signal, 'fixture'),
+      ).rejects.toThrow('disconnected');
+      expect(fixture.store.localDesktopGrant()).toEqual(originalGrant);
+
+      displays.mockReturnValue([display, secondDisplay]);
+      capture.mockImplementation(async () => {
+        const thumbnail = {
+          isEmpty: () => false,
+          toPNG: () => frame,
+          getSize: () => ({ width: 8, height: 6 }),
+        };
+        return [
+          { display_id: '12', thumbnail },
+          { display_id: '34', thumbnail },
+        ];
+      });
+      await fixture.driver.prepareScreen('', { id: 34, label: 'Display 2' }, signal, 'fixture');
+      expect(fixture.store.localDesktopGrant()).toMatchObject({
+        displayKey: 'second',
+        label: 'Display 2',
+      });
+      await expect(
+        dispatch('computer.observe', { sessionId: next, format: 'image' }, 'other'),
+      ).rejects.toMatchObject({ code: 'PERMISSION_DENIED' });
+      fixture.driver.revoke();
+      await fixture.restart();
+      await expect(fixture.driver.access(signal)).resolves.toEqual({ state: 'off' });
+      await expect(open('other')).rejects.toMatchObject({ code: 'CAPABILITY_UNAVAILABLE' });
+    } finally {
+      displays.mockReset();
+      capture.mockReset();
+      nativeCommand.mockReset();
+      await fixture.close();
+    }
+  },
+);
+
+it.runIf(supportsScreenMouse)(
+  'binds every verified local mouse gesture to an approved image',
   async () => {
     nativeCommand.mockClear();
+    let visualVersion = 0;
+    capture.mockImplementation(async () => [
+      {
+        display_id: '12',
+        thumbnail: {
+          isEmpty: () => false,
+          toPNG: () => Buffer.concat([frame, Buffer.from([visualVersion])]),
+          getSize: () => ({ width: 8, height: 6 }),
+        },
+      },
+    ]);
     nativeCommand.mockImplementation((input) => {
       if (input.operation === 'screen_probe')
-        return { approved: true, accessibility: true, messages: true };
+        return {
+          approved: true,
+          displayKey: 'first',
+          accessibility: true,
+          messages: process.platform === 'darwin',
+        };
       if (input.operation === 'open_application') return { submitted: true, verified: true };
+      if (input.operation === 'screen_pointer') visualVersion++;
       return { submitted: true, verified: input.action === 'move' };
     });
     const { driver, dispatch, signal, approve, close } = await localScreen();
@@ -261,9 +381,12 @@ it.runIf(process.platform === 'darwin')(
       expect(opened.data?.actions).toEqual([
         'screenshot',
         'open_file_manager',
-        'open_application',
+        ...(process.platform === 'darwin' ? ['open_application'] : []),
         'move',
         'click',
+        'double_click',
+        'drag',
+        'scroll',
       ]);
       const sessionId = String(opened.data?.sessionId);
       const observe = async (format: 'structured' | 'image') => {
@@ -283,15 +406,23 @@ it.runIf(process.platform === 'darwin')(
       await expect(
         act(id, { type: 'open_application', application: 'other' }),
       ).rejects.toMatchObject({ code: 'INVALID_ARGUMENT' });
-      approve.mockResolvedValueOnce(true);
-      await expect(
-        act(id, { type: 'open_application', application: 'messages' }),
-      ).resolves.toMatchObject({
-        data: { outcomes: [{ action: 'open_application', status: 'verified' }] },
-      });
-      expect(nativeCommand).toHaveBeenLastCalledWith(
-        expect.objectContaining({ operation: 'open_application', application: 'messages' }),
-      );
+      if (process.platform === 'darwin') {
+        approve.mockResolvedValueOnce(true);
+        await expect(
+          act(id, { type: 'open_application', application: 'messages' }),
+        ).resolves.toMatchObject({
+          data: { outcomes: [{ action: 'open_application', status: 'verified' }] },
+        });
+        expect(
+          nativeCommand.mock.calls.some(
+            ([input]) => input.operation === 'open_application' && input.application === 'messages',
+          ),
+        ).toBe(true);
+      }
+      const pointerCommands = () =>
+        nativeCommand.mock.calls
+          .map(([input]) => input)
+          .filter(({ operation }) => operation === 'screen_pointer');
       approve.mockResolvedValueOnce(true);
       id = await observe('image');
       await expect(act(id, { type: 'click', x: 8, y: 2, button: 'left' })).rejects.toMatchObject({
@@ -300,7 +431,7 @@ it.runIf(process.platform === 'darwin')(
       await expect(act(id, { type: 'move', x: 2, y: 2 })).resolves.toMatchObject({
         data: { outcomes: [{ action: 'move', status: 'declined' }] },
       });
-      expect(nativeCommand).toHaveBeenCalledTimes(2);
+      expect(pointerCommands()).toHaveLength(0);
       approve.mockResolvedValueOnce(true);
       id = await observe('image');
       approve.mockImplementationOnce(async () => {
@@ -319,13 +450,13 @@ it.runIf(process.platform === 'darwin')(
       await expect(act(id, { type: 'click', x: 2, y: 2, button: 'left' })).resolves.toMatchObject({
         data: { outcomes: [{ action: 'click', status: 'stale-approval' }] },
       });
-      expect(nativeCommand).toHaveBeenCalledTimes(2);
+      expect(pointerCommands()).toHaveLength(0);
       approve.mockResolvedValueOnce(true).mockResolvedValueOnce(true);
       id = await observe('image');
       await expect(act(id, { type: 'move', x: 3, y: 4 })).resolves.toMatchObject({
         data: { outcomes: [{ action: 'move', status: 'verified' }] },
       });
-      expect(nativeCommand).toHaveBeenLastCalledWith(
+      expect(pointerCommands().at(-1)).toEqual(
         expect.objectContaining({
           operation: 'screen_pointer',
           action: 'move',
@@ -339,9 +470,94 @@ it.runIf(process.platform === 'darwin')(
       await expect(act(id, { type: 'click', x: 3, y: 4, button: 'left' })).resolves.toMatchObject({
         data: { outcomes: [{ action: 'click', status: 'submitted' }] },
       });
-      expect(nativeCommand).toHaveBeenLastCalledWith(
-        expect.objectContaining({ action: 'click', button: 'left' }),
-      );
+      expect(pointerCommands().at(-1)).toMatchObject({ action: 'click', button: 'left' });
+      expect(pointerCommands()).toHaveLength(2);
+      for (const action of [
+        { type: 'click', x: 1, y: 1, button: 'right' },
+        { type: 'click', x: 1, y: 1, button: 'middle' },
+        { type: 'double_click', x: 1, y: 1 },
+        {
+          type: 'drag',
+          path: [
+            { x: 1, y: 1 },
+            { x: 7, y: 5 },
+          ],
+        },
+        { type: 'scroll', x: 1, y: 1, scrollX: 100, scrollY: -200 },
+      ]) {
+        approve.mockResolvedValueOnce(true).mockResolvedValueOnce(true);
+        id = await observe('image');
+        await expect(act(id, action)).resolves.toMatchObject({
+          data: { outcomes: [{ action: action.type, status: 'submitted' }] },
+        });
+        expect(pointerCommands().at(-1)?.action).toBe(action.type);
+      }
+      approve.mockResolvedValueOnce(true);
+      id = await observe('image');
+      await expect(
+        act(id, {
+          type: 'drag',
+          path: [
+            { x: 1, y: 1 },
+            { x: 8, y: 5 },
+          ],
+        }),
+      ).rejects.toMatchObject({ code: 'INVALID_ARGUMENT' });
+      expect(pointerCommands()).toHaveLength(7);
+    } finally {
+      nativeCommand.mockReset();
+      capture.mockReset();
+      await close();
+    }
+  },
+);
+
+it.runIf(supportsScreenMouse)(
+  'fences a pending capture and mouse action when the grant is revoked',
+  async () => {
+    const { driver, runtime, dispatch, signal, close } = await localScreen();
+    nativeCommand.mockImplementation((input) =>
+      input.operation === 'screen_probe'
+        ? { approved: true, displayKey: 'first', accessibility: true }
+        : { submitted: true },
+    );
+    try {
+      await driver.prepareScreen('', { id: 12, label: 'Display 1' }, signal, 'fixture');
+      const { data } = await dispatch('computer.open', {
+        environment: 'local-desktop',
+        mode: 'aria',
+      });
+      const sessionId = String(data?.sessionId);
+      const initial = await dispatch('computer.observe', { sessionId, format: 'image' });
+      let captureStarted!: () => void;
+    const capturing = new Promise<void>((resolve) => {
+      captureStarted = resolve;
+    });
+    let release!: (sources: Awaited<ReturnType<typeof capture>>) => void;
+    const held = new Promise<Awaited<ReturnType<typeof capture>>>((resolve) => {
+      release = resolve;
+    });
+    const sources = await capture();
+      capture.mockImplementationOnce(() => {
+        captureStarted();
+        return held;
+      });
+
+      const action = dispatch('computer.act', {
+        sessionId,
+        observationId: initial.computerImage?.observation.id,
+        actions: [{ type: 'click', x: 2, y: 2, button: 'left' }],
+      }).catch((error: unknown) => error);
+      await capturing;
+      driver.revoke();
+      const stopped = runtime.closeLocalSessions();
+      release(sources);
+      await stopped;
+      expect(await action).toMatchObject({ name: 'AbortError' });
+      expect(
+        nativeCommand.mock.calls.some(([request]) => request.operation === 'screen_pointer'),
+      ).toBe(false);
+      await expect(driver.access(signal)).resolves.toEqual({ state: 'off' });
     } finally {
       nativeCommand.mockReset();
       await close();

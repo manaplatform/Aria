@@ -13,6 +13,7 @@ import type { BrowserCommand, BrowserLayout, BrowserState } from './browser.js';
 import type {
   ComputerAction,
   ComputerSessionSummary,
+  LocalDesktopAccess,
   ComputerSupervision,
 } from './computer-use.js';
 import type { WebSettings, WebSettingsInput } from './web.js';
@@ -393,7 +394,8 @@ export interface DesktopBridge {
   computerPreview(conversationId: string, sessionId: string): Promise<string | undefined>;
   probeVirtualComputer(): Promise<void>;
   localComputerSupported(): Promise<boolean>;
-  selectLocalComputer(conversationId: string, target?: 'window' | 'screen', standing?: boolean): Promise<boolean>;
+  selectLocalComputer(conversationId: string | null, target?: 'window' | 'screen', standing?: boolean): Promise<boolean>;
+  localDesktopAccess(requestPermission?: boolean): Promise<LocalDesktopAccess>;
   revokeLocalComputer(): Promise<void>;
   superviseComputer(conversationId: string, command: ComputerSupervision): Promise<void>;
   sendComputerInput(
@@ -409,6 +411,7 @@ export interface DesktopBridge {
   executionHistory(): Promise<ExecutionHistoryEntry[]>;
   runtimeSettings(): Promise<RuntimeSettings>;
   saveRuntimeSettings(settings: RuntimeSettings): Promise<RuntimeSettings>;
+  saveEmbeddingTarget(target: RuntimeSettings['embeddingTarget']): Promise<RuntimeSettings>;
   nativeRuntimeModes(): Promise<OpenAIRuntimeFeature[]>;
   setNativeRuntime(mode: OpenAIRuntimeFeature, enabled: boolean): Promise<OpenAIRuntimeFeature[]>;
   probeRuntime(): Promise<Record<string, unknown>>;

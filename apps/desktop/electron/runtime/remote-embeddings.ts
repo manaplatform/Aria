@@ -15,6 +15,26 @@ const responseSchema = z.object({
     .max(32),
 });
 
+function rejectionMessage(status: number) {
+  const prefix = `The embedding provider returned HTTP ${status}.`;
+  switch (status) {
+    case 401:
+    case 403:
+      return `${prefix} Check the connection’s API key and access to the selected model.`;
+    case 400:
+    case 404:
+    case 405:
+    case 422:
+      return `${prefix} Check that the configured endpoint supports /embeddings and the exact model ID.`;
+    case 402:
+      return `${prefix} Check the provider’s billing and credits.`;
+    case 429:
+      return `${prefix} Check the provider’s rate or usage limit, then retry.`;
+    default:
+      return `${prefix} Check the provider’s status and retry.`;
+  }
+}
+
 export class RemoteEmbeddings {
   readonly origin: string;
   readonly revision: string;
@@ -51,42 +71,47 @@ export class RemoteEmbeddings {
   }
 
   async embed(texts: string[], signal: AbortSignal) {
-    const response = await fetch(this.connection.baseUrl.replace(/\/$/, '') + '/embeddings', {
-      method: 'POST',
-      redirect: 'error',
-      signal: AbortSignal.any([signal, AbortSignal.timeout(18_000)]),
-      headers: {
-        Authorization: `Bearer ${this.connection.apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ model: this.model, input: texts, encoding_format: 'float' }),
-    });
-    if (!response.ok || !response.body) {
-      await response.body?.cancel();
+    const timeout = AbortSignal.timeout(18_000);
+    let bytes: Buffer;
+    try {
+      const response = await fetch(this.connection.baseUrl.replace(/\/+$/, '') + '/embeddings', {
+        method: 'POST',
+        redirect: 'error',
+        signal: AbortSignal.any([signal, timeout]),
+        headers: {
+          Authorization: `Bearer ${this.connection.apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ model: this.model, input: texts, encoding_format: 'float' }),
+      });
+      if (!response.ok) {
+        void response.body?.cancel().catch(() => undefined);
+        throw new RuntimeError('CAPABILITY_UNAVAILABLE', rejectionMessage(response.status));
+      }
+      bytes = await readEmbeddingResponse(response);
+    } catch (error) {
+      signal.throwIfAborted();
+      if (error instanceof RuntimeError) throw error;
+      if (timeout.aborted)
+        throw new RuntimeError('TIMEOUT', 'The embedding request timed out. Try again.');
       throw new RuntimeError(
         'CAPABILITY_UNAVAILABLE',
-        'The configured provider rejected the embedding request.',
+        'Could not reach the embedding provider. Check the HTTPS endpoint and your connection.',
       );
     }
-    const reader = response.body.getReader();
-    const bytes: Uint8Array[] = [];
-    let received = 0;
+    let result: unknown;
     try {
-      for (;;) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        received += value.byteLength;
-        if (received > 2_000_000)
-          throw new RuntimeError(
-            'BUDGET_EXCEEDED',
-            'The embedding response exceeded its size limit.',
-          );
-        bytes.push(value);
-      }
-    } finally {
-      await reader.cancel().catch(() => undefined);
+      result = JSON.parse(bytes.toString('utf8'));
+    } catch {
+      // Malformed JSON is handled like any other incompatible provider response.
     }
-    const { data } = responseSchema.parse(JSON.parse(Buffer.concat(bytes).toString('utf8')));
+    const parsed = responseSchema.safeParse(result);
+    if (!parsed.success)
+      throw new RuntimeError(
+        'EXECUTION_FAILED',
+        'The provider returned an invalid embedding response. Check that the selected model returns numeric vectors.',
+      );
+    const { data } = parsed.data;
     data.sort((a, b) => a.index - b.index);
     if (
       data.length !== texts.length ||
@@ -99,5 +124,24 @@ export class RemoteEmbeddings {
         'The embedding result does not match the requested input batch.',
       );
     return data.map((item) => item.embedding);
+  }
+}
+
+async function readEmbeddingResponse(response: Response) {
+  if (!response.body) return Buffer.alloc(0);
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let received = 0;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) return Buffer.concat(chunks, received);
+      received += value.byteLength;
+      if (received > 2_000_000)
+        throw new RuntimeError('BUDGET_EXCEEDED', 'The embedding response exceeded its size limit.');
+      chunks.push(value);
+    }
+  } finally {
+    void reader.cancel().catch(() => undefined);
   }
 }

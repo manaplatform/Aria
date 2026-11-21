@@ -41,6 +41,7 @@ const bridge: DesktopBridge = {
   localComputerSupported: () => ipcRenderer.invoke('aria:local-computer-supported'),
   selectLocalComputer: (conversation, target, standing) =>
     ipcRenderer.invoke('aria:select-local-computer', conversation, target, standing),
+  localDesktopAccess: (requestPermission) => ipcRenderer.invoke('aria:local-desktop-access', requestPermission),
   revokeLocalComputer: () => ipcRenderer.invoke('aria:revoke-local-computer'),
   superviseComputer: (conversation, command) =>
     ipcRenderer.invoke('aria:computer-supervise', conversation, command),
@@ -68,6 +69,7 @@ const bridge: DesktopBridge = {
   executionHistory: () => ipcRenderer.invoke('aria:execution-history'),
   runtimeSettings: () => ipcRenderer.invoke('aria:runtime-settings'),
   saveRuntimeSettings: (settings) => ipcRenderer.invoke('aria:save-runtime-settings', settings),
+  saveEmbeddingTarget: (target) => ipcRenderer.invoke('aria:save-embedding-target', target),
   nativeRuntimeModes: () => ipcRenderer.invoke('aria:native-runtime-modes'),
   setNativeRuntime: (mode, enabled) => ipcRenderer.invoke('aria:set-native-runtime', mode, enabled),
   probeRuntime: () => ipcRenderer.invoke('aria:probe-runtime'),

@@ -25,6 +25,7 @@ const labels: Record<ModelCapability, string> = {
   chat: 'Text streaming',
   tools: 'Function calling',
   vision: 'Vision',
+  embeddings: 'Embeddings',
   image: 'Image generation',
   'image-edit': 'Image editing',
   speech: 'Speech',
@@ -33,6 +34,15 @@ const labels: Record<ModelCapability, string> = {
   'web-search': 'Web Search',
 };
 const voices = registryPolicySchema.shape.live.unwrap().shape.voice.options;
+
+function includeDiscoveredEmbeddings(
+  model: ConnectionInput['models'][number],
+  descriptor?: DiscoveredModel,
+): ConnectionInput['models'][number] {
+  if (!descriptor?.capabilities.includes('embeddings') || model.declared.includes('embeddings'))
+    return model;
+  return { ...model, declared: [...model.declared, 'embeddings'] };
+}
 
 export function ModelSettings() {
   const { settings, loading, error } = useProviderStore();
@@ -118,11 +128,26 @@ function RegistryEditor({ settings }: { settings: RegistrySettings }) {
     }));
     try {
       const models = await desktop().discoverModels(connection);
-      if (catalogRevisions.current.get(connection.id) === revision)
+      if (catalogRevisions.current.get(connection.id) === revision) {
+        const descriptors = new Map(models.map((model) => [model.id, model]));
+        setDraft((current) => ({
+          ...current,
+          connections: current.connections.map((item) =>
+            item.id === connection.id
+              ? {
+                  ...item,
+                  models: item.models.map((model) =>
+                    includeDiscoveredEmbeddings(model, descriptors.get(model.id)),
+                  ),
+                }
+              : item,
+          ),
+        }));
         setCatalogs((current) => ({
           ...current,
           [connection.id]: { ...current[connection.id], models, busy: false },
         }));
+      }
     } catch (error) {
       if (catalogRevisions.current.get(connection.id) === revision)
         setCatalogs((current) => ({ ...current, [connection.id]: { error: errorMessage(error) } }));
@@ -620,11 +645,16 @@ function ConnectionCard({
                     checked={model.enabled}
                     disabled={disabled || (!model.enabled && !discovered)}
                     onChange={(event) =>
-                      setModel({
-                        ...model,
-                        enabled: event.target.checked,
-                        delegate: event.target.checked,
-                      })
+                      setModel(
+                        includeDiscoveredEmbeddings(
+                          {
+                            ...model,
+                            enabled: event.target.checked,
+                            delegate: event.target.checked,
+                          },
+                          discovered,
+                        ),
+                      )
                     }
                   />{' '}
                   Enabled

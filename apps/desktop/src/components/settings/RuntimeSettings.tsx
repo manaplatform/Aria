@@ -1,12 +1,14 @@
 import { useEffect, useState } from 'react';
-import type {
-  ExecutionHistoryEntry,
-  OpenAIRuntimeFeature,
-  RegistrySettings,
-  RuntimeSettings as Settings,
+import {
+  modelReference,
+  type ExecutionHistoryEntry,
+  type LocalDesktopAccess,
+  type OpenAIRuntimeFeature,
+  type RuntimeSettings as Settings,
 } from '@aria/shared';
 import { desktop, errorMessage } from '../../services/desktop';
 import { ensureChatDraft } from '../../stores/chatStore';
+import { useProviderStore } from '../../stores/providerStore';
 import { Button } from '../ui';
 import { flushPersistence, useWorkspaceStore } from '../../stores/workspaceStore';
 
@@ -18,16 +20,47 @@ const nativeModes: { id: OpenAIRuntimeFeature; label: string }[] = [
   { id: 'computer-image', label: 'Aria Computer Use image observations' },
 ];
 
+const desktopAccessMessage: Record<LocalDesktopAccess['state'], string> = {
+  off: '',
+  ready: 'Mouse control is available in active chats with the approved primary.',
+  'primary-changed': 'Switch to the approved primary or select a display for your current primary.',
+  'screen-permission': 'Allow Aria in macOS Screen & System Audio Recording.',
+  'pointer-permission': 'Mouse control is unavailable. On macOS, allow the Aria helper in Accessibility.',
+  unavailable: 'Reconnect the approved display and make sure the desktop is unlocked.',
+};
+
 export function RuntimeSettings() {
   const [value, setValue] = useState<Settings>();
   const [history, setHistory] = useState<ExecutionHistoryEntry[]>([]);
   const [status, setStatus] = useState('');
   const [error, setError] = useState('');
-  const [registry, setRegistry] = useState<RegistrySettings>();
+  const registry = useProviderStore((state) => state.settings);
+  const [embeddingChoice, setEmbeddingChoice] = useState<string>();
+  const [embeddingFeedback, setEmbeddingFeedback] = useState<{ error: boolean; text: string }>();
   const [native, setNative] = useState<OpenAIRuntimeFeature[]>([]);
   const [busy, setBusy] = useState(false);
-  const [standingDesktopAccess, setStandingDesktopAccess] = useState(false);
+  const [standingDesktopAccess, setStandingDesktopAccess] = useState(true);
+  const [desktopAccess, setDesktopAccess] = useState<LocalDesktopAccess>();
   const screenSupported = window.aria?.platform === 'darwin' || window.aria?.platform === 'win32';
+  const savedEmbedding = value?.embeddingTarget;
+  const embeddingSelection =
+    embeddingChoice ?? (savedEmbedding ? modelReference(savedEmbedding.connectionId, savedEmbedding.model) : '');
+  const embeddingOptions = (registry?.connections ?? [])
+    .filter(
+      (connection) =>
+        connection.keyConfigured && !connection.locked && new URL(connection.baseUrl).protocol === 'https:',
+    )
+    .flatMap((connection) =>
+      connection.models
+        .filter((model) => model.enabled && model.declared.includes('embeddings'))
+        .map((model) => ({
+          id: modelReference(connection.id, model.id),
+          label: `${connection.name} · ${model.id}`,
+          target: { connectionId: connection.id, model: model.id },
+        })),
+    );
+  const selectedEmbedding = embeddingOptions.find((option) => option.id === embeddingSelection);
+  const unavailableEmbedding = Boolean(embeddingSelection && !selectedEmbedding);
 
   useEffect(() => {
     let mounted = true;
@@ -45,16 +78,18 @@ export function RuntimeSettings() {
         if (mounted) setNative(features);
       })
       .catch(() => undefined);
-    void Promise.resolve()
-      .then(() => desktop().registrySettings())
-      .then((value) => {
-        if (mounted) setRegistry(value);
-      })
-      .catch(() => undefined);
+    if (screenSupported) {
+      void Promise.resolve()
+        .then(() => desktop().localDesktopAccess())
+        .then((value) => {
+          if (mounted) setDesktopAccess(value);
+        })
+        .catch(() => undefined);
+    }
     return () => {
       mounted = false;
     };
-  }, []);
+  }, [screenSupported]);
 
   async function save(probe: boolean | 'desktop') {
     if (!value) return;
@@ -62,7 +97,9 @@ export function RuntimeSettings() {
     setError('');
     setStatus('');
     try {
-      setValue(await desktop().saveRuntimeSettings(value));
+      const settings = { ...value };
+      delete settings.embeddingTarget;
+      setValue(await desktop().saveRuntimeSettings(settings));
       if (probe === 'desktop') {
         await desktop().probeVirtualComputer();
         setStatus('The isolated graphical desktop passed its capture and isolation checks.');
@@ -74,6 +111,26 @@ export function RuntimeSettings() {
       }
     } catch (failure) {
       setError(errorMessage(failure));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function saveEmbedding() {
+    setBusy(true);
+    setEmbeddingFeedback(undefined);
+    try {
+      const { embeddingTarget } = await desktop().saveEmbeddingTarget(selectedEmbedding?.target);
+      setValue((current) => current && { ...current, embeddingTarget });
+      setEmbeddingChoice(undefined);
+      setEmbeddingFeedback({
+        error: false,
+        text: embeddingTarget
+          ? 'Embedding model verified and saved.'
+          : 'Local embedding pack selected.',
+      });
+    } catch (failure) {
+      setEmbeddingFeedback({ error: true, text: errorMessage(failure) });
     } finally {
       setBusy(false);
     }
@@ -92,27 +149,29 @@ export function RuntimeSettings() {
     }
   }
 
-  async function localDesktop(action: 'screen' | 'revoke') {
+  async function localDesktop(action: 'screen' | 'revoke' | 'recheck') {
     setBusy(true);
     setError('');
     setStatus('');
     try {
       if (action === 'revoke') {
         await desktop().revokeLocalComputer();
+        setDesktopAccess({ state: 'off' });
         setStatus('Local desktop access revoked.');
+      } else if (action === 'recheck') {
+        setDesktopAccess(await desktop().localDesktopAccess(true));
       } else {
-        const conversationId = ensureChatDraft();
-        await flushPersistence();
-        if (useWorkspaceStore.getState().saveError)
-          throw new Error(
-            'The chat draft could not be saved. Resolve the storage error and retry.',
-          );
-        if (await desktop().selectLocalComputer(conversationId, 'screen', standingDesktopAccess))
-          setStatus(
-            standingDesktopAccess
-              ? 'This chat can use the selected display until you click Revoke or quit Aria.'
-              : 'Start a local desktop session in this chat within two minutes.',
-          );
+        let conversationId: string | null = null;
+        if (!standingDesktopAccess) {
+          conversationId = ensureChatDraft();
+          await flushPersistence();
+          if (useWorkspaceStore.getState().saveError)
+            throw new Error('The chat draft could not be saved. Resolve the storage error and retry.');
+        }
+        if (await desktop().selectLocalComputer(conversationId, 'screen', standingDesktopAccess)) {
+          setDesktopAccess(await desktop().localDesktopAccess());
+          if (!standingDesktopAccess) setStatus('Start a local desktop session in this chat within two minutes.');
+        }
       }
     } catch (failure) {
       setError(errorMessage(failure));
@@ -231,46 +290,6 @@ export function RuntimeSettings() {
             />
           </div>
           <div className="shortcut-row">
-            <label htmlFor="embedding-target">Embedding provider</label>
-            <select
-              id="embedding-target"
-              disabled={busy}
-              value={
-                value.embeddingTarget
-                  ? `${value.embeddingTarget.connectionId}:${value.embeddingTarget.model}`
-                  : ''
-              }
-              onChange={(event) => {
-                const target = event.target.value;
-                setValue({
-                  ...value,
-                  embeddingTarget: target
-                    ? { connectionId: target.slice(0, 36), model: target.slice(37) }
-                    : undefined,
-                });
-              }}
-            >
-              <option value="">Local embedding pack</option>
-              {registry?.connections
-                .filter(
-                  (connection) =>
-                    connection.keyConfigured && connection.baseUrl.startsWith('https://'),
-                )
-                .flatMap((connection) =>
-                  connection.models
-                    .filter((model) => model.enabled)
-                    .map((model) => (
-                      <option
-                        key={`${connection.id}:${model.id}`}
-                        value={`${connection.id}:${model.id}`}
-                      >
-                        {connection.name} · {model.id}
-                      </option>
-                    )),
-                )}
-            </select>
-          </div>
-          <div className="shortcut-row">
             <Button size="sm" disabled={busy} onClick={() => void save(false)}>
               Save runtime settings
             </Button>
@@ -283,6 +302,46 @@ export function RuntimeSettings() {
               Save and test environment
             </Button>
           </div>
+          <div className="shortcut-row">
+            <label htmlFor="embedding-target">Embedding model</label>
+            <select
+              id="embedding-target"
+              disabled={busy}
+              value={embeddingSelection}
+              onChange={(event) => {
+                setEmbeddingChoice(event.target.value);
+                setEmbeddingFeedback(undefined);
+              }}
+            >
+              <option value="">Local embedding pack</option>
+              {unavailableEmbedding && (
+                <option value={embeddingSelection} disabled>
+                  {embeddingSelection.slice(embeddingSelection.indexOf(':') + 1)} (refresh AI Models)
+                </option>
+              )}
+              {embeddingOptions.map((option) => (
+                <option key={option.id} value={option.id}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+            <Button
+              size="sm"
+              variant="secondary"
+              disabled={busy || unavailableEmbedding || (!embeddingSelection && !savedEmbedding)}
+              onClick={() => void saveEmbedding()}
+            >
+              {embeddingSelection ? 'Verify and save embedding' : 'Use local embedding pack'}
+            </Button>
+          </div>
+          {registry && !embeddingOptions.length && (
+            <p className="muted">
+              Enable a model with Embeddings in AI Models to use a remote provider.
+            </p>
+          )}
+          {embeddingFeedback && (
+            <p role={embeddingFeedback.error ? 'alert' : 'status'}>{embeddingFeedback.text}</p>
+          )}
         </>
       )}
       {screenSupported && (
@@ -290,7 +349,7 @@ export function RuntimeSettings() {
           <div className="shortcut-row">
             <span>Local desktop</span>
             <Button variant="secondary" disabled={busy} onClick={() => void localDesktop('screen')}>
-              Select a full screen
+              {desktopAccess?.display && standingDesktopAccess ? 'Change display' : 'Select a full screen'}
             </Button>
             <Button variant="ghost" disabled={busy} onClick={() => void localDesktop('revoke')}>
               Revoke
@@ -305,6 +364,18 @@ export function RuntimeSettings() {
               onChange={(event) => setStandingDesktopAccess(event.target.checked)}
             />
           </label>
+          {desktopAccess?.display && (
+            <div className="shortcut-row">
+              <p className="muted" role="status">
+                <strong>{desktopAccess.display}</strong> · {desktopAccessMessage[desktopAccess.state]}
+              </p>
+              {desktopAccess.state !== 'ready' && desktopAccess.state !== 'primary-changed' && (
+                <Button variant="ghost" disabled={busy} onClick={() => void localDesktop('recheck')}>
+                  Check permissions
+                </Button>
+              )}
+            </div>
+          )}
         </>
       )}
       {nativeModes.map(({ id, label }) => (

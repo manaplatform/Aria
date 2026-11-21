@@ -172,48 +172,97 @@ test('captures the approved full display into the originating draft for review',
   await expect(remove).toHaveCount(0);
 });
 
-test('selects and revokes a full screen in Settings from an unsent chat', async () => {
+test('keeps the approved display through restart and revokes it from Settings', async () => {
   test.skip(process.platform !== 'darwin' && process.platform !== 'win32');
+
+  const mockDisplay = (restored: boolean) => app.evaluate(
+    ({ BrowserWindow, desktopCapturer, dialog, nativeImage, screen, systemPreferences }, restored) => {
+      const display = screen.getPrimaryDisplay();
+      const thumbnail = nativeImage.createFromBitmap(Buffer.alloc(16 * 12 * 4, 255), {
+        width: 16,
+        height: 12,
+      });
+      let selected = restored;
+      let cancel = restored;
+      dialog.showMessageBox = async () => {
+        if (cancel) {
+          cancel = false;
+          return { response: 0, checkboxChecked: false };
+        }
+        selected = true;
+        return { response: 1, checkboxChecked: false };
+      };
+      screen.getAllDisplays = () => [display];
+      systemPreferences.getMediaAccessStatus = () => 'granted';
+      desktopCapturer.getSources = async () => {
+        if (!selected) throw new Error('Capture before display selection');
+        return [{ id: 'selected', name: 'Display', display_id: String(display.id), thumbnail, appIcon: thumbnail }];
+      };
+      BrowserWindow.getAllWindows()[0].isFocused = () => restored;
+
+      const children = process.getBuiltinModule('node:child_process')!;
+      const { PassThrough } = process.getBuiltinModule('node:stream')!;
+      const { EventEmitter } = process.getBuiltinModule('node:events')!;
+      children.spawn = new Proxy(children.spawn, {
+        apply(spawn, receiver, args) {
+          if (!/(aria-macos-computer|Aria\.Computer\.exe)$/.test(String(args[0])))
+            return Reflect.apply(spawn, receiver, args);
+          const stdin = new PassThrough();
+          const stdout = new PassThrough();
+          stdin.on('data', (chunk: Buffer) => {
+            const { id, operation } = JSON.parse(chunk.toString()) as { id: string; operation: string };
+            queueMicrotask(() => stdout.write(JSON.stringify({
+              id,
+              ...(operation === 'screen_probe' && selected && {
+                approved: true, displayKey: 'test-display', accessibility: true,
+              }),
+            }) + '\n'));
+          });
+          return Object.assign(new EventEmitter(), {
+            stdin, stdout, stderr: new PassThrough(), kill: () => true,
+          });
+        },
+      });
+    },
+    restored,
+  );
+  const settings = () => page.getByRole('button', { name: 'Open settings', exact: true }).click();
   await launch();
-  await app.evaluate(({ BrowserWindow, desktopCapturer, dialog, nativeImage, screen, systemPreferences }) => {
-    const display = screen.getPrimaryDisplay();
-    const thumbnail = nativeImage.createFromBitmap(Buffer.alloc(16 * 12 * 4, 255), {
-      width: 16,
-      height: 12,
-    });
-    let selected = false;
-    dialog.showMessageBox = (async () => {
-      selected = true;
-      return { response: 1, checkboxChecked: false };
-    }) as typeof dialog.showMessageBox;
-    screen.getAllDisplays = () => [display];
-    systemPreferences.getMediaAccessStatus = () => 'granted';
-    desktopCapturer.getSources = async () => {
-      if (!selected) throw new Error('Capture before display selection');
-      return [{ id: 'selected', name: 'Display', display_id: String(display.id), thumbnail, appIcon: thumbnail }];
-    };
-    BrowserWindow.getAllWindows()[0].isFocused = () => false;
-  });
+  await mockDisplay(false);
   await page.getByRole('textbox', { name: 'Message Aria' }).fill('Unsent draft');
-  await page.getByRole('button', { name: 'Open settings', exact: true }).click();
-  await expect(page.getByRole('button', { name: 'Select a text editor window' })).toHaveCount(0);
+  await settings();
   const select = page.getByRole('button', { name: 'Select a full screen', exact: true });
-  await expect(select).toBeEnabled();
+  const standing = page.getByRole('checkbox', { name: 'Allow access until revoked', exact: true });
+  await expect(standing).toBeChecked();
   await select.click();
-  await expect(page.getByText('Focus Aria before selecting a display.')).toBeVisible();
+  await expect(page.getByText('Focus Aria before selecting desktop access.')).toBeVisible();
   await app.evaluate(({ BrowserWindow }) => {
     BrowserWindow.getAllWindows()[0].isFocused = () => true;
   });
+  await standing.uncheck();
   await select.click();
   await expect(page.getByText('Start a local desktop session in this chat within two minutes.')).toBeVisible();
-  await page.getByRole('checkbox', { name: 'Allow access until revoked', exact: true }).check();
+  await standing.check();
   await select.click();
-  await expect(page.getByText('This chat can use the selected display until you click Revoke or quit Aria.')).toBeVisible();
+  const change = () => page.getByRole('button', { name: 'Change display', exact: true });
+  await expect(change()).toBeVisible();
+  await app.close();
+
+  await launch();
+  await mockDisplay(true);
+  await settings();
+  await expect(change()).toBeVisible();
+  await expect(page.getByText('Mouse control is available in active chats with the approved primary.'))
+    .toBeVisible();
+  await change().click();
+  await expect(change()).toBeEnabled();
+  await expect.poll(() => page.evaluate(() => window.aria!.localDesktopAccess()))
+    .toMatchObject({ state: 'ready' });
   await page.getByRole('button', { name: 'Revoke', exact: true }).click();
   await expect(page.getByText('Local desktop access revoked.')).toBeVisible();
+  await expect.poll(() => page.evaluate(() => window.aria!.localDesktopAccess())).toEqual({ state: 'off' });
   await page.getByRole('button', { name: 'Back to chat', exact: true }).click();
   await expect(page.getByRole('textbox', { name: 'Message Aria' })).toHaveValue('Unsent draft');
-  await expect(page.locator('.from-user')).toHaveCount(0);
 });
 
 test('streams through the managed NestJS API, renders Markdown, manages conversations, and stops background replies', async () => {
@@ -528,6 +577,68 @@ test('configures a provider in Settings using native encrypted storage and resto
   await launch(false, false, true);
   await send('The saved key still works');
   await expect(page.locator('.from-assistant[data-status="completed"]')).toHaveCount(2);
+});
+
+test('verifies remote embeddings separately from runtime settings', async () => {
+  await launch();
+  const registryPath = path.join(temporary, 'provider-v2.json');
+  const registry = JSON.parse(await fs.readFile(registryPath, 'utf8'));
+  const embeddingConnection = '20000000-0000-4000-8000-000000000001';
+  registry.connections.push({
+    id: embeddingConnection,
+    name: 'Embedding fixture',
+    baseUrl: 'https://embeddings.fixture.test/v1',
+    encryptedKey: registry.connections[0].encryptedKey,
+    webSearch: false,
+    verified: [],
+    models: [
+      { id: 'working', declared: ['embeddings'] },
+      { id: 'rejected', declared: ['embeddings'] },
+      { id: 'chat-only', declared: ['chat', 'tools'] },
+    ].map((model) => ({ ...model, enabled: true, delegate: false })),
+  });
+  await fs.writeFile(registryPath, JSON.stringify(registry));
+  await app.evaluate(() => {
+    const fetch = globalThis.fetch;
+    globalThis.fetch = async (url, options) => {
+      if (url !== 'https://embeddings.fixture.test/v1/embeddings') return fetch(url, options);
+      const { model, input } = JSON.parse(String(options?.body));
+      if (model === 'rejected')
+        return new Response('private provider diagnostic', { status: 404 });
+      if (
+        model !== 'working' || options?.method !== 'POST' ||
+        new Headers(options.headers).get('Authorization') !== 'Bearer test-only-key' ||
+        JSON.stringify(input) !== JSON.stringify(['Aria embedding test.', 'Synthetic input for vector search.'])
+      ) return new Response('unexpected request', { status: 400 });
+      return Response.json({
+        data: input.map((_: string, index: number) => ({ index, embedding: Array(8).fill(0.1) })),
+      });
+    };
+  });
+
+  await page.getByRole('button', { name: 'Open settings', exact: true }).click();
+  const section = page.locator('#execution-runtime');
+  const picker = section.getByRole('combobox', { name: 'Embedding model' });
+  const verify = section.getByRole('button', { name: 'Verify and save embedding' });
+  await expect(picker.locator('option')).toHaveCount(3);
+  await picker.selectOption(`${embeddingConnection}:working`);
+  await verify.click();
+  await expect(section.getByText('Embedding model verified and saved.')).toBeVisible();
+  await picker.selectOption(`${embeddingConnection}:rejected`);
+  await verify.click();
+  await expect(section.getByRole('alert')).toContainText('HTTP 404');
+  await expect(section.getByText('private provider diagnostic')).toHaveCount(0);
+
+  await section.getByLabel('Maximum command duration (seconds)').fill('42');
+  await section.getByRole('button', { name: 'Save runtime settings' }).click();
+  await expect(section.getByText('Runtime settings saved.')).toBeVisible();
+  expect(await page.evaluate(() => window.aria!.runtimeSettings())).toMatchObject({
+    commandMs: 42_000,
+    embeddingTarget: { connectionId: embeddingConnection, model: 'working' },
+  });
+  await page.getByRole('button', { name: 'Back to chat', exact: true }).click();
+  await send('Ordinary chat after an embedding rejection');
+  await expect(page.locator('.from-assistant[data-status="completed"]')).toHaveCount(1);
 });
 
 async function enableFixtureModels(ids: string[], voice = false) {

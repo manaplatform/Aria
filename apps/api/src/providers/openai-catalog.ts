@@ -200,15 +200,15 @@ const descriptions = new Map([
   }),
   ...entries(['chatgpt-4o-latest'], ['chat', 'vision'], { contextTokens: 128000 }),
   ...entries(['gpt-4', 'gpt-4-0613', 'gpt-4-0314'], ['chat'], { contextTokens: 8192 }),
+  ...entries(['text-embedding-3-large', 'text-embedding-3-small', 'text-embedding-ada-002'], [
+    'embeddings',
+  ]),
   ...entries(
     [
       'gpt-realtime-translate',
       'gpt-live-transcribe',
       'gpt-realtime-whisper',
       'gpt-audio-1.5',
-      'text-embedding-3-large',
-      'text-embedding-3-small',
-      'text-embedding-ada-002',
       'omni-moderation-latest',
       'omni-moderation-2024-09-26',
       'gpt-audio',

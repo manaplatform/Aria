@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="logo.svg" alt="Logo" width="120" />
+</p>
+
 # Aria
 
 Aria is a desktop-first AI chatbot built with Electron, React, TypeScript, Tailwind, Radix UI, NestJS, and Vercel AI SDK.

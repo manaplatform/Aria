@@ -1,3 +1,4 @@
+import ColorSync
 import AppKit
 import ApplicationServices
 import ScreenCaptureKit
@@ -63,7 +64,8 @@ private final class Driver: NSObject, SCContentSharingPickerObserver {
             let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
             reply(id, ["trusted": AXIsProcessTrustedWithOptions(options)])
         case "screen_probe":
-            guard let display = input["displayId"] as? UInt32, screenBounds(display, input) != nil else {
+            guard let display = input["displayId"] as? UInt32, screenBounds(display, input) != nil,
+                  let key = screenKey(display) else {
                 reply(id, ["error": "The selected display is unavailable or mirrored."])
                 return
             }
@@ -71,11 +73,12 @@ private final class Driver: NSObject, SCContentSharingPickerObserver {
             if input["requestPointerPermission"] as? Bool == true && !CGPreflightPostEventAccess() {
                 _ = CGRequestPostEventAccess()
             }
-            reply(id, ["approved": true, "accessibility": CGPreflightPostEventAccess(), "messages": messagesURL() != nil])
+            reply(id, ["approved": true, "displayKey": key, "accessibility": CGPreflightPostEventAccess(), "messages": messagesURL() != nil])
         case "screen_pointer":
             pointer(id, input)
         case "open_application":
             guard let display = sharedDisplay, screenBounds(display, input) != nil,
+                  let key = screenKey(display), key == input["displayKey"] as? String,
                   input["application"] as? String == "messages", let url = messagesURL() else {
                 reply(id, ["error": "The selected display or system Messages app is unavailable."])
                 return
@@ -117,55 +120,105 @@ private final class Driver: NSObject, SCContentSharingPickerObserver {
         return bounds
     }
 
+    private func screenKey(_ display: CGDirectDisplayID) -> String? {
+        guard let uuid = CGDisplayCreateUUIDFromDisplayID(display)?.takeRetainedValue(),
+              let value = CFUUIDCreateString(nil, uuid) else { return nil }
+        return value as String
+    }
+
     private func pointer(_ id: String, _ input: [String: Any]) {
         guard CGPreflightPostEventAccess() else {
-            reply(id, ["error": "Allow the Aria native helper in macOS Accessibility, then select the display again."])
+            reply(id, ["error": "Allow the Aria native helper in macOS Accessibility, then check permissions again."])
             return
         }
         guard let display = sharedDisplay, let bounds = screenBounds(display, input),
-              let x = input["x"] as? Double, let y = input["y"] as? Double,
-              (0..<1).contains(x), (0..<1).contains(y),
+              let key = screenKey(display), key == input["displayKey"] as? String,
               let action = input["action"] as? String else {
-            reply(id, ["error": "The selected display or pointer position changed."])
+            reply(id, ["error": "The selected display changed. Observe it again."])
             return
         }
-        let point = CGPoint(x: bounds.minX + bounds.width * x, y: bounds.minY + bounds.height * y)
         let modifiers: CGEventFlags = [.maskCommand, .maskAlternate, .maskControl, .maskShift]
-        guard bounds.contains(point),
-              CGEventSource.flagsState(.combinedSessionState).intersection(modifiers).isEmpty,
+        guard CGEventSource.flagsState(.combinedSessionState).intersection(modifiers).isEmpty,
               ![CGMouseButton.left, .right, .center].contains(where: { CGEventSource.buttonState(.combinedSessionState, button: $0) }) else {
             reply(id, ["error": "Release any mouse buttons or modifier keys and retry."])
             return
         }
-        if action == "move", let event = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved,
-                                                mouseCursorPosition: point, mouseButton: .left) {
+        let positions = action == "drag" ? input["path"] as? [[String: Any]] ?? [] : [input]
+        let points = positions.compactMap { position -> CGPoint? in
+            guard let x = position["x"] as? Double, let y = position["y"] as? Double,
+                  (0..<1).contains(x), (0..<1).contains(y) else { return nil }
+            let point = CGPoint(x: bounds.minX + bounds.width * x, y: bounds.minY + bounds.height * y)
+            return bounds.contains(point) ? point : nil
+        }
+        guard points.count == positions.count, let first = points.first,
+              let events = mouseEvents(action, input, points) else {
+            reply(id, ["error": "The native mouse action could not be prepared."])
+            return
+        }
+        for event in events {
             event.flags = []
             event.post(tap: .cghidEventTap)
+        }
+        if action == "move" {
             DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(80)) {
                 let position = CGEvent(source: nil)?.location
-                let verified = position.map { abs($0.x - point.x) <= 2 && abs($0.y - point.y) <= 2 } ?? false
+                let verified = position.map { abs($0.x - first.x) <= 2 && abs($0.y - first.y) <= 2 } ?? false
                 self.reply(id, ["submitted": true, "verified": verified])
             }
-            return
+        } else {
+            reply(id, ["submitted": true])
         }
-        let buttons: [String: (CGMouseButton, CGEventType, CGEventType)] = [
-            "left": (.left, .leftMouseDown, .leftMouseUp),
-            "right": (.right, .rightMouseDown, .rightMouseUp),
-            "middle": (.center, .otherMouseDown, .otherMouseUp),
-        ]
-        guard action == "click", let name = input["button"] as? String,
-              let (button, down, up) = buttons[name],
-              let press = CGEvent(mouseEventSource: nil, mouseType: down, mouseCursorPosition: point, mouseButton: button),
-              let release = CGEvent(mouseEventSource: nil, mouseType: up, mouseCursorPosition: point, mouseButton: button) else {
-            reply(id, ["error": "The native pointer action could not be prepared."])
-            return
+    }
+
+    private func mouseEvents(_ action: String, _ input: [String: Any], _ points: [CGPoint]) -> [CGEvent]? {
+        guard let first = points.first,
+              let move = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved,
+                                 mouseCursorPosition: first, mouseButton: .left) else { return nil }
+        var events = [move]
+        switch action {
+        case "move":
+            break
+        case "click", "double_click":
+            let buttons: [String: (CGMouseButton, CGEventType, CGEventType)] = [
+                "left": (.left, .leftMouseDown, .leftMouseUp),
+                "right": (.right, .rightMouseDown, .rightMouseUp),
+                "middle": (.center, .otherMouseDown, .otherMouseUp),
+            ]
+            let name = action == "double_click" ? "left" : input["button"] as? String ?? ""
+            guard let (button, down, up) = buttons[name] else { return nil }
+            for count in 1...(action == "double_click" ? 2 : 1) {
+                for type in [down, up] {
+                    guard let event = CGEvent(mouseEventSource: nil, mouseType: type,
+                                              mouseCursorPosition: first, mouseButton: button) else { return nil }
+                    event.setIntegerValueField(.mouseEventClickState, value: Int64(count))
+                    events.append(event)
+                }
+            }
+        case "drag":
+            guard (2...32).contains(points.count),
+                  let last = points.last,
+                  let press = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown,
+                                      mouseCursorPosition: first, mouseButton: .left),
+                  let release = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp,
+                                        mouseCursorPosition: last, mouseButton: .left) else { return nil }
+            events.append(press)
+            for point in points.dropFirst() {
+                guard let drag = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDragged,
+                                         mouseCursorPosition: point, mouseButton: .left) else { return nil }
+                events.append(drag)
+            }
+            events.append(release)
+        case "scroll":
+            guard let x = input["scrollX"] as? Int32, let y = input["scrollY"] as? Int32,
+                  (-1500...1500).contains(x), (-1500...1500).contains(y),
+                  let wheel = CGEvent(scrollWheelEvent2Source: nil, units: .pixel,
+                                      wheelCount: 2, wheel1: -y, wheel2: -x, wheel3: 0) else { return nil }
+            wheel.location = first
+            events.append(wheel)
+        default:
+            return nil
         }
-        for event in [press, release] {
-            event.flags = []
-            event.setIntegerValueField(.mouseEventClickState, value: 1)
-            event.post(tap: .cghidEventTap)
-        }
-        reply(id, ["submitted": true])
+        return events
     }
 
     private func finishSelection(_ filter: SCContentFilter?) {

@@ -60,11 +60,15 @@ it('resolves speech transport and voices for documented audio variants and snaps
   for (const model of models.values()) expect(model.voices?.length).toBeGreaterThan(0);
 });
 
-it('identifies documented embedding and moderation models as having no supported Aria operations', async () => {
+it('recognizes documented embeddings and keeps moderation models unavailable', async () => {
   const ids = ['text-embedding-3-large', 'omni-moderation-latest'];
   const models = await discover(ids.map((id) => ({ id })));
-  for (const id of ids)
-    expect(models.get(id)).toMatchObject({ source: 'documentation', capabilities: [] });
+  expect(models.get('text-embedding-3-large')).toMatchObject({
+    source: 'documentation', capabilities: ['embeddings'],
+  });
+  expect(models.get('omni-moderation-latest')).toMatchObject({
+    source: 'documentation', capabilities: [],
+  });
 });
 
 it('keeps undocumented model IDs unknown instead of inferring capabilities from their spelling', async () => {

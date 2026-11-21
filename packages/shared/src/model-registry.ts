@@ -5,6 +5,7 @@ export const modelCapabilities = [
   'chat',
   'tools',
   'vision',
+  'embeddings',
   'image',
   'image-edit',
   'speech',

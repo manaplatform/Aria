@@ -5,10 +5,15 @@ import { release } from 'node:os';
 import path from 'node:path';
 import { app, nativeImage, screen, shell, type Display } from 'electron';
 import { z } from 'zod';
-import { computerLimits, type ComputerAction, type ComputerObservation } from '@aria/shared';
+import {
+  computerLimits,
+  type ComputerAction,
+  type ComputerObservation,
+  type LocalDesktopAccess,
+} from '@aria/shared';
 import { captureDisplayThumbnail, displayAccessGranted } from '../screen-capture';
-import type { ComputerDriver } from './computer';
-import { digest, RuntimeError } from './store';
+import { isLocalPointerAction, localPointerPoints, type ComputerDriver } from './computer';
+import { digest, RuntimeError, type LocalDesktopGrant, type RuntimeStore } from './store';
 
 const response = z.object({
   id: z.string().uuid(),
@@ -19,6 +24,7 @@ const response = z.object({
   submitted: z.boolean().optional(),
   verified: z.boolean().optional(),
   messages: z.boolean().optional(),
+  displayKey: z.string().min(1).max(256).optional(),
   image: z
     .base64()
     .max(Math.ceil(computerLimits.imageBytes / 3) * 4)
@@ -44,6 +50,7 @@ class Helper {
   private buffer = '';
   private pending?: (value?: z.infer<typeof response>) => void;
   private id?: string;
+  private operation?: string;
   alive = true;
 
   constructor(filename: string) {
@@ -78,13 +85,16 @@ class Helper {
       throw new RuntimeError('CAPABILITY_UNAVAILABLE', 'The native window driver is unavailable.');
     const id = randomUUID();
     this.id = id;
+    this.operation = operation;
     const value = await new Promise<z.infer<typeof response> | undefined>((resolve) => {
       const abort = () => this.close();
       this.pending = (result) => {
         signal.removeEventListener('abort', abort);
         this.pending = undefined;
         this.id = undefined;
+        this.operation = undefined;
         resolve(result);
+        if (!this.alive) this.child.kill();
       };
       signal.addEventListener('abort', abort, { once: true });
       this.child.stdin.write(`${JSON.stringify({ id, operation, ...input })}\n`);
@@ -106,16 +116,29 @@ class Helper {
   close() {
     if (!this.alive) return;
     this.alive = false;
+    if (this.operation === 'screen_pointer') {
+      // A submitted native gesture is bounded and must be allowed to release its button.
+      const deadline = setTimeout(() => {
+        if (this.pending) {
+          this.pending();
+          this.child.kill('SIGKILL');
+        }
+      }, 1000);
+      deadline.unref();
+      return;
+    }
     this.pending?.();
     this.child.kill('SIGKILL');
   }
 }
 
 type ScreenTarget = { id: number; label: string; requestPointerPermission?: boolean };
-type ScreenControl = { helper: Helper; pointer: boolean; messages: boolean };
+type ScreenControl = { helper: Helper; displayKey: string; pointer: boolean; messages: boolean };
+const screenActions = ['screenshot', 'open_file_manager'] as const;
+const pointerActions = ['move', 'click', 'double_click', 'drag', 'scroll'] as const;
 type Grant = { owner: string; expires: number; key?: string; revision: string } & (
   | { kind: 'window'; helper: Helper }
-  | { kind: 'screen'; display: ScreenTarget; control?: ScreenControl; standingProvider?: string }
+  | { kind: 'screen'; display: ScreenTarget; control?: ScreenControl; standing?: LocalDesktopGrant }
 );
 
 function displayGeometry(display: Display) {
@@ -127,7 +150,13 @@ export class LocalComputer implements ComputerDriver {
   private prepared?: Grant;
   private readonly sessions = new Map<string, Grant>();
 
-  constructor(private readonly providerIdentity: () => string | undefined = () => undefined) {}
+  private suspended = false;
+  private generation = 0;
+
+  constructor(
+    private readonly store: RuntimeStore,
+    private readonly providerIdentity: () => string | undefined,
+  ) {}
 
   private binary() {
     const file =
@@ -145,18 +174,39 @@ export class LocalComputer implements ComputerDriver {
     return !!this.binary();
   }
 
+  configured() {
+    return !!this.standingGrant() || this.ready();
+  }
+
   ready() {
     return (
-      !!this.availableGrant() || [...this.sessions.values()].some((grant) => this.alive(grant))
+      !this.suspended &&
+      (!!this.availableGrant() ||
+        !!this.standingGrant() ||
+        [...this.sessions.values()].some((grant) => this.alive(grant)))
     );
   }
 
+  private standingGrant() {
+    const provider = this.providerIdentity();
+    if (!provider) return;
+    try {
+      const grant = this.store.localDesktopGrant();
+      if (grant?.provider === provider) return grant;
+    } catch {
+      // An unreadable grant store denies desktop access without blocking ordinary chat.
+    }
+  }
+
   private alive(grant: Grant) {
-    return grant.kind === 'window'
-      ? grant.helper.alive
-      : (!grant.standingProvider || grant.standingProvider === this.providerIdentity()) &&
-          displayAccessGranted() &&
-          screen.getAllDisplays().some(({ id }) => id === grant.display.id);
+    if (this.suspended) return false;
+    if (grant.kind === 'window') return grant.helper.alive;
+    return (
+      (!grant.standing || grant.standing.id === this.standingGrant()?.id) &&
+      (!grant.control || grant.control.helper.alive) &&
+      displayAccessGranted() &&
+      screen.getAllDisplays().some(({ id }) => id === grant.display.id)
+    );
   }
 
   private availableGrant() {
@@ -170,22 +220,44 @@ export class LocalComputer implements ComputerDriver {
   private setPrepared(grant: Grant) {
     if (this.prepared) this.closeGrant(this.prepared);
     this.prepared = grant;
-    if (Number.isFinite(grant.expires)) {
-      const timer = setTimeout(() => this.availableGrant(), 120_000);
-      timer.unref();
-    }
+    const timer = setTimeout(() => this.availableGrant(), 120_000);
+    timer.unref();
+  }
+
+  private screenActions(control?: ScreenControl): ComputerAction['type'][] {
+    return [
+      ...screenActions,
+      ...(control?.messages ? ['open_application' as const] : []),
+      ...(control?.pointer ? pointerActions : []),
+    ];
   }
 
   actions(owner: string, id?: string): ComputerAction['type'][] {
     const grant = id ? this.sessions.get(id) : this.availableGrant();
     if (!grant || grant.owner !== owner || !this.alive(grant)) return [];
-    if (grant.kind === 'window') return ['set_value', 'screenshot', 'wait'];
-    const actions: ComputerAction['type'][] = ['screenshot', 'open_file_manager'];
-    if (grant.control?.helper.alive) {
-      if (grant.control.messages) actions.push('open_application');
-      if (grant.control.pointer) actions.push('move', 'click');
+    return grant.kind === 'window'
+      ? ['set_value', 'screenshot', 'wait']
+      : this.screenActions(grant.control);
+  }
+
+  async inspectActions(owner: string, signal: AbortSignal) {
+    const prepared = this.actions(owner);
+    const standing = this.standingGrant();
+    if (prepared.length || !standing || this.suspended || !displayAccessGranted()) return prepared;
+    const found = await this.resolveScreen(standing.displayKey, signal);
+    if (!found) return [];
+    try {
+      await captureDisplayThumbnail(found.display.id, { width: 64, height: 64 });
+      await this.checkScreen(found.control, found.display, signal);
+      signal.throwIfAborted();
+      if (this.suspended || this.standingGrant()?.id !== standing.id) return [];
+      return this.screenActions(found.control);
+    } catch {
+      signal.throwIfAborted();
+      return [];
+    } finally {
+      found.control.helper.close();
     }
-    return actions;
   }
 
   targetAlive(owner: string, _target: string, id: string) {
@@ -198,40 +270,37 @@ export class LocalComputer implements ComputerDriver {
     return (
       grant?.kind === 'screen' &&
       grant.owner === owner &&
-      grant.standingProvider === provider &&
+      grant.standing?.provider === provider &&
       this.alive(grant)
     );
   }
 
   pointerFingerprint(
-    ...[capture, point]: Parameters<NonNullable<ComputerDriver['pointerFingerprint']>>
+    ...[capture, action]: Parameters<NonNullable<ComputerDriver['pointerFingerprint']>>
   ) {
     const { screenshot } = capture.observation;
     if (!capture.bytes || !screenshot) return;
     const image = nativeImage.createFromBuffer(Buffer.from(capture.bytes));
     if (image.isEmpty()) return;
     const { width, height } = image.getSize();
-    if (
-      width !== screenshot.width ||
-      height !== screenshot.height ||
-      point.x >= width ||
-      point.y >= height
-    )
-      return;
-    // A prompt or activity update elsewhere on the display does not change the approved target.
+    if (width !== screenshot.width || height !== screenshot.height) return;
+    // Changes elsewhere on the display, such as the approval dialog closing, are immaterial.
     const radius = 48;
-    const x = Math.max(0, point.x - radius);
-    const y = Math.max(0, point.y - radius);
-    const region = image.crop({
-      x,
-      y,
-      width: Math.min(width, point.x + radius + 1) - x,
-      height: Math.min(height, point.y + radius + 1) - y,
+    const regions = localPointerPoints(action, screenshot).map((point) => {
+      const x = Math.max(0, point.x - radius);
+      const y = Math.max(0, point.y - radius);
+      const region = image.crop({
+        x,
+        y,
+        width: Math.min(width, point.x + radius + 1) - x,
+        height: Math.min(height, point.y + radius + 1) - y,
+      });
+      return region.isEmpty() ? undefined : digest(region.toPNG());
     });
-    if (!region.isEmpty()) return digest(region.toPNG());
+    if (regions.every(Boolean)) return digest(JSON.stringify(regions));
   }
 
-  async prepare(owner: string, signal: AbortSignal) {
+  async prepare(owner: string, signal: AbortSignal, beforeCommit = () => {}) {
     const binary = this.binary();
     if (!binary)
       throw new RuntimeError(
@@ -254,6 +323,7 @@ export class LocalComputer implements ComputerDriver {
           'CAPABILITY_UNAVAILABLE',
           'Open an editable text editor window and select it again.',
         );
+      beforeCommit();
       this.setPrepared({
         kind: 'window',
         owner,
@@ -272,32 +342,67 @@ export class LocalComputer implements ComputerDriver {
     display: ScreenTarget,
     signal: AbortSignal,
     standingProvider?: string,
+    beforeCommit = () => {},
   ) {
     signal.throwIfAborted();
-    await captureDisplayThumbnail(display.id, { width: 64, height: 64 });
-    signal.throwIfAborted();
     const selected = this.selectedDisplay(display.id);
-    const control = await this.screenControl(
-      selected,
-      display.requestPointerPermission === true,
-      signal,
-    );
-    if (standingProvider && this.providerIdentity() !== standingProvider) {
-      control?.helper.close();
-      throw new RuntimeError(
-        'PERMISSION_DENIED',
-        'The configured primary changed during display selection.',
-      );
+    const helper = this.newHelper();
+    try {
+      const control =
+        helper && (await this.probe(helper, selected, !!display.requestPointerPermission, signal));
+      if (standingProvider) {
+        const matched = control && (await this.resolveScreen(control.displayKey, signal));
+        if (!matched || matched.display.id !== display.id) {
+          matched?.control.helper.close();
+          throw new RuntimeError(
+            'CAPABILITY_UNAVAILABLE',
+            'Aria could not identify this display for ongoing access.',
+          );
+        }
+        matched.control.helper.close();
+      }
+      try {
+        await captureDisplayThumbnail(display.id, { width: 64, height: 64 });
+      } catch (error) {
+        if (!standingProvider || displayAccessGranted()) throw error;
+      }
+      if (control) await this.checkScreen(control, selected, signal);
+      signal.throwIfAborted();
+      beforeCommit();
+      if (this.suspended)
+        throw new RuntimeError(
+          'PERMISSION_DENIED',
+          'Unlock the desktop before selecting a display.',
+        );
+      if (standingProvider && control) {
+        if (this.providerIdentity() !== standingProvider)
+          throw new RuntimeError(
+            'PERMISSION_DENIED',
+            'The primary changed during display selection.',
+          );
+        this.store.saveLocalDesktopGrant({
+          id: randomUUID(),
+          provider: standingProvider,
+          displayKey: control.displayKey,
+          label: display.label,
+        });
+        this.closePrepared();
+      } else {
+        this.setPrepared({
+          kind: 'screen',
+          owner,
+          display,
+          control,
+          expires: Date.now() + 120_000,
+          revision: randomUUID(),
+        });
+        if (control) return;
+      }
+    } catch (error) {
+      helper?.close();
+      throw error;
     }
-    this.setPrepared({
-      kind: 'screen',
-      owner,
-      display,
-      control,
-      standingProvider,
-      expires: standingProvider ? Infinity : Date.now() + 120_000,
-      revision: randomUUID(),
-    });
+    helper?.close();
   }
 
   private selectedDisplay(id: number) {
@@ -307,32 +412,105 @@ export class LocalComputer implements ComputerDriver {
     return display;
   }
 
-  private async screenControl(
+  private newHelper() {
+    const binary = this.binary();
+    if (binary) return new Helper(binary);
+  }
+
+  private screenBounds(display: Display) {
+    return process.platform === 'win32'
+      ? screen.dipToScreenRect(null, display.bounds)
+      : display.bounds;
+  }
+
+  private async probe(
+    helper: Helper,
     display: Display,
     requestPointerPermission: boolean,
     signal: AbortSignal,
   ) {
-    const binary = process.platform === 'darwin' ? this.binary() : undefined;
-    if (!binary) return;
-    const helper = new Helper(binary);
     try {
       const proof = await helper.run(
         'screen_probe',
         {
           displayId: display.id,
-          bounds: display.bounds,
+          bounds: this.screenBounds(display),
           requestPointerPermission,
         },
         signal,
       );
-      if (proof.approved && (proof.accessibility || proof.messages))
-        return { helper, pointer: !!proof.accessibility, messages: !!proof.messages };
+      if (proof.approved && proof.displayKey) {
+        return {
+          helper,
+          displayKey: proof.displayKey,
+          pointer: !!proof.accessibility,
+          messages: !!proof.messages,
+        };
+      }
     } catch {
       signal.throwIfAborted();
-    } finally {
-      if (signal.aborted) helper.close();
     }
-    helper.close();
+  }
+
+  private async checkScreen(control: ScreenControl, display: Display, signal: AbortSignal) {
+    const proof = await this.probe(control.helper, display, false, signal);
+    if (
+      proof?.displayKey !== control.displayKey ||
+      displayGeometry(display) !== displayGeometry(this.selectedDisplay(display.id))
+    )
+      throw new RuntimeError(
+        'CAPABILITY_UNAVAILABLE',
+        'The selected display changed. Open a new local desktop session.',
+      );
+    control.pointer = proof.pointer;
+    control.messages = proof.messages;
+  }
+
+  private async resolveScreen(displayKey: string, signal: AbortSignal, requestPermission = false) {
+    const helper = this.newHelper();
+    if (!helper) return;
+    let retain = false;
+    try {
+      let selected: Display | undefined;
+      for (const display of screen.getAllDisplays()) {
+        const proof = await this.probe(helper, display, false, signal);
+        if (proof?.displayKey !== displayKey) continue;
+        if (selected) return;
+        selected = display;
+      }
+      if (!selected) return;
+      const control = await this.probe(helper, selected, requestPermission, signal);
+      if (control?.displayKey !== displayKey) return;
+      retain = true;
+      return { display: selected, control };
+    } finally {
+      if (!retain) helper.close();
+    }
+  }
+
+  async access(signal: AbortSignal, requestPermission = false): Promise<LocalDesktopAccess> {
+    const standing = this.store.localDesktopGrant();
+    if (!standing) return { state: 'off' };
+    const display = standing.label;
+    if (this.standingGrant()?.id !== standing.id) return { state: 'primary-changed', display };
+    if (this.suspended) return { state: 'unavailable', display };
+    const found = await this.resolveScreen(standing.displayKey, signal, requestPermission);
+    if (!found) return { state: 'unavailable', display };
+    try {
+      if (requestPermission || displayAccessGranted()) {
+        try {
+          await captureDisplayThumbnail(found.display.id, { width: 64, height: 64 });
+        } catch {
+          signal.throwIfAborted();
+          return { state: displayAccessGranted() ? 'unavailable' : 'screen-permission', display };
+        }
+      }
+      signal.throwIfAborted();
+      if (!displayAccessGranted()) return { state: 'screen-permission', display };
+      return { state: found.control.pointer ? 'ready' : 'pointer-permission', display };
+    } finally {
+      found.control.helper.close();
+    }
   }
 
   async open(
@@ -342,16 +520,48 @@ export class LocalComputer implements ComputerDriver {
     signal: AbortSignal,
   ) {
     signal.throwIfAborted();
-    const selected = this.availableGrant();
-    if (!selected || selected.owner !== owner)
+    const prepared = this.availableGrant();
+    if (prepared?.owner === owner) {
+      this.prepared = undefined;
+      this.sessions.set(id, prepared);
+      return id;
+    }
+    const standing = this.standingGrant();
+    if (!standing || this.suspended)
+      throw new RuntimeError('PERMISSION_DENIED', 'Approve a display in Settings → Tools.');
+    if (!displayAccessGranted())
       throw new RuntimeError(
         'PERMISSION_DENIED',
-        'Select a window or full screen for this conversation in Settings.',
+        'Allow Aria in macOS Screen & System Audio Recording.',
       );
-    if (selected.kind === 'screen' && selected.standingProvider) selected.revision = randomUUID();
-    else this.prepared = undefined;
-    this.sessions.set(id, selected);
-    return id;
+    const generation = this.generation;
+    const found = await this.resolveScreen(standing.displayKey, signal);
+    if (!found)
+      throw new RuntimeError(
+        'CAPABILITY_UNAVAILABLE',
+        'Reconnect the approved display or change it in Settings → Tools.',
+      );
+    const { display, control } = found;
+    try {
+      await captureDisplayThumbnail(display.id, { width: 64, height: 64 });
+      await this.checkScreen(control, display, signal);
+      signal.throwIfAborted();
+      if (this.generation !== generation || this.standingGrant()?.id !== standing.id)
+        throw new RuntimeError('PERMISSION_DENIED', 'The local desktop grant changed.');
+      this.sessions.set(id, {
+        kind: 'screen',
+        owner,
+        standing,
+        revision: randomUUID(),
+        expires: Infinity,
+        display: { id: display.id, label: standing.label },
+        control,
+      });
+      return id;
+    } catch (error) {
+      control.helper.close();
+      throw error;
+    }
   }
 
   private grant(owner: string, id: string) {
@@ -369,6 +579,8 @@ export class LocalComputer implements ComputerDriver {
     if (grant.kind === 'screen') {
       const display = this.selectedDisplay(grant.display.id);
       const geometry = displayGeometry(display);
+      if (grant.control) await this.checkScreen(grant.control, display, signal);
+      this.grant(owner, id);
       if (grant.key !== geometry) {
         grant.key = geometry;
         grant.revision = randomUUID();
@@ -394,6 +606,7 @@ export class LocalComputer implements ComputerDriver {
       signal.throwIfAborted();
       const side = computerLimits.frameSide;
       let frame = await captureDisplayThumbnail(display.id, { width: side, height: side });
+      if (grant.control) await this.checkScreen(grant.control, display, signal);
       signal.throwIfAborted();
       this.grant(owner, id);
       if (displayGeometry(this.selectedDisplay(display.id)) !== geometry)
@@ -459,7 +672,7 @@ export class LocalComputer implements ComputerDriver {
     const grant = this.grant(owner, id);
     if (
       grant.kind === 'screen' &&
-      (action.type === 'move' || action.type === 'click' || action.type === 'open_application')
+      (isLocalPointerAction(action) || action.type === 'open_application')
     ) {
       const { control } = grant;
       if (!control?.helper.alive || !this.actions(owner, id).includes(action.type))
@@ -478,7 +691,8 @@ export class LocalComputer implements ComputerDriver {
           'open_application',
           {
             application: action.application,
-            bounds: display.bounds,
+            displayKey: control.displayKey,
+            bounds: this.screenBounds(display),
           },
           signal,
         );
@@ -490,19 +704,20 @@ export class LocalComputer implements ComputerDriver {
         return 'verified' as const;
       }
       const frame = observation.screenshot;
-      if (!frame || action.x >= frame.width || action.y >= frame.height || action.keys?.length)
-        throw new RuntimeError(
-          'INVALID_ARGUMENT',
-          'Use an unmodified pointer action inside the current screenshot.',
-        );
+      if (!frame) throw new RuntimeError('INVALID_ARGUMENT', 'A screenshot is required.');
+      const normalized = localPointerPoints(action, frame).map(({ x, y }) => ({
+        x: (x + 0.5) / frame.width,
+        y: (y + 0.5) / frame.height,
+      }));
       const result = await control.helper.run(
         'screen_pointer',
         {
           action: action.type,
-          bounds: display.bounds,
-          x: (action.x + 0.5) / frame.width,
-          y: (action.y + 0.5) / frame.height,
+          displayKey: control.displayKey,
+          bounds: this.screenBounds(display),
+          ...(action.type === 'drag' ? { path: normalized } : normalized[0]),
           ...(action.type === 'click' && { button: action.button }),
+          ...(action.type === 'scroll' && { scrollX: action.scrollX, scrollY: action.scrollY }),
         },
         signal,
       );
@@ -556,27 +771,39 @@ export class LocalComputer implements ComputerDriver {
   close(owner: string, _target: string, id: string) {
     const grant = this.sessions.get(id);
     if (grant?.owner === owner) {
-      if (this.prepared !== grant) this.closeGrant(grant);
+      this.closeGrant(grant);
       this.sessions.delete(id);
     }
   }
 
   disconnectDisplay(displayId: number) {
-    if (this.prepared?.kind === 'screen' && this.prepared.display.id === displayId) {
-      this.closeGrant(this.prepared);
-      this.prepared = undefined;
-    }
-    for (const [id, grant] of this.sessions) {
-      if (grant.kind === 'screen' && grant.display.id === displayId)
-        this.close(grant.owner, id, id);
-    }
+    const matches = (grant: Grant) => grant.kind === 'screen' && grant.display.id === displayId;
+    if (this.prepared && matches(this.prepared)) this.closePrepared();
+    const affected = [...this.sessions].filter(([, grant]) => matches(grant));
+    for (const [id, grant] of affected) this.close(grant.owner, id, id);
+    return affected.length > 0;
+  }
+
+  setSuspended(suspended: boolean) {
+    this.suspended = suspended;
+    if (suspended) this.reset();
   }
 
   revoke() {
-    if (this.prepared) this.closeGrant(this.prepared);
-    this.prepared = undefined;
+    this.reset();
+    this.store.revokeLocalDesktopGrant();
+  }
+
+  reset() {
+    this.generation++;
+    this.closePrepared();
     for (const grant of this.sessions.values()) this.closeGrant(grant);
     this.sessions.clear();
+  }
+
+  private closePrepared() {
+    if (this.prepared) this.closeGrant(this.prepared);
+    this.prepared = undefined;
   }
 
   private closeGrant(grant: Grant) {

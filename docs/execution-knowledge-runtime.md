@@ -18,6 +18,8 @@ Attach documents in chat or add them to a library and enable that library for ch
 
 For offline semantic and hybrid ranking, obtain the pinned [multilingual ONNX pack](https://huggingface.co/Xenova/paraphrase-multilingual-MiniLM-L12-v2/tree/2c4055b12046f11709e9df2c122e59ffbdc2f900). Put `tokenizer.json` and `tokenizer_config.json` in the selected directory and `model_quantized.onnx` in its `onnx` subdirectory. Select that directory from **Install local embedding pack**. Aria checks every file against its expected SHA-256 before enabling inference. Keyword and phrase search use SQLite FTS5.
 
+For remote semantic and hybrid ranking, enable an embedding model on an HTTPS connection in **Settings → AI Models**. If the catalog lists only the model ID, declare **Embeddings** under that model’s **Capabilities**. Save AI Models, select the model in **Tools → Execution and knowledge**, and click **Verify and save embedding**. Aria sends synthetic inputs to `/embeddings` and saves the selection after receiving valid vectors. Runtime settings have their own save action. Document passages and queries require separate approval before transfer to the embedding provider.
+
 Use an artifact's card to preview, save, or attach it to a draft. Local artifacts receive opaque IDs after verification. Executable example skills are packaged with Aria and use the managed workspace.
 
 ## OpenAI provider modes

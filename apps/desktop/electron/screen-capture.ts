@@ -37,7 +37,7 @@ export async function chooseDisplay(
     cancelId: 0,
     ...(offerPointerPermission &&
       process.platform === 'darwin' && {
-        checkboxLabel: 'Request macOS Accessibility permission for pointer control',
+        checkboxLabel: 'Request macOS Accessibility permission for mouse control',
       }),
   });
   const display = displays[response - 1];
@@ -65,7 +65,7 @@ export async function captureDisplayThumbnail(id: number, thumbnailSize: Size) {
   if (!displayAccessGranted()) throw new Error(permissionMessage);
   const source = sources.find((candidate) => candidate.display_id === String(id));
   if (!source || source.thumbnail.isEmpty())
-    throw new Error('The selected display could not be captured. Select it again and retry.');
+    throw new Error('The selected display could not be captured. Check that it is connected and retry.');
   return source.thumbnail;
 }
 

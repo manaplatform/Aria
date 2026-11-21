@@ -189,6 +189,10 @@ export const computerSessionSummary = z.strictObject({
 });
 
 export type ComputerAction = z.infer<typeof computerAction>;
+export type LocalDesktopAccess = {
+  display?: string;
+  state: 'off' | 'ready' | 'primary-changed' | 'screen-permission' | 'pointer-permission' | 'unavailable';
+};
 export type ComputerObservation = z.infer<typeof computerObservation>;
 export type ComputerImage = z.infer<typeof computerImage>;
 export type ComputerEnvironment = z.infer<typeof computerEnvironment>;

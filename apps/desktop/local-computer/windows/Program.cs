@@ -27,25 +27,36 @@ internal static class Program
         while (Console.ReadLine() is { Length: <= 20000 } line)
         {
             string? id = null;
+            string? operation = null;
             try
             {
                 using var request = JsonDocument.Parse(line);
                 var input = request.RootElement;
                 id = input.GetProperty("id").GetString();
                 if (!Guid.TryParse(id, out _)) continue;
-                var result = input.GetProperty("operation").GetString() switch
+                operation = input.GetProperty("operation").GetString();
+                var result = operation switch
                 {
                     "pick" => Pick(),
                     "observe" => Observe(input.GetProperty("image").GetBoolean()),
                     "set_value" => SetValue(input),
+                    "screen_probe" => ScreenMouse.Probe(input),
+                    "screen_pointer" => ScreenMouse.Act(input),
                     _ => throw new InvalidOperationException(),
                 };
                 result["id"] = id;
                 Console.WriteLine(JsonSerializer.Serialize(result));
             }
+            catch (ScreenMouseError error)
+            {
+                if (id is not null) Console.WriteLine(JsonSerializer.Serialize(new { id, error = error.Message }));
+            }
             catch (Exception)
             {
-                if (id is not null) Console.WriteLine(JsonSerializer.Serialize(new { id, error = "The selected Notepad window is unavailable or no longer authorized." }));
+                var error = operation is "screen_probe" or "screen_pointer"
+                    ? "The Windows desktop helper could not complete the requested operation."
+                    : "The selected Notepad window is unavailable or no longer authorized.";
+                if (id is not null) Console.WriteLine(JsonSerializer.Serialize(new { id, error }));
             }
         }
     }

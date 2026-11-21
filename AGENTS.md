@@ -149,7 +149,7 @@ When implementing AI features:
 - Register optional Computer Use operations in the shared Tool Registry and execution lifecycle. Keep semantic decisions with the configured primary. Let Browser, Web Search, Shell, File Search, and Skills complement graphical interaction. Ordinary chat works without a project, a computer session, or a required observation loop.
 - Advertise only verified environment actions and provider transports. Require explicit environment and mode selection. Keep protocol details inside provider adapters and return actionable errors when either capability is unavailable.
 - Use Electron main and the existing scoped port, authorization checks, and dispatch journal. Treat interface content and artifacts as untrusted. Bind approvals and coordinates to the current target, action, and observation. Fence input on cancellation, scope changes, user takeover, and recovery.
-- Keep local desktop off until the user selects an authorized window. Use window-scoped native helpers for platform APIs. Keep authentication private and hold computer scripts in isolated runtimes behind the same action and transfer boundary.
+- Keep local desktop off until the user approves a window or display. Use native helpers scoped to that target and keep revocable grants bound to the approved primary. Keep authentication private and hold computer scripts in isolated runtimes behind the same action and transfer boundary.
 - Verify observable postconditions before reporting consequential success. Treat interrupted effects as uncertain and inspect the target before retrying.
 
 ## Conductor Programmatic Tool Calling

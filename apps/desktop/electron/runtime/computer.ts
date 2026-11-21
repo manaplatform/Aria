@@ -45,6 +45,24 @@ const scriptRequest = z.discriminatedUnion('request', [
 ]);
 const terminal = new Set<Status>(['completed', 'cancelled', 'failed', 'expired']);
 
+export type LocalPointerAction = Extract<
+  ComputerAction, { type: 'move' | 'click' | 'double_click' | 'drag' | 'scroll' }
+>;
+
+export function isLocalPointerAction(action: ComputerAction): action is LocalPointerAction {
+  return (
+    action.type === 'move' || action.type === 'click' || action.type === 'double_click' ||
+    action.type === 'drag' || action.type === 'scroll'
+  );
+}
+
+export function localPointerPoints(action: LocalPointerAction, frame: ComputerObservation['screenshot']) {
+  const points = action.type === 'drag' ? action.path : [{ x: action.x, y: action.y }];
+  if (!frame || action.keys || points.some(({ x, y }) => x < 0 || y < 0 || x >= frame.width || y >= frame.height))
+    throw new RuntimeError('INVALID_ARGUMENT', 'Use unmodified mouse input inside the current screenshot.');
+  return points;
+}
+
 function describeInput(action: InputAction) {
   switch (action.type) {
     case 'open_application':
@@ -77,10 +95,11 @@ export interface ComputerDriver {
   readonly environment: ComputerEnvironment;
   ready(): boolean;
   actions?(owner: string, id?: string): ComputerAction['type'][];
+  inspectActions?(owner: string, signal: AbortSignal): Promise<ComputerAction['type'][]>;
   standingAccess?(owner: string, id: string, provider: string): boolean;
   pointerFingerprint?(
     capture: Capture,
-    action: Extract<ComputerAction, { type: 'click' | 'move' }>,
+    action: LocalPointerAction,
   ): string | undefined;
   targetAlive?(owner: string, target: string, id: string): boolean;
   wait?(owner: string, target: string, id: string, signal: AbortSignal): Promise<void>;
@@ -368,7 +387,10 @@ export class ComputerRuntime {
         (item) => item.environment === 'managed-browser' && item.ready(),
       );
       const local = this.drivers.find((item) => item.environment === 'local-desktop');
-      const localActions = local?.actions?.(request.conversationId) ?? [];
+      const localActions = this.foreground(request.conversationId)
+        ? await local?.inspectActions?.(request.conversationId, signal) ??
+          local?.actions?.(request.conversationId) ?? []
+        : [];
       return {
         data: {
           environments: [
@@ -413,6 +435,9 @@ export class ComputerRuntime {
               environment: 'local-desktop',
               available: localActions.length > 0,
               actions: localActions,
+              ...(localActions.length === 0 && {
+                reason: 'Check the approved display and permissions in Settings → Tools.',
+              }),
             },
           ],
           sessions: this.states(request.conversationId).map(
@@ -608,7 +633,7 @@ export class ComputerRuntime {
           action.type === 'open_file_manager' ||
           action.type === 'open_application' ||
           (session.summary.environment === 'local-desktop' &&
-            (action.type === 'move' || action.type === 'click')) ||
+            isLocalPointerAction(action)) ||
           dispatched.has(index)
         )
           throw new RuntimeError(
@@ -879,6 +904,8 @@ export class ComputerRuntime {
     if (!input.success)
       throw new RuntimeError('INVALID_ARGUMENT', 'The computer environment request is invalid.');
     const { environment, mode, tabId, restoreId, resumeId } = input.data;
+    if (environment === 'local-desktop' && (mode !== 'aria' || request.programId))
+      throw new RuntimeError('PERMISSION_DENIED', 'Local desktop requires direct Aria Computer Use.');
     const owner = request.conversationId;
     const provider = this.identity();
     const driver = this.drivers.find((item) => item.environment === environment && item.ready());
@@ -1166,26 +1193,24 @@ export class ComputerRuntime {
       if (!reference) break;
       const localPointer =
         session.summary.environment === 'local-desktop' &&
-        (action.type === 'move' || action.type === 'click');
+        isLocalPointerAction(action);
       if (localPointer) {
-        const frame = reference.observation.screenshot;
-        if (reference.observation.id !== input.observationId || !reference.bytes || !frame)
+        if (request.programId)
+          throw new RuntimeError('PERMISSION_DENIED', 'Local mouse input requires a direct tool call.');
+        if (reference.observation.id !== input.observationId || !reference.bytes)
           throw new RuntimeError(
             'INVALID_ARGUMENT',
-            'Use a fresh, approved image observation before moving or clicking on the selected display.',
+            'Use the latest approved image observation for mouse input on the selected display.',
           );
-        if (action.x >= frame.width || action.y >= frame.height || action.keys?.length)
-          throw new RuntimeError(
-            'INVALID_ARGUMENT',
-            'Use an unmodified pointer action inside the current screenshot.',
-          );
+        localPointerPoints(action, reference.observation.screenshot);
       }
-      const fingerprint = (capture: Capture) =>
-        this.captureDigest(
-          capture,
-          localPointer ? session.driver.pointerFingerprint?.(capture, action) : undefined,
-        );
+      const fingerprint = (capture: Capture) => {
+        const target = localPointer ? session.driver.pointerFingerprint?.(capture, action) : undefined;
+        return !localPointer || target ? this.captureDigest(capture, target) : undefined;
+      };
       const expected = fingerprint(reference);
+      if (!expected)
+        throw new RuntimeError('INVALID_ARGUMENT', 'Observe the display again before sending mouse input.');
       const current = await this.capture(session, !!reference.bytes, active);
       if (expected !== fingerprint(current)) {
         reference = current;
@@ -1411,6 +1436,10 @@ export class ComputerRuntime {
     for (const session of this.sessions.values()) {
       if (session.summary.conversationId !== conversation || terminal.has(session.summary.status))
         continue;
+      if (session.summary.environment === 'local-desktop') {
+        void this.close(session, 'cancelled');
+        continue;
+      }
       session.lease++;
       session.capture = undefined;
       session.active?.controller.abort();
