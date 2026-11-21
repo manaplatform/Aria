@@ -1,6 +1,6 @@
 import type { ConductorSource } from '@aria/shared';
 import type { ReactNode } from 'react';
-import ReactMarkdown from 'react-markdown';
+import ReactMarkdown, { defaultUrlTransform } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { CopyButton } from '../ui';
 import { openExternal, errorMessage } from '../../services/desktop';
@@ -28,20 +28,37 @@ export default function MarkdownRenderer({
   content,
   sources = [],
   research = false,
+  evidenceIds = [],
+  onEvidence,
 }: {
   content: string;
   sources?: ConductorSource[];
   research?: boolean;
+  evidenceIds?: string[];
+  onEvidence?: (id: string) => void;
 }): ReactNode {
   return (
     <div className="markdown">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
+        urlTransform={(value) =>
+          value.startsWith('aria-evidence:') && evidenceIds.includes(value.slice(14))
+            ? value
+            : defaultUrlTransform(value)
+        }
         components={{
           pre: ({ children }) => <CodeBlock>{children}</CodeBlock>,
           a: ({ href, children }) =>
-            !href ||
-            ((research || sources.length) && !sources.some((source) => source.url === href)) ? (
+            href?.startsWith('aria-evidence:') && evidenceIds.includes(href.slice(14)) ? (
+              <button
+                className="document-evidence-link"
+                type="button"
+                onClick={() => onEvidence?.(href.slice(14))}
+              >
+                {children}
+              </button>
+            ) : !href ||
+              ((research || sources.length) && !sources.some((source) => source.url === href)) ? (
               <>{children}</>
             ) : (
               <a

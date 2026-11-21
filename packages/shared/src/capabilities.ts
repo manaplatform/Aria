@@ -1,4 +1,9 @@
 import { z } from 'zod';
+import {
+  openAIRuntimeFeatureSchema,
+  runtimeCallSchema,
+  runtimeResultSchema,
+} from './execution-runtime.js';
 import { identifier } from './model-registry.js';
 
 export const capabilityId = z
@@ -35,6 +40,8 @@ export const toolPolicySchema = z.strictObject({
   disabled: z.array(capabilityId).max(1024),
   discovery: toolDiscoverySchema,
   nativeVerified: z.boolean().optional(),
+  desktopRuntime: z.boolean().optional(),
+  nativeRuntime: z.array(openAIRuntimeFeatureSchema).max(3).optional(),
   skills: z.array(skillSummarySchema).max(128),
 });
 export const defaultToolPolicy: ToolPolicy = {
@@ -77,6 +84,7 @@ export interface SkillResource {
 export interface SkillContent {
   text: string;
   resources?: SkillResource[];
+  scripts?: SkillResource[];
   nextOffset?: number;
 }
 
@@ -120,6 +128,7 @@ const scope = {
   voiceSessionId: identifier.optional(),
 };
 export const capabilityHostRequest = z.discriminatedUnion('type', [
+  runtimeCallSchema.extend({ ...scope, id: z.string().uuid(), type: z.literal('runtime') }),
   z.strictObject({
     ...scope,
     id: z.string().uuid(),
@@ -139,10 +148,15 @@ export const capabilityHostReply = z.discriminatedUnion('ok', [
   z.strictObject({
     id: z.string().uuid(),
     ok: z.literal(true),
+    runtime: runtimeResultSchema.optional(),
     content: z
       .strictObject({
         text: z.string().max(12_000),
         resources: z
+          .array(z.strictObject({ id: z.string().uuid(), name: z.string().max(240) }))
+          .max(256)
+          .optional(),
+        scripts: z
           .array(z.strictObject({ id: z.string().uuid(), name: z.string().max(240) }))
           .max(256)
           .optional(),
@@ -153,7 +167,8 @@ export const capabilityHostReply = z.discriminatedUnion('ok', [
   z.strictObject({
     id: z.string().uuid(),
     ok: z.literal(false),
-    code: z.enum(['DUPLICATE_DISPATCH', 'PERMISSION_DENIED', 'CAPABILITY_UNAVAILABLE']),
+    code: toolProblemSchema.shape.code,
+    message: z.string().max(400).optional(),
   }),
 ]);
 export type CapabilityHostRequest = z.infer<typeof capabilityHostRequest>;

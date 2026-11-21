@@ -133,3 +133,11 @@ When implementing AI features:
 - Keep semantic selection in the model. Hardcoded intent routing, model-name rules in the execution loop, and silent provider, model, or tool substitutions are prohibited.
 - Establish provider support from authenticated and validated capability evidence, explicit configuration, or a supported probe. Handle provider-specific protocol details in adapters.
 - Enforce authorization again at dispatch. Model decisions, tool outputs, and skill instructions grant no permissions. Keep approvals, scoped credentials, and dispatch protection in the trusted runtime.
+
+## Conductor execution and knowledge
+
+- Route execution, retrieval, skill scripts, and file publication through the shared registry and Conductor lifecycle. The configured primary selects operations and continues from observed outcomes.
+- Execute Shell and skill scripts only in an authorized isolation profile. Report the selected backend and its verified limits. Keep private files and file-derived content behind destination-specific approval at transfer.
+- Scope documents, evidence, workspaces, and artifacts to their verified owners. Preserve source/version provenance, and publish artifacts after format, existence, and readability checks.
+- Use dispatch reservations, progress checks, and bounded continuations. Recover interrupted work without replaying uncertain effects. Keep ordinary chat usable when execution and retrieval backends are unavailable.
+- Keep optional coding engines behind the same registration contract. Native runtime features must work independently of any external coding engine.

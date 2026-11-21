@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { ZipWriter, Uint8ArrayReader, Uint8ArrayWriter } from '@zip.js/zip.js';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { MessageChannelMain } from 'electron';
@@ -7,6 +8,10 @@ import {
   builtinSourceSkill,
   capabilityHostRequest,
   capabilityId,
+  executionLimits,
+  openAIRuntimeFeatureSchema,
+  type OpenAIRuntimeFeature,
+  type RuntimeResult,
   toolDiscoverySchema,
   type CapabilityHostReply,
   type CapabilityHostRequest,
@@ -22,6 +27,7 @@ import {
   installedSkillSchema,
   readSkillFile,
 } from './skill-bundles';
+import { RuntimeError } from './runtime/store';
 import { writeBrowserJson } from './web-settings-storage';
 
 const settingsSchema = z.strictObject({
@@ -33,6 +39,10 @@ const settingsSchema = z.strictObject({
     .optional(),
   disabled: z.array(capabilityId).max(1024),
   builtinEnabled: z.boolean(),
+  disabledExamples: z.array(capabilityId).max(8).optional(),
+  nativeRuntimeProofs: z
+    .partialRecord(openAIRuntimeFeatureSchema, z.string().regex(/^[a-f0-9]{64}$/))
+    .optional(),
   skills: z.array(installedSkillSchema).max(127),
 });
 
@@ -53,6 +63,15 @@ export class CapabilityStorage {
     preview: Awaited<ReturnType<typeof inspectBundle>>;
   };
   private queue = Promise.resolve();
+  private examples: Awaited<ReturnType<typeof inspectBundle>>[] = [];
+
+  private exampleSummaries(): SkillSummary[] {
+    return this.examples.map(({ manifest }) => ({
+      ...manifest.summary,
+      provenance: 'builtin',
+      enabled: !this.data.disabledExamples?.includes(manifest.summary.id),
+    }));
+  }
 
   constructor(directory: string) {
     this.file = path.join(directory, 'capabilities-v1.json');
@@ -61,6 +80,15 @@ export class CapabilityStorage {
   }
 
   async load() {
+    const bundled = path.join(__dirname, '../skills');
+    const examples = await Promise.allSettled(
+      ['spreadsheet-summary', 'chart-generation', 'pdf-report', 'pdf-inspection'].map((name) =>
+        inspectBundle(path.join(bundled, name), 'directory'),
+      ),
+    );
+    this.examples = examples.flatMap((result) =>
+      result.status === 'fulfilled' ? [result.value] : [],
+    );
     try {
       this.data = settingsSchema.parse(
         JSON.parse((await readSkillFile(this.file, 16 * 1024 * 1024)).toString('utf8')),
@@ -80,8 +108,15 @@ export class CapabilityStorage {
       discovery: this.data.discovery,
       disabled: this.data.disabled,
       nativeVerified: Boolean(proof && this.data.proof === proof),
+      ...(proof &&
+        this.data.nativeRuntimeProofs && {
+          nativeRuntime: Object.entries(this.data.nativeRuntimeProofs)
+            .filter(([, verified]) => proof === verified)
+            .map(([feature]) => openAIRuntimeFeatureSchema.parse(feature)),
+        }),
       skills: [
         { ...builtinSourceSkill, enabled: this.data.builtinEnabled },
+        ...this.exampleSummaries(),
         ...active.map((skill) => skill.summary),
       ],
     };
@@ -90,6 +125,7 @@ export class CapabilityStorage {
   skills(): SkillSummary[] {
     return [
       { ...builtinSourceSkill, enabled: this.data.builtinEnabled },
+      ...this.exampleSummaries(),
       ...this.data.skills.map((item) => item.summary),
     ];
   }
@@ -109,6 +145,13 @@ export class CapabilityStorage {
 
   setDiscovery(discovery: ToolDiscovery, proof?: string) {
     return this.save({ discovery, proof: discovery === 'openai-responses' ? proof : undefined });
+  }
+
+  verifyNativeRuntime(feature: OpenAIRuntimeFeature, proof?: string) {
+    const proofs = { ...this.data.nativeRuntimeProofs };
+    if (proof) proofs[feature] = proof;
+    else delete proofs[feature];
+    return this.save({ nativeRuntimeProofs: proofs });
   }
 
   async preview(source: string, kind: 'directory' | 'zip') {
@@ -167,6 +210,18 @@ export class CapabilityStorage {
       if (action === 'remove') throw new Error('Disable the built-in skill from Settings.');
       return this.save({ builtinEnabled: action === 'enable' });
     }
+    if (
+      this.examples.some(
+        ({ manifest }) =>
+          manifest.summary.id === ref.id && manifest.summary.version === ref.version,
+      )
+    ) {
+      if (action === 'remove') throw new Error('Disable the built-in skill from Settings.');
+      const disabled = new Set(this.data.disabledExamples ?? []);
+      if (action === 'disable') disabled.add(ref.id);
+      else disabled.delete(ref.id);
+      return this.save({ disabledExamples: [...disabled] });
+    }
     const current = this.data.skills.find(
       (item) => item.summary.id === ref.id && item.summary.version === ref.version,
     );
@@ -184,22 +239,37 @@ export class CapabilityStorage {
       await fs.rm(path.join(this.root, current.digest), { recursive: true, force: true });
   }
 
+  private findExample(ref: SkillRef) {
+    return this.data.disabledExamples?.includes(ref.id)
+      ? undefined
+      : this.examples.find(
+          ({ manifest }) =>
+            manifest.summary.id === ref.id && manifest.summary.version === ref.version,
+        );
+  }
+
   async read(ref: SkillRef, resourceId: string | undefined, offset: number, signal: AbortSignal) {
-    const current = this.data.skills.find(
-      (item) =>
-        item.summary.id === ref.id && item.summary.version === ref.version && item.summary.enabled,
-    );
+    const example = this.findExample(ref);
+    const current =
+      example?.manifest ??
+      this.data.skills.find(
+        (item) =>
+          item.summary.id === ref.id &&
+          item.summary.version === ref.version &&
+          item.summary.enabled,
+      );
     const entry = current?.entries.find((item) =>
       resourceId ? item.readable && item.id === resourceId : item.id === current.instructions,
     );
     if (!current || !entry || (!resourceId && offset)) return;
     const filename = path.join(this.root, current.digest, entry.id);
     if (
+      !example &&
       (await fs.realpath(filename)) !==
-      path.join(await fs.realpath(this.root), current.digest, entry.id)
+        path.join(await fs.realpath(this.root), current.digest, entry.id)
     )
       return;
-    const bytes = await readSkillFile(filename);
+    const bytes = example?.entries.get(entry.id) ?? (await readSkillFile(filename));
     signal.throwIfAborted();
     if (hash(bytes) !== entry.digest) return;
     const content = decodeSkillText(bytes);
@@ -209,11 +279,78 @@ export class CapabilityStorage {
     return {
       text: content.slice(offset, end),
       ...(!resourceId && {
+        scripts: current.entries
+          .filter((item) => /^scripts\/[^/]+\.(py|sh)$/u.test(item.name))
+          .map(({ id, name }) => ({ id, name })),
         resources: current.entries
           .filter((item) => item.readable)
           .map(({ id, name }) => ({ id, name })),
       }),
       ...(end < content.length && { nextOffset: end }),
+    };
+  }
+
+  async executionScript(ref: SkillRef, id: string, signal: AbortSignal) {
+    const example = this.findExample(ref);
+    const current =
+      example?.manifest ??
+      this.data.skills.find(
+        (item) =>
+          item.summary.id === ref.id &&
+          item.summary.version === ref.version &&
+          item.summary.enabled,
+      );
+    const entry = current?.entries.find((item) => item.id === id);
+    const extension = /^scripts\/[^/]+\.(py|sh)$/u.exec(entry?.name ?? '')?.[1];
+    if (!current || !entry || !extension) return;
+    const filename = path.join(this.root, current.digest, entry.id);
+    if (
+      !example &&
+      (await fs.realpath(filename)) !==
+        path.join(await fs.realpath(this.root), current.digest, entry.id)
+    )
+      return;
+    const bytes = example?.entries.get(entry.id) ?? (await readSkillFile(filename));
+    signal.throwIfAborted();
+    if (hash(bytes) !== entry.digest) return;
+    return { ...entry, bytes, extension };
+  }
+
+  async hostedBundle(ref: SkillRef, signal: AbortSignal) {
+    const example = this.findExample(ref);
+    const manifest =
+      example?.manifest ??
+      this.data.skills.find(
+        (item) =>
+          item.summary.id === ref.id &&
+          item.summary.version === ref.version &&
+          item.summary.enabled,
+      );
+    if (!manifest) return;
+    const entries = manifest.entries.filter((entry) => entry.id !== manifest.instructions);
+    if (entries.reduce((size, entry) => size + entry.bytes, 0) > 1_000_000)
+      throw new Error('This skill is too large to mount inline.');
+    const root = example ? undefined : await fs.realpath(this.root);
+    const writer = new ZipWriter(new Uint8ArrayWriter(), { useWebWorkers: false });
+    for (const entry of entries) {
+      signal.throwIfAborted();
+      const filename = path.join(this.root, manifest.digest, entry.id);
+      if (!example && (await fs.realpath(filename)) !== path.join(root!, manifest.digest, entry.id))
+        return;
+      const bytes = example?.entries.get(entry.id) ?? (await readSkillFile(filename));
+      if (hash(bytes) !== entry.digest) return;
+      await writer.add(
+        `${manifest.summary.name}/${entry.name}`,
+        new Uint8ArrayReader(new Uint8Array(bytes)),
+      );
+    }
+    const data = Buffer.from(await writer.close()).toString('base64');
+    signal.throwIfAborted();
+    return {
+      type: 'inline' as const,
+      name: manifest.summary.name,
+      description: manifest.summary.description,
+      source: { type: 'base64' as const, media_type: 'application/zip' as const, data },
     };
   }
 
@@ -267,6 +404,10 @@ export function openCapabilityBridge(
   storage: CapabilityStorage,
   revision: string,
   authorize: (request: CapabilityHostRequest) => AbortSignal | undefined,
+  runtime?: (
+    request: Extract<CapabilityHostRequest, { type: 'runtime' }>,
+    signal: AbortSignal,
+  ) => Promise<RuntimeResult>,
 ) {
   const { port1, port2 } = new MessageChannelMain();
   const active = new Map<string, AbortController>();
@@ -308,9 +449,25 @@ export function openCapabilityBridge(
     }
     const controller = new AbortController();
     active.set(request.id, controller);
-    const signal = AbortSignal.any([parent, controller.signal, AbortSignal.timeout(5000)]);
+    const signal = AbortSignal.any([
+      parent,
+      controller.signal,
+      AbortSignal.timeout(request.type === 'runtime' ? executionLimits.operationMs : 5000),
+    ]);
     const execute = async (): Promise<CapabilityHostReply> => {
       const { id } = request;
+      if (request.type === 'runtime') {
+        if (
+          !runtime ||
+          request.voiceSessionId ||
+          storage.policy().disabled.includes(request.operation)
+        )
+          return { id, ok: false, code: 'PERMISSION_DENIED' };
+        if (Buffer.byteLength(JSON.stringify(request.input)) > 48_000)
+          return { id, ok: false, code: 'INVALID_ARGUMENT' };
+        const result = await runtime(request, signal);
+        return { id, ok: true, runtime: result };
+      }
       if (request.type === 'skill') {
         const content = await storage.read(
           request.skill,
@@ -338,8 +495,24 @@ export function openCapabilityBridge(
         (reply) => {
           if (!signal.aborted) send(reply);
         },
-        () => {
-          if (!signal.aborted) send({ id: request.id, ok: false, code: 'CAPABILITY_UNAVAILABLE' });
+        (error: unknown) => {
+          if (signal.aborted) return;
+          send(
+            error instanceof RuntimeError
+              ? {
+                  id: request.id,
+                  ok: false,
+                  code: error.code,
+                  message: error.message.slice(0, 400),
+                }
+              : {
+                  id: request.id,
+                  ok: false,
+                  code: 'EXECUTION_FAILED',
+                  message:
+                    'The desktop could not complete this operation. Check input availability and runtime settings.',
+                },
+          );
         },
       )
       .finally(() => active.delete(request.id));

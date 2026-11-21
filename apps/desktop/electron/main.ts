@@ -39,7 +39,9 @@ import {
   registryInputSchema,
 } from '@aria/shared';
 import { ChatService } from './chat-service';
-import { MediaStorage } from './media-storage';
+import { DesktopRuntime } from './runtime/controller';
+import { openAIRuntimeFeatureSchema, runtimeSettingsSchema } from '@aria/shared';
+import { MediaStorage, referencedAssets } from './media-storage';
 import { MediaService, liveRequestSchema } from './media-service';
 import { chatRequestSchema } from './chat-protocol';
 import {
@@ -54,6 +56,16 @@ import {
 app.setName('Aria');
 app.commandLine.appendSwitch('disable-quic');
 protocol.registerSchemesAsPrivileged([
+  {
+    scheme: 'aria-embedding-pack',
+    privileges: {
+      standard: true,
+      secure: true,
+      supportFetchAPI: true,
+      corsEnabled: true,
+      stream: true,
+    },
+  },
   {
     scheme: 'aria-media',
     privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true },
@@ -71,6 +83,7 @@ let browser: BrowserController;
 let provider: ProviderStorage;
 let chat: ChatService;
 let assets: MediaStorage;
+let executionRuntime: DesktopRuntime;
 let media: MediaService;
 let saving = Promise.resolve();
 let configuring = false;
@@ -436,9 +449,150 @@ function registerIpc(): void {
       )
     )
       throw new Error('Attach the files to this turn before sending them.');
-    chat.submit(parsed);
+    const blockedHistory = new Set(
+      messages
+        .filter(
+          (message) =>
+            message.id !== assistant.id &&
+            message.run?.revision !== chat.getStatus().revision &&
+            message.activity?.some((step) => step.privateContent),
+        )
+        .map((message) => message.content),
+    );
+    chat.submit({
+      ...parsed,
+      messages: parsed.messages.filter(
+        (item, index) =>
+          index === parsed.messages.length - 1 ||
+          item.role !== 'assistant' ||
+          !blockedHistory.has(item.content),
+      ),
+    });
   });
+  handle('aria:execution-history', () => executionRuntime.history());
+  handle('aria:runtime-settings', () => executionRuntime.settings());
+  handle('aria:save-runtime-settings', async (value) => {
+    chat.assertIdle();
+    media.assertIdle();
+    await executionRuntime.configure(runtimeSettingsSchema.parse(value));
+    return executionRuntime.settings();
+  });
+  handle(
+    'aria:native-runtime-modes',
+    async () => capabilities.policy(nativeProof(await provider.resolve())).nativeRuntime ?? [],
+  );
+  handle('aria:set-native-runtime', (raw, enabled) => {
+    const feature = openAIRuntimeFeatureSchema.parse(raw);
+    const verify = z.boolean().parse(enabled);
+    return changeCapabilities(async () => {
+      if (!verify) {
+        await capabilities.verifyNativeRuntime(feature);
+        return;
+      }
+      const proof = nativeProof(await provider.resolve());
+      if (!proof) throw new Error('Configure an official OpenAI primary model first.');
+      const response = await chat.http('providers/verify-native-runtime', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ feature }),
+        signal: AbortSignal.timeout(45_000),
+      });
+      z.object({ feature: z.literal(feature), verified: z.literal(true) }).parse(
+        await response.json(),
+      );
+      await capabilities.verifyNativeRuntime(feature, proof);
+    }).then(
+      async () => capabilities.policy(nativeProof(await provider.resolve())).nativeRuntime ?? [],
+    );
+  });
+  handle('aria:probe-runtime', () => executionRuntime.inspect(AbortSignal.timeout(10_000)));
+  handle('aria:local-embeddings', () => executionRuntime.embeddings.available());
+  handle('aria:install-local-embeddings', async () => {
+    chat.assertIdle();
+    const selection = await dialog.showOpenDialog(mainWindow!, {
+      title: 'Select the verified embedding pack',
+      properties: ['openDirectory'],
+    });
+    if (selection.canceled) return executionRuntime.embeddings.available();
+    chat.assertIdle();
+    await executionRuntime.embeddings.install(selection.filePaths[0]);
+    return true;
+  });
+  handle('aria:remove-local-embeddings', async () => {
+    chat.assertIdle();
+    await executionRuntime.embeddings.remove();
+  });
+  handle('aria:knowledge-collections', () => executionRuntime.library.list());
+  handle('aria:manage-knowledge', async (value) => {
+    const id = z.string().uuid();
+    const input = z
+      .discriminatedUnion('operation', [
+        z.strictObject({ operation: z.literal('create'), name: z.string().trim().min(1).max(100) }),
+        z.strictObject({ operation: z.literal('enable'), id, enabled: z.boolean() }),
+        z.strictObject({ operation: z.literal('add'), id }),
+        z.strictObject({ operation: z.literal('remove'), id }),
+        z.strictObject({ operation: z.literal('remove-file'), id, fileId: id }),
+      ])
+      .parse(value);
+    chat.assertIdle();
+    const library = executionRuntime.library;
+    switch (input.operation) {
+      case 'create':
+        library.create(input.name);
+        break;
+      case 'enable':
+        library.enable(input.id, input.enabled);
+        break;
+      case 'add': {
+        const selected = await dialog.showOpenDialog(mainWindow!, {
+          title: 'Add documents to this library',
+          properties: ['openFile', 'multiSelections'],
+        });
+        chat.assertIdle();
+        if (!selected.canceled) await library.add(input.id, selected.filePaths);
+        break;
+      }
+      case 'remove':
+        await library.remove(input.id);
+        break;
+      case 'remove-file':
+        await library.remove(input.id, input.fileId);
+        break;
+    }
+    return library.list();
+  });
+  handle('aria:preview-document', (conversation, id) =>
+    executionRuntime.preview(identifier.parse(conversation), z.string().uuid().parse(id)),
+  );
+  handle('aria:remove-artifact', async (conversation, id) => {
+    chat.assertConversationIdle(identifier.parse(conversation));
+    await executionRuntime.removeArtifact(
+      identifier.parse(conversation),
+      z.string().uuid().parse(id),
+    );
+  });
+  handle('aria:document-evidence', (conversationId, evidenceId) =>
+    executionRuntime.evidence(
+      z.string().uuid().parse(evidenceId),
+      identifier.parse(conversationId),
+    ),
+  );
   handle('aria:cancel-chat', (id) => chat.cancel(identifier.parse(id)));
+  async function importFiles(filenames: string[], kind: 'image' | 'audio' | 'text' | 'any') {
+    if (filenames.length > 4 || filenames.some((file) => !path.isAbsolute(file)))
+      throw new Error('Choose up to four files from your device.');
+    const imported = [];
+    try {
+      for (const filename of filenames) imported.push(await assets.import(filename, kind));
+      return imported;
+    } catch (error) {
+      await Promise.allSettled(imported.map((asset) => assets.remove(asset.id)));
+      throw error;
+    }
+  }
+  handle('aria:import-dropped-files', (files) =>
+    importFiles(z.array(z.string().min(1).max(16000)).max(4).parse(files), 'any'),
+  );
   handle('aria:choose-media', async (kind) => {
     const parsed = z.enum(['image', 'audio', 'text', 'any']).parse(kind);
     const result = await dialog.showOpenDialog(mainWindow!, {
@@ -446,7 +600,7 @@ function registerIpc(): void {
       properties: ['openFile', 'multiSelections'],
       filters: [
         {
-          name: 'Images, audio, and text',
+          name: 'Documents, data, images, and audio',
           extensions: [
             'png',
             'jpg',
@@ -461,6 +615,11 @@ function registerIpc(): void {
             'ogg',
             'wav',
             'webm',
+            'pdf',
+            'docx',
+            'xlsx',
+            'pptx',
+            'zip',
             'txt',
             'md',
             'csv',
@@ -487,18 +646,13 @@ function registerIpc(): void {
       ],
     });
     if (result.canceled) return [];
-    if (result.filePaths.length > 4) throw new Error('Choose up to four attachments.');
-    const imported = [];
-    try {
-      for (const filename of result.filePaths) imported.push(await assets.import(filename, parsed));
-      return imported;
-    } catch (error) {
-      await Promise.allSettled(imported.map((asset) => assets.remove(asset.id)));
-      throw error;
-    }
+    return importFiles(result.filePaths, parsed);
   });
   handle('aria:export-media', async (id) => {
-    const { asset, bytes } = await assets.get(z.string().uuid().parse(id));
+    const knownId = z.string().uuid().parse(id);
+    if (!referencedAssets(initial.data).has(knownId) && !chat.recentlyPublished(knownId))
+      throw new Error('This file is unavailable.');
+    const { asset, bytes } = await assets.get(knownId);
     const result = await dialog.showSaveDialog(mainWindow!, { defaultPath: asset.name });
     if (!result.canceled && result.filePath) await fs.writeFile(result.filePath, bytes);
   });
@@ -656,6 +810,34 @@ app
     provider = new ProviderStorage(directory, cipher);
     capabilities = new CapabilityStorage(directory);
     await capabilities.load();
+    executionRuntime = new DesktopRuntime(
+      directory,
+      assets,
+      capabilities,
+      (conversationId) =>
+        new Set(
+          initial.data.chat.messages
+            .filter((message) => message.conversationId === conversationId)
+            .flatMap((message) => (message.assets ?? []).map((asset) => asset.id)),
+        ),
+      async (message, detail, signal) => {
+        signal.throwIfAborted();
+        if (!mainWindow || mainWindow.isDestroyed()) return false;
+        const { response } = await dialog.showMessageBox(mainWindow, {
+          type: 'warning',
+          message,
+          detail,
+          buttons: ['Decline', 'Allow'],
+          cancelId: 0,
+          defaultId: 0,
+          noLink: true,
+          signal,
+        });
+        return response === 1 && !signal.aborted;
+      },
+      () => chat.executionIdentity(),
+      () => provider.resolve(),
+    );
     webSettings = new WebSettingsStorage(directory);
     await webSettings.load();
     browser = new BrowserController(directory, () => webSettings.get());
@@ -710,10 +892,35 @@ app
           ),
       },
       {
-        policy: (registry) => capabilities.policy(nativeProof(registry)),
+        policy: (registry) => ({
+          ...capabilities.policy(nativeProof(registry)),
+          desktopRuntime: true,
+        }),
+        artifact: (id, conversation, request) =>
+          executionRuntime.resolveArtifact(id, conversation, request),
+        adoptHostedArtifact: (asset, conversation, request, execution, signal) =>
+          executionRuntime.adoptHostedArtifact(asset, conversation, request, execution, signal),
+        release: (request) => executionRuntime.release(request),
+        availableAssets: (conversation) =>
+          [
+            ...new Map(
+              initial.data.chat.messages
+                .filter((message) => message.conversationId === conversation)
+                .flatMap((message) => message.assets ?? [])
+                .map((asset) => [asset.id, asset]),
+            ).values(),
+          ].slice(-12),
         open: (revision, authorize) =>
-          openCapabilityBridge(capabilities, revision, (request) =>
-            request.voiceSessionId ? media.authorizeCapability(request) : authorize(request),
+          openCapabilityBridge(
+            capabilities,
+            revision,
+            (request) =>
+              request.type === 'runtime'
+                ? authorize(request) && chat.authorizeRuntime(request)
+                : request.voiceSessionId
+                  ? media.authorizeCapability(request)
+                  : authorize(request),
+            (request, signal) => executionRuntime.dispatch(request, signal),
           ),
       },
     );
@@ -742,6 +949,7 @@ app.on('before-quit', (event) => {
     shutdown ??= media
       .close()
       .then(() => chat.close())
+      .then(() => executionRuntime.close())
       .finally(() => {
         browser.close();
         shutdownComplete = true;

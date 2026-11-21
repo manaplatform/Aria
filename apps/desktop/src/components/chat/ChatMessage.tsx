@@ -1,3 +1,4 @@
+import { useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Activity, ExternalLink, RotateCcw } from 'lucide-react';
 import type { ChatMessage as Message } from '@aria/shared';
@@ -7,6 +8,8 @@ import { Button, CopyButton } from '../ui';
 import { openExternal } from '../../services/desktop';
 import { openResearchSource } from '../../stores/browserStore';
 import MarkdownRenderer from './MarkdownRenderer';
+import { ArtifactCard } from './ArtifactCard';
+import { DocumentEvidence } from './DocumentEvidence';
 import { MediaPreview } from './MediaPreview';
 
 export function ChatMessage({
@@ -20,6 +23,15 @@ export function ChatMessage({
   canRegenerate: boolean;
   name: string;
 }) {
+  const [selectedEvidence, setSelectedEvidence] = useState<string | null>(null);
+  const evidence = useMemo(
+    () => [
+      ...new Map(
+        message.activity?.flatMap((step) => step.evidence ?? []).map((item) => [item.id, item]),
+      ).values(),
+    ],
+    [message.activity],
+  );
   const busy = generating(message);
   const revision = useChatStore((state) => state.status.revision);
   const retry = message.retryConfirmed && message.run?.revision === revision;
@@ -55,7 +67,13 @@ export function ChatMessage({
         {message.role === 'user' ? (
           <div className="user-message-text">{message.content}</div>
         ) : message.content ? (
-          <MarkdownRenderer content={message.content} sources={sources} research={research} />
+          <MarkdownRenderer
+            content={message.content}
+            sources={sources}
+            research={research}
+            evidenceIds={evidence.map((item) => item.id)}
+            onEvidence={setSelectedEvidence}
+          />
         ) : busy ? (
           <div className="thinking-indicator" aria-label="Waiting for response">
             <i />
@@ -90,12 +108,26 @@ export function ChatMessage({
                 </small>
                 {step.inputSummary && <small>{step.inputSummary}</small>}
                 {step.resultSummary && <small>{step.resultSummary}</small>}
+                {step.executionDetails && (
+                  <details>
+                    <summary>Command output</summary>
+                    <pre>{step.executionDetails}</pre>
+                  </details>
+                )}
                 {step.error && <small>{step.error}</small>}
               </li>
             ))}
           </ul>
         </details>
       ) : null}
+      {evidence.length > 0 && (
+        <DocumentEvidence
+          conversation={message.conversationId}
+          evidence={evidence}
+          selected={selectedEvidence}
+          onSelect={setSelectedEvidence}
+        />
+      )}
       {sources.length ? (
         <nav className="conductor-sources" aria-label="Research sources">
           <span>Sources</span>
@@ -159,13 +191,22 @@ export function ChatMessage({
           Live voice{message.role === 'assistant' ? ' · AI-generated audio' : ''}
         </p>
       )}
-      {message.assets?.map((asset) => (
-        <MediaPreview
-          key={asset.id}
-          asset={asset}
-          reusable={message.role === 'assistant' && canRegenerate && !busy}
-        />
-      ))}
+      {message.assets?.map((asset) =>
+        asset.mimeType === 'text/plain' || asset.mimeType.startsWith('application/') ? (
+          <ArtifactCard
+            key={asset.id}
+            asset={asset}
+            conversation={message.conversationId}
+            reusable={message.role === 'assistant' && canRegenerate && !busy}
+          />
+        ) : (
+          <MediaPreview
+            key={asset.id}
+            asset={asset}
+            reusable={message.role === 'assistant' && canRegenerate && !busy}
+          />
+        ),
+      )}
       {(message.status === 'failed' || message.status === 'interrupted') && (
         <p className="chat-response-error" role="alert">
           {message.error || 'The response did not finish. Please retry.'}

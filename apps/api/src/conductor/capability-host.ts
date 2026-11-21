@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { Injectable } from '@nestjs/common';
 import {
   capabilityHostReply,
+  executionLimits,
   defaultToolPolicy,
   toolPolicySchema,
   type CapabilityHostRequest,
@@ -16,6 +17,7 @@ type HostCommand = CapabilityHostRequest extends infer Request
     ? Omit<Request, 'id'>
     : never
   : never;
+type RuntimeCommand = Extract<HostCommand, { type: 'runtime' }>;
 
 export class ToolError extends RunError {
   constructor(
@@ -52,7 +54,18 @@ export class CapabilityHost {
     port.start();
   }
 
-  async request(command: HostCommand, signal: AbortSignal) {
+  async request(command: Exclude<HostCommand, RuntimeCommand>, signal: AbortSignal) {
+    return (await this.dispatch(command, signal))?.content;
+  }
+
+  async runtime(command: RuntimeCommand, signal: AbortSignal) {
+    const reply = await this.dispatch(command, signal);
+    if (!reply?.runtime)
+      throw new ToolError('EXECUTION_FAILED', 'The desktop returned no runtime result.');
+    return reply.runtime;
+  }
+
+  private async dispatch(command: HostCommand, signal: AbortSignal) {
     signal.throwIfAborted();
     const port = this.port;
     if (!port) {
@@ -63,7 +76,10 @@ export class CapabilityHost {
       );
     }
     const id = randomUUID();
-    const deadline = AbortSignal.any([signal, AbortSignal.timeout(5000)]);
+    const deadline = AbortSignal.any([
+      signal,
+      AbortSignal.timeout(command.type === 'runtime' ? executionLimits.operationMs : 5000),
+    ]);
     const reply = await new Promise<CapabilityHostReply | undefined>((resolve) => {
       const cancel = () => {
         try {
@@ -93,8 +109,8 @@ export class CapabilityHost {
         reply.code === 'DUPLICATE_DISPATCH'
           ? 'An earlier dispatch may already have taken effect. Check the result before sending a new request.'
           : 'The tool or skill is no longer available to this turn.';
-      throw new ToolError(reply.code, message);
+      throw new ToolError(reply.code, reply.message ?? message);
     }
-    return reply.content;
+    return reply;
   }
 }

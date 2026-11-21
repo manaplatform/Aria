@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { tool, type ModelMessage, type ToolSet } from 'ai';
 import { z } from 'zod';
 import {
+  builtinSourceSkill,
   capabilityId,
   conductorLimits,
   modelRefSchema,
@@ -379,7 +380,7 @@ export class CapabilityTurn {
         'That skill or resource is unavailable to this turn.',
       );
     const content =
-      current.provenance === 'builtin'
+      current.id === builtinSourceSkill.id
         ? { text: builtinInstructions, resources: [] }
         : await this.registry.host.request(
             {

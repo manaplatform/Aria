@@ -9,3 +9,9 @@ The recorded notice for `@ai-sdk/provider-utils@5.0.79` comes from its [tagged u
 Review entries flagged by the check for absent metadata, absent license files, or additional terms. Review generated CSS, embedded assets, trademarks, and any installer-specific additions separately. No standalone image, icon, or font asset was tracked at the start of this change. Aria's own name and marks require a separate ownership and trademark review before adding an open-source notice.
 
 See [Electron's license](https://github.com/electron/electron/blob/main/LICENSE) and the license notices included with each published Electron binary.
+
+The opt-in local embedding pack is a pinned ONNX export of the Apache-2.0
+paraphrase-multilingual-MiniLM-L12-v2 model. Its model and tokenizer data are
+installed separately. The optional managed sandbox uses a digest-pinned
+Docker Official Python image. The bundled renderer dependency inventory
+covers the document and ONNX runtime libraries.

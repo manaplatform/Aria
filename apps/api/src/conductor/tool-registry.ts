@@ -1,9 +1,16 @@
+import { createHash } from 'node:crypto';
 import { Inject, Injectable } from '@nestjs/common';
 import type { JSONSchema7, ModelMessage } from 'ai';
 import { z } from 'zod';
 import {
   capabilityId,
   conductorLimits,
+  desktopArtifactSchema,
+  evidenceSchema,
+  executionLimits,
+  runtimeOperations,
+  runtimeResultSchema,
+  type RuntimeOperation,
   modelRefSchema,
   referenceInput,
   researchToolArgs,
@@ -18,6 +25,7 @@ import {
 import { AiService } from '../ai/ai.service';
 import { MediaService } from '../media/media.service';
 import { ModelRegistry, type ResolvedModel } from '../providers/model-registry.service';
+import { OpenAIRuntime, nativeFeatureName } from '../providers/openai-runtime';
 import type { ResearchRun } from '../web/web.service';
 import { CapabilityHost, ToolError } from './capability-host';
 import { RunError, type RunAttachment, type RunFile } from './run-assets';
@@ -29,6 +37,11 @@ export type StepValue = {
   file?: RunFile;
   sources?: ConductorSource[];
   data?: Record<string, unknown>;
+  managedArtifact?: z.infer<typeof desktopArtifactSchema>;
+  evidence?: z.infer<typeof evidenceSchema>[];
+  privateContent?: boolean;
+  executionDetails?: string;
+  commandProblem?: z.infer<typeof runtimeResultSchema>['commandProblem'];
 };
 
 const resultSchema = z.strictObject({
@@ -46,6 +59,11 @@ const resultSchema = z.strictObject({
     .optional(),
   sources: z.array(sourceSchema).max(8).optional(),
   data: z.record(z.string(), z.unknown()).optional(),
+  managedArtifact: desktopArtifactSchema.optional(),
+  evidence: z.array(evidenceSchema).max(executionLimits.searchResults).optional(),
+  privateContent: z.boolean().optional(),
+  executionDetails: z.string().max(12_000).optional(),
+  commandProblem: runtimeResultSchema.shape.commandProblem,
 });
 
 const dependsOn = z
@@ -68,6 +86,8 @@ export interface ToolContext {
   research: ResearchRun;
   attachments: Map<string, RunAttachment>;
   privateContent: boolean;
+  native?: OpenAIRuntime;
+  runtime?: { requestId: string; conversationId: string; assistantMessageId: string };
 }
 
 type Invocation = {
@@ -77,6 +97,7 @@ type Invocation = {
   inputs: StepInputs;
   signal: AbortSignal;
   approval: () => void;
+  callId: string;
 };
 
 export interface ToolDescriptor<Input = unknown, Output extends StepValue = StepValue> {
@@ -141,6 +162,59 @@ const researchDescriptions: Record<ResearchToolId, string> = {
   browser_switch_tab: 'Select another AI browser tab in this conversation.',
 };
 
+const runtimeDescriptions: Record<RuntimeOperation, readonly [string, string, ToolEffect]> = {
+  'shell.inspect': [
+    'Inspect execution environments',
+    'Check the configured sandbox, available runtimes and limits before choosing commands.',
+    'read',
+  ],
+  'shell.open': [
+    'Prepare execution workspace',
+    'Explicitly select a verified managed or OpenAI Shell backend. Managed inputs are staged in /workspace/inputs. Hosted outputs use /mnt/data.',
+    'local',
+  ],
+  'shell.run': [
+    'Run sandbox commands',
+    'Run ordered POSIX shell commands in /workspace/working. Put requested downloadable files in /workspace/outputs. Results include actual exit outcomes and partial output.',
+    'local',
+  ],
+  'shell.fetch': [
+    'Download to workspace',
+    'Request an approved public HTTPS download with a known SHA-256 into the sandbox inputs.',
+    'local',
+  ],
+  'knowledge.prepare_search': [
+    'Prepare OpenAI File Search',
+    'Request approval to index selected current-turn attachments in native OpenAI File Search.',
+    'consequential',
+  ],
+  'knowledge.list': [
+    'List knowledge collections',
+    'Get the search modes and exact IDs of user-authorized knowledge collections.',
+    'read',
+  ],
+  'knowledge.search': [
+    'Search documents',
+    'Search the authorized conversation or selected libraries and return passages with document evidence IDs. Discover available search modes before relying on semantic search.',
+    'read',
+  ],
+  'files.read_document': [
+    'Read attached document',
+    'Read text or a bounded document excerpt from an authorized attachment. Use File Search for targeted evidence across larger files.',
+    'read',
+  ],
+  'skills.run_script': [
+    'Run skill script',
+    'Run a reviewed script by its exact skill version and script ID inside an authorized workspace.',
+    'local',
+  ],
+  'artifacts.publish': [
+    'Publish generated file',
+    'Validate and publish a file from the isolated workspace outputs as a downloadable conversation artifact.',
+    'local',
+  ],
+};
+
 const modelDescriptions = {
   chat: [
     'Delegate text analysis or a specialized writing task to an explicitly selected chat model.',
@@ -186,17 +260,42 @@ export class ToolRegistry {
       ...base,
       id: 'files.read_attachment',
       name: 'Read text attachment',
-      description: 'Read an authorized UTF-8 attachment from this turn by its attachment ID.',
+      description:
+        'Read an authorized attachment by ID. Managed desktop supports document extraction.',
       input: z.strictObject({ attachmentId: z.string().uuid() }),
       output: 'text',
       capability: 'read-file',
       effect: 'read',
       dependency: 'local',
       permission: 'Files attached to this turn',
-      available: ({ attachments }) =>
+      available: ({ attachments, runtime }) =>
+        Boolean(runtime) ||
         [...attachments.values()].some((file) => file.mimeType === 'text/plain'),
       normalize: ({ attachmentId }) => ({ inputs: [{ kind: 'attachment', id: attachmentId }] }),
-      execute: (_, { inputs }) => {
+      execute: async ({ attachmentId }, { inputs, context, signal, step, callId, approval }) => {
+        if (context.runtime) {
+          approval();
+          const { primary } = context.registry;
+          return this.host
+            .runtime(
+              {
+                ...context.runtime,
+                type: 'runtime',
+                revision: this.host.current.revision,
+                operation: 'files.read_document',
+                stepId: step.id,
+                callId,
+                input: { fileId: attachmentId },
+                primary: {
+                  connectionId: primary.connection.id,
+                  model: primary.id,
+                  endpoint: primary.connection.baseUrl,
+                },
+              },
+              signal,
+            )
+            .then(({ artifact: _artifact, ...result }) => result);
+        }
         const [file] = inputs.files;
         if (file?.mimeType !== 'text/plain')
           throw new RunError('Select one authorized UTF-8 text attachment to read.');
@@ -239,6 +338,199 @@ export class ToolRegistry {
         };
       },
     });
+
+    for (const [operation, schema] of Object.entries(runtimeOperations) as [
+      RuntimeOperation,
+      z.ZodType<Record<string, unknown>>,
+    ][]) {
+      const [name, description, effect] = runtimeDescriptions[operation];
+      this.register({
+        ...base,
+        id: operation,
+        name,
+        description,
+        input: schema,
+        output: operation === 'artifacts.publish' ? 'file' : 'data',
+        capability: operation,
+        effect,
+        dependency: 'local',
+        permission: 'Authorized desktop conversation runtime',
+        timeoutMs: executionLimits.operationMs + 1000,
+        artifacts: operation === 'artifacts.publish',
+        citations: operation === 'knowledge.search',
+        available: (context) =>
+          Boolean(
+            context.runtime &&
+            this.host.current.desktopRuntime &&
+            (operation !== 'knowledge.prepare_search' ||
+              this.host.current.nativeRuntime?.includes('file-search')),
+          ),
+        normalize: (input) => ({ args: input }),
+        execute: async (input, { step, callId, context, signal, approval }) => {
+          if (!context.runtime)
+            throw new ToolError(
+              'CAPABILITY_UNAVAILABLE',
+              'Open desktop text chat to use this runtime.',
+            );
+          const { primary } = context.registry;
+          const nativeFeature =
+            operation === 'knowledge.prepare_search'
+              ? 'file-search'
+              : operation === 'shell.open' && typeof input.backend === 'string'
+                ? nativeFeatureName(input.backend)
+                : undefined;
+          if (nativeFeature && !this.host.current.nativeRuntime?.includes(nativeFeature))
+            throw new ToolError(
+              'CAPABILITY_UNAVAILABLE',
+              'Verify the exact OpenAI runtime mode in Tools settings first.',
+            );
+          if (
+            operation === 'shell.open' &&
+            context.native?.active.shell &&
+            [nativeFeature, context.native.active.shell.kind].join('/') !== 'local-shell/local'
+          )
+            throw new ToolError(
+              'PERMISSION_DENIED',
+              'The current turn already selected a Shell backend.',
+            );
+          if (operation === 'shell.run' && context.native?.active.shell?.kind === 'hosted')
+            throw new ToolError(
+              'PERMISSION_DENIED',
+              'Use the activated OpenAI Shell tool in this turn.',
+            );
+          if (
+            operation === 'artifacts.publish' &&
+            context.native?.active.shell?.kind === 'hosted'
+          ) {
+            const { sessionId, filename } = runtimeOperations['artifacts.publish'].parse(input);
+            return {
+              file: await context.native.artifact(sessionId, filename, signal),
+              privateContent: context.privateContent,
+            };
+          }
+          const needsUpload = nativeFeature === 'hosted-shell' || nativeFeature === 'file-search';
+          const selected = needsUpload
+            ? [
+                ...new Set(
+                  (operation === 'shell.open' ? input.inputs : input.fileIds) as
+                    string[] | undefined,
+                ),
+              ]
+            : [];
+          if (selected.some((id) => !context.attachments.has(id)))
+            throw new ToolError(
+              'PERMISSION_DENIED',
+              'Hosted inputs must be attached to the current turn.',
+            );
+          if (
+            needsUpload ||
+            [
+              'shell.fetch',
+              'knowledge.search',
+              'files.read_document',
+              'skills.run_script',
+            ].includes(operation)
+          )
+            approval();
+          const { artifact, data, ...value } = await this.host.runtime(
+            {
+              ...context.runtime,
+              type: 'runtime',
+              revision: this.host.current.revision,
+              operation,
+              callId,
+              stepId: step.id,
+              input,
+              primary: {
+                connectionId: primary.connection.id,
+                model: primary.id,
+                endpoint: primary.connection.baseUrl,
+              },
+            },
+            signal,
+          );
+          if (nativeFeature) {
+            if (!context.native) {
+              const scope = context.runtime;
+              context.native = new OpenAIRuntime(primary, (input, deadline) =>
+                this.host
+                  .runtime(
+                    {
+                      ...scope,
+                      type: 'runtime',
+                      operation: 'hosted.resources',
+                      revision: this.host.current.revision,
+                      callId,
+                      stepId: step.id,
+                      input,
+                      primary: {
+                        connectionId: primary.connection.id,
+                        model: primary.id,
+                        endpoint: primary.connection.baseUrl,
+                      },
+                    },
+                    deadline,
+                  )
+                  .then((result) => result.data),
+              );
+              if (needsUpload) await context.native.recover(signal);
+            }
+            if (needsUpload) {
+              const versions = z.record(z.string(), z.string()).parse(data?.versions);
+              const files = selected.map((id) => {
+                const file = context.attachments.get(id)!;
+                if (createHash('sha256').update(file.bytes).digest('hex') !== versions[id])
+                  throw new ToolError(
+                    'PERMISSION_DENIED',
+                    'A hosted input changed after approval.',
+                  );
+                return { file, version: versions[id] };
+              });
+              if (nativeFeature === 'file-search') {
+                await context.native.prepareSearch(files, signal);
+                return { data: { ready: true, fileCount: files.length }, privateContent: true };
+              }
+              const settings = runtimeOperations['shell.open'].parse(input);
+              const inlineSkills = z
+                .array(
+                  z.strictObject({
+                    type: z.literal('inline'),
+                    name: z.string().max(64),
+                    description: z.string().max(1024),
+                    source: z.strictObject({
+                      type: z.literal('base64'),
+                      media_type: z.literal('application/zip'),
+                      data: z.base64().max(1_500_000),
+                    }),
+                  }),
+                )
+                .max(2)
+                .parse(data?.inlineSkills ?? []);
+              const sessionId = await context.native.openHosted(
+                files.map(({ file }) => file),
+                settings.allowDomains ?? [],
+                settings.hostedSkills ?? [],
+                signal,
+                inlineSkills,
+              );
+              return {
+                data: { sessionId, backend: 'openai-hosted', outputs: '/mnt/data/outputs' },
+                privateContent: value.privateContent,
+              };
+            }
+            const sessionId = z.string().uuid().parse(data?.sessionId);
+            context.native.openLocal(sessionId);
+          }
+          return {
+            ...value,
+            data,
+            managedArtifact: artifact,
+            ...(operation === 'shell.run' &&
+              data && { executionDetails: JSON.stringify(data).slice(0, 12_000) }),
+          };
+        },
+      });
+    }
 
     for (const op of Object.keys(researchToolArgs) as ResearchToolId[]) {
       const browser = op.startsWith('browser_');
@@ -412,18 +704,20 @@ export class ToolRegistry {
     return [...this.entries.values()].map((descriptor) => {
       const reason = this.host.current.disabled.includes(descriptor.id)
         ? 'Disabled in Tools settings.'
-        : descriptor.dependency === 'browser' && !browserAvailable
-          ? 'Enable AI Browser in Web & Browser.'
-          : descriptor.dependency === 'delegate' &&
-              ![...(registry?.models.values() ?? [])].some(
-                (model) =>
-                  model.delegate &&
-                  descriptor.requiredModelCapabilities.every((cap) =>
-                    model.capabilities.some((value) => cap === value),
-                  ),
-              )
-            ? 'Configure an eligible delegated model in AI Models.'
-            : undefined;
+        : Object.hasOwn(runtimeOperations, descriptor.id) && !this.host.current.desktopRuntime
+          ? 'Open the managed Aria desktop application to use this tool.'
+          : descriptor.dependency === 'browser' && !browserAvailable
+            ? 'Enable AI Browser in Web & Browser.'
+            : descriptor.dependency === 'delegate' &&
+                ![...(registry?.models.values() ?? [])].some(
+                  (model) =>
+                    model.delegate &&
+                    descriptor.requiredModelCapabilities.every((cap) =>
+                      model.capabilities.some((value) => cap === value),
+                    ),
+                )
+              ? 'Configure an eligible delegated model in AI Models.'
+              : undefined;
       return summarize(descriptor, !reason, reason);
     });
   }

@@ -3,6 +3,8 @@ import { useEffect, useState } from 'react';
 import type { SkillPreview, ToolSettings as Settings } from '@aria/shared';
 import { desktop, errorMessage } from '../../services/desktop';
 import { Button } from '../ui';
+import { KnowledgeSettings } from './KnowledgeSettings';
+import { RuntimeSettings } from './RuntimeSettings';
 
 export function ToolSettings() {
   const [settings, setSettings] = useState<Settings>();
@@ -39,6 +41,8 @@ export function ToolSettings() {
 
   return (
     <>
+      <RuntimeSettings />
+      <KnowledgeSettings />
       <section className="settings-section" id="tools">
         <div className="settings-section-heading">
           <h2>Tools</h2>

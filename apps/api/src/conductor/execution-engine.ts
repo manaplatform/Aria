@@ -142,6 +142,9 @@ export class ExecutionEngine {
               : undefined,
           resultId: outcome?.artifact?.id,
           sources: outcome?.sources,
+          evidence: outcome?.evidence,
+          executionDetails: outcome?.executionDetails,
+          privateContent: outcome?.privateContent,
         },
       });
     let result: Outcome;
@@ -291,6 +294,7 @@ export class ExecutionEngine {
         raw = await waitForTool(
           descriptor.execute(input.data, {
             step,
+            callId,
             model,
             inputs: { text, files },
             context: this.context,
@@ -316,33 +320,60 @@ export class ExecutionEngine {
       if (!value.success)
         throw new ToolError('EXECUTION_FAILED', 'The tool returned an unexpected result.');
       if (
-        (['image', 'file', 'audio'].includes(descriptor.output) && !value.data.file) ||
+        (['image', 'file', 'audio'].includes(descriptor.output) &&
+          !value.data.file &&
+          !value.data.managedArtifact) ||
         (descriptor.output === 'sources' && !value.data.sources?.length) ||
         (descriptor.output === 'text' && typeof value.data.text !== 'string')
       )
         throw new ToolError('EXECUTION_FAILED', 'The tool returned no usable result.');
-      const artifact = value.data.file && this.assets.put(this.request.requestId, value.data.file);
+      const { managedArtifact, privateContent, commandProblem, ...resultValue } = value.data;
+      const hosted =
+        descriptor.id === 'artifacts.publish' &&
+        this.context.native?.active.shell?.kind === 'hosted'
+          ? this.context.native.active.shell
+          : undefined;
+      const fileArtifact =
+        value.data.file && this.assets.put(this.request.requestId, value.data.file);
+      const artifact =
+        managedArtifact ??
+        (fileArtifact && {
+          ...fileArtifact,
+          ...(hosted && { hostedExecution: { stepId: id, sessionId: hosted.id } }),
+        });
       if (artifact) this.emit({ type: 'artifact', artifact });
-      if (restricted || descriptor.capability === 'browser_screenshot') {
+      if (restricted || privateContent || descriptor.capability === 'browser_screenshot') {
         this.restricted.add(id);
-        if (value.data.text) this.context.privateContent = true;
+        if (value.data.text || privateContent) this.context.privateContent = true;
       }
       result = {
         id,
-        ...value.data,
+        ...resultValue,
+        privateContent: privateContent || restricted,
         text: value.data.text?.slice(0, conductorLimits.resultCharacters),
-        status: 'completed',
+        status: commandProblem ? 'failed' : 'completed',
+        problem: commandProblem,
         artifact,
       };
       const evidence = createHash('sha256')
-        .update(canonical([fingerprint, result.text, result.data, result.sources, artifact?.id]))
+        .update(
+          canonical(
+            result.evidence?.length
+              ? [
+                  descriptor.id,
+                  result.evidence.map(({ chunkId, version }) => [chunkId, version]).sort(),
+                ]
+              : [fingerprint, result.text, result.data, result.sources, artifact?.id],
+          ),
+        )
         .digest('hex');
       if (!this.evidence.has(evidence)) {
         this.evidence.add(evidence);
         this.progress++;
       }
+      if (commandProblem?.code === 'EXECUTION_FAILED') this.recoverable.set(id, descriptor.id);
       for (const [failedId, toolId] of this.recoverable) {
-        if (toolId === descriptor.id) {
+        if (!commandProblem && toolId === descriptor.id) {
           this.corrected.add(failedId);
           this.recoverable.delete(failedId);
         }

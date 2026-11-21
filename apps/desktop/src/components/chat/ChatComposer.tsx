@@ -49,12 +49,14 @@ export function ChatComposer() {
     };
   }, []);
 
-  const choose = async () => {
+  const choose = async (dropped?: File[]) => {
     setError('');
     setPicking(true);
     const id = conversation?.id ?? null;
     try {
-      const files = await desktop().chooseMedia('any');
+      const files = await (dropped
+        ? desktop().importDroppedFiles(dropped)
+        : desktop().chooseMedia('any'));
       if (!files.length) return;
       const chat = useWorkspaceStore.getState().data.chat;
       const target = id ? chat.conversations.find((item) => item.id === id) : null;
@@ -81,6 +83,14 @@ export function ChatComposer() {
   return (
     <div className="chat-composer-area">
       <form
+        onDragOver={(event) => {
+          if (event.dataTransfer.types.includes('Files')) event.preventDefault();
+        }}
+        onDrop={(event) => {
+          if (!event.dataTransfer.files.length) return;
+          event.preventDefault();
+          if (!busy && !voiceActive && !picking) void choose(Array.from(event.dataTransfer.files));
+        }}
         className={`chat-composer ${busy ? 'responding' : ''}`}
         onSubmit={(event) => {
           event.preventDefault();

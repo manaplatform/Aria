@@ -24,6 +24,13 @@ const allowedInputs = new Map<string, number>([
     'video/webm',
   ].map((mime): [string, number] => [mime, 25_000_000]),
   ['text/plain', 1_000_000],
+  ...[
+    'application/pdf',
+    'application/zip',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  ].map((mime): [string, number] => [mime, 25_000_000]),
 ]);
 
 export function validateAttachment(file: RunAttachment) {

@@ -30,6 +30,16 @@ interface BrowserIntegration {
 
 interface CapabilityIntegration {
   policy(registry: RuntimeRegistry): ToolPolicy;
+  artifact?(id: string, conversation: string, request: string): Promise<MediaAsset>;
+  adoptHostedArtifact?(
+    asset: MediaAsset,
+    conversation: string,
+    request: string,
+    execution: NonNullable<ArtifactReference['hostedExecution']>,
+    signal: AbortSignal,
+  ): Promise<void>;
+  release?(request: string): void;
+  availableAssets?(conversation: string): MediaAsset[];
   open(
     revision: string,
     authorize: (request: CapabilityHostRequest) => AbortSignal | undefined,
@@ -52,6 +62,9 @@ export class ChatService {
   private url = '';
   private token = '';
   private generation = 0;
+  private readonly newlyPublished = new Map<string, number>();
+  private runtimePrimary?: { connectionId: string; model: string; endpoint: string };
+  private runtimeProviderKey?: string;
   private starting?: Promise<void>;
   private requests = new Map<string, ActiveRequest>();
   private status: ChatServiceStatus = { state: 'starting', configured: false, model: '' };
@@ -99,6 +112,23 @@ export class ChatService {
         registry = { ...emptyRegistryPolicy, revision: '', connections: [] };
         configurationError = error.message;
       }
+      const runtimeConnection = registry.connections.find((item) =>
+        registry.primary?.startsWith(`${item.id}:`),
+      );
+      this.runtimePrimary =
+        runtimeConnection && registry.primary
+          ? {
+              connectionId: runtimeConnection.id,
+              model: registry.primary.slice(runtimeConnection.id.length + 1),
+              endpoint: runtimeConnection.baseUrl,
+            }
+          : undefined;
+      this.runtimeProviderKey =
+        runtimeConnection && this.runtimePrimary
+          ? createHash('sha256')
+              .update(JSON.stringify([this.runtimePrimary, runtimeConnection.apiKey]))
+              .digest('hex')
+          : undefined;
       const registryRevision = registry.revision;
       const web = await this.browser?.runtime();
       const tools = this.capabilities?.policy(registry);
@@ -311,12 +341,35 @@ export class ChatService {
       return;
     return turn.controller.signal;
   }
+  executionIdentity() {
+    return this.runtimeProviderKey;
+  }
+  authorizeRuntime(request: Extract<CapabilityHostRequest, { type: 'runtime' }>) {
+    const primary = this.runtimePrimary;
+    if (
+      !primary ||
+      request.primary.connectionId !== primary.connectionId ||
+      request.primary.model !== primary.model ||
+      new URL(request.primary.endpoint).href.replace(/\/$/, '') !==
+        new URL(primary.endpoint).href.replace(/\/$/, '')
+    )
+      return;
+    return this.activeTurn(request);
+  }
   assistantForTurn(requestId: string) {
     return this.requests.get(requestId)?.request.assistantMessageId;
   }
   submit(input: ChatRequest): void {
     this.begin(input);
   }
+  recentlyPublished(id: string) {
+    const now = Date.now();
+    for (const [asset, expires] of this.newlyPublished) {
+      if (expires <= now) this.newlyPublished.delete(asset);
+    }
+    return this.newlyPublished.has(id);
+  }
+
   private async consume(active: ActiveRequest): Promise<void> {
     const { request, controller } = active;
     let terminal = false;
@@ -327,7 +380,12 @@ export class ChatService {
       const response = await this.http('chat/stream', {
         method: 'POST',
         headers: this.headers(),
-        body: JSON.stringify(request),
+        body: JSON.stringify({
+          ...request,
+          availableAssets: this.capabilities
+            ?.availableAssets?.(request.conversationId)
+            ?.map(({ id, name, mimeType, size }) => ({ id, name, mimeType, size })),
+        }),
         signal: controller.signal,
       });
       if (
@@ -354,16 +412,43 @@ export class ChatService {
         if (event.type === 'reset') active.length = 0;
         if (active.stopped) break;
         if (event.type === 'artifact') {
-          const asset = await this.importArtifact(
-            request.requestId,
-            event.artifact,
-            controller.signal,
-          );
+          const asset =
+            event.artifact.storage === 'desktop'
+              ? await this.capabilities?.artifact?.(
+                  event.artifact.id,
+                  request.conversationId,
+                  request.requestId,
+                )
+              : await this.importArtifact(request.requestId, event.artifact, controller.signal);
+          if (
+            !asset ||
+            asset.name !== event.artifact.name ||
+            asset.mimeType !== event.artifact.mimeType ||
+            asset.size !== event.artifact.size
+          )
+            throw new Error('The artifact does not match its verified storage record.');
           if (active.stopped) break;
+          if (event.artifact.hostedExecution)
+            await this.capabilities?.adoptHostedArtifact?.(
+              asset,
+              request.conversationId,
+              request.requestId,
+              event.artifact.hostedExecution,
+              controller.signal,
+            );
+          this.recentlyPublished(asset.id);
+          if (this.newlyPublished.size >= 128) {
+            const oldest = this.newlyPublished.keys().next().value;
+            if (oldest) this.newlyPublished.delete(oldest);
+          }
+          this.newlyPublished.set(asset.id, Date.now() + 30_000);
           artifacts.set(event.artifact.id, asset.id);
           active.emit({
             type: 'asset',
-            asset,
+            asset:
+              event.artifact.storage === 'desktop' || event.artifact.hostedExecution
+                ? { ...asset, managed: true }
+                : asset,
             requestId: event.requestId,
             conversationId: event.conversationId,
             assistantMessageId: event.assistantMessageId,
@@ -400,6 +485,7 @@ export class ChatService {
         });
       controller.abort();
       this.requests.delete(request.requestId);
+      this.capabilities?.release?.(request.requestId);
       void this.releaseAssets(request.requestId);
     }
   }

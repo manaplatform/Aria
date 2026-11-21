@@ -46,13 +46,23 @@ export class AiService {
     tools?: ToolSet,
     forcedTool?: string,
     disableTools = false,
+    nativeOptions?: { fileSearch: boolean; toolLimit: number },
   ): ReturnType<typeof streamText<ToolSet>> {
     const official = new URL(target.connection.baseUrl).origin === 'https://api.openai.com';
     return streamText({
       model: this.model(target.connection, target.id),
       ...(official
         ? {
-            providerOptions: { openai: { store: false, include: ['reasoning.encrypted_content'] } },
+            providerOptions: {
+              openai: {
+                store: false,
+                include: [
+                  'reasoning.encrypted_content',
+                  ...(nativeOptions?.fileSearch ? ['file_search_call.results'] : []),
+                ],
+                ...(nativeOptions && { maxToolCalls: nativeOptions.toolLimit }),
+              },
+            },
           }
         : {}),
       system,

@@ -17,3 +17,7 @@ The tool registry evaluates policy at discovery, definition load, and dispatch. 
 Before an approved consequential action or billable model operation runs, the runtime records its reservation under the saved logical turn. A retry with the same logical turn cannot dispatch external actions after a previous attempt may have dispatched one. A fresh user turn can authorize a new action. A timeout after dispatch may leave the remote result uncertain. The journal stores hashes and attempt ownership, without tool inputs or approval values.
 
 Verify with the built macOS and Windows Electron suites, the API's native wire fixtures, and a live configured Responses smoke test where credentials are available. Test malformed archives, private-resource transfer restrictions, revocation, cancellation, and recovery after a reservation.
+
+## Execution capability boundary
+
+The private capability port validates active turn bindings and the configured primary before runtime operations. Docker workspaces access staged files through the main-process broker, with kernel resource controls and an offline network namespace. Document parsers and the optional local embedding runtime use isolated Chromium sessions. Evidence and artifact access use versioned application IDs. File and network transfers require a reviewed, destination-specific grant. See [execution and knowledge](execution-knowledge-runtime.md).

@@ -1,3 +1,10 @@
+import type {
+  DocumentEvidence,
+  ExecutionHistoryEntry,
+  KnowledgeCollection,
+  OpenAIRuntimeFeature,
+  RuntimeSettings,
+} from './execution-runtime.js';
 import type { SkillRef, SkillPreview, ToolDiscovery, ToolSettings } from './capabilities.js';
 export * from './capabilities.js';
 import type { BrowserCommand, BrowserLayout, BrowserState } from './browser.js';
@@ -267,6 +274,7 @@ export interface ChatRequest {
   assistantMessageId: string;
   messages: { role: 'user' | 'assistant'; content: string }[];
   attachmentIds?: string[];
+  availableAssets?: MediaAsset[];
   expectedRevision?: string;
 }
 export type ChatEvent = {
@@ -301,6 +309,7 @@ export interface MediaAsset {
   name: string;
   mimeType: string;
   size: number;
+  managed?: boolean;
 }
 export interface OperationInput {
   mode: Exclude<GenerationMode, 'live'>;
@@ -373,6 +382,26 @@ export interface DesktopBridge {
   webSettings(): Promise<WebSettings>;
   saveWebSettings(input: WebSettingsInput): Promise<WebSettings>;
   toolSettings(): Promise<ToolSettings>;
+  executionHistory(): Promise<ExecutionHistoryEntry[]>;
+  runtimeSettings(): Promise<RuntimeSettings>;
+  saveRuntimeSettings(settings: RuntimeSettings): Promise<RuntimeSettings>;
+  nativeRuntimeModes(): Promise<OpenAIRuntimeFeature[]>;
+  setNativeRuntime(mode: OpenAIRuntimeFeature, enabled: boolean): Promise<OpenAIRuntimeFeature[]>;
+  probeRuntime(): Promise<Record<string, unknown>>;
+  localEmbeddings(): Promise<boolean>;
+  installLocalEmbeddings(): Promise<boolean>;
+  removeLocalEmbeddings(): Promise<void>;
+  knowledgeCollections(): Promise<KnowledgeCollection[]>;
+  manageKnowledge(
+    input:
+      | { operation: 'create'; name: string }
+      | { operation: 'enable'; id: string; enabled: boolean }
+      | { operation: 'add' | 'remove'; id: string }
+      | { operation: 'remove-file'; id: string; fileId: string },
+  ): Promise<KnowledgeCollection[]>;
+  previewDocument(conversationId: string, id: string): Promise<string>;
+  removeArtifact(conversationId: string, id: string): Promise<void>;
+  documentEvidence(conversationId: string, id: string): Promise<DocumentEvidence>;
   setToolEnabled(id: string, enabled: boolean): Promise<ToolSettings>;
   setToolDiscovery(mode: ToolDiscovery): Promise<ToolSettings>;
   previewSkill(kind: 'directory' | 'zip'): Promise<SkillPreview | null>;
@@ -386,6 +415,7 @@ export interface DesktopBridge {
   discoverModels(connection: ConnectionInput): Promise<DiscoveredModel[]>;
   verifyModel(connection: ConnectionInput, model: string): Promise<void>;
   importRegistryEnvironment(): Promise<RegistrySettings>;
+  importDroppedFiles(files: File[]): Promise<MediaAsset[]>;
   chooseMedia(kind: 'image' | 'audio' | 'text' | 'any'): Promise<MediaAsset[]>;
   exportMedia(id: string): Promise<void>;
   startLive(request: LiveRequest): Promise<void>;
@@ -397,3 +427,5 @@ export interface DesktopBridge {
   cancelChat(requestId: string): Promise<void>;
   onChatEvent(callback: (event: ChatEvent) => void): () => void;
 }
+
+export * from './execution-runtime.js';

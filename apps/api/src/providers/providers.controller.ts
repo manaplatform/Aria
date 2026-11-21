@@ -9,10 +9,12 @@ import {
 } from '@nestjs/common';
 import { IsIn, IsNotEmpty, IsString, MaxLength } from 'class-validator';
 import { jsonSchema, tool, type ModelMessage } from 'ai';
-import { providerEndpointSchema } from '@aria/shared';
+import { createHash, randomUUID } from 'node:crypto';
+import { openAIRuntimeFeatureSchema, providerEndpointSchema } from '@aria/shared';
 import { AiService, nativeToolSearch, providerError } from '../ai/ai.service';
 import { LocalApiGuard } from '../chat/local-api.guard';
 import { ModelRegistry, officialConnection } from './model-registry.service';
+import { OpenAIRuntime } from './openai-runtime';
 import { ProvidersService } from './providers.service';
 
 export class ConnectionDto {
@@ -39,6 +41,117 @@ export class ProvidersController {
     if (!providerEndpointSchema.safeParse(input.baseUrl).success)
       throw new BadRequestException('Invalid provider endpoint.');
     return this.providers.discover(input, true);
+  }
+
+  @Post('verify-native-runtime')
+  async verifyNativeRuntime(@Body() body: { feature?: unknown }) {
+    const parsed = openAIRuntimeFeatureSchema.safeParse(body.feature);
+    if (!parsed.success) throw new BadRequestException('Select an OpenAI runtime mode.');
+    const feature = parsed.data;
+    const signal = AbortSignal.timeout(35_000);
+    const { primary } = await this.models.resolve(signal, undefined, false, true);
+    if (!officialConnection(primary.connection.baseUrl))
+      throw new BadRequestException(
+        'Native runtime tools require the official OpenAI Responses endpoint.',
+      );
+    const runtime = new OpenAIRuntime(primary);
+    const marker = 'aria-runtime-probe-17';
+    try {
+      if (feature === 'hosted-shell') await runtime.openHosted([], [], [], signal);
+      else if (feature === 'local-shell') runtime.openLocal(randomUUID());
+      else {
+        const bytes = Buffer.from(
+          `Aria verification document. The synthetic reference number is ${marker}.`,
+        );
+        await runtime.prepareSearch(
+          [
+            {
+              file: { id: randomUUID(), name: 'aria-probe.txt', mimeType: 'text/plain', bytes },
+              version: createHash('sha256').update(bytes).digest('hex'),
+            },
+          ],
+          signal,
+        );
+      }
+      const shell = feature !== 'file-search';
+      const name = shell ? 'aria_native_shell' : 'aria_native_file_search';
+      const tools = runtime.tools();
+      const messages: ModelMessage[] = [
+        {
+          role: 'user',
+          content: shell
+            ? `Use the provided shell to run printf '${marker}' exactly once.`
+            : 'Use the file search tool to find the synthetic reference number in the supplied document.',
+        },
+      ];
+      const run = this.ai.generate(
+        messages,
+        signal,
+        primary,
+        'This is a synthetic capability probe.',
+        tools,
+        name,
+        false,
+        { fileSearch: !shell, toolLimit: 1 },
+      );
+      let verified = false;
+      let localId: string | undefined;
+      for await (const part of run.stream) {
+        if (part.type === 'error') throw part.error;
+        if (
+          part.type === 'tool-call' &&
+          part.toolName === name &&
+          feature === 'local-shell' &&
+          !part.providerExecuted
+        )
+          localId = part.toolCallId;
+        if (part.type === 'tool-result' && part.toolName === name) {
+          verified ||= shell
+            ? JSON.stringify(part.output).includes(marker)
+            : runtime.evidence(part.output).some((item) => item.excerpt.includes(marker));
+        }
+      }
+      if (localId) {
+        const response = await run.response;
+        messages.push(...response.messages.filter((message) => message.role === 'assistant'), {
+          role: 'tool',
+          content: [
+            {
+              type: 'tool-result',
+              toolCallId: localId,
+              toolName: name,
+              output: {
+                type: 'json',
+                value: {
+                  output: [{ stdout: marker, stderr: '', outcome: { type: 'exit', exitCode: 0 } }],
+                },
+              },
+            },
+          ],
+        });
+        const continuation = this.ai.generate(
+          messages,
+          signal,
+          primary,
+          'Report the verified synthetic shell result.',
+          tools,
+          undefined,
+          true,
+        );
+        for await (const part of continuation.stream) {
+          if (part.type === 'error') throw part.error;
+          if (part.type === 'text-delta') verified = true;
+        }
+      }
+      if (!verified) throw new Error('Missing native runtime result.');
+      return { feature, verified: true };
+    } catch {
+      throw new BadGatewayException(
+        'The configured OpenAI primary did not pass the runtime probe. Check model and account capabilities.',
+      );
+    } finally {
+      await runtime.close();
+    }
   }
 
   @Post('verify-tool-search')

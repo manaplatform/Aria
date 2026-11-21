@@ -69,3 +69,7 @@ Settings → Skills imports approved Agent Skills directories or single-root ZIP
 Set `ARIA_RUN_MODEL_EVALS=1` with an authorized `OPENAI_API_KEY` and `OPENAI_MODEL`, then run `pnpm --filter @aria/api test -- tool-intelligence.test.ts` to evaluate direct answers, tool selection, and skill selection against the configured model. Set `ARIA_TOOL_DISCOVERY=openai-responses` for the native evaluation. The deterministic suites require no credentials.
 
 The local chat benchmark used 20 warm turns with the same fixture, browser policy, and delegates as the baseline. A greeting request fell from 21,021 to 4,447 bytes. Median and p95 time to first delta fell from 10.4/13.3 ms to 8.1/9.2 ms. Warm turns made one primary request and produced zero tool activity in both runs. These figures measure the local fixture.
+
+## Execution and knowledge
+
+Desktop text chat extends the Part 1 capability bridge with conversation-scoped operations for offline Shell, local and hosted retrieval, reviewed skill execution, and artifact publication. The desktop runtime opens its SQLite index and journal lazily. Ordinary chat remains independent of the execution substrate. See [execution and knowledge](execution-knowledge-runtime.md) for setup and verification.

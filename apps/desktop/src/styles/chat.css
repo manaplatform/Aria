@@ -1192,3 +1192,19 @@
     border-top: 1px solid var(--border);
   }
 }
+
+.document-passage {
+  max-height: 20rem;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  width: 100%;
+}
+
+.document-evidence-link {
+  background: transparent;
+  border: 0;
+  color: inherit;
+  cursor: pointer;
+  text-decoration: underline;
+}

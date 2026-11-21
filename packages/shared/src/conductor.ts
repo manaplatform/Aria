@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { evidenceSchema } from './execution-runtime.js';
 import { capabilityId, type ToolProblem } from './capabilities.js';
 import { browserOps, browserToolArgs } from './browser.js';
 import { webToolArgs } from './web.js';
@@ -110,6 +111,8 @@ export const artifactReferenceSchema = z
     name: z.string().max(255),
     mimeType: z.string().max(100),
     size: z.number().int().positive().max(conductorLimits.artifactBytes),
+    storage: z.literal('desktop').optional(),
+    hostedExecution: z.strictObject({ stepId, sessionId: z.string().uuid() }).optional(),
   })
   .strict();
 export const activitySchema = z
@@ -136,6 +139,9 @@ export const activitySchema = z
     error: z.string().max(400).optional(),
     resultId: z.string().uuid().optional(),
     sources: z.array(sourceSchema).max(8).optional(),
+    evidence: z.array(evidenceSchema).max(6).optional(),
+    executionDetails: z.string().max(12_000).optional(),
+    privateContent: z.boolean().optional(),
   })
   .strict();
 export const runInfoSchema = z
