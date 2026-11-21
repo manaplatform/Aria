@@ -14,9 +14,7 @@ export class ExecutionScheduler {
   private readonly queue: Ticket[] = [];
   private readonly active = new Set<Ticket>();
 
-  async acquire(
-    ticket: Omit<Ticket, 'ready' | 'cancelled'>,
-  ): Promise<() => void> {
+  async acquire(ticket: Omit<Ticket, 'ready' | 'cancelled'>): Promise<() => void> {
     ticket.signal.throwIfAborted();
     if (this.queue.length >= 48) throw new Error('The tool execution queue is full.');
     return new Promise((resolve, reject) => {
@@ -27,7 +25,8 @@ export class ExecutionScheduler {
         this.schedule();
       };
       const item: Ticket = {
-        ...ticket, cancelled,
+        ...ticket,
+        cancelled,
         ready: (release) => {
           ticket.signal.removeEventListener('abort', cancelled);
           resolve(release);
@@ -49,8 +48,8 @@ export class ExecutionScheduler {
         (ticket.provider &&
           active.filter((current) => current.provider === ticket.provider).length >= 3) ||
         active.filter((current) => current.tool === ticket.tool).length >= ticket.toolLimit ||
-        ticket.locks.some((key) =>
-          waitingLocks.has(key) || active.some((current) => current.locks.includes(key)),
+        ticket.locks.some(
+          (key) => waitingLocks.has(key) || active.some((current) => current.locks.includes(key)),
         )
       ) {
         ticket.locks.forEach((key) => waitingLocks.add(key));

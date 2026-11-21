@@ -24,6 +24,10 @@ jobs:
       - run: pnpm typecheck
       - run: pnpm lint
       - run: pnpm test
+      - run: npm ci --ignore-scripts
+        working-directory: apps/desktop/program-runner
+      - run: node --experimental-strip-types --test runner.test.mts
+        working-directory: apps/desktop/program-runner
       - run: pnpm build
       - run: pnpm --filter @aria/desktop exec node scripts/ensure-electron.cjs
       - run: pnpm licenses:check
@@ -69,6 +73,13 @@ jobs:
           docker --host "$ARIA_TEST_DOCKER_ENDPOINT" pull docker.io/library/python@sha256:c5ba3deef00c7758561a0f03c26f44f10589263d40e732b8748e0d1f38f6dd89
       - run: pnpm --filter @aria/desktop exec vitest run tests/execution-runtime.test.ts
       - run: pnpm --filter @aria/desktop test:electron --grep 'runs real commands|runs a reviewed built-in skill'
+      - name: Verify the offline program runner
+        shell: bash
+        run: |
+          docker --host "$ARIA_TEST_DOCKER_ENDPOINT" build --tag aria-program-runner:ci apps/desktop/program-runner
+          ARIA_TEST_PROGRAM_IMAGE=$(docker --host "$ARIA_TEST_DOCKER_ENDPOINT" image inspect aria-program-runner:ci --format '{{.Id}}')
+          export ARIA_TEST_PROGRAM_IMAGE
+          pnpm --filter @aria/desktop test:electron --grep 'runs an isolated program'
       - name: Prepare and test the offline graphical desktop
         shell: bash
         run: |

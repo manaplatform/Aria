@@ -17,3 +17,5 @@ Docker Official Python image. The bundled renderer dependency inventory
 covers the document and ONNX runtime libraries.
 
 The optional Aria graphical desktop recipe uses the pinned Debian base image and its distribution packages. If distributing the built image, retain the upstream package notices and review the applicable redistribution and source obligations. Windows local desktop builds stage a self-contained .NET Windows Desktop helper. Include the runtime license and third-party notices from the exact runtime packs used to publish that helper.
+
+The optional program runner recipe uses a digest-pinned Docker Official Node image and the QuickJS WebAssembly packages pinned in `apps/desktop/program-runner/package-lock.json`. Retain the base image notices and the license files included in those packages with any distribution of the runner image.

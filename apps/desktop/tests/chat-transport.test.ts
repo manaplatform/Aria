@@ -9,7 +9,7 @@ import {
   type ChatRequest,
   type ChatServiceStatus,
 } from '@aria/shared';
-import { readChatEvents } from '../electron/chat-protocol';
+import { chatRequestSchema, readChatEvents } from '../electron/chat-protocol';
 import { ChatService } from '../electron/chat-service';
 import { ProviderConfigurationError, type ProviderStorage } from '../electron/provider-storage';
 
@@ -76,12 +76,14 @@ let service: ChatService;
 let children: Child[];
 let events: ChatEvent[];
 let states: ChatServiceStatus[];
+let lastRequest: ChatRequest | undefined;
 let mode: 'normal' | 'slow' | 'wrong';
 beforeEach(async () => {
   mode = 'normal';
   children = [];
   events = [];
   states = [];
+  lastRequest = undefined;
   server = http.createServer(async (incoming, response) => {
     if (incoming.method === 'DELETE') {
       response.end('{}');
@@ -95,6 +97,7 @@ beforeEach(async () => {
     let body = '';
     for await (const chunk of incoming) body += String(chunk);
     const input = JSON.parse(body) as ChatRequest;
+    lastRequest = input;
     expect(incoming.headers.authorization).toMatch(/^Bearer .+/);
     response.setHeader('Content-Type', 'text/event-stream');
     const current = {
@@ -152,6 +155,14 @@ it('starts one managed service, streams once, and restarts without replaying mes
   await service.restart();
   expect(children).toHaveLength(2);
   expect(events.filter((event) => event.type === 'delta')).toHaveLength(1);
+});
+it('forwards main-owned private-history metadata while rejecting it at the renderer boundary', async () => {
+  const managedRequest = { ...request, programPrivateHistory: true };
+  expect(chatRequestSchema.safeParse(managedRequest).success).toBe(false);
+  await service.start();
+  service.submit(managedRequest);
+  await vi.waitFor(() => expect(events.at(-1)?.type).toBe('completed'));
+  expect(lastRequest?.programPrivateHistory).toBe(true);
 });
 it('cancels requests and rejects configuration changes during generation', async () => {
   mode = 'slow';

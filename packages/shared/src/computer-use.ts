@@ -40,6 +40,8 @@ export const computerStatus = z.enum([
 
 export const computerAction = z.discriminatedUnion('type', [
   z.strictObject({ type: z.literal('screenshot') }),
+  z.strictObject({ type: z.literal('open_file_manager') }),
+  z.strictObject({ type: z.literal('open_application'), application: z.literal('messages') }),
   z.strictObject({
     type: z.literal('click'),
     ...point,

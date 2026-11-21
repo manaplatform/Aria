@@ -134,6 +134,7 @@ export const activitySchema = z
     callId: z.string().max(256).optional(),
     parentStepId: stepId.optional(),
     programStatus: z.enum(['complete', 'partial', 'failed', 'cancelled', 'uncertain']).optional(),
+    programResultSaved: z.boolean().optional(),
     inputSummary: z.string().max(200).optional(),
     resultSummary: z.string().max(200).optional(),
     at: z.number().int().nonnegative(),
@@ -152,6 +153,14 @@ export const runInfoSchema = z
     primary: modelRefSchema,
     primaryName: z.string().max(310).optional(),
     billableChildStarted: z.boolean(),
+    usage: z.strictObject({
+      providerRequests: z.number().int().nonnegative(),
+      responseContinuations: z.number().int().nonnegative(),
+      directToolCalls: z.number().int().nonnegative(),
+      programChildCalls: z.number().int().nonnegative(),
+      inputTokens: z.number().int().nonnegative().optional(),
+      outputTokens: z.number().int().nonnegative().optional(),
+    }).optional(),
   })
   .strict();
 export const conductorAttemptSchema = z

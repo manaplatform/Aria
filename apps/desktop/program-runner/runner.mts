@@ -1,6 +1,9 @@
 import { createInterface } from 'node:readline';
 import variant from '@jitl/quickjs-wasmfile-release-sync';
-import { newQuickJSWASMModuleFromVariant, type QuickJSDeferredPromise } from 'quickjs-emscripten-core';
+import {
+  newQuickJSWASMModuleFromVariant,
+  type QuickJSDeferredPromise,
+} from 'quickjs-emscripten-core';
 
 const maximumFrame = 48_000;
 
@@ -59,8 +62,11 @@ async function run() {
   // The guest receives a promise of JSON data, never an object from the Node process.
   const code = `
     (async (invoke, stringify, parse) => {
-      const tools = Object.freeze({ invoke: async (id, input) =>
-        parse(await invoke(id, stringify(input))) });
+      const call = async (id, input) => parse(await invoke(id, stringify(input)));
+      const tools = Object.freeze({
+        invoke: call,
+        readResult: (resultId, offset = 0) => call('programs.read_result', { resultId, offset }),
+      });
       const value = await (async (tools) => {
         "use strict";
         ${start.code}
@@ -111,9 +117,11 @@ async function run() {
   }
 }
 
-void run().catch((error: unknown) => {
-  const reason = error instanceof Error ? error.message : '';
-  send({ type: 'failure', code: reason === 'LIMIT' ? 'BUDGET_EXCEEDED' : 'INVALID_PROGRAM' });
-}).finally(() => {
-  process.stdin.destroy();
-});
+void run()
+  .catch((error: unknown) => {
+    const reason = error instanceof Error ? error.message : '';
+    send({ type: 'failure', code: reason === 'LIMIT' ? 'BUDGET_EXCEEDED' : 'INVALID_PROGRAM' });
+  })
+  .finally(() => {
+    process.stdin.destroy();
+  });

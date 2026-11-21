@@ -148,4 +148,12 @@ When implementing AI features:
 - Advertise only verified environment actions and provider transports. Require explicit environment and mode selection. Keep protocol details inside provider adapters and return actionable errors when either capability is unavailable.
 - Use Electron main and the existing scoped port, authorization checks, and dispatch journal. Treat interface content and artifacts as untrusted. Bind approvals and coordinates to the current target, action, and observation. Fence input on cancellation, scope changes, user takeover, and recovery.
 - Keep local desktop off until the user selects an authorized window. Use window-scoped native helpers for platform APIs. Keep authentication private and hold computer scripts in isolated runtimes behind the same action and transfer boundary.
-- Verify observable postconditions before reporting consequential success. Treat interrupted effects as uncertain and inspect the target before retrying. Keep programmatic eligibility declarative until the separate Programmatic Tool Calling work.
+- Verify observable postconditions before reporting consequential success. Treat interrupted effects as uncertain and inspect the target before retrying.
+
+## Conductor Programmatic Tool Calling
+
+- The configured primary decides when ordinary replies, direct calls, parallel calls, or programs fit the task. Keep all dispatch in Conductor and the shared registry. Ordinary chat starts independently of program runtime availability.
+- Advertise only verified backends and registered caller modes. Revalidate the descriptor, arguments, provenance, ownership, active policy, and session immediately before dispatch. Keep sensitive or consequential effects direct-only unless the trusted runtime can suspend and authorize the exact operation.
+- Execute generated code and executable skill resources inside a verified isolation boundary. Programs receive only scoped bindings, consume the parent budgets, and cannot expand permissions or launch nested programs.
+- Verify program results, evidence, and artifact references against trusted receipts. Keep program fingerprints, hidden provider state, and credentials out of renderer events. Journal reservations and outcomes and fence interrupted work before considering any retry.
+- Preserve provider protocol semantics in the adapter. Select the exact verified model and backend. Keep semantic routing model-driven and reject unsupported capabilities explicitly.

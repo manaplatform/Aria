@@ -57,6 +57,11 @@ function desktopInput(action: Input) {
       throw new RuntimeError('INVALID_ARGUMENT', 'The pointer is outside the virtual display.');
     return ['mousemove', String(x), String(y)];
   };
+  if (action.type === 'open_file_manager' || action.type === 'open_application')
+    throw new RuntimeError(
+      'PERMISSION_DENIED',
+      'Launching a desktop application requires a selected local display.',
+    );
   const keys = 'keys' in action ? (action.keys?.map(key) ?? []) : [];
   if (action.type === 'keypress') return ['key', '--clearmodifiers', keys.join('+')];
   if (action.type === 'type') return ['type', '--clearmodifiers', '--', action.text];

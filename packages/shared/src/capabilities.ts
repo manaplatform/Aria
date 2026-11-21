@@ -92,6 +92,7 @@ export interface SkillContent {
   text: string;
   resources?: SkillResource[];
   scripts?: SkillResource[];
+  programs?: SkillResource[];
   nextOffset?: number;
 }
 
@@ -174,6 +175,7 @@ export const capabilityHostReply = z.discriminatedUnion('ok', [
           .array(z.strictObject({ id: z.string().uuid(), name: z.string().max(240) }))
           .max(256)
           .optional(),
+        programs: z.array(z.object({ id: z.string().uuid(), name: z.string().max(240) })).max(256).optional(),
         nextOffset: z.number().int().positive().optional(),
       })
       .optional(),

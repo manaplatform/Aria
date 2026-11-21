@@ -5,6 +5,7 @@ import { desktop, errorMessage } from '../../services/desktop';
 import { Button } from '../ui';
 import { KnowledgeSettings } from './KnowledgeSettings';
 import { RuntimeSettings } from './RuntimeSettings';
+import { ProgramSettings } from './ProgramSettings';
 
 export function ToolSettings() {
   const [settings, setSettings] = useState<Settings>();
@@ -51,6 +52,7 @@ export function ToolSettings() {
         {!settings && !error && <p className="muted">Loading tools and skills…</p>}
         {settings && (
           <>
+            <ProgramSettings settings={settings} onSaved={setSettings} />
             <div className="shortcut-row">
               <label htmlFor="tool-discovery">Discovery backend</label>
               <select
@@ -93,6 +95,10 @@ export function ToolSettings() {
                   <strong>{tool.name}</strong>
                   <p className="muted">{tool.description}</p>
                   <small>{tool.permission}</small>
+                  {tool.programmatic?.length ? (
+                    <small>Program calling · {tool.programmatic.map((backend) =>
+                      backend === 'managed' ? 'Aria' : 'OpenAI Responses').join(', ')}</small>
+                  ) : null}
                   {tool.reason && <p className="muted">{tool.reason}</p>}
                 </div>
                 <Button

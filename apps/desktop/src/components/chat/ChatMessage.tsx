@@ -1,16 +1,88 @@
 import { useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Activity, ExternalLink, RotateCcw } from 'lucide-react';
-import type { ChatMessage as Message } from '@aria/shared';
+import type { ChatMessage as Message, ConductorActivity } from '@aria/shared';
 import { generating, regenerateChat, useChatStore } from '../../stores/chatStore';
 import { AriaMark } from '../layout/AriaMark';
 import { Button, CopyButton } from '../ui';
-import { openExternal } from '../../services/desktop';
+import { desktop, errorMessage, openExternal } from '../../services/desktop';
 import { openResearchSource } from '../../stores/browserStore';
 import MarkdownRenderer from './MarkdownRenderer';
 import { ArtifactCard } from './ArtifactCard';
 import { DocumentEvidence } from './DocumentEvidence';
 import { MediaPreview } from './MediaPreview';
+
+function ActivityRow({ step, children }: {
+  step: ConductorActivity;
+  children?: React.ReactNode;
+}) {
+  return (
+    <li>
+      <span>
+        {step.summary} · {step.status === 'approval' ? 'Waiting for approval' : step.programStatus ?? step.status}
+      </span>
+      <small>
+        {step.target}
+        {step.durationMs !== undefined ? ` · ${(step.durationMs / 1000).toFixed(1)} s` : ''}
+      </small>
+      {step.inputSummary && <small>{step.inputSummary}</small>}
+      {step.resultSummary && <small>{step.resultSummary}</small>}
+      {step.executionDetails && (
+        <details>
+          <summary>{step.capability === 'programs.run' ? 'Program result' : 'Command output'}</summary>
+          <pre>{step.executionDetails}</pre>
+        </details>
+      )}
+      {step.error && <small>{step.error}</small>}
+      {children}
+    </li>
+  );
+}
+
+function ProgramControls({ message, id }: { message: Message; id: string }) {
+  const [paused, setPaused] = useState(false);
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState('');
+  return (
+    <div>
+      <Button size="sm" variant="ghost" disabled={pending} onClick={async () => {
+        if (!message.requestId) return;
+        setPending(true);
+        setError('');
+        try {
+          await desktop().superviseProgram(message.requestId, message.conversationId, id, !paused);
+          setPaused(!paused);
+        } catch (failure) {
+          setError(errorMessage(failure));
+        } finally {
+          setPending(false);
+        }
+      }}>
+        {paused ? 'Resume program' : 'Pause program'}
+      </Button>
+      {error && <small role="alert">{error}</small>}
+    </div>
+  );
+}
+
+function SavedProgramResult({ conversation, id }: { conversation: string; id: string }) {
+  const [value, setValue] = useState('');
+  const [error, setError] = useState('');
+  return (
+    <details onToggle={async (event) => {
+      if (!event.currentTarget.open || value) return;
+      setError('');
+      try {
+        setValue(await desktop().inspectProgramResult(conversation, id));
+      } catch (failure) {
+        setError(errorMessage(failure));
+      }
+    }}>
+      <summary>Saved program result</summary>
+      {error ? <small role="alert">{error}</small> : <pre>{value || 'Loading…'}</pre>}
+    </details>
+  );
+}
 
 export function ChatMessage({
   message,
@@ -94,29 +166,24 @@ export function ChatMessage({
             · {message.activity.length}
           </summary>
           <ul>
-            {message.activity.map((step) => (
-              <li key={step.stepId}>
-                <span>
-                  {step.summary} ·{' '}
-                  {step.status === 'approval' ? 'Waiting for approval' : step.status}
-                </span>
-                <small>
-                  {step.target} · {step.capability}
-                  {step.durationMs !== undefined
-                    ? ` · ${(step.durationMs / 1000).toFixed(1)} s`
-                    : ''}
-                </small>
-                {step.inputSummary && <small>{step.inputSummary}</small>}
-                {step.resultSummary && <small>{step.resultSummary}</small>}
-                {step.executionDetails && (
-                  <details>
-                    <summary>Command output</summary>
-                    <pre>{step.executionDetails}</pre>
-                  </details>
-                )}
-                {step.error && <small>{step.error}</small>}
-              </li>
-            ))}
+            {message.activity
+              .filter((step) => !step.parentStepId || !message.activity?.some(({ stepId }) => stepId === step.parentStepId))
+              .map((step) => {
+                const child = message.activity?.filter(({ parentStepId }) => parentStepId === step.stepId) ?? [];
+                return (
+                  <ActivityRow key={step.stepId} step={step}>
+                    {step.capability === 'programs.run' && step.target === 'Aria isolated JavaScript' &&
+                      step.status === 'running' && busy && <ProgramControls message={message} id={step.stepId} />}
+                    {step.programResultSaved && <SavedProgramResult conversation={message.conversationId} id={step.stepId} />}
+                    {child.length > 0 && (
+                      <details>
+                        <summary>{child.length} tool {child.length === 1 ? 'call' : 'calls'}</summary>
+                        <ul>{child.map((item) => <ActivityRow key={item.stepId} step={item} />)}</ul>
+                      </details>
+                    )}
+                  </ActivityRow>
+                );
+              })}
           </ul>
         </details>
       ) : null}

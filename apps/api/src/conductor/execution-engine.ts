@@ -30,7 +30,7 @@ export type Invocation = {
   descriptor: ToolDescriptor;
   callId: string;
   input: unknown;
-  program?: { id: string; backend: 'managed' | 'openai-responses'; signal: AbortSignal };
+  program?: { id: string; backend: 'managed' | 'openai-responses'; revision: string; signal: AbortSignal };
 };
 
 function canonical(value: unknown): string {
@@ -54,6 +54,8 @@ export class ExecutionEngine {
   private readonly failedCapabilities = new Set<string>();
   private readonly counters = { searches: 0, fetches: 0, screenshots: 0 };
   private count = 0;
+  directToolCalls = 0;
+  programChildCalls = 0;
   billableChildStarted = false;
   partial = false;
   progress = 0;
@@ -133,6 +135,8 @@ export class ExecutionEngine {
           stepId: id,
           callId,
           parentStepId: program?.id,
+          programStatus: outcome?.programStatus,
+          programResultSaved: outcome?.programResultSaved,
           capability: descriptor.capability,
           target: model ? `${model.connection.name} / ${model.id}`.slice(0, 310) : descriptor.id,
           summary: descriptor.name,
@@ -163,7 +167,7 @@ export class ExecutionEngine {
     let operation: Promise<StepValue> | undefined;
     try {
       parent.throwIfAborted();
-      this.reserveProgram();
+      if (!program) this.reserveProgram();
       if (!program && !descriptor.modes.includes('direct'))
         throw new ToolError('CALLER_MISMATCH', 'This tool is only available inside an authorized program.');
       if (!this.tools.allowed(descriptor, this.context)) {
@@ -190,7 +194,8 @@ export class ExecutionEngine {
           'INVALID_ARGUMENT',
           'The arguments do not match the loaded tool schema.',
         );
-      if (program && !this.tools.allowedForProgram(descriptor, this.context, program.backend, input.data))
+      if (program && (program.revision !== this.tools.host.current.revision ||
+        !this.tools.allowedForProgram(descriptor, this.context, program.backend, input.data)))
         throw new ToolError('PERMISSION_DENIED', 'The program cannot invoke this tool with these arguments.');
       const step: ExecutionStep = {
         id,
@@ -268,7 +273,7 @@ export class ExecutionEngine {
         throw new ToolError('INVALID_ARGUMENT', 'The supplied text exceeds the step input limit.');
       const fingerprint = createHash('sha256')
         .update(
-          canonical([descriptor.id, step.target, step.args ?? step.instructions, step.inputs]),
+          canonical([descriptor.id, step.target, step.args ?? (descriptor.normalize ? step.instructions : input.data), step.inputs]),
         )
         .digest('hex');
       if (!descriptor.repeatable && this.dispatched.has(fingerprint))
@@ -319,10 +324,13 @@ export class ExecutionEngine {
       }
       signal.throwIfAborted();
       if (!this.tools.allowed(descriptor, this.context) ||
-        (program && !this.tools.allowedForProgram(descriptor, this.context, program.backend, input.data)))
+        (program && (program.revision !== this.tools.host.current.revision ||
+          !this.tools.allowedForProgram(descriptor, this.context, program.backend, input.data))))
         throw new ToolError('PERMISSION_DENIED', 'The tool was revoked before dispatch.');
       activity('running');
       launched = true;
+      if (program) this.programChildCalls++;
+      else if (descriptor.id !== 'programs.run') this.directToolCalls++;
       if (descriptor.effect === 'consequential') this.billableChildStarted = true;
       let raw;
       try {
@@ -419,14 +427,14 @@ export class ExecutionEngine {
     } catch (error) {
       const stopped = parent.aborted;
       const code = stopped
-        ? 'CANCELLED'
+        ? program && launched && descriptor.program?.retry === 'never' ? 'OUTCOME_UNCERTAIN' : 'CANCELLED'
         : error instanceof ToolError
           ? error.code
           : reserved && !(error instanceof RunError)
             ? 'OUTCOME_UNCERTAIN'
             : 'EXECUTION_FAILED';
       const message = stopped
-        ? 'The operation stopped.'
+        ? code === 'OUTCOME_UNCERTAIN' ? 'The operation stopped after dispatch and needs reconciliation.' : 'The operation stopped.'
         : error instanceof RunError
           ? error.message
           : providerError(error);
@@ -434,7 +442,7 @@ export class ExecutionEngine {
         this.recoverable.set(id, descriptor.id);
       result = {
         id,
-        status: stopped ? 'cancelled' : code === 'DUPLICATE_DISPATCH' ? 'blocked' : 'failed',
+        status: code === 'CANCELLED' ? 'cancelled' : code === 'DUPLICATE_DISPATCH' ? 'blocked' : 'failed',
         problem: { code, message: message.slice(0, 400) },
       };
     } finally {

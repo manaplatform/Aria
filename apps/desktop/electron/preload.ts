@@ -39,8 +39,8 @@ const bridge: DesktopBridge = {
     ipcRenderer.invoke('aria:computer-preview', conversation, id),
   probeVirtualComputer: () => ipcRenderer.invoke('aria:probe-virtual-computer'),
   localComputerSupported: () => ipcRenderer.invoke('aria:local-computer-supported'),
-  selectLocalComputer: (conversation) =>
-    ipcRenderer.invoke('aria:select-local-computer', conversation),
+  selectLocalComputer: (conversation, target) =>
+    ipcRenderer.invoke('aria:select-local-computer', conversation, target),
   revokeLocalComputer: () => ipcRenderer.invoke('aria:revoke-local-computer'),
   superviseComputer: (conversation, command) =>
     ipcRenderer.invoke('aria:computer-supervise', conversation, command),
@@ -60,6 +60,9 @@ const bridge: DesktopBridge = {
   saveWebSettings: (input) => ipcRenderer.invoke('aria:save-web-settings', input),
   toolSettings: () => ipcRenderer.invoke('aria:tool-settings'),
   setProgramSettings: (settings) => ipcRenderer.invoke('aria:set-program-settings', settings),
+  superviseProgram: (request, conversation, id, pause) =>
+    ipcRenderer.invoke('aria:supervise-program', request, conversation, id, pause),
+  inspectProgramResult: (conversation, id) => ipcRenderer.invoke('aria:inspect-program-result', conversation, id),
   executionHistory: () => ipcRenderer.invoke('aria:execution-history'),
   runtimeSettings: () => ipcRenderer.invoke('aria:runtime-settings'),
   saveRuntimeSettings: (settings) => ipcRenderer.invoke('aria:save-runtime-settings', settings),

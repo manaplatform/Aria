@@ -4,6 +4,7 @@ import {
   clipboard,
   dialog,
   ipcMain,
+  screen,
   shell,
   safeStorage,
   utilityProcess,
@@ -48,7 +49,7 @@ import { VirtualComputer } from './runtime/virtual-computer';
 import { LocalComputer } from './runtime/local-computer';
 import { openAIRuntimeFeatureSchema, runtimeSettingsSchema } from '@aria/shared';
 import { MediaStorage, referencedAssets } from './media-storage';
-import { captureDisplay } from './screen-capture';
+import { captureDisplay, chooseDisplay } from './screen-capture';
 import { MediaService, liveRequestSchema } from './media-service';
 import { chatRequestSchema } from './chat-protocol';
 import {
@@ -379,14 +380,51 @@ function registerIpc(): void {
     changeCapabilities(() => virtualComputer.verify(AbortSignal.timeout(30_000))),
   );
   handle('aria:local-computer-supported', () => localComputer.supported());
-  handle('aria:select-local-computer', (value) => {
+  handle('aria:select-local-computer', async (value, rawTarget) => {
     const owner = identifier.parse(value);
-    if (!browser.computerForeground(owner))
-      throw new Error('Open the conversation that will use the local window.');
-    return changeCapabilities(() => localComputer.prepare(owner, AbortSignal.timeout(85_000)));
+    const target = z.enum(['window', 'screen']).default('window').parse(rawTarget);
+    const checkForeground = () => {
+      const active = browser.activeConversation();
+      if (
+        initial.data.chat.selectedId !== owner ||
+        (active !== null && active !== owner) ||
+        !mainWindow ||
+        mainWindow.isDestroyed() ||
+        mainWindow.isMinimized()
+      )
+        throw new Error('Open the conversation that will use the local desktop.');
+    };
+    checkForeground();
+    let display: Awaited<ReturnType<typeof chooseDisplay>>;
+    if (target === 'screen') {
+      if (!mainWindow?.isFocused()) throw new Error('Focus Aria before selecting a display.');
+      display = await chooseDisplay(
+        mainWindow,
+        'Select a full screen',
+        'Aria can ask to share screenshots, open a supported app, or move and click the mouse on this display. Each action requires your approval.',
+        true,
+      );
+      if (!display) return false;
+    }
+    return changeCapabilities(async () => {
+      checkForeground();
+      const signal = AbortSignal.timeout(85_000);
+      if (display) await localComputer.prepareScreen(owner, display, signal);
+      else await localComputer.prepare(owner, signal);
+      await computerRuntime.closeLocalSessions();
+      try {
+        checkForeground();
+      } catch (error) {
+        localComputer.revoke();
+        throw error;
+      }
+    }, async () => true);
   });
   handle('aria:revoke-local-computer', () =>
-    changeCapabilities(async () => localComputer.revoke()),
+    changeCapabilities(async () => {
+      localComputer.revoke();
+      await computerRuntime.closeLocalSessions();
+    }, async () => undefined),
   );
   handle('aria:web-settings', () => webSettings.get());
   handle('aria:save-web-settings', async (input) => {
@@ -552,6 +590,10 @@ function registerIpc(): void {
     );
     chat.submit({
       ...parsed,
+      programPrivateHistory: messages.some((message) =>
+        message.id !== assistant.id && message.activity?.some((step) => step.privateContent) &&
+        !blockedHistory.has(message.content) &&
+        parsed.messages.some((item) => item.role === 'assistant' && item.content === message.content)),
       messages: parsed.messages.filter(
         (item, index) =>
           index === parsed.messages.length - 1 ||
@@ -668,6 +710,16 @@ function registerIpc(): void {
     ),
   );
   handle('aria:cancel-chat', (id) => chat.cancel(identifier.parse(id)));
+  handle('aria:supervise-program', (request, conversation, id, paused) => {
+    const requestId = identifier.parse(request);
+    const conversationId = identifier.parse(conversation);
+    if (!chat.activeTurn({ requestId, conversationId }))
+      throw new Error('The program is no longer active in this conversation.');
+    executionRuntime.programs.supervise(requestId, conversationId, z.string().uuid().parse(id), z.boolean().parse(paused));
+  });
+  handle('aria:inspect-program-result', (conversation, id) =>
+    executionRuntime.inspectProgramResult(identifier.parse(conversation), z.string().uuid().parse(id)),
+  );
   async function importFiles(filenames: string[], kind: 'image' | 'audio' | 'text' | 'any') {
     if (filenames.length > 4 || filenames.some((file) => !path.isAbsolute(file)))
       throw new Error('Choose up to four files from your device.');
@@ -933,6 +985,7 @@ app
       approve,
       () => chat.executionIdentity(),
       () => provider.resolve(),
+      cipher,
     );
     webSettings = new WebSettingsStorage(directory);
     await webSettings.load();
@@ -940,6 +993,7 @@ app
     await browser.load();
     virtualComputer = new VirtualComputer(() => executionRuntime.settings(), directory);
     localComputer = new LocalComputer();
+    screen.on('display-removed', (_event, display) => localComputer.disconnectDisplay(display.id));
     computerRuntime = new ComputerRuntime(
       executionRuntime.store,
       [

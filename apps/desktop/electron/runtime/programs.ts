@@ -15,7 +15,9 @@ import { RuntimeError } from './store';
 type Request = Extract<CapabilityHostRequest, { type: 'runtime' }>;
 const startSchema = z.strictObject({
   code: z.string().min(1).max(programLimits.code),
-  bindings: z.record(z.string().max(100), z.string().uuid()).refine((v) => Object.keys(v).length <= 8),
+  bindings: z
+    .record(z.string().max(100), z.string().uuid())
+    .refine((v) => Object.keys(v).length <= 9),
   toolCalls: z.number().int().min(1).max(12),
   milliseconds: z.number().int().min(1).max(120_000),
 });
@@ -29,6 +31,7 @@ type Session = {
   frames: ProgramFrame[];
   awaiting: Set<number>;
   seen: Set<number>;
+  paused: boolean;
   wake?: () => void;
   reply: (value: object) => void;
   done: Promise<void>;
@@ -37,7 +40,8 @@ type Session = {
 
 function parse<T>(schema: z.ZodType<T>, value: unknown) {
   const parsed = schema.safeParse(programJson(value, programLimits.frame));
-  if (!parsed.success) throw new RuntimeError('INVALID_ARGUMENT', 'Invalid program runtime request.');
+  if (!parsed.success)
+    throw new RuntimeError('INVALID_ARGUMENT', 'Invalid program runtime request.');
   return parsed.data;
 }
 
@@ -46,22 +50,33 @@ export class ProgramRuntime {
   private readonly starting = new Set<string>();
 
   private owner(request: Request) {
-    return JSON.stringify([request.conversationId, request.assistantMessageId, request.requestId, request.revision]);
+    return JSON.stringify([
+      request.conversationId,
+      request.assistantMessageId,
+      request.requestId,
+      request.revision,
+    ]);
   }
 
-  async dispatch(
-    request: Request,
-    engine: DockerSandbox,
-    image: string,
-    signal: AbortSignal,
-  ) {
+  async dispatch(request: Request, engine: DockerSandbox, image: string, signal: AbortSignal) {
     const id = request.stepId;
     if (request.operation === 'program.start') {
-      if (this.sessions.has(id) || this.starting.has(id) || this.sessions.size + this.starting.size >= 4)
+      if (
+        this.sessions.has(id) ||
+        this.starting.has(id) ||
+        this.sessions.size + this.starting.size >= 4
+      )
         throw new RuntimeError('BUDGET_EXCEEDED', 'The desktop program runner is busy.');
       this.starting.add(id);
       try {
-        await this.start(id, this.owner(request), engine, image, parse(startSchema, request.input), signal);
+        await this.start(
+          id,
+          this.owner(request),
+          engine,
+          image,
+          parse(startSchema, request.input),
+          signal,
+        );
         return {};
       } finally {
         this.starting.delete(id);
@@ -75,18 +90,27 @@ export class ProgramRuntime {
       return {};
     }
     const { replies, wait } = parse(exchangeSchema, request.input);
-    if (session.wake) throw new RuntimeError('DUPLICATE_DISPATCH', 'A program exchange is already pending.');
+    if (session.wake)
+      throw new RuntimeError('DUPLICATE_DISPATCH', 'A program exchange is already pending.');
     for (const reply of replies) {
       if (!session.awaiting.delete(reply.id))
-        throw new RuntimeError('CALLER_MISMATCH', 'The program reply does not match a pending call.');
+        throw new RuntimeError(
+          'CALLER_MISMATCH',
+          'The program reply does not match a pending call.',
+        );
       session.reply(reply);
     }
     await this.wait(session, wait, signal);
-    return { data: { frames: this.drain(session) } };
+    return { data: { frames: session.paused ? [] : this.drain(session) } };
   }
 
   private async start(
-    id: string, owner: string, engine: DockerSandbox, image: string, input: Start, signal: AbortSignal,
+    id: string,
+    owner: string,
+    engine: DockerSandbox,
+    image: string,
+    input: Start,
+    signal: AbortSignal,
   ) {
     const child = await engine.programProcess(id, image, signal);
     const decoder = new StringDecoder('utf8');
@@ -107,7 +131,13 @@ export class ProgramRuntime {
       });
     });
     const session: Session = {
-      owner, frames: [], awaiting: new Set(), seen: new Set(), done, close: finish,
+      owner,
+      frames: [],
+      awaiting: new Set(),
+      seen: new Set(),
+      done,
+      close: finish,
+      paused: false,
       reply: (value) => {
         if (!stopping && !terminal) child.stdin.write(JSON.stringify(value) + '\n');
       },
@@ -137,9 +167,11 @@ export class ProgramRuntime {
           const frame = parse(programFrameSchema, JSON.parse(line));
           if (frame.type === 'call') {
             if (
-              session.seen.has(frame.id) || session.seen.size >= input.toolCalls ||
+              session.seen.has(frame.id) ||
+              session.seen.size >= input.toolCalls ||
               !Object.values(input.bindings).includes(frame.handle)
-            ) throw new Error();
+            )
+              throw new Error();
             session.seen.add(frame.id);
             session.awaiting.add(frame.id);
           }
@@ -159,7 +191,7 @@ export class ProgramRuntime {
   }
 
   private async wait(session: Session, milliseconds: number, signal: AbortSignal) {
-    if (session.frames.length || !milliseconds) return;
+    if ((!session.paused && session.frames.length) || !milliseconds) return;
     await new Promise<void>((resolve) => {
       const wake = () => {
         clearTimeout(timer);
@@ -193,36 +225,67 @@ export class ProgramRuntime {
     await session.done;
   }
 
+  supervise(requestId: string, conversationId: string, id: string, pause: boolean) {
+    const session = this.sessions.get(id);
+    const owner = session && (JSON.parse(session.owner) as string[]);
+    if (!session || !owner || owner[0] !== conversationId || owner[2] !== requestId)
+      throw new RuntimeError(
+        'PERMISSION_DENIED',
+        'The program is no longer active in this conversation.',
+      );
+    session.paused = pause;
+    session.wake?.();
+  }
+
   release(requestId?: string) {
-    return Promise.all([...this.sessions].flatMap(([id, session]) =>
-      !requestId || (JSON.parse(session.owner) as string[])[2] === requestId
-        ? [this.stop(id, session)]
-        : [],
-    ));
+    return Promise.all(
+      [...this.sessions].flatMap(([id, session]) =>
+        !requestId || (JSON.parse(session.owner) as string[])[2] === requestId
+          ? [this.stop(id, session)]
+          : [],
+      ),
+    );
   }
 
   async probe(engine: DockerSandbox, image: string, signal: AbortSignal) {
     const id = randomUUID();
     const handle = randomUUID();
-    await this.start(id, '[]', engine, image, {
-      code: 'const answer = await tools.invoke("probe.echo", { value: 21 }); return { value: answer.value * 2, isolated: typeof process === "undefined" && typeof require === "undefined" && typeof fetch === "undefined" };',
-      bindings: { 'probe.echo': handle },
-      toolCalls: 1,
-      milliseconds: 8000,
-    }, signal);
+    await this.start(
+      id,
+      '[]',
+      engine,
+      image,
+      {
+        code: 'const answer = await tools.invoke("probe.echo", { value: 21 }); return { value: answer.value * 2, isolated: typeof process === "undefined" && typeof require === "undefined" && typeof fetch === "undefined" };',
+        bindings: { 'probe.echo': handle },
+        toolCalls: 1,
+        milliseconds: 8000,
+      },
+      signal,
+    );
     const session = this.sessions.get(id)!;
     try {
       const deadline = AbortSignal.any([signal, AbortSignal.timeout(8500)]);
       while (!deadline.aborted) {
         await this.wait(session, 500, deadline);
         for (const frame of this.drain(session)) {
-          if (frame.type === 'call' && frame.handle === handle && JSON.stringify(frame.input) === '{"value":21}') {
+          if (
+            frame.type === 'call' &&
+            frame.handle === handle &&
+            JSON.stringify(frame.input) === '{"value":21}'
+          ) {
             session.awaiting.delete(frame.id);
             session.reply({ id: frame.id, value: { value: 21 } });
-          } else if (frame.type === 'result' && JSON.stringify(frame.value) === '{"value":42,"isolated":true}') {
+          } else if (
+            frame.type === 'result' &&
+            JSON.stringify(frame.value) === '{"value":42,"isolated":true}'
+          ) {
             return;
           } else {
-            throw new RuntimeError('CAPABILITY_UNAVAILABLE', 'The isolated JavaScript runner failed its capability probe.');
+            throw new RuntimeError(
+              'CAPABILITY_UNAVAILABLE',
+              'The isolated JavaScript runner failed its capability probe.',
+            );
           }
         }
       }

@@ -83,6 +83,10 @@ export class Conductor {
     let native: OpenAIRuntime | undefined;
     let toolContext: import('./tool-registry').ToolContext | undefined;
     let hosted: HostedProgramTurn | undefined;
+    let providerRequests = 0;
+    let responseContinuations = 0;
+    let inputTokens: number | undefined;
+    let outputTokens: number | undefined;
     const runInfo = () =>
       primary
         ? {
@@ -90,6 +94,14 @@ export class Conductor {
             primaryName,
             revision,
             billableChildStarted: engine?.billableChildStarted ?? false,
+            usage: {
+              providerRequests,
+              responseContinuations,
+              directToolCalls: engine?.directToolCalls ?? 0,
+              programChildCalls: engine?.programChildCalls ?? 0,
+              inputTokens,
+              outputTokens,
+            },
           }
         : undefined;
     try {
@@ -109,6 +121,7 @@ export class Conductor {
         attachments,
         research: this.web.scope(request, !config),
         privateContent: false,
+        programPrivateHistory: request.programPrivateHistory,
         ...(!voiceSessionId &&
           this.tools.host.current.desktopRuntime && {
             runtime: {
@@ -157,8 +170,13 @@ export class Conductor {
       const programming = context.runtime && policy.programming?.backend !== 'off'
         ? policy.programming : undefined;
       const broker = programming && new ProgramBroker(engine, this.tools, emit, signal);
+      if (broker) context.readProgramResult = (id, offset) => broker.read(id, offset);
       if (programming?.backend === 'managed' && broker)
-        context.runProgram = (input, id, deadline) => broker.managed(input, id, turn.loadedTools(), deadline);
+        context.runProgram = (input, id, deadline) => {
+          if (input.skillSource && !turn.hasLoadedSkill(input.skillSource.id, input.skillSource.version))
+            throw new ToolError('PERMISSION_DENIED', 'Load the approved skill version before running its program.');
+          return broker.managed(input, id, turn.loadedTools(), deadline);
+        };
       emit({ type: 'started', run: runInfo() });
       const namespaces = this.tools.namespaceInfo(context);
       if (policy.skills.some((skill) => skill.enabled))
@@ -177,7 +195,7 @@ export class Conductor {
           'Use direct calls for semantic choices, sensitive approvals, and native artifact validation. Use parallel direct calls for independent operations without intermediate logic. Compose a program only when bounded deterministic code can handle dependencies or reduce intermediate results. Discover and load the tools before writing code. Use known tool inputs and preserve actual result IDs in dependsOn when required.',
           'Define a meaningful objective and termination condition, await every invoked tool, and return one JSON object with objective, data, missing (string array), checks (name and passed), evidence (real evidence or source IDs), artifacts (published IDs), and optional warnings. Report partial work. Return to Conductor when new tools, permissions, or semantic decisions are needed.',
           programming.backend === 'managed'
-            ? 'The managed program body uses await tools.invoke("namespace.tool", arguments) and returns that JSON object. Tool replies include status, optional data, evidence, sources, artifact, and problem. Use only IDs listed in the program request and keep private operations apart from public-network operations.'
+            ? 'The managed program body uses await tools.invoke("namespace.tool", arguments) and returns that JSON object. Tool replies include status, optional data, evidence, sources, artifact, and problem. Use tools.readResult(resultRef, offset) when a reply contains a large result reference. Use only IDs listed in the program request and keep private operations apart from public-network operations.'
             : 'When the OpenAI program tool and loaded function bindings are exposed, emit the program JSON object via text(JSON.stringify(result)). Function results contain structured status, data, source references, and any problem. The hosted program can use only tools allowed for programmatic callers.',
         ] : []),
         ...(policy.computerBrowser || policy.computerVirtual || policy.computerLocal
@@ -216,6 +234,7 @@ export class Conductor {
         const nativeTools = synthesis ? {} : (native?.tools() ?? {});
         nativeComputerUsed ||= nativeComputerActive;
         const computerTools = nativeComputerUsed ? nativeComputerTools : {};
+        context.hostedProgramsBlocked = nativeComputerActive || Object.keys(nativeTools).length > 0;
         const controls = turn.controls(messages);
         const hostedBindings = turn.programTools('openai-responses');
         if (
@@ -231,6 +250,8 @@ export class Conductor {
           computerStatus && `Previous computer batch results from the trusted runtime: ${computerStatus}`,
           hosted?.outcome && `Program validation reported ${hosted.outcome.code}. ${hosted.outcome.message}`,
         ].filter(Boolean);
+        if (hosted?.transport.hasContinuation) responseContinuations++;
+        providerRequests++;
         const response = this.ai.generate(
           messages,
           signal,
@@ -330,6 +351,11 @@ export class Conductor {
           throw error;
         }
         signal.throwIfAborted();
+        const usage = await response.usage;
+        if (usage.inputTokens !== undefined && Number.isSafeInteger(usage.inputTokens) && usage.inputTokens >= 0)
+          inputTokens = (inputTokens ?? 0) + usage.inputTokens;
+        if (usage.outputTokens !== undefined && Number.isSafeInteger(usage.outputTokens) && usage.outputTokens >= 0)
+          outputTokens = (outputTokens ?? 0) + usage.outputTokens;
         const previousProgramProblem = hosted?.outcome;
         await hosted?.receive(calls.map(({ toolCallId }) => toolCallId));
         if (hosted) {
@@ -343,6 +369,7 @@ export class Conductor {
           }
         }
         if (!calls.length) {
+          if (hosted?.finalText) text = hosted.finalText;
           if (hosted?.final && !text.trim()) text = 'The provider declined to answer this request.';
           if (hosted && text) emit({ type: 'delta', text });
           if (!text.trim() && !engine.succeeded && !problem)

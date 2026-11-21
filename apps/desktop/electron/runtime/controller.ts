@@ -4,6 +4,9 @@ import { stripVTControlCharacters } from 'node:util';
 import {
   evidenceSchema,
   executionLimits,
+  programSkillSource,
+  programLimits,
+  programJournalSchema,
   runtimeOperations,
   runtimeSettingsSchema,
   workspaceFilename,
@@ -17,6 +20,8 @@ import {
 } from '@aria/shared';
 import { z } from 'zod';
 import type { CapabilityStorage } from '../capability-storage';
+import { decodeSkillText } from '../skill-bundles';
+import type { SecretCipher } from '../provider-storage';
 import type { MediaStorage } from '../media-storage';
 import { downloadVerified } from './downloads';
 import { extractDocument } from './extraction';
@@ -70,6 +75,7 @@ export class DesktopRuntime {
     private readonly approve: Grant,
     private readonly providerIdentity: () => string | undefined,
     private readonly resolveRegistry: () => Promise<RuntimeRegistry>,
+    private readonly programCipher: SecretCipher,
   ) {
     this.store = new RuntimeStore(directory);
     this.knowledge = new Knowledge(this.store, extractDocument);
@@ -139,6 +145,14 @@ export class DesktopRuntime {
     return this.programs.probe(this.sandbox(), image, signal);
   }
 
+  async inspectProgramResult(conversation: string, id: string) {
+    const payload = this.store.programResult(conversation, id);
+    if (!payload || !(await this.programCipher.available()))
+      throw new Error('The saved program result is unavailable or has expired.');
+    const { result } = await this.programCipher.decrypt(payload);
+    return JSON.stringify(JSON.parse(result), null, 2);
+  }
+
   async dispatch(request: RuntimeRequest, signal: AbortSignal): Promise<RuntimeResult> {
     if (request.voiceSessionId)
       throw new RuntimeError('PERMISSION_DENIED', 'Open desktop chat to use the runtime.');
@@ -147,10 +161,17 @@ export class DesktopRuntime {
     switch (request.operation) {
       case 'program.journal': {
         const provider = this.providerIdentity();
-        if (!provider || this.skills.policy().programming?.backend === 'off')
+        const settings = this.skills.policy().programming;
+        if (!provider || !settings || settings.backend === 'off')
           throw new RuntimeError('PERMISSION_DENIED', 'Enable program execution in Tools settings.');
-        this.store.journalProgram(request, provider);
-        return {};
+        const input = checked(programJournalSchema.safeParse(request.input));
+        const result = input.action === 'finish' ? input.result : undefined;
+        let sealed: Buffer | undefined;
+        if (result && Buffer.byteLength(result) <= 24_000 && await this.programCipher.available().catch(() => false))
+          sealed = await this.programCipher.encrypt(result).catch(() => undefined);
+        signal.throwIfAborted();
+        const saved = this.store.journalProgram(request, provider, sealed);
+        return saved ? { data: { saved: true } } : {};
       }
       case 'program.start':
       case 'program.exchange':
@@ -158,6 +179,16 @@ export class DesktopRuntime {
         const settings = this.skills.policy().programming;
         if (settings?.backend !== 'managed' || !settings.image)
           throw new RuntimeError('CAPABILITY_UNAVAILABLE', 'Verify an Aria program image in Tools settings.');
+        if (request.operation === 'program.start' && request.input.skillSource !== undefined) {
+          const ref = checked(programSkillSource.safeParse(request.input.skillSource));
+          const script = await this.skills.executionScript(ref, ref.resourceId, signal, 'program');
+          if (!script || script.bytes.length > programLimits.code)
+            throw new RuntimeError('PERMISSION_DENIED', 'The approved program resource is unavailable.');
+          const { bindings, toolCalls, milliseconds } = request.input;
+          return this.programs.dispatch({
+            ...request, input: { bindings, toolCalls, milliseconds, code: decodeSkillText(script.bytes) },
+          }, this.sandbox(), settings.image, signal);
+        }
         return this.programs.dispatch(request, this.sandbox(), settings.image, signal);
       }
       case 'hosted.resources': {
@@ -360,7 +391,8 @@ Skills: ${[...references, ...inline].join(', ') || 'none'}`,
           if (
             !(await this.approve(
               'Run a reviewed skill script?',
-              `Skill: ${input.skill.id}\nScript: ${script.name}\nVersion: ${input.skill.version}\nEnvironment: offline Aria workspace`,
+              `Skill: ${input.skill.id}\nScript: ${script.name}\nVersion: ${input.skill.version}\nEnvironment: offline Aria workspace` +
+                (request.programId ? `\nWorkspace: ${input.sessionId}\nArguments: ${JSON.stringify(input.arguments ?? [])}` : ''),
               signal,
             ))
           )
@@ -532,6 +564,7 @@ ${
       JSON.stringify([
         request.primary,
         files.map(({ asset, bytes }) => [asset.id, digest(bytes)]).sort(),
+        ...(request.programId ? [request.programId, request.operation, request.input] : []),
       ]),
     );
     const grants = this.grants.get(request.requestId) ?? new Set<string>();
@@ -542,7 +575,9 @@ ${
           `Allow excerpts or command results derived from the selected files in this turn and its active workspace to ${new URL(request.primary.endpoint).origin}.\n\n${files
             .map(({ asset }) => asset.name)
             .join('\n')
-            .slice(0, 900)}`,
+            .slice(0, 900)}` + (request.programId
+              ? `\n\nProgram operation: ${request.operation}\nArguments: ${JSON.stringify(request.input)}`
+              : ''),
           signal,
         ))
       )

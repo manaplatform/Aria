@@ -34,6 +34,10 @@ export const chatRequestSchema = z
     'Message context is invalid or too large.',
   );
 
+export const managedChatRequestSchema = chatRequestSchema.safeExtend({
+  programPrivateHistory: z.boolean().optional(),
+});
+
 const envelope = z.object({
   requestId: id,
   conversationId: id,

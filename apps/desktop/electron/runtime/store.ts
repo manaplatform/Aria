@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { closeSync, mkdirSync, openSync } from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { types } from 'node:util';
 import {
   executionLimits,
   programJournalSchema,
@@ -38,7 +39,7 @@ export class RuntimeStore {
     try {
       db.exec('PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 2000; PRAGMA journal_mode = WAL;');
       const version = Number(db.prepare('PRAGMA user_version').get()?.user_version);
-      if (version > 3) throw new Error('This runtime profile requires a newer version of Aria.');
+      if (version > 4) throw new Error('This runtime profile requires a newer version of Aria.');
       if (version === 0) {
         db.exec(`
           BEGIN IMMEDIATE;
@@ -146,7 +147,20 @@ export class RuntimeStore {
           COMMIT;
         `);
       }
+      if (version < 4) {
+        db.exec(`
+          BEGIN IMMEDIATE;
+          CREATE TABLE program_results (
+            program TEXT PRIMARY KEY REFERENCES programs(id) ON DELETE CASCADE,
+            payload BLOB NOT NULL,
+            expires INTEGER NOT NULL
+          );
+          PRAGMA user_version = 4;
+          COMMIT;
+        `);
+      }
       db.exec(`
+        DELETE FROM program_results WHERE expires <= unixepoch() * 1000;
         UPDATE program_children SET state = 'uncertain' WHERE state = 'reserved';
         UPDATE programs SET state = 'uncertain' WHERE state = 'running';
         UPDATE attempts SET state = 'uncertain' WHERE state = 'running';
@@ -235,7 +249,7 @@ export class RuntimeStore {
       .run(state, Date.now(), exitCode ?? null, id);
   }
 
-  journalProgram(request: Extract<CapabilityHostRequest, { type: 'runtime' }>, provider: string) {
+  journalProgram(request: Extract<CapabilityHostRequest, { type: 'runtime' }>, provider: string, sealed?: Buffer) {
     const command = programJournalSchema.safeParse(request.input);
     if (!command.success) throw new RuntimeError('INVALID_ARGUMENT', 'Invalid program journal request.');
     const input = command.data;
@@ -245,6 +259,7 @@ export class RuntimeStore {
       if (input.deadline <= now || input.deadline - now > 120_000)
         throw new RuntimeError('BUDGET_EXCEEDED', 'The program deadline is invalid or expired.');
       this.db.prepare('DELETE FROM programs WHERE started < ?').run(now - 30 * 86_400_000);
+      this.db.prepare('DELETE FROM program_results WHERE expires <= ?').run(now);
       const write = this.db.prepare(`
         INSERT OR IGNORE INTO programs VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, NULL)
       `).run(stepId, conversationId, assistantMessageId, requestId, provider, revision, input.backend, now, input.deadline);
@@ -261,6 +276,12 @@ export class RuntimeStore {
     if (input.action === 'reserve') {
       if (Number(record.deadline) <= now)
         throw new RuntimeError('TIMEOUT', 'The program expired before dispatch.');
+      if (input.mutable && this.db.prepare(`
+        SELECT 1 FROM program_children c JOIN programs p ON p.id = c.program
+        WHERE p.conversation = ? AND p.turn = ? AND c.fingerprint = ?
+        AND c.state IN ('reserved', 'completed', 'uncertain')
+      `).get(conversationId, assistantMessageId, input.fingerprint))
+        throw new RuntimeError('DUPLICATE_DISPATCH', 'This operation already ran or needs reconciliation.');
       const write = this.db.prepare(`
         INSERT OR IGNORE INTO program_children (program, call, tool, version, fingerprint, state, started)
         VALUES (?, ?, ?, ?, ?, 'reserved', ?)
@@ -276,12 +297,35 @@ export class RuntimeStore {
       if (write.changes) return;
       throw new RuntimeError('CALLER_MISMATCH', 'The child result has no pending dispatch record.');
     }
-    const uncertain = this.db.prepare(`
-      UPDATE program_children SET state = 'uncertain', finished = ?
-      WHERE program = ? AND state = 'reserved'
-    `).run(now, stepId);
-    this.db.prepare('UPDATE programs SET state = ?, finished = ? WHERE id = ?')
-      .run(uncertain.changes ? 'uncertain' : input.state, now, stepId);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.db.prepare(`
+        UPDATE program_children SET state = 'uncertain', finished = ?
+        WHERE program = ? AND state = 'reserved'
+      `).run(now, stepId);
+      const uncertain = this.db.prepare(`
+        SELECT 1 FROM program_children WHERE program = ? AND state = 'uncertain'
+      `).get(stepId);
+      this.db.prepare('UPDATE programs SET state = ?, finished = ? WHERE id = ?')
+        .run(uncertain ? 'uncertain' : input.state, now, stepId);
+      const save = Boolean(sealed && !uncertain && (input.state === 'complete' || input.state === 'partial'));
+      if (save && sealed)
+        this.db.prepare('INSERT INTO program_results VALUES (?, ?, ?)').run(stepId, sealed, now + 86_400_000);
+      this.db.exec('COMMIT');
+      return save;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  programResult(conversation: string, id: string) {
+    this.db.prepare('DELETE FROM program_results WHERE expires <= ?').run(Date.now());
+    const payload = this.db.prepare(`
+      SELECT r.payload FROM program_results r JOIN programs p ON p.id = r.program
+      WHERE p.id = ? AND p.conversation = ? AND p.state IN ('complete', 'partial')
+    `).get(id, conversation)?.payload;
+    return types.isUint8Array(payload) ? Buffer.from(payload) : undefined;
   }
 
   interruptPrograms(request: string) {

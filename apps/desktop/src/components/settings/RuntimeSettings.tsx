@@ -6,8 +6,9 @@ import type {
   RuntimeSettings as Settings,
 } from '@aria/shared';
 import { desktop, errorMessage } from '../../services/desktop';
+import { ensureChatDraft } from '../../stores/chatStore';
 import { Button } from '../ui';
-import { useWorkspaceStore } from '../../stores/workspaceStore';
+import { flushPersistence, useWorkspaceStore } from '../../stores/workspaceStore';
 
 const nativeModes: { id: OpenAIRuntimeFeature; label: string }[] = [
   { id: 'hosted-shell', label: 'OpenAI-hosted Shell' },
@@ -25,17 +26,10 @@ export function RuntimeSettings() {
   const [registry, setRegistry] = useState<RegistrySettings>();
   const [native, setNative] = useState<OpenAIRuntimeFeature[]>([]);
   const [busy, setBusy] = useState(false);
-  const [localSupported, setLocalSupported] = useState(false);
-  const conversationId = useWorkspaceStore((state) => state.data.chat.selectedId);
+  const screenSupported = window.aria?.platform === 'darwin' || window.aria?.platform === 'win32';
 
   useEffect(() => {
     let mounted = true;
-    void Promise.resolve()
-      .then(() => desktop().localComputerSupported())
-      .then((supported) => {
-        if (mounted) setLocalSupported(supported);
-      })
-      .catch(() => undefined);
     void Promise.resolve()
       .then(() => desktop().runtimeSettings())
       .then((settings) => {
@@ -97,19 +91,24 @@ export function RuntimeSettings() {
     }
   }
 
-  async function localWindow(select: boolean) {
-    if (select && !conversationId) return;
+  async function localDesktop(action: 'screen' | 'revoke') {
     setBusy(true);
     setError('');
     setStatus('');
     try {
-      if (select && conversationId) await desktop().selectLocalComputer(conversationId);
-      else await desktop().revokeLocalComputer();
-      setStatus(
-        select
-          ? 'The selected window is available to this chat for two minutes.'
-          : 'Local desktop access revoked.',
-      );
+      if (action === 'revoke') {
+        await desktop().revokeLocalComputer();
+        setStatus('Local desktop access revoked.');
+      } else {
+        const conversationId = ensureChatDraft();
+        await flushPersistence();
+        if (useWorkspaceStore.getState().saveError)
+          throw new Error(
+            'The chat draft could not be saved. Resolve the storage error and retry.',
+          );
+        if (await desktop().selectLocalComputer(conversationId, 'screen'))
+          setStatus('Start a local desktop session in this chat within two minutes.');
+      }
     } catch (failure) {
       setError(errorMessage(failure));
     } finally {
@@ -281,17 +280,13 @@ export function RuntimeSettings() {
           </div>
         </>
       )}
-      {localSupported && (
+      {screenSupported && (
         <div className="shortcut-row">
-          <span>Local desktop window</span>
-          <Button
-            variant="secondary"
-            disabled={!conversationId || busy}
-            onClick={() => void localWindow(true)}
-          >
-            Select a text editor window
+          <span>Local desktop</span>
+          <Button variant="secondary" disabled={busy} onClick={() => void localDesktop('screen')}>
+            Select a full screen
           </Button>
-          <Button variant="ghost" disabled={busy} onClick={() => void localWindow(false)}>
+          <Button variant="ghost" disabled={busy} onClick={() => void localDesktop('revoke')}>
             Revoke
           </Button>
         </div>

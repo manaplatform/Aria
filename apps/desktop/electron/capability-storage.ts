@@ -305,6 +305,9 @@ export class CapabilityStorage {
         scripts: current.entries
           .filter((item) => /^scripts\/[^/]+\.(py|sh)$/u.test(item.name))
           .map(({ id, name }) => ({ id, name })),
+        programs: current.entries
+          .filter((item) => /^scripts\/[^/]+\.(js|mjs)$/u.test(item.name))
+          .map(({ id, name }) => ({ id, name })),
         resources: current.entries
           .filter((item) => item.readable)
           .map(({ id, name }) => ({ id, name })),
@@ -313,7 +316,7 @@ export class CapabilityStorage {
     };
   }
 
-  async executionScript(ref: SkillRef, id: string, signal: AbortSignal) {
+  async executionScript(ref: SkillRef, id: string, signal: AbortSignal, format: 'shell' | 'program' = 'shell') {
     const example = this.findExample(ref);
     const current =
       example?.manifest ??
@@ -324,7 +327,8 @@ export class CapabilityStorage {
           item.summary.enabled,
       );
     const entry = current?.entries.find((item) => item.id === id);
-    const extension = /^scripts\/[^/]+\.(py|sh)$/u.exec(entry?.name ?? '')?.[1];
+    const pattern = format === 'shell' ? /^scripts\/[^/]+\.(py|sh)$/u : /^scripts\/[^/]+\.(js|mjs)$/u;
+    const extension = pattern.exec(entry?.name ?? '')?.[1];
     if (!current || !entry || !extension) return;
     const filename = path.join(this.root, current.digest, entry.id);
     if (

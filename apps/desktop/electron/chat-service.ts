@@ -16,7 +16,7 @@ import {
 } from '@aria/shared';
 import { z } from 'zod';
 import WebSocket from 'ws';
-import { chatRequestSchema, readChatEvents } from './chat-protocol';
+import { managedChatRequestSchema, readChatEvents } from './chat-protocol';
 import { ProviderConfigurationError, type ProviderStorage } from './provider-storage';
 import type { MediaStorage } from './media-storage';
 
@@ -303,7 +303,7 @@ export class ChatService {
     });
   }
   private begin(input: ChatRequest, emit = this.emitEvent): ActiveRequest {
-    const request = chatRequestSchema.parse(input);
+    const request = managedChatRequestSchema.parse(input);
     if (this.status.state !== 'ready' || !this.status.configured || !this.url)
       throw new Error('Configure your provider in Settings before sending a message.');
     if (request.expectedRevision && this.status.revision !== request.expectedRevision)

@@ -33,6 +33,34 @@ export function selectChat(id: string | null): void {
     selectedId: id && chat.conversations.some((item) => item.id === id) ? id : null,
   }));
 }
+
+export function ensureChatDraft(): string {
+  const chat = useWorkspaceStore.getState().data.chat;
+  if (chat.selectedId) return chat.selectedId;
+  if (chat.conversations.length >= 500)
+    throw new Error('Delete a conversation before starting another.');
+  const id = crypto.randomUUID();
+  const now = new Date().toISOString();
+  updateChat((current) => ({
+    ...current,
+    selectedId: id,
+    newDraft: '',
+    newAttachments: [],
+    conversations: [
+      ...current.conversations,
+      {
+        id,
+        title: 'New chat',
+        draft: current.newDraft,
+        attachments: current.newAttachments,
+        pinned: false,
+        createdAt: now,
+        updatedAt: now,
+      },
+    ],
+  }));
+  return id;
+}
 export function setChatDraft(
   draft: string,
   id = useWorkspaceStore.getState().data.chat.selectedId,
@@ -256,6 +284,10 @@ export async function sendChat(): Promise<void> {
     ...chat.messages.filter((item) => item.conversationId === conversation.id),
     user,
   ];
+  const firstTitle =
+    history.length === 1 && conversation.title === 'New chat'
+      ? text.split('\n')[0].slice(0, 70)
+      : conversation.title;
   updateChat((current) => ({
     ...current,
     selectedId: conversation.id,
@@ -264,7 +296,7 @@ export async function sendChat(): Promise<void> {
     conversations: selected
       ? current.conversations.map((item) =>
           item.id === conversation.id
-            ? { ...item, draft: '', attachments: [], updatedAt: now }
+            ? { ...item, title: firstTitle, draft: '', attachments: [], updatedAt: now }
             : item,
         )
       : [...current.conversations, conversation],

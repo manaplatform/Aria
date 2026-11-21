@@ -3,6 +3,7 @@ import {
   ArrayMaxSize,
   ArrayMinSize,
   IsArray,
+  IsBoolean,
   ArrayUnique,
   IsUUID,
   IsIn,
@@ -45,6 +46,10 @@ class AvailableAssetDto {
 }
 
 export class ChatRequestDto {
+  @IsOptional()
+  @IsBoolean()
+  programPrivateHistory?: boolean;
+
   @IsOptional()
   @IsArray()
   @ArrayMaxSize(12)

@@ -167,6 +167,42 @@ test('captures the approved full display into the originating draft for review',
   await expect(remove).toHaveCount(0);
 });
 
+test('selects and revokes a full screen in Settings from an unsent chat', async () => {
+  test.skip(process.platform !== 'darwin' && process.platform !== 'win32');
+  await launch();
+  await app.evaluate(({ BrowserWindow, desktopCapturer, dialog, nativeImage, screen, systemPreferences }) => {
+    const display = screen.getPrimaryDisplay();
+    const thumbnail = nativeImage.createFromBitmap(Buffer.alloc(16 * 12 * 4, 255), {
+      width: 16,
+      height: 12,
+    });
+    let selected = false;
+    dialog.showMessageBox = (async () => {
+      selected = true;
+      return { response: 1, checkboxChecked: false };
+    }) as typeof dialog.showMessageBox;
+    screen.getAllDisplays = () => [display];
+    systemPreferences.getMediaAccessStatus = () => 'granted';
+    desktopCapturer.getSources = async () => {
+      if (!selected) throw new Error('Capture before display selection');
+      return [{ id: 'selected', name: 'Display', display_id: String(display.id), thumbnail, appIcon: thumbnail }];
+    };
+    BrowserWindow.getAllWindows()[0].focus();
+  });
+  await page.getByRole('textbox', { name: 'Message Aria' }).fill('Unsent draft');
+  await page.getByRole('button', { name: 'Open settings', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Select a text editor window' })).toHaveCount(0);
+  const select = page.getByRole('button', { name: 'Select a full screen', exact: true });
+  await expect(select).toBeEnabled();
+  await select.click();
+  await expect(page.getByText('Start a local desktop session in this chat within two minutes.')).toBeVisible();
+  await page.getByRole('button', { name: 'Revoke', exact: true }).click();
+  await expect(page.getByText('Local desktop access revoked.')).toBeVisible();
+  await page.getByRole('button', { name: 'Back to chat', exact: true }).click();
+  await expect(page.getByRole('textbox', { name: 'Message Aria' })).toHaveValue('Unsent draft');
+  await expect(page.locator('.from-user')).toHaveCount(0);
+});
+
 test('streams through the managed NestJS API, renders Markdown, manages conversations, and stops background replies', async () => {
   await launch();
   await send('Help me think');
@@ -700,6 +736,47 @@ test('finds document evidence and opens an authorized citation through the built
   await expect(page.locator('.from-assistant .markdown').last()).toContainText('Thirty days');
   await page.getByRole('button', { name: 'Supplier contract', exact: true }).click();
   await expect(page.locator('.document-passage')).toContainText('Termination requires thirty days');
+});
+
+test('runs an isolated program with a real desktop capability through the built app', async () => {
+  const endpoint = process.env.ARIA_TEST_DOCKER_ENDPOINT;
+  const image = process.env.ARIA_TEST_PROGRAM_IMAGE;
+  test.skip(!endpoint || !image, 'Requires a reviewed program image and configured Docker Engine.');
+  await launch();
+  await page.evaluate(async ({ endpoint, image }) => {
+    await window.aria!.saveRuntimeSettings({ engineSocket: endpoint, commandMs: 30_000 });
+    await window.aria!.setProgramSettings({
+      backend: 'managed', continuation: 'stateless', toolCalls: 8, parallel: 3, milliseconds: 30_000, image,
+    });
+  }, { endpoint: endpoint!, image: image! });
+  const prompt = 'Run an isolated program to check available computer environments.';
+  const objective = 'Check environments';
+  const ids = ['programs.run', 'computer.inspect'];
+  fixture.queueTool(prompt, 'find_capabilities', { ids, query: '', kind: 'tools' });
+  fixture.queueTool(prompt, 'load_capabilities', { ids });
+  fixture.queueTool(prompt, 'programs_run', {
+    objective, termination: 'The desktop inspection settled', tools: ['computer.inspect'],
+    dataContract: [{ key: 'inspected', type: 'boolean' }],
+    code: `
+      const observation = await tools.invoke('computer.inspect', {});
+      const isolated = typeof process === 'undefined' && typeof require === 'undefined';
+      return { objective: 'Check environments', data: { inspected: observation.status === 'completed' && isolated },
+        missing: [], checks: [{ name: 'isolated', passed: isolated }], evidence: [], artifacts: [] };
+    `,
+  });
+  fixture.onToolResult(prompt, (value) => {
+    const result = value as { data?: { status?: string; data?: { inspected?: boolean } } };
+    if (result.data?.status === 'complete' && result.data.data?.inspected)
+      fixture.finalReply(prompt, 'Verified isolated inspection.');
+    return undefined;
+  });
+  await send(prompt);
+  await expect(page.locator('.from-assistant .markdown').last()).toContainText('Verified isolated inspection.');
+  const history = await page.evaluate(() => window.aria!.executionHistory());
+  expect(history).toContainEqual(expect.objectContaining({ operation: 'program.managed', state: 'complete' }));
+  await page.locator('.conductor-activity > summary').last().click();
+  await page.getByText('1 tool call', { exact: true }).click();
+  await expect(page.getByText('computer.inspect', { exact: true })).toBeVisible();
 });
 
 test('runs real commands and publishes a durable result file through the built app', async () => {

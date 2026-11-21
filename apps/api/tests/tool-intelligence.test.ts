@@ -4,6 +4,7 @@ import { createRequire } from 'node:module';
 import type { INestApplication } from '@nestjs/common';
 import {
   defaultToolPolicy,
+  defaultProgramSettings,
   defaultWebPolicy,
   capabilityHostRequest,
   type ChatEvent,
@@ -65,7 +66,7 @@ async function chat(content: string) {
   return events;
 }
 
-function registerExample() {
+function registerExample(programmatic = false) {
   const run = vi.fn((input: { question: string }) => ({
     text: `Example result for ${input.question}`,
   }));
@@ -85,14 +86,192 @@ function registerExample() {
     requiredModelCapabilities: [],
     timeoutMs: 1000,
     deferred: true,
-    modes: ['direct'],
-    programmaticEligible: false,
+    modes: programmatic ? ['direct', 'programmatic'] : ['direct'],
+    programmaticEligible: programmatic,
+    ...(programmatic && { program: {
+      backends: ['managed', 'openai-responses'],
+      scope: 'public',
+      parallel: true,
+      retry: 'verified-read',
+    } as const }),
     artifacts: false,
     citations: false,
     execute: run,
   });
   return { run, remove };
 }
+
+function programPort(
+  settings: Partial<typeof defaultProgramSettings>,
+  runtime?: (message: object) => object | undefined,
+  discovery: 'aria' | 'openai-responses' = 'aria',
+) {
+  const port = Object.assign(new EventEmitter(), {
+    start: () => undefined,
+    close: () => undefined,
+    postMessage: (_input: unknown) => {},
+  });
+  const dispatched: object[] = [];
+  port.postMessage = (input) => {
+    const value = capabilityHostRequest.safeParse(input);
+    if (!value.success || value.data.type !== 'runtime') return;
+    const request = value.data;
+    dispatched.push(request);
+    queueMicrotask(() => port.emit('message', { data: {
+      id: request.id, ok: true, runtime: runtime?.(request) ?? {},
+    } }));
+  };
+  app.get(CapabilityHost).install({
+    ...defaultToolPolicy,
+    desktopRuntime: true,
+    discovery,
+    nativeVerified: discovery === 'openai-responses',
+    programming: { ...defaultProgramSettings, ...settings },
+    nativeProgramVerified: settings.backend === 'openai-responses',
+  }, port);
+  return dispatched as Extract<import('@aria/shared').CapabilityHostRequest, { type: 'runtime' }>[];
+}
+
+it('dispatches a managed program through discovery, the broker, journal and nested activity', async () => {
+  const { run } = registerExample(true);
+  const prompt = 'Use a program to coordinate two reference operations.';
+  const objective = 'Compare examples';
+  const program = {
+    objective, termination: 'Both lookups settled',
+    tools: ['example.lookup'], code: 'return null;',
+    dataContract: [{ key: 'count', type: 'number' }],
+  };
+  let binding = '';
+  let sent = false;
+  let delivered = 0;
+  const dispatched = programPort({ backend: 'managed' }, (value) => {
+    const request = value as Extract<import('@aria/shared').CapabilityHostRequest, { type: 'runtime' }>;
+    if (request.operation === 'program.start') {
+      binding = (request.input.bindings as Record<string, string>)['example.lookup'];
+    } else if (request.operation === 'program.exchange') {
+      if (!sent) {
+        sent = true;
+        return { data: { frames: [
+          { type: 'call', id: 1, handle: binding, input: { question: 'One' } },
+          { type: 'call', id: 2, handle: binding, input: { question: 'Two' } },
+          { type: 'call', id: 3, handle: randomUUID(), input: { question: 'Outside scope' } },
+        ] } };
+      }
+      delivered += (request.input.replies as unknown[]).length;
+      if (delivered === 3) return { data: { frames: [{
+        type: 'result', value: { objective, data: { count: 2 }, checks: [], missing: [], evidence: [], artifacts: [] },
+      }] } };
+      return { data: { frames: [] } };
+    }
+  });
+  const ids = ['programs.run', 'example.lookup'];
+  fixture.queueTool(prompt, 'find_capabilities', { query: '', ids });
+  fixture.queueTool(prompt, 'load_capabilities', { ids });
+  fixture.queueTool(prompt, 'programs_run', program);
+  const events = await chat(prompt);
+  expect(events.at(-1), JSON.stringify(events)).toMatchObject({ type: 'completed', partial: true });
+  expect(run.mock.calls.map(([input]) => input)).toEqual([{ question: 'One' }, { question: 'Two' }]);
+  const parent = events.find((event) => event.type === 'activity' && event.activity.programStatus === 'partial');
+  expect(parent).toBeDefined();
+  expect(events.filter((event) => event.type === 'activity' &&
+    parent?.type === 'activity' && event.activity.parentStepId === parent.activity.stepId &&
+    event.activity.status === 'completed')).toHaveLength(2);
+  const journal = dispatched.filter(({ operation }) => operation === 'program.journal');
+  expect(journal.map(({ input }) => input.action)).toEqual(['open', 'reserve', 'reserve', 'receipt', 'receipt', 'finish']);
+  expect(journal.at(-1)?.input.state).toBe('partial');
+});
+
+it.each([
+  ['stateless', 'aria'],
+  ['stored', 'aria'],
+  ['stateless', 'openai-responses'],
+  ['stored', 'openai-responses'],
+] as const)('round-trips a hosted program with %s continuation and %s discovery', async (continuation, discovery) => {
+  const { run } = registerExample(true);
+  vi.stubEnv('OPENAI_BASE_URL', 'https://api.openai.com/v1');
+  vi.stubEnv('OPENAI_MODEL', 'response-fixture');
+  const journal = programPort({ backend: 'openai-responses', continuation }, undefined, discovery);
+  const params: Record<string, unknown>[] = [];
+  const fn = (id: string, name: string, input: object, caller?: object) => ({
+    type: 'function_call', status: 'completed', id: 'fc_' + id, call_id: id, name,
+    arguments: JSON.stringify(input), ...(caller && { caller }),
+  });
+  const caller = { type: 'program', caller_id: 'call_program' };
+  const program = { type: 'program', id: 'prog1', call_id: 'call_program', code: 'test()', fingerprint: 'opaque-state' };
+  const child = {
+    ...fn('call_child', 'example_lookup', { question: 'Aria' }, caller),
+    ...(discovery === 'openai-responses' && { namespace: 'example' }),
+  };
+  const output = {
+    type: 'program_output', id: 'output1', call_id: 'call_program', status: 'completed',
+    result: JSON.stringify({ objective: 'Example', data: { count: 1 }, checks: [], missing: [], evidence: [], artifacts: [] }),
+  };
+  const answer = {
+    type: 'message', id: 'msg_done', role: 'assistant', status: 'completed',
+    content: [{ type: 'output_text', text: 'Completed.', annotations: [], logprobs: [] }],
+  };
+  const responses = [
+    [fn('find', 'find_capabilities', { query: '', ids: ['example.lookup'] })],
+    [discovery === 'aria'
+      ? fn('load', 'load_capabilities', { ids: ['example.lookup'] })
+      : {
+          type: 'tool_search_call', id: 'ts_load_program', call_id: 'load',
+          execution: 'client', arguments: { ids: ['example.lookup'] }, status: 'completed',
+        }],
+    [program, child],
+    [output],
+    [answer],
+  ];
+  const realFetch = globalThis.fetch;
+  vi.spyOn(globalThis, 'fetch').mockImplementation(async (request, init) => {
+    if (String(request) === 'https://api.openai.com/v1/models')
+      return Response.json({ data: [{ id: 'response-fixture', capabilities: ['chat', 'tools'] }] });
+    if (String(request) !== 'https://api.openai.com/v1/responses') return realFetch(request, init);
+    const index = params.length;
+    params.push(JSON.parse(String(init?.body)));
+    const items = responses[index] ?? [answer];
+    const response = { id: `resp_${index}`, created_at: 1, model: 'response-fixture', status: 'completed', output: items };
+    const events = [
+      { type: 'response.created', response },
+      ...items.flatMap((item, output_index) => [
+        { type: 'response.output_item.added', output_index, item },
+        ...(item.type === 'message' ? [
+          { type: 'response.output_text.delta', item_id: 'msg_done', output_index, delta: 'Completed.' },
+        ] : []),
+        { type: 'response.output_item.done', output_index, item },
+      ]),
+      { type: 'response.completed', response },
+    ];
+    return new Response(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(''), {
+      headers: { 'Content-Type': 'text/event-stream' },
+    });
+  });
+  const events = await chat('Run the synthetic analysis.');
+  expect(events.at(-1), JSON.stringify({ events, requests: params.length })).toMatchObject({ type: 'completed', partial: false });
+  expect(run.mock.calls.map(([input]) => input)).toEqual([{ question: 'Aria' }]);
+  expect(params).toHaveLength(5);
+  expect(params[0].tools).not.toContainEqual(expect.objectContaining({ type: 'programmatic_tool_calling' }));
+  expect(params[2].tools).toContainEqual(expect.objectContaining({ type: 'programmatic_tool_calling' }));
+  const eligible = expect.objectContaining({
+    name: 'example_lookup', allowed_callers: ['direct', 'programmatic'], output_schema: expect.any(Object),
+  });
+  if (discovery === 'aria') expect(params[2].tools).toContainEqual(eligible);
+  else expect(params[2].input).toContainEqual(expect.objectContaining({
+    type: 'tool_search_output', call_id: 'load',
+    tools: [expect.objectContaining({ name: 'example', tools: [eligible] })],
+  }));
+  expect(params[3]).toMatchObject({ store: continuation === 'stored' });
+  expect(params[3].input).toContainEqual(expect.objectContaining({ type: 'function_call_output', call_id: 'call_child', caller }));
+  if (continuation === 'stateless') {
+    expect(params[3].input).toContainEqual(program);
+    expect(params[4].input).toContainEqual(output);
+  } else {
+    expect(params[3].previous_response_id).toBe('resp_2');
+    expect(params[4].input).toEqual([]);
+  }
+  expect(journal.map(({ input }) => input.action)).toEqual(['open', 'reserve', 'receipt', 'finish']);
+  expect(JSON.stringify(events)).not.toContain('opaque-state');
+});
 
 it.each(['Hello there', 'Why are some clouds gray?'])(
   'streams an ordinary turn with a single primary call | %s',

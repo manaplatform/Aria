@@ -50,6 +50,7 @@ export type StepValue = {
   executionDetails?: string;
   commandProblem?: z.infer<typeof runtimeResultSchema>['commandProblem'];
   programStatus?: z.infer<typeof programStatus>;
+  programResultSaved?: boolean;
 };
 
 const resultSchema = z.strictObject({
@@ -74,6 +75,7 @@ const resultSchema = z.strictObject({
   executionDetails: z.string().max(12_000).optional(),
   commandProblem: runtimeResultSchema.shape.commandProblem,
   programStatus: programStatus.optional(),
+  programResultSaved: z.boolean().optional(),
 });
 
 const dependsOn = z
@@ -96,11 +98,14 @@ export interface ToolContext {
   research: ResearchRun;
   attachments: Map<string, RunAttachment>;
   privateContent: boolean;
+  programPrivateHistory?: boolean;
+  hostedProgramsBlocked?: boolean;
   native?: OpenAIRuntime;
   computer?: { sessionId: string; mode: 'aria' | 'openai-responses'; observationId?: string };
   computerCall?: ComputerProviderCall;
   runtime?: { requestId: string; conversationId: string; assistantMessageId: string };
   runProgram?: (input: ProgramRequest, stepId: string, signal: AbortSignal) => Promise<StepValue>;
+  readProgramResult?: (resultId: string, offset: number) => StepValue;
 }
 
 type Invocation = {
@@ -205,7 +210,7 @@ const runtimeDescriptions: Record<RuntimeOperation, readonly [string, string, To
   ],
   'computer.act': [
     'Interact with computer',
-    'Use the latest observation to dispatch an ordered action batch. Check the returned per-action results and actual state before claiming success.',
+    'Use the latest observation and the actions allowed by this session. For a selected full screen, open_file_manager requests approval to open Finder or File Explorer. Use a structured observation before requesting it. Check per-action results and observed state before claiming success.',
     'local',
   ],
   'computer.close': [
@@ -327,7 +332,7 @@ export class ToolRegistry {
       ...base,
       id: 'programs.run',
       name: 'Run a JavaScript tool program',
-      description: 'Coordinate loaded tools using bounded async JavaScript. Use tools.invoke(toolId, arguments) and return a structured program result.',
+      description: 'Coordinate loaded tools with an async JavaScript body or an approved program resource from a loaded skill. Use tools.invoke(toolId, arguments) and return a structured program result.',
       input: programRequestSchema,
       output: 'data',
       capability: 'programs.run',
@@ -341,6 +346,28 @@ export class ToolRegistry {
         if (!context.runProgram)
           throw new ToolError('CAPABILITY_UNAVAILABLE', 'The managed program runner is unavailable.');
         return context.runProgram(input, step.id, signal);
+      },
+    });
+    this.register({
+      ...base,
+      id: 'programs.read_result',
+      name: 'Read a scoped program result',
+      description: 'Read bounded JSON text from a resultRef returned by a program tool in the current turn.',
+      input: z.strictObject({
+        resultId: z.string().uuid(),
+        offset: z.number().int().min(0).max(2_000_000).optional(),
+      }),
+      output: 'data',
+      capability: 'programs.read_result',
+      effect: 'read',
+      dependency: 'local',
+      permission: 'Read verified results from the current turn',
+      repeatable: true,
+      available: (context) => Boolean(context.readProgramResult),
+      execute: ({ resultId, offset }, { context }) => {
+        if (!context.readProgramResult)
+          throw new ToolError('CAPABILITY_UNAVAILABLE', 'No program result scope is available.');
+        return context.readProgramResult(resultId, offset ?? 0);
       },
     });
     this.register({
@@ -832,6 +859,7 @@ export class ToolRegistry {
       'report_unavailable',
       'load_skill',
       'read_skill_resource',
+      'programmatic_tool_calling',
     ];
     if (
       !capabilityId.safeParse(id).success ||
@@ -926,8 +954,10 @@ export class ToolRegistry {
       context.runtime &&
       this.host.current.programming?.backend === backend &&
       (backend === 'managed' || this.host.current.nativeProgramVerified) &&
+      !(backend === 'openai-responses' && context.hostedProgramsBlocked) &&
       descriptor.modes.includes('programmatic') &&
       descriptor.program?.backends.includes(backend) &&
+      !(descriptor.program.scope === 'public' && context.programPrivateHistory) &&
       this.allowed(descriptor, context) &&
       (input === undefined || !descriptor.program.argument || descriptor.program.argument(input, context)),
     );

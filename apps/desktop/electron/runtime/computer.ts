@@ -20,7 +20,11 @@ import { digest, RuntimeError, type RuntimeStore } from './store';
 import { downloadPublicFile, uploadPublicFile } from './downloads';
 
 type Request = Extract<CapabilityHostRequest, { type: 'runtime' }>;
-type Capture = { observation: ComputerObservation; bytes?: Uint8Array<ArrayBuffer> };
+type Capture = {
+  observation: ComputerObservation;
+  bytes?: Uint8Array<ArrayBuffer>;
+  geometryOnly?: boolean;
+};
 type InputAction = Exclude<ComputerAction, { type: 'screenshot' | 'wait' }>;
 type Status = ComputerSessionSummary['status'];
 type OpenInput = ReturnType<(typeof computerOperations)['computer.open']['parse']>;
@@ -43,6 +47,8 @@ const terminal = new Set<Status>(['completed', 'cancelled', 'failed', 'expired']
 
 function describeInput(action: InputAction) {
   switch (action.type) {
+    case 'open_file_manager':
+      return 'Open the system file manager to your home folder.';
     case 'type':
       return `Type “${action.text}” into the focused control.`;
     case 'set_value':
@@ -68,6 +74,7 @@ function describeInput(action: InputAction) {
 export interface ComputerDriver {
   readonly environment: ComputerEnvironment;
   ready(): boolean;
+  actions?(owner: string, id?: string): ComputerAction['type'][];
   targetAlive?(owner: string, target: string, id: string): boolean;
   wait?(owner: string, target: string, id: string, signal: AbortSignal): Promise<void>;
   open(owner: string, id: string, input: OpenInput, signal: AbortSignal): Promise<string>;
@@ -199,6 +206,7 @@ export class ComputerRuntime {
       !session ||
       session.summary.conversationId !== conversation ||
       !this.foreground(conversation) ||
+      session.driver.targetAlive?.(...this.driverSession(session)) === false ||
       terminal.has(session.summary.status)
     )
       return;
@@ -233,6 +241,7 @@ export class ComputerRuntime {
       !session.userObservation ||
       session.userBusy ||
       action.type === 'screenshot' ||
+      action.type === 'open_file_manager' ||
       action.type === 'wait'
     )
       throw new RuntimeError(
@@ -324,15 +333,17 @@ export class ComputerRuntime {
   }
 
   private remember(session: Session, capture: Capture) {
-    const hash = this.captureDigest(capture);
-    session.repeats = session.previousDigest === hash ? session.repeats + 1 : 0;
-    session.previousDigest = hash;
     session.capture = capture;
-    if (session.repeats >= 3)
-      throw new RuntimeError(
-        'BUDGET_EXCEEDED',
-        'The interface has not changed across repeated observations.',
-      );
+    if (!capture.geometryOnly) {
+      const hash = this.captureDigest(capture);
+      session.repeats = session.previousDigest === hash ? session.repeats + 1 : 0;
+      session.previousDigest = hash;
+      if (session.repeats >= 3)
+        throw new RuntimeError(
+          'BUDGET_EXCEEDED',
+          'The interface has not changed across repeated observations.',
+        );
+    }
     this.changed(session.summary);
     return capture;
   }
@@ -347,6 +358,8 @@ export class ComputerRuntime {
       const browser = this.drivers.some(
         (item) => item.environment === 'managed-browser' && item.ready(),
       );
+      const local = this.drivers.find((item) => item.environment === 'local-desktop');
+      const localActions = local?.actions?.(request.conversationId) ?? [];
       return {
         data: {
           environments: [
@@ -370,26 +383,28 @@ export class ComputerRuntime {
                   }
                 : { reason: 'Enable AI Browser in Web & Browser settings.' }),
             },
-            ...(['virtual-desktop', 'local-desktop'] as const).map((environment) => ({
-              environment,
+            {
+              environment: 'virtual-desktop',
               available: this.drivers.some(
-                (item) => item.environment === environment && item.ready(),
+                (item) => item.environment === 'virtual-desktop' && item.ready(),
               ),
-              actions:
-                environment === 'local-desktop'
-                  ? ['set_value', 'screenshot']
-                  : [
-                      'screenshot',
-                      'click',
-                      'double_click',
-                      'move',
-                      'drag',
-                      'scroll',
-                      'keypress',
-                      'type',
-                      'wait',
-                    ],
-            })),
+              actions: [
+                'screenshot',
+                'click',
+                'double_click',
+                'move',
+                'drag',
+                'scroll',
+                'keypress',
+                'type',
+                'wait',
+              ],
+            },
+            {
+              environment: 'local-desktop',
+              available: localActions.length > 0,
+              actions: localActions,
+            },
           ],
           sessions: this.states(request.conversationId).map(
             ({ id, environment, mode, status, targetId }) => ({
@@ -398,6 +413,7 @@ export class ComputerRuntime {
               mode,
               status,
               targetId,
+              actions: this.sessions.get(id)?.driver.actions?.(request.conversationId, id),
             }),
           ),
           recoverable: this.store.db
@@ -577,7 +593,12 @@ export class ComputerRuntime {
         }
         const { index } = parsed.data;
         const action = input.actions?.[index];
-        if (!action || action.type === 'screenshot' || dispatched.has(index))
+        if (
+          !action ||
+          action.type === 'screenshot' ||
+          action.type === 'open_file_manager' ||
+          dispatched.has(index)
+        )
           throw new RuntimeError(
             'PERMISSION_DENIED',
             'The script requested an undeclared or already dispatched action.',
@@ -881,6 +902,7 @@ export class ComputerRuntime {
           mode,
           targetId: session.summary.targetId,
           status: 'ready',
+          actions: driver.actions?.(owner, resumeId),
         },
       };
     }
@@ -988,6 +1010,7 @@ export class ComputerRuntime {
           mode,
           targetId: target,
           status: 'ready',
+          actions: driver.actions?.(owner, id),
           ...(prior && { needsVerification: true }),
         },
       };
@@ -1030,6 +1053,18 @@ export class ComputerRuntime {
   ): Promise<RuntimeResult> {
     if (input.actions.length > this.limits.batch)
       throw new RuntimeError('BUDGET_EXCEEDED', 'The action batch exceeds the configured limit.');
+    const allowed = session.driver.actions?.(session.summary.conversationId, session.summary.id);
+    if (
+      input.actions.some(({ type }) =>
+        type === 'open_file_manager'
+          ? !allowed?.includes(type)
+          : allowed && !allowed.includes(type),
+      )
+    )
+      throw new RuntimeError(
+        'PERMISSION_DENIED',
+        'The current desktop selection does not allow those actions.',
+      );
     let reference = session.capture;
     if (
       input.actions.some(({ type }) => type !== 'screenshot') &&
@@ -1119,9 +1154,13 @@ export class ComputerRuntime {
       if (action.type !== 'move' && action.type !== 'scroll') {
         this.state(session, 'waiting-for-approval', `Approve ${action.type.replace('_', ' ')}`);
         const consent = describeInput(action);
+        const detail =
+          action.type === 'open_file_manager'
+            ? `${reference.observation.title}\n\n${consent}`
+            : `${reference.observation.url ?? session.summary.environment}\n\n${consent}\n\nThis sends input to the current target.`;
         const approved = await this.approve(
           'Allow this computer action once?',
-          `${reference.observation.url ?? session.summary.environment}\n\n${consent}\n\nThis sends input to the current target.`,
+          detail,
           AbortSignal.any([signal, AbortSignal.timeout(60_000)]),
         );
         this.guard(session, lease, signal);
@@ -1317,6 +1356,14 @@ export class ComputerRuntime {
       session.active?.controller.abort();
       this.state(session, 'paused');
     }
+  }
+
+  async closeLocalSessions() {
+    await Promise.allSettled(
+      [...this.sessions.values()]
+        .filter(({ summary }) => summary.environment === 'local-desktop')
+        .map((session) => this.close(session, 'cancelled')),
+    );
   }
 
   private async close(session: Session, status: Status) {

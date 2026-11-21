@@ -284,6 +284,7 @@ export interface ChatRequest {
   attachmentIds?: string[];
   availableAssets?: MediaAsset[];
   expectedRevision?: string;
+  programPrivateHistory?: boolean;
 }
 export type ChatEvent = {
   requestId: string;
@@ -390,7 +391,7 @@ export interface DesktopBridge {
   computerPreview(conversationId: string, sessionId: string): Promise<string | undefined>;
   probeVirtualComputer(): Promise<void>;
   localComputerSupported(): Promise<boolean>;
-  selectLocalComputer(conversationId: string): Promise<void>;
+  selectLocalComputer(conversationId: string, target?: 'window' | 'screen'): Promise<boolean>;
   revokeLocalComputer(): Promise<void>;
   superviseComputer(conversationId: string, command: ComputerSupervision): Promise<void>;
   sendComputerInput(
@@ -426,6 +427,8 @@ export interface DesktopBridge {
   setToolEnabled(id: string, enabled: boolean): Promise<ToolSettings>;
   setToolDiscovery(mode: ToolDiscovery): Promise<ToolSettings>;
   setProgramSettings(settings: ProgramSettings): Promise<ToolSettings>;
+  superviseProgram(requestId: string, conversationId: string, id: string, pause: boolean): Promise<void>;
+  inspectProgramResult(conversationId: string, id: string): Promise<string>;
   previewSkill(kind: 'directory' | 'zip'): Promise<SkillPreview | null>;
   approveSkill(token: string): Promise<ToolSettings>;
   manageSkill(skill: SkillRef, action: 'enable' | 'disable' | 'remove'): Promise<ToolSettings>;

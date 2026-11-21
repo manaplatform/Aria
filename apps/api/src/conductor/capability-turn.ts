@@ -1,8 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { tool, type ModelMessage, type ToolSet } from 'ai';
 import { z } from 'zod';
-import { programChildOutput } from './program-broker';
-import type { JSONSchema7 } from 'ai';
+import { programWireOutput } from './program-broker';
 import {
   builtinSourceSkill,
   capabilityId,
@@ -82,6 +81,10 @@ export class CapabilityTurn {
     return new Map(this.loaded);
   }
 
+  hasLoadedSkill(id: string, version: string) {
+    return this.skills.has(`${id}@${version}`);
+  }
+
   programTools(backend: 'managed' | 'openai-responses') {
     return new Map([...this.loaded].filter(([, tool]) =>
       this.registry.allowedForProgram(tool, this.context, backend),
@@ -102,7 +105,7 @@ export class CapabilityTurn {
       deferred: descriptor.deferred,
       ...(hosted && {
         callers: [...descriptor.modes],
-        outputSchema: z.toJSONSchema(programChildOutput, { target: 'draft-7' }) as JSONSchema7,
+        outputSchema: programWireOutput,
       }),
     };
   }

@@ -31,6 +31,10 @@ private final class Driver: NSObject, SCContentSharingPickerObserver {
     private var pending: String?
     private var elements: [String: AXUIElement] = [:]
     private var surface: CGRect?
+    private var sharedDisplay: CGDirectDisplayID?
+
+    private let messagesPath = "/System/Applications/Messages.app"
+    private let messagesID = "com.apple.MobileSMS"
 
     func reply(_ id: String, _ fields: [String: Any]) {
         guard let data = try? JSONSerialization.data(withJSONObject: fields.merging(["id": id]) { first, _ in first }) else { return }
@@ -58,6 +62,31 @@ private final class Driver: NSObject, SCContentSharingPickerObserver {
         case "accessibility":
             let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
             reply(id, ["trusted": AXIsProcessTrustedWithOptions(options)])
+        case "screen_probe":
+            guard let display = input["displayId"] as? UInt32, screenBounds(display, input) != nil else {
+                reply(id, ["error": "The selected display is unavailable or mirrored."])
+                return
+            }
+            sharedDisplay = display
+            if input["requestPointerPermission"] as? Bool == true && !CGPreflightPostEventAccess() {
+                _ = CGRequestPostEventAccess()
+            }
+            reply(id, ["approved": true, "accessibility": CGPreflightPostEventAccess(), "messages": messagesURL() != nil])
+        case "screen_pointer":
+            pointer(id, input)
+        case "open_application":
+            guard let display = sharedDisplay, screenBounds(display, input) != nil,
+                  input["application"] as? String == "messages", let url = messagesURL() else {
+                reply(id, ["error": "The selected display or system Messages app is unavailable."])
+                return
+            }
+            let configuration = NSWorkspace.OpenConfiguration()
+            configuration.activates = true
+            NSWorkspace.shared.openApplication(at: url, configuration: configuration) { app, error in
+                let verified = error == nil && app?.bundleIdentifier == self.messagesID &&
+                    app?.bundleURL?.standardizedFileURL.path == self.messagesPath && app?.isTerminated == false
+                self.reply(id, ["submitted": true, "verified": verified])
+            }
         case "observe", "set_value":
             Task { @MainActor in
                 do {
@@ -70,6 +99,73 @@ private final class Driver: NSObject, SCContentSharingPickerObserver {
         default:
             reply(id, ["error": "Unsupported local desktop operation."])
         }
+    }
+
+    private func messagesURL() -> URL? {
+        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: messagesID)?.standardizedFileURL,
+              url.path == messagesPath, Bundle(url: url)?.bundleIdentifier == messagesID else { return nil }
+        return url
+    }
+
+    private func screenBounds(_ display: CGDirectDisplayID, _ input: [String: Any]) -> CGRect? {
+        guard CGDisplayIsActive(display) != 0, CGDisplayIsInMirrorSet(display) == 0,
+              let expected = input["bounds"] as? [String: Double] else { return nil }
+        let bounds = CGDisplayBounds(display)
+        guard bounds.width > 0, bounds.height > 0,
+              [("x", bounds.minX), ("y", bounds.minY), ("width", bounds.width), ("height", bounds.height)]
+                .allSatisfy({ key, actual in expected[key].map { abs($0 - actual) < 1 } ?? false }) else { return nil }
+        return bounds
+    }
+
+    private func pointer(_ id: String, _ input: [String: Any]) {
+        guard CGPreflightPostEventAccess() else {
+            reply(id, ["error": "Allow the Aria native helper in macOS Accessibility, then select the display again."])
+            return
+        }
+        guard let display = sharedDisplay, let bounds = screenBounds(display, input),
+              let x = input["x"] as? Double, let y = input["y"] as? Double,
+              (0..<1).contains(x), (0..<1).contains(y),
+              let action = input["action"] as? String else {
+            reply(id, ["error": "The selected display or pointer position changed."])
+            return
+        }
+        let point = CGPoint(x: bounds.minX + bounds.width * x, y: bounds.minY + bounds.height * y)
+        let modifiers: CGEventFlags = [.maskCommand, .maskAlternate, .maskControl, .maskShift]
+        guard bounds.contains(point),
+              CGEventSource.flagsState(.combinedSessionState).intersection(modifiers).isEmpty,
+              ![CGMouseButton.left, .right, .center].contains(where: { CGEventSource.buttonState(.combinedSessionState, button: $0) }) else {
+            reply(id, ["error": "Release any mouse buttons or modifier keys and retry."])
+            return
+        }
+        if action == "move", let event = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved,
+                                                mouseCursorPosition: point, mouseButton: .left) {
+            event.flags = []
+            event.post(tap: .cghidEventTap)
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(80)) {
+                let position = CGEvent(source: nil)?.location
+                let verified = position.map { abs($0.x - point.x) <= 2 && abs($0.y - point.y) <= 2 } ?? false
+                self.reply(id, ["submitted": true, "verified": verified])
+            }
+            return
+        }
+        let buttons: [String: (CGMouseButton, CGEventType, CGEventType)] = [
+            "left": (.left, .leftMouseDown, .leftMouseUp),
+            "right": (.right, .rightMouseDown, .rightMouseUp),
+            "middle": (.center, .otherMouseDown, .otherMouseUp),
+        ]
+        guard action == "click", let name = input["button"] as? String,
+              let (button, down, up) = buttons[name],
+              let press = CGEvent(mouseEventSource: nil, mouseType: down, mouseCursorPosition: point, mouseButton: button),
+              let release = CGEvent(mouseEventSource: nil, mouseType: up, mouseCursorPosition: point, mouseButton: button) else {
+            reply(id, ["error": "The native pointer action could not be prepared."])
+            return
+        }
+        for event in [press, release] {
+            event.flags = []
+            event.setIntegerValueField(.mouseEventClickState, value: 1)
+            event.post(tap: .cghidEventTap)
+        }
+        reply(id, ["submitted": true])
     }
 
     private func finishSelection(_ filter: SCContentFilter?) {

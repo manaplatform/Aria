@@ -16,7 +16,10 @@ export const programSettingsSchema = z.strictObject({
   toolCalls: z.number().int().min(1).max(12),
   parallel: z.number().int().min(1).max(3),
   milliseconds: z.number().int().min(5000).max(120_000),
-  image: z.string().regex(/^sha256:[a-f0-9]{64}$/).optional(),
+  image: z
+    .string()
+    .regex(/^sha256:[a-f0-9]{64}$/)
+    .optional(),
 });
 export type ProgramSettings = z.infer<typeof programSettingsSchema>;
 export const defaultProgramSettings: ProgramSettings = {
@@ -27,20 +30,35 @@ export const defaultProgramSettings: ProgramSettings = {
   milliseconds: programLimits.milliseconds,
 };
 
-const toolId = z.string().min(1).max(100).regex(/^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$/);
+const toolId = z
+  .string()
+  .min(1)
+  .max(100)
+  .regex(/^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$/);
 const reference = z.string().min(1).max(256);
 const fields = z.enum(['string', 'number', 'boolean', 'array', 'object', 'null']);
-const contractKey = z.string().max(80).regex(/^[a-zA-Z][a-zA-Z0-9_]*$/);
-export const programRequestSchema = z.strictObject({
-  objective: z.string().trim().min(1).max(500),
-  termination: z.string().trim().min(1).max(500),
-  tools: z.array(toolId).max(8),
-  code: z.string().min(1).max(programLimits.code),
-  dataContract: z
-    .array(z.strictObject({ key: contractKey, type: fields }))
-    .max(12)
-    .refine((items) => new Set(items.map(({ key }) => key)).size === items.length),
+const contractKey = z
+  .string()
+  .max(80)
+  .regex(/^[a-zA-Z][a-zA-Z0-9_]*$/);
+export const programSkillSource = z.strictObject({
+  id: toolId,
+  version: z.string().min(1).max(100),
+  resourceId: z.string().uuid(),
 });
+export const programRequestSchema = z
+  .strictObject({
+    objective: z.string().trim().min(1).max(500),
+    termination: z.string().trim().min(1).max(500),
+    tools: z.array(toolId).max(8),
+    code: z.string().min(1).max(programLimits.code).optional(),
+    skillSource: programSkillSource.optional(),
+    dataContract: z
+      .array(z.strictObject({ key: contractKey, type: fields }))
+      .max(12)
+      .refine((items) => new Set(items.map(({ key }) => key)).size === items.length),
+  })
+  .refine(({ code, skillSource }) => Boolean(code) !== Boolean(skillSource));
 export type ProgramRequest = z.infer<typeof programRequestSchema>;
 
 export const programStatus = z.enum(['complete', 'partial', 'failed', 'cancelled', 'uncertain']);
@@ -80,6 +98,7 @@ export const programChildRecordSchema = z.strictObject({
   tool: toolId,
   version: z.string().min(1).max(100),
   fingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+  mutable: z.boolean().optional(),
 });
 export const programJournalSchema = z.discriminatedUnion('action', [
   z.strictObject({
@@ -94,7 +113,11 @@ export const programJournalSchema = z.discriminatedUnion('action', [
     state: z.enum(['completed', 'failed', 'blocked', 'cancelled', 'uncertain']),
     stepId: z.string().uuid(),
   }),
-  z.strictObject({ action: z.literal('finish'), state: programStatus }),
+  z.strictObject({
+    action: z.literal('finish'),
+    state: programStatus,
+    result: z.string().max(24_000).optional(),
+  }),
 ]);
 
 // Bound nesting before handing model or guest values to recursive validators or serializers.
@@ -103,7 +126,8 @@ export function programJson(value: unknown, maximum: number): z.infer<ReturnType
   let visited = 0;
   while (pending.length) {
     const entry = pending.pop()!;
-    if (++visited > maximum || entry.depth > 24) throw new Error('Program value exceeds its limit.');
+    if (++visited > maximum || entry.depth > 24)
+      throw new Error('Program value exceeds its limit.');
     const node = entry.value;
     if (node === null || typeof node === 'string' || typeof node === 'boolean') continue;
     if (typeof node === 'number' && Number.isFinite(node)) continue;

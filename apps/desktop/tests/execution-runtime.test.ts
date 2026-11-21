@@ -8,6 +8,47 @@ import { RuntimeStore } from '../electron/runtime/store';
 import { Knowledge, textPassages } from '../electron/runtime/knowledge';
 
 describe('durable runtime', () => {
+  it('fences program children by owner and records interrupted reservations as uncertain', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'aria-program-journal-'));
+    const store = new RuntimeStore(directory);
+    try {
+      const id = randomUUID();
+      const parent = {
+        type: 'runtime' as const, id: randomUUID(), requestId: 'request', conversationId: 'owner',
+        assistantMessageId: 'turn', revision: 'revision', stepId: id, callId: id,
+        operation: 'program.journal' as const,
+        primary: { connectionId: randomUUID(), model: 'fixture', endpoint: 'https://fixture.test/v1' },
+      };
+      const provider = 'provider';
+      store.journalProgram({ ...parent, input: { action: 'open', backend: 'managed', deadline: Date.now() + 5000 } }, provider);
+      const reserve = { action: 'reserve', callId: 'child', tool: 'knowledge.search', version: '1', fingerprint: 'a'.repeat(64) };
+      store.journalProgram({ ...parent, input: reserve }, provider);
+      const child = { ...parent, programId: id, operation: 'knowledge.search' as const, callId: 'child', input: {} };
+      expect(() => store.assertProgramChild(child, provider)).not.toThrow();
+      expect(() => store.assertProgramChild({ ...child, conversationId: 'other' }, provider)).toThrow('not reserved');
+      expect(() => store.journalProgram({ ...parent, input: reserve }, provider)).toThrow('already');
+      store.close();
+      expect(store.db.prepare('SELECT state FROM program_children WHERE program = ?').get(id)?.state).toBe('uncertain');
+      expect(store.db.prepare('SELECT state FROM programs WHERE id = ?').get(id)?.state).toBe('uncertain');
+      expect(() => store.assertProgramChild(child, provider)).toThrow('not reserved');
+      store.deletePrograms('owner');
+      expect(store.db.prepare('SELECT * FROM program_children').all()).toEqual([]);
+      const finished = { ...parent, stepId: randomUUID(), requestId: 'next' };
+      store.journalProgram({ ...finished, input: { action: 'open', backend: 'managed', deadline: Date.now() + 5000 } }, provider);
+      expect(store.journalProgram({
+        ...finished,
+        input: { action: 'finish', state: 'complete', result: '{"data":"synthetic"}' },
+      }, provider, Buffer.from('sealed fixture'))).toBe(true);
+      store.close();
+      expect(store.programResult('owner', finished.stepId)?.toString()).toBe('sealed fixture');
+      expect(store.programResult('other', finished.stepId)).toBeUndefined();
+      store.db.prepare('UPDATE program_results SET expires = 0').run();
+      expect(store.programResult('owner', finished.stepId)).toBeUndefined();
+    } finally {
+      store.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
   it('recovers pending attempts as uncertain and rejects their replay', async () => {
     const directory = await mkdtemp(path.join(tmpdir(), 'aria-runtime-'));
     const store = new RuntimeStore(directory);

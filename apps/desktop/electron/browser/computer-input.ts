@@ -83,6 +83,12 @@ export async function dispatchBrowserInput(
   let release: { method: string; args: Record<string, unknown> } | undefined;
   try {
     switch (action.type) {
+      case 'open_file_manager':
+      case 'open_application':
+        throw new RuntimeError(
+          'PERMISSION_DENIED',
+          'Launching a desktop application requires a selected local display.',
+        );
       case 'set_value':
         throw new RuntimeError('INVALID_ARGUMENT', 'Use a browser text action for this target.');
       case 'type':
