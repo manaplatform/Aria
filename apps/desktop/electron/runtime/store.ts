@@ -4,7 +4,9 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import {
   executionLimits,
+  programJournalSchema,
   runtimeSettingsSchema,
+  type CapabilityHostRequest,
   type RuntimeSettings,
   type ToolProblem,
 } from '@aria/shared';
@@ -36,7 +38,7 @@ export class RuntimeStore {
     try {
       db.exec('PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 2000; PRAGMA journal_mode = WAL;');
       const version = Number(db.prepare('PRAGMA user_version').get()?.user_version);
-      if (version > 2) throw new Error('This runtime profile requires a newer version of Aria.');
+      if (version > 3) throw new Error('This runtime profile requires a newer version of Aria.');
       if (version === 0) {
         db.exec(`
           BEGIN IMMEDIATE;
@@ -123,7 +125,30 @@ export class RuntimeStore {
           COMMIT;
         `);
       }
+      if (version < 3) {
+        db.exec(`
+          BEGIN IMMEDIATE;
+          CREATE TABLE programs (
+            id TEXT PRIMARY KEY, conversation TEXT NOT NULL, turn TEXT NOT NULL,
+            request TEXT NOT NULL, provider TEXT NOT NULL, revision TEXT NOT NULL,
+            backend TEXT NOT NULL, state TEXT NOT NULL, started INTEGER NOT NULL,
+            deadline INTEGER NOT NULL, finished INTEGER
+          );
+          CREATE INDEX programs_conversation ON programs(conversation, started);
+          CREATE TABLE program_children (
+            program TEXT NOT NULL REFERENCES programs(id) ON DELETE CASCADE,
+            call TEXT NOT NULL, tool TEXT NOT NULL, version TEXT NOT NULL,
+            fingerprint TEXT NOT NULL, step TEXT, state TEXT NOT NULL,
+            started INTEGER NOT NULL, finished INTEGER,
+            PRIMARY KEY(program, call), UNIQUE(program, fingerprint)
+          );
+          PRAGMA user_version = 3;
+          COMMIT;
+        `);
+      }
       db.exec(`
+        UPDATE program_children SET state = 'uncertain' WHERE state = 'reserved';
+        UPDATE programs SET state = 'uncertain' WHERE state = 'running';
         UPDATE attempts SET state = 'uncertain' WHERE state = 'running';
         UPDATE sessions SET state = 'cleanup' WHERE state = 'active'
           AND id IN (SELECT session FROM attempts WHERE state = 'uncertain');
@@ -208,6 +233,80 @@ export class RuntimeStore {
     this.db
       .prepare('UPDATE attempts SET state = ?, elapsed = ? - started, exit_code = ? WHERE id = ?')
       .run(state, Date.now(), exitCode ?? null, id);
+  }
+
+  journalProgram(request: Extract<CapabilityHostRequest, { type: 'runtime' }>, provider: string) {
+    const command = programJournalSchema.safeParse(request.input);
+    if (!command.success) throw new RuntimeError('INVALID_ARGUMENT', 'Invalid program journal request.');
+    const input = command.data;
+    const { stepId, conversationId, assistantMessageId, requestId, revision } = request;
+    const now = Date.now();
+    if (input.action === 'open') {
+      if (input.deadline <= now || input.deadline - now > 120_000)
+        throw new RuntimeError('BUDGET_EXCEEDED', 'The program deadline is invalid or expired.');
+      this.db.prepare('DELETE FROM programs WHERE started < ?').run(now - 30 * 86_400_000);
+      const write = this.db.prepare(`
+        INSERT OR IGNORE INTO programs VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, NULL)
+      `).run(stepId, conversationId, assistantMessageId, requestId, provider, revision, input.backend, now, input.deadline);
+      if (write.changes) return;
+      throw new RuntimeError('DUPLICATE_DISPATCH', 'The program already has a dispatch record.');
+    }
+    const record = this.db.prepare(`
+      SELECT deadline FROM programs
+      WHERE id = ? AND conversation = ? AND turn = ? AND request = ? AND provider = ?
+        AND revision = ? AND state = 'running'
+    `).get(stepId, conversationId, assistantMessageId, requestId, provider, revision);
+    if (!record)
+      throw new RuntimeError('PERMISSION_DENIED', 'The program journal belongs to another scope or is closed.');
+    if (input.action === 'reserve') {
+      if (Number(record.deadline) <= now)
+        throw new RuntimeError('TIMEOUT', 'The program expired before dispatch.');
+      const write = this.db.prepare(`
+        INSERT OR IGNORE INTO program_children (program, call, tool, version, fingerprint, state, started)
+        VALUES (?, ?, ?, ?, ?, 'reserved', ?)
+      `).run(stepId, input.callId, input.tool, input.version, input.fingerprint, now);
+      if (write.changes) return;
+      throw new RuntimeError('DUPLICATE_DISPATCH', 'This program operation already has a dispatch record.');
+    }
+    if (input.action === 'receipt') {
+      const write = this.db.prepare(`
+        UPDATE program_children SET state = ?, step = ?, finished = ?
+        WHERE program = ? AND call = ? AND state = 'reserved'
+      `).run(input.state, input.stepId, now, stepId, input.callId);
+      if (write.changes) return;
+      throw new RuntimeError('CALLER_MISMATCH', 'The child result has no pending dispatch record.');
+    }
+    const uncertain = this.db.prepare(`
+      UPDATE program_children SET state = 'uncertain', finished = ?
+      WHERE program = ? AND state = 'reserved'
+    `).run(now, stepId);
+    this.db.prepare('UPDATE programs SET state = ?, finished = ? WHERE id = ?')
+      .run(uncertain.changes ? 'uncertain' : input.state, now, stepId);
+  }
+
+  interruptPrograms(request: string) {
+    this.db.prepare(`
+      UPDATE program_children SET state = 'uncertain' WHERE state = 'reserved'
+        AND program IN (SELECT id FROM programs WHERE request = ? AND state = 'running')
+    `).run(request);
+    this.db.prepare("UPDATE programs SET state = 'uncertain' WHERE request = ? AND state = 'running'")
+      .run(request);
+  }
+
+  assertProgramChild(request: Extract<CapabilityHostRequest, { type: 'runtime' }>, provider: string | undefined) {
+    if (!provider || !request.programId) throw new RuntimeError('PERMISSION_DENIED', 'Missing program authorization.');
+    const match = this.db.prepare(`
+      SELECT 1 FROM program_children c JOIN programs p ON p.id = c.program
+      WHERE c.program = ? AND c.call = ? AND c.tool = ? AND c.state = 'reserved'
+        AND p.conversation = ? AND p.turn = ? AND p.request = ? AND p.revision = ?
+        AND p.provider = ? AND p.state = 'running' AND p.deadline > ?
+    `).get(request.programId, request.callId, request.operation, request.conversationId,
+      request.assistantMessageId, request.requestId, request.revision, provider, Date.now());
+    if (!match) throw new RuntimeError('PERMISSION_DENIED', 'This tool call was not reserved for the active program.');
+  }
+
+  deletePrograms(conversation: string) {
+    this.db.prepare('DELETE FROM programs WHERE conversation = ?').run(conversation);
   }
 
   close() {

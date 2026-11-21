@@ -132,6 +132,8 @@ export const activitySchema = z
       'cancelled',
     ]),
     callId: z.string().max(256).optional(),
+    parentStepId: stepId.optional(),
+    programStatus: z.enum(['complete', 'partial', 'failed', 'cancelled', 'uncertain']).optional(),
     inputSummary: z.string().max(200).optional(),
     resultSummary: z.string().max(200).optional(),
     at: z.number().int().nonnegative(),

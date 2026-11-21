@@ -19,7 +19,7 @@ import {
   type ToolRegistry,
 } from './tool-registry';
 
-type Outcome = StepValue & {
+export type Outcome = StepValue & {
   id: string;
   status: 'completed' | 'failed' | 'blocked' | 'cancelled';
   problem?: ToolProblem;
@@ -30,6 +30,7 @@ export type Invocation = {
   descriptor: ToolDescriptor;
   callId: string;
   input: unknown;
+  program?: { id: string; backend: 'managed' | 'openai-responses'; signal: AbortSignal };
 };
 
 function canonical(value: unknown): string {
@@ -54,6 +55,7 @@ export class ExecutionEngine {
   private readonly counters = { searches: 0, fetches: 0, screenshots: 0 };
   private count = 0;
   billableChildStarted = false;
+  partial = false;
   progress = 0;
   private readonly evidence = new Set<string>();
 
@@ -75,6 +77,11 @@ export class ExecutionEngine {
 
   get succeeded() {
     return [...this.results.values()].some((result) => result.status === 'completed');
+  }
+
+  reserveProgram() {
+    if (++this.count > conductorLimits.steps)
+      throw new ToolError('BUDGET_EXCEEDED', 'The turn reached its execution step limit.');
   }
 
   async execute(
@@ -114,7 +121,8 @@ export class ExecutionEngine {
     delegates: () => ReturnType<ToolRegistry['delegates']>,
     discovered: (id: string, ref: string) => boolean,
   ): Promise<Outcome> {
-    const { descriptor, callId } = invocation;
+    const { descriptor, callId, program } = invocation;
+    const parent = program ? AbortSignal.any([this.signal, program.signal]) : this.signal;
     const id = randomUUID();
     const start = Date.now();
     let model: ResolvedModel | undefined;
@@ -124,6 +132,7 @@ export class ExecutionEngine {
         activity: {
           stepId: id,
           callId,
+          parentStepId: program?.id,
           capability: descriptor.capability,
           target: model ? `${model.connection.name} / ${model.id}`.slice(0, 310) : descriptor.id,
           summary: descriptor.name,
@@ -150,10 +159,13 @@ export class ExecutionEngine {
     let result: Outcome;
     let reserved = false;
     let launched = false;
+    let release: (() => void) | undefined;
+    let operation: Promise<StepValue> | undefined;
     try {
-      this.signal.throwIfAborted();
-      if (++this.count > conductorLimits.steps)
-        throw new ToolError('BUDGET_EXCEEDED', 'The turn reached its execution step limit.');
+      parent.throwIfAborted();
+      this.reserveProgram();
+      if (!program && !descriptor.modes.includes('direct'))
+        throw new ToolError('CALLER_MISMATCH', 'This tool is only available inside an authorized program.');
       if (!this.tools.allowed(descriptor, this.context)) {
         if (descriptor.dependency === 'browser' && this.context.privateContent)
           throw new ToolError(
@@ -178,6 +190,8 @@ export class ExecutionEngine {
           'INVALID_ARGUMENT',
           'The arguments do not match the loaded tool schema.',
         );
+      if (program && !this.tools.allowedForProgram(descriptor, this.context, program.backend, input.data))
+        throw new ToolError('PERMISSION_DENIED', 'The program cannot invoke this tool with these arguments.');
       const step: ExecutionStep = {
         id,
         target: { kind: 'tool', tool: descriptor.id, model: null },
@@ -267,7 +281,27 @@ export class ExecutionEngine {
       this.dispatched.add(fingerprint);
       activity('queued');
       const timeout = AbortSignal.timeout(descriptor.timeoutMs);
-      const signal = AbortSignal.any([this.signal, timeout]);
+      const signal = AbortSignal.any([parent, timeout]);
+      if (descriptor.id !== 'programs.run') {
+        const resource = step.args?.sessionId ?? step.args?.tabId ??
+          (step.args?.args as Record<string, unknown> | undefined)?.tabId;
+        const locks = typeof resource === 'string'
+          ? [`${this.request.conversationId}/${resource}`]
+          : descriptor.effect === 'local' || (program && !descriptor.program?.parallel)
+            ? [`${this.request.conversationId}/state`]
+            : [];
+        release = await this.tools.scheduler.acquire({
+          turn: this.request.requestId,
+          provider: model?.connection.id,
+          tool: descriptor.id,
+          toolLimit: descriptor.program?.parallel ? 3 : 4,
+          limit: this.tools.host.current.programming?.backend !== 'off'
+            ? this.tools.host.current.programming?.parallel ?? conductorLimits.parallel
+            : conductorLimits.parallel,
+          locks,
+          signal,
+        });
+      }
       if (descriptor.effect === 'billable') {
         await this.tools.host.request(
           {
@@ -284,15 +318,15 @@ export class ExecutionEngine {
         this.billableChildStarted = reserved = true;
       }
       signal.throwIfAborted();
-      if (!this.tools.allowed(descriptor, this.context))
+      if (!this.tools.allowed(descriptor, this.context) ||
+        (program && !this.tools.allowedForProgram(descriptor, this.context, program.backend, input.data)))
         throw new ToolError('PERMISSION_DENIED', 'The tool was revoked before dispatch.');
       activity('running');
       launched = true;
       if (descriptor.effect === 'consequential') this.billableChildStarted = true;
       let raw;
       try {
-        raw = await waitForTool(
-          descriptor.execute(input.data, {
+        operation = Promise.resolve(descriptor.execute(input.data, {
             step,
             callId,
             model,
@@ -300,9 +334,9 @@ export class ExecutionEngine {
             context: this.context,
             signal,
             approval: () => activity('approval'),
-          }),
-          signal,
-        );
+            programId: program?.id,
+          }));
+        raw = await waitForTool(operation, signal);
       } catch (error) {
         if (timeout.aborted)
           throw new ToolError(
@@ -318,7 +352,7 @@ export class ExecutionEngine {
       activity('processing');
       const value = descriptor.outputSchema.safeParse(raw);
       if (!value.success)
-        throw new ToolError('EXECUTION_FAILED', 'The tool returned an unexpected result.');
+        throw new ToolError('INVALID_TOOL_OUTPUT', 'The tool returned an unexpected result.');
       if (
         (['image', 'file', 'audio'].includes(descriptor.output) &&
           !value.data.file &&
@@ -328,6 +362,7 @@ export class ExecutionEngine {
       )
         throw new ToolError('EXECUTION_FAILED', 'The tool returned no usable result.');
       const { managedArtifact, privateContent, commandProblem, ...resultValue } = value.data;
+      if (value.data.programStatus === 'partial') this.partial = true;
       const hosted =
         descriptor.id === 'artifacts.publish' &&
         this.context.native?.active.shell?.kind === 'hosted'
@@ -351,8 +386,11 @@ export class ExecutionEngine {
         ...resultValue,
         privateContent: privateContent || restricted,
         text: value.data.text?.slice(0, conductorLimits.resultCharacters),
-        status: commandProblem ? 'failed' : 'completed',
-        problem: commandProblem,
+        status: commandProblem || ['failed', 'uncertain'].includes(value.data.programStatus ?? '')
+          ? 'failed' : value.data.programStatus === 'cancelled' ? 'cancelled' : 'completed',
+        problem: commandProblem ?? (value.data.programStatus === 'uncertain'
+          ? { code: 'OUTCOME_UNCERTAIN', message: 'Some program operations have uncertain outcomes.' }
+          : undefined),
         artifact,
       };
       const evidence = createHash('sha256')
@@ -379,7 +417,7 @@ export class ExecutionEngine {
         }
       }
     } catch (error) {
-      const stopped = this.signal.aborted;
+      const stopped = parent.aborted;
       const code = stopped
         ? 'CANCELLED'
         : error instanceof ToolError
@@ -399,6 +437,12 @@ export class ExecutionEngine {
         status: stopped ? 'cancelled' : code === 'DUPLICATE_DISPATCH' ? 'blocked' : 'failed',
         problem: { code, message: message.slice(0, 400) },
       };
+    } finally {
+      const free = release;
+      if (free) {
+        if (operation) void operation.then(free, free);
+        else free();
+      }
     }
     this.results.set(id, result);
     activity(result.status, result);

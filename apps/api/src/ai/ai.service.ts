@@ -3,6 +3,7 @@ import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
 import { createOpenAI, openai } from '@ai-sdk/openai';
 import { streamText, type ModelMessage, type ToolSet } from 'ai';
 import type { Connection } from '../providers/providers.service';
+import type { OpenAIProgramTransport } from '../providers/openai-program';
 
 export const DEFAULT_SYSTEM_PROMPT =
   'You are Aria, a thoughtful, helpful general-purpose AI assistant. Answer clearly and naturally. Use Markdown when it improves readability.';
@@ -17,9 +18,16 @@ export function nativeToolSearch(parameters: Record<string, unknown>): ToolSet[s
 
 @Injectable()
 export class AiService {
-  private client(config: Pick<Connection, 'apiKey' | 'baseUrl'>) {
-    const fetchWithoutRedirect: typeof fetch = (input, init) =>
-      fetch(input, { ...init, redirect: 'error' });
+  private client(
+    config: Pick<Connection, 'apiKey' | 'baseUrl'>,
+    program?: { transport: OpenAIProgramTransport; system: string },
+  ) {
+    const fetchWithoutRedirect: typeof fetch = (input, init) => {
+      const body = program && typeof init?.body === 'string'
+        ? JSON.stringify(program.transport.serialize(JSON.parse(init.body), program.system))
+        : init?.body;
+      return fetch(input, { ...init, body, redirect: 'error' });
+    };
     return createOpenAI({
       baseURL: config.baseUrl,
       apiKey: config.apiKey,
@@ -31,9 +39,10 @@ export class AiService {
     config: Pick<Connection, 'apiKey' | 'baseUrl'>,
     id: string,
     multipartComputerResults: boolean,
+    program?: { transport: OpenAIProgramTransport; system: string },
   ) {
     if (new URL(config.baseUrl).origin === 'https://api.openai.com')
-      return this.client(config).responses(id);
+      return this.client(config, program).responses(id);
     return createOpenAICompatible({
       name: 'aria-provider',
       baseURL: config.baseUrl,
@@ -49,13 +58,20 @@ export class AiService {
     target: { id: string; connection: Pick<Connection, 'apiKey' | 'baseUrl'> },
     system: string,
     tools?: ToolSet,
-    forcedTool?: string,
+    forcedTool?: 'required' | { name: string },
     disableTools = false,
-    nativeOptions?: { fileSearch: boolean; toolLimit: number; computerImages?: boolean },
+    nativeOptions?: {
+      fileSearch: boolean;
+      toolLimit: number;
+      computerImages?: boolean;
+      program?: OpenAIProgramTransport;
+    },
   ): ReturnType<typeof streamText<ToolSet>> {
     const official = new URL(target.connection.baseUrl).origin === 'https://api.openai.com';
     return streamText({
-      model: this.model(target.connection, target.id, nativeOptions?.computerImages === true),
+      model: this.model(target.connection, target.id, nativeOptions?.computerImages === true,
+        nativeOptions?.program && { transport: nativeOptions.program, system }),
+      ...(nativeOptions?.program && { include: { rawChunks: true } }),
       ...(official
         ? {
             providerOptions: {
@@ -77,9 +93,9 @@ export class AiService {
             tools,
             toolChoice: disableTools
               ? 'none'
-              : forcedTool
-                ? { type: 'tool', toolName: forcedTool }
-                : 'auto',
+              : typeof forcedTool === 'object'
+                ? { type: 'tool', toolName: forcedTool.name }
+                : (forcedTool ?? 'auto'),
           }
         : {}),
       abortSignal: signal,
@@ -115,6 +131,8 @@ export function providerError(error: unknown): string {
       'stream',
       'reasoning_effort',
       'reasoning.effort',
+      'tool_choice',
+      'tools',
     ];
     return `The provider rejected this request (HTTP ${status}${typeof param === 'string' && known.includes(param) ? `; parameter: ${param}` : ''}). Check the model’s supported API and settings.`;
   }

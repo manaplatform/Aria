@@ -34,6 +34,8 @@ Conductor snapshots allowed models and tools per turn, exposing each eligible op
 
 Main resolves submitted attachment IDs against the saved user turn. It stages validated files with `POST /chat/:requestId/attachments`. NestJS accepts only run-scoped attachment and dependency references from tools. Activity and artifact references arrive over SSE. Main downloads binary results from the authenticated run-scoped endpoint, checks the size and MIME type, and stores them under UUIDs in the local `media/` directory. The renderer receives metadata. The asset protocol accepts only known IDs and supports byte ranges for local playback. Conversation and draft references govern pruning.
 
+The **Share full screen** button opens a native display chooser on macOS and Windows. Electron main captures one image after the user selects a display and attaches it to the originating chat draft. macOS requires Screen & System Audio Recording permission. The composer previews the image locally before the user sends it through the usual attachment flow.
+
 The authenticated loopback `/voice` WebSocket connects to the registry's GPT-Live profile using client delegation. The renderer requests microphone permission after an explicit action and sends 24 kHz mono PCM16 through Electron main. NestJS correlates each delegation ID and timestamp with transcript context and dispatches it once to the configured primary. It sends the result back for speech and streams delegated activity and artifacts to the conversation. Captions, assistant audio, mute, and interruption use the existing voice lifecycle. Ending voice aborts delegated work. Session startup, audio queues, transcripts, and close are bounded.
 
 ## Persistence and legacy compatibility

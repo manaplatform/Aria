@@ -197,17 +197,87 @@ it('reports request compatibility and network failures without revealing provide
 const { OpenAIRuntime } = createRequire(import.meta.url)(
   '../dist/providers/openai-runtime.js',
 ) as typeof import('../src/providers/openai-runtime');
+const { ProvidersController } = createRequire(import.meta.url)(
+  '../dist/providers/providers.controller.js',
+) as typeof import('../src/providers/providers.controller');
+const { ProvidersService } = createRequire(import.meta.url)(
+  '../dist/providers/providers.service.js',
+) as typeof import('../src/providers/providers.service');
+const { ModelRegistry } = createRequire(import.meta.url)(
+  '../dist/providers/model-registry.service.js',
+) as typeof import('../src/providers/model-registry.service');
 const { createHash, randomUUID } = createRequire(import.meta.url)(
   'node:crypto',
 ) as typeof import('node:crypto');
 
+const primary = {
+  id: 'fixture-model',
+  connection: { baseUrl: 'https://api.openai.com/v1', apiKey: 'synthetic-fixture-key' },
+} as ConstructorParameters<typeof OpenAIRuntime>[0];
+
 function runtime() {
-  const primary = {
-    id: 'fixture-model',
-    connection: { baseUrl: 'https://api.openai.com/v1', apiKey: 'synthetic-fixture-key' },
-  } as ConstructorParameters<typeof OpenAIRuntime>[0];
   return new OpenAIRuntime(primary);
 }
+
+it('verifies managed Shell with a required native tool call and a correlated synthetic result', async () => {
+  const requests: Record<string, unknown>[] = [];
+  const stream = (events: object[]) =>
+    new Response(
+      [
+        { type: 'response.created', response: { id: 'resp_1', created_at: 1, model: primary.id } },
+        ...events,
+        { type: 'response.completed', response: {} },
+      ].map((event) => `data: ${JSON.stringify(event)}\n\n`).join(''),
+      { headers: { 'Content-Type': 'text/event-stream' } },
+    );
+  vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, options) => {
+    const request = JSON.parse(String(options?.body));
+    requests.push(request);
+    const send = (type: string, item: object) => ({ type, output_index: 0, item });
+    if (requests.length === 1) {
+      const command = JSON.stringify(request.input).match(/printf '[^']+'/u)?.[0];
+      const call = {
+        id: 'shell_1',
+        type: 'shell_call',
+        call_id: 'call_1',
+        action: { commands: [command] },
+      };
+      return stream([
+        send('response.output_item.added', { ...call, status: 'in_progress' }),
+        send('response.output_item.done', { ...call, status: 'completed' }),
+      ]);
+    }
+    const result = request.input.find(({ type }: { type: string }) => type === 'shell_call_output');
+    const item = { type: 'message', id: 'msg_1' };
+    return stream([
+      send('response.output_item.added', item),
+      { type: 'response.output_text.delta', output_index: 0, item_id: item.id, delta: result.output[0].stdout },
+      send('response.output_item.done', item),
+    ]);
+  });
+  const providers = new ProvidersService();
+  const models = new ModelRegistry(providers);
+  vi.spyOn(models, 'resolve').mockResolvedValue({
+    primary,
+    models: new Map(),
+    config: models.configuration(),
+  });
+  const controller = new ProvidersController(providers, new AiService(), models);
+  await expect(controller.verifyNativeRuntime({ feature: 'local-shell' })).resolves.toEqual({
+    feature: 'local-shell', verified: true,
+  });
+  expect(requests[0]).toMatchObject({
+    tool_choice: 'required',
+    tools: [{ type: 'shell', environment: { type: 'local' } }],
+  });
+  expect(requests[1]).toMatchObject({
+    tool_choice: 'none',
+    input: expect.arrayContaining([
+      expect.objectContaining({ type: 'shell_call', id: 'shell_1', call_id: 'call_1' }),
+      expect.objectContaining({ type: 'shell_call_output', call_id: 'call_1' }),
+    ]),
+  });
+});
 
 it('binds the hosted shell container, uses the approved network policy, and retrieves actual files', async () => {
   const calls: { url: string; method?: string; body?: BodyInit | null }[] = [];
@@ -253,16 +323,20 @@ it('binds the hosted shell container, uses the approved network policy, and retr
 
 it('associates File Search attachments with a scoped version and discards unknown citations', async () => {
   const writes: Record<string, unknown>[] = [];
+  const deleted: string[] = [];
   vi.spyOn(globalThis, 'fetch').mockImplementation(async (url, options) => {
-    if (options?.method === 'DELETE') return new Response(null, { status: 204 });
+    if (options?.method === 'DELETE') {
+      deleted.push(new URL(String(url)).pathname);
+      return new Response(null, { status: 204 });
+    }
     if (typeof options?.body === 'string') writes.push(JSON.parse(options.body));
     if (String(url).endsWith('/vector_stores')) return Response.json({ id: 'vs_ABC' });
-    if (String(url).endsWith('/vs_ABC/files')) return Response.json({ id: 'file_ABC' });
-    if (String(url).endsWith('/vs_ABC/files/file_ABC'))
+    if (String(url).endsWith('/vs_ABC/files')) return Response.json({ id: 'file-ABC' });
+    if (String(url).endsWith('/vs_ABC/files/file-ABC'))
       return Response.json({ status: 'completed' });
     if (String(url).endsWith('/files') && options?.body instanceof FormData) {
       expect(options.body.get('purpose')).toBe('assistants');
-      return Response.json({ id: 'file_ABC' });
+      return Response.json({ id: 'file-ABC' });
     }
     throw new Error('Unexpected request in fixture');
   });
@@ -272,19 +346,20 @@ it('associates File Search attachments with a scoped version and discards unknow
   const file = { id: randomUUID(), name: 'terms.txt', mimeType: 'text/plain', bytes };
   try {
     await client.prepareSearch([{ file, version }], AbortSignal.timeout(1000));
-    expect(writes[1]).toMatchObject({ file_id: 'file_ABC', attributes: { aria_version: version } });
+    expect(writes[1]).toMatchObject({ file_id: 'file-ABC', attributes: { aria_version: version } });
     expect(
       client.evidence({
         queries: ['termination'],
         results: [
           { fileId: 'file_OUTSIDE_SCOPE', score: 0.99, text: 'unrelated document' },
-          { fileId: 'file_ABC', score: 0.8, text: 'thirty days' },
+          { fileId: 'file-ABC', score: 0.8, text: 'thirty days' },
         ],
       }),
     ).toEqual([expect.objectContaining({ fileId: file.id, excerpt: 'thirty days', version })]);
   } finally {
     await client.close();
   }
+  expect(deleted).toEqual(['/v1/vector_stores/vs_ABC', '/v1/files/file-ABC']);
 });
 
 it('serializes the application-managed native shell call and its correlated result', async () => {

@@ -39,6 +39,7 @@ import {
   identifier,
   modelCapabilitySchema,
   registryInputSchema,
+  programSettingsSchema,
 } from '@aria/shared';
 import { ChatService } from './chat-service';
 import { DesktopRuntime } from './runtime/controller';
@@ -47,6 +48,7 @@ import { VirtualComputer } from './runtime/virtual-computer';
 import { LocalComputer } from './runtime/local-computer';
 import { openAIRuntimeFeatureSchema, runtimeSettingsSchema } from '@aria/shared';
 import { MediaStorage, referencedAssets } from './media-storage';
+import { captureDisplay } from './screen-capture';
 import { MediaService, liveRequestSchema } from './media-service';
 import { chatRequestSchema } from './chat-protocol';
 import {
@@ -206,6 +208,7 @@ const toolList = z
       permission: z.string().max(200),
       available: z.boolean(),
       reason: z.string().max(200).optional(),
+      programmatic: z.array(z.enum(['managed', 'openai-responses'])).max(2).optional(),
     }),
   )
   .max(1024);
@@ -217,12 +220,17 @@ async function toolSettings() {
   return {
     discovery: policy.discovery,
     nativeVerified: policy.nativeVerified ?? false,
+    programming: policy.programming,
+    nativeProgramVerified: policy.nativeProgramVerified,
     tools: toolList.parse(await response.json()),
     skills: capabilities.skills(),
   };
 }
 
-async function changeCapabilities(change: () => Promise<unknown>) {
+async function changeCapabilities(
+  change: () => Promise<unknown>,
+  read: () => Promise<unknown> = toolSettings,
+) {
   if (configuring) throw new Error('Wait for settings to finish saving.');
   configuring = true;
   try {
@@ -230,7 +238,7 @@ async function changeCapabilities(change: () => Promise<unknown>) {
     await media.close();
     await change();
     await chat.restart();
-    return await toolSettings();
+    return await read();
   } finally {
     configuring = false;
   }
@@ -285,6 +293,9 @@ function registerIpc(): void {
         await storage.save(parsed);
         initial = { data: parsed };
         browser.pruneConversations(parsed.chat.conversations);
+        const retained = new Set(parsed.chat.conversations.map(({ id }) => id));
+        for (const { id } of previous.chat.conversations)
+          if (!retained.has(id)) executionRuntime.store.deletePrograms(id);
         await assets.prune(previous, parsed).catch(() => undefined);
       });
     await saving;
@@ -431,6 +442,30 @@ function registerIpc(): void {
       await capabilities.setDiscovery(mode, proof);
     });
   });
+  handle('aria:set-program-settings', (input) => {
+    const settings = programSettingsSchema.parse(input);
+    return changeCapabilities(async () => {
+      let proof: string | undefined;
+      if (settings.backend === 'managed') {
+        if (!settings.image) throw new Error('Enter the immutable Aria program runner image ID.');
+        await executionRuntime.verifyProgramImage(settings.image, AbortSignal.timeout(16_000));
+      } else if (settings.backend === 'openai-responses') {
+        proof = nativeProof(await provider.resolve());
+        if (!proof) throw new Error('Select an official OpenAI primary in AI Models first.');
+        const policy = capabilities.policy(proof);
+        if (policy.discovery === 'openai-responses' && !policy.nativeVerified)
+          throw new Error('Verify OpenAI Tool Search before enabling this combination.');
+        const response = await chat.http('providers/verify-programmatic', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ continuation: settings.continuation, discovery: policy.discovery }),
+          signal: AbortSignal.timeout(45_000),
+        });
+        z.object({ verified: z.literal(true) }).parse(await response.json());
+      }
+      await capabilities.setProgramming(settings, proof);
+    });
+  });
   handle('aria:preview-skill', async (input) => {
     const kind = z.enum(['directory', 'zip']).parse(input);
     if (configuring || !mainWindow) throw new Error('Wait for settings to finish saving.');
@@ -539,18 +574,13 @@ function registerIpc(): void {
     }
     return executionRuntime.settings();
   });
-  handle(
-    'aria:native-runtime-modes',
-    async () => runtimePolicy(await provider.resolve()).nativeRuntime ?? [],
-  );
+  const nativeRuntimeModes = async () => runtimePolicy(await provider.resolve()).nativeRuntime ?? [];
+  handle('aria:native-runtime-modes', nativeRuntimeModes);
   handle('aria:set-native-runtime', (raw, enabled) => {
     const feature = openAIRuntimeFeatureSchema.parse(raw);
     const verify = z.boolean().parse(enabled);
     return changeCapabilities(async () => {
-      if (!verify) {
-        await capabilities.verifyNativeRuntime(feature);
-        return;
-      }
+      if (!verify) return capabilities.verifyNativeRuntime(feature);
       const proof = nativeProof(await provider.resolve(), feature === 'computer-image');
       if (!proof) throw new Error('Configure a compatible primary model first.');
       const response = await chat.http('providers/verify-native-runtime', {
@@ -562,8 +592,8 @@ function registerIpc(): void {
       z.object({ feature: z.literal(feature), verified: z.literal(true) }).parse(
         await response.json(),
       );
-      await capabilities.verifyNativeRuntime(feature, proof);
-    }).then(async () => runtimePolicy(await provider.resolve()).nativeRuntime ?? []);
+      return capabilities.verifyNativeRuntime(feature, proof);
+    }, nativeRuntimeModes);
   });
   handle('aria:probe-runtime', () => executionRuntime.inspect(AbortSignal.timeout(10_000)));
   handle('aria:local-embeddings', () => executionRuntime.embeddings.available());
@@ -653,6 +683,11 @@ function registerIpc(): void {
   handle('aria:import-dropped-files', (files) =>
     importFiles(z.array(z.string().min(1).max(16000)).max(4).parse(files), 'any'),
   );
+  handle('aria:capture-screen', async () => {
+    if (!mainWindow?.isFocused()) throw new Error('Focus Aria before capturing your screen.');
+    const bytes = await captureDisplay(mainWindow);
+    return bytes ? [await assets.put(bytes, 'Screen capture.jpg', 'image/jpeg')] : [];
+  });
   handle('aria:choose-media', async (kind) => {
     const parsed = z.enum(['image', 'audio', 'text', 'any']).parse(kind);
     const result = await dialog.showOpenDialog(mainWindow!, {
@@ -1038,10 +1073,13 @@ app
                 : request.voiceSessionId
                   ? media.authorizeCapability(request)
                   : authorize(request),
-            (request, signal) =>
-              request.operation.startsWith('computer.')
+            (request, signal) => {
+              if (request.programId)
+                executionRuntime.store.assertProgramChild(request, chat.executionIdentity());
+              return request.operation.startsWith('computer.')
                 ? computerRuntime.dispatch(request, signal)
-                : executionRuntime.dispatch(request, signal),
+                : executionRuntime.dispatch(request, signal);
+            },
           ),
       },
     );

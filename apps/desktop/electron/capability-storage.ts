@@ -10,6 +10,9 @@ import {
   capabilityId,
   executionLimits,
   openAIRuntimeFeatureSchema,
+  defaultProgramSettings,
+  programSettingsSchema,
+  type ProgramSettings,
   type OpenAIRuntimeFeature,
   type RuntimeResult,
   toolDiscoverySchema,
@@ -43,6 +46,8 @@ const settingsSchema = z.strictObject({
   nativeRuntimeProofs: z
     .partialRecord(openAIRuntimeFeatureSchema, z.string().regex(/^[a-f0-9]{64}$/))
     .optional(),
+  programming: programSettingsSchema.optional(),
+  programProof: z.string().regex(/^[a-f0-9]{64}$/).optional(),
   skills: z.array(installedSkillSchema).max(127),
 });
 
@@ -103,11 +108,15 @@ export class CapabilityStorage {
 
   policy(proof?: string, imageProof?: string): ToolPolicy {
     const active = this.data.skills.filter((item) => item.summary.enabled);
+    const programming = this.data.programming ?? defaultProgramSettings;
     return {
       revision: this.data.revision,
       discovery: this.data.discovery,
       disabled: this.data.disabled,
       nativeVerified: Boolean(proof && this.data.proof === proof),
+      programming,
+      nativeProgramVerified: programming.backend === 'openai-responses' &&
+        Boolean(proof && this.data.programProof === this.programProof(proof, programming)),
       ...((proof || imageProof) &&
         this.data.nativeRuntimeProofs && {
           nativeRuntime: Object.entries(this.data.nativeRuntimeProofs)
@@ -148,6 +157,17 @@ export class CapabilityStorage {
 
   setDiscovery(discovery: ToolDiscovery, proof?: string) {
     return this.save({ discovery, proof: discovery === 'openai-responses' ? proof : undefined });
+  }
+
+  private programProof(primary: string, settings: ProgramSettings) {
+    return hash(Buffer.from(JSON.stringify([primary, this.data.discovery, settings.continuation, 'program/1'])));
+  }
+
+  setProgramming(settings: ProgramSettings, proof?: string) {
+    return this.save({
+      programming: settings,
+      programProof: proof ? this.programProof(proof, settings) : undefined,
+    });
   }
 
   verifyNativeRuntime(feature: OpenAIRuntimeFeature, proof?: string) {

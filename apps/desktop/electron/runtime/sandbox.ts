@@ -224,6 +224,32 @@ export class DockerSandbox {
     return this.verified;
   }
 
+  async programProcess(id: string, image: string, signal: AbortSignal) {
+    if (!/^sha256:[a-f0-9]{64}$/.test(image))
+      throw new RuntimeError('CAPABILITY_UNAVAILABLE', 'Select an immutable program runner image.');
+    const engine = await this.verifyEngine(signal);
+    const inspected = await this.invoke(
+      ['image', 'inspect', image, '--format', '{{index .Config.Labels "com.aria.program.protocol"}}'],
+      signal,
+    );
+    if (inspected.code !== 0 || inspected.stdout.toString('utf8').trim() !== '1')
+      throw new RuntimeError('CAPABILITY_UNAVAILABLE', 'The configured Aria program image is unavailable.');
+    signal.throwIfAborted();
+    return spawn(
+      engine.binary,
+      [
+        '--host', this.endpoint, 'run', '--rm', '--interactive', '--pull=never',
+        '--name', `aria-${id}`,
+        '--label', 'com.aria.program=1',
+        '--network=none', '--ipc=none', '--read-only', '--cap-drop=ALL',
+        '--security-opt=no-new-privileges', '--memory=256m', '--memory-swap=256m',
+        '--cpus=1', '--pids-limit=32', '--ulimit=nofile=128:128', '--log-driver=none',
+        '--user', user, '--hostname', 'aria-program', '--env', 'HOME=/nonexistent', image,
+      ],
+      { env: dockerEnvironment(), windowsHide: true, stdio: ['pipe', 'pipe', 'ignore'] },
+    );
+  }
+
   async create(id: string, profile: string, signal: AbortSignal) {
     await this.probe(signal);
     const thumb = (name: string, size: string, writable = false) =>

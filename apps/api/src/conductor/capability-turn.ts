@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { tool, type ModelMessage, type ToolSet } from 'ai';
 import { z } from 'zod';
+import { programChildOutput } from './program-broker';
+import type { JSONSchema7 } from 'ai';
 import {
   builtinSourceSkill,
   capabilityId,
@@ -76,17 +78,32 @@ export class CapabilityTurn {
     return descriptor && this.protocol.accepts(descriptor.id, metadata) ? descriptor : undefined;
   }
 
+  loadedTools() {
+    return new Map(this.loaded);
+  }
+
+  programTools(backend: 'managed' | 'openai-responses') {
+    return new Map([...this.loaded].filter(([, tool]) =>
+      this.registry.allowedForProgram(tool, this.context, backend),
+    ));
+  }
+
   resultFormat(name: string) {
     return name === this.protocol.name ? this.protocol.resultFormat : 'text';
   }
 
   private definition(descriptor: ToolDescriptor) {
+    const hosted = this.registry.allowedForProgram(descriptor, this.context, 'openai-responses');
     return {
       id: descriptor.id,
       name: this.registry.wireName(descriptor.id),
       description: descriptor.description,
       schema: this.registry.schema(descriptor),
       deferred: descriptor.deferred,
+      ...(hosted && {
+        callers: [...descriptor.modes],
+        outputSchema: z.toJSONSchema(programChildOutput, { target: 'draft-7' }) as JSONSchema7,
+      }),
     };
   }
 
@@ -124,7 +141,8 @@ export class CapabilityTurn {
       });
     }
     for (const [name, descriptor] of this.loaded) {
-      tools[name] = this.protocol.definition(this.definition(descriptor));
+      if (descriptor.modes.includes('direct') || this.registry.allowedForProgram(descriptor, this.context, 'openai-responses'))
+        tools[name] = this.protocol.definition(this.definition(descriptor));
     }
     return tools;
   }

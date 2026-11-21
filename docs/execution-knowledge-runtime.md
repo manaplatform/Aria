@@ -24,6 +24,8 @@ Use an artifact's card to preview, save, or attach it to a draft. Local artifact
 
 Verify each mode individually in **Settings → Tools**. Verification is bound to the primary, endpoint, and credential. Hosted Shell and OpenAI File Search are separate operations that require approval before sending full file contents. Hosted containers use scoped inputs and explicit network policy. Results are correlated using Responses call identifiers. Native indexing is scoped to the selected attached versions, with provider expiration and cleanup at the end of the turn.
 
+The managed Shell probe verifies a native Responses call and a synthetic result round trip. Use **Save and test environment** to verify the separate Docker execution environment. The File Search probe uploads a synthetic document, verifies retrieval from its scoped index, and cleans up both resources.
+
 ## Verification
 
 Run `pnpm typecheck`, `pnpm lint`, `pnpm test`, `pnpm build`, `pnpm licenses:check`, and the built Electron suite. Set `ARIA_TEST_DOCKER_ENDPOINT` to exercise the real workspace and set `ARIA_TEST_EMBEDDING_PACK` to exercise the pinned local inference pack. Native OpenAI Settings probes use synthetic content and require an authorized account. Fixture tests use local mock provider traffic.

@@ -1,6 +1,17 @@
 import { useEffect, useRef, useState } from 'react';
-import { ArrowUp, ArrowUpRight, Mic, MicOff, Paperclip, PhoneOff, Square, X } from 'lucide-react';
+import {
+  ArrowUp,
+  ArrowUpRight,
+  Mic,
+  MicOff,
+  Monitor,
+  Paperclip,
+  PhoneOff,
+  Square,
+  X,
+} from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
+import type { MediaAsset } from '@aria/shared';
 import { useChat } from '../../hooks/useChat';
 import { desktop, errorMessage } from '../../services/desktop';
 import { sendChat, setChatDraft, stopChat, setChatAttachments } from '../../stores/chatStore';
@@ -24,6 +35,8 @@ export function ChatComposer() {
   const navigate = useNavigate();
   const attachments = conversation ? (conversation.attachments ?? []) : (newAttachments ?? []);
   const voiceActive = live.phase !== 'idle';
+  const canAttach = !busy && !voiceActive && !picking && attachments.length < 4;
+  const canCaptureScreen = window.aria?.platform === 'darwin' || window.aria?.platform === 'win32';
   const canSend =
     status.state === 'ready' &&
     status.configured &&
@@ -49,14 +62,12 @@ export function ChatComposer() {
     };
   }, []);
 
-  const choose = async (dropped?: File[]) => {
+  const choose = async (pick: () => Promise<MediaAsset[]>) => {
     setError('');
     setPicking(true);
     const id = conversation?.id ?? null;
     try {
-      const files = await (dropped
-        ? desktop().importDroppedFiles(dropped)
-        : desktop().chooseMedia('any'));
+      const files = await pick();
       if (!files.length) return;
       const chat = useWorkspaceStore.getState().data.chat;
       const target = id ? chat.conversations.find((item) => item.id === id) : null;
@@ -89,7 +100,8 @@ export function ChatComposer() {
         onDrop={(event) => {
           if (!event.dataTransfer.files.length) return;
           event.preventDefault();
-          if (!busy && !voiceActive && !picking) void choose(Array.from(event.dataTransfer.files));
+          const files = Array.from(event.dataTransfer.files);
+          if (canAttach) void choose(() => desktop().importDroppedFiles(files));
         }}
         className={`chat-composer ${busy ? 'responding' : ''}`}
         onSubmit={(event) => {
@@ -101,6 +113,9 @@ export function ChatComposer() {
           <div className="composer-attachments">
             {attachments.map((asset) => (
               <span key={asset.id}>
+                {asset.mimeType.startsWith('image/') && (
+                  <img src={`aria-media://asset/${encodeURIComponent(asset.id)}`} alt="" />
+                )}
                 {asset.name}
                 <Button
                   type="button"
@@ -147,11 +162,24 @@ export function ChatComposer() {
               type="button"
               size="sm"
               variant="ghost"
-              disabled={busy || voiceActive || picking || attachments.length >= 4}
-              onClick={() => void choose()}
+              disabled={!canAttach}
+              onClick={() => void choose(() => desktop().chooseMedia('any'))}
             >
               <Paperclip size={14} /> Attach files
             </Button>
+            {canCaptureScreen && (
+              <Button
+                type="button"
+                size="icon"
+                variant="ghost"
+                aria-label="Share full screen"
+                title="Share full screen"
+                disabled={!canAttach}
+                onClick={() => void choose(() => desktop().captureScreen())}
+              >
+                <Monitor size={17} />
+              </Button>
+            )}
             {voiceActive && (
               <span role="status">
                 {live.phase === 'active'

@@ -13,10 +13,12 @@ import { createHash, randomUUID } from 'node:crypto';
 import { openAIRuntimeFeatureSchema, providerEndpointSchema } from '@aria/shared';
 import { AiService, nativeToolSearch, providerError } from '../ai/ai.service';
 import { LocalApiGuard } from '../chat/local-api.guard';
+import { ToolError } from '../conductor/capability-host';
 import { ModelRegistry, officialConnection } from './model-registry.service';
 import { OpenAIRuntime } from './openai-runtime';
 import { verifyComputerTransport } from './openai-computer';
 import { ProvidersService } from './providers.service';
+import { verifyOpenAIProgram } from './openai-program-probe';
 
 export class ConnectionDto {
   @IsIn(['openai']) provider!: 'openai';
@@ -44,6 +46,25 @@ export class ProvidersController {
     return this.providers.discover(input, true);
   }
 
+  @Post('verify-programmatic')
+  async verifyProgrammatic(@Body() body: { continuation?: unknown; discovery?: unknown }) {
+    const { continuation, discovery } = body;
+    if ((continuation !== 'stored' && continuation !== 'stateless') ||
+      (discovery !== 'aria' && discovery !== 'openai-responses'))
+      throw new BadRequestException('Select a program continuation and discovery mode.');
+    const signal = AbortSignal.timeout(40_000);
+    const { primary } = await this.models.resolve(signal, undefined, false, true);
+    if (!officialConnection(primary.connection.baseUrl))
+      throw new BadRequestException('The native program tool requires the official OpenAI Responses endpoint.');
+    try {
+      if (await verifyOpenAIProgram(this.ai, primary, continuation, discovery, signal))
+        return { verified: true };
+    } catch (error) {
+      throw new BadGatewayException(error instanceof ToolError ? error.message : providerError(error));
+    }
+    throw new BadGatewayException('The configured primary did not complete the native program and its synthetic child call.');
+  }
+
   @Post('verify-native-runtime')
   async verifyNativeRuntime(@Body() body: { feature?: unknown }) {
     const parsed = openAIRuntimeFeatureSchema.safeParse(body.feature);
@@ -69,7 +90,13 @@ export class ProvidersController {
       return { feature, verified: true };
     }
     const runtime = new OpenAIRuntime(primary);
-    const marker = 'aria-runtime-probe-17';
+    const marker = `aria-runtime-probe-${randomUUID()}`;
+    const label = {
+      'hosted-shell': 'OpenAI-hosted Shell',
+      'local-shell': 'OpenAI Shell with managed execution',
+      'file-search': 'OpenAI File Search',
+    }[feature];
+    let phase = 'preparing the synthetic test';
     try {
       if (feature === 'hosted-shell') await runtime.openHosted([], [], [], signal);
       else if (feature === 'local-shell') runtime.openLocal(randomUUID());
@@ -90,6 +117,7 @@ export class ProvidersController {
       const shell = feature !== 'file-search';
       const name = shell ? 'aria_native_shell' : 'aria_native_file_search';
       const tools = runtime.tools();
+      phase = 'requesting the native tool call';
       const messages: ModelMessage[] = [
         {
           role: 'user',
@@ -104,7 +132,8 @@ export class ProvidersController {
         primary,
         'This is a synthetic capability probe.',
         tools,
-        name,
+        // The SDK maps named Shell tool choices to custom function names.
+        'required',
         false,
         { fileSearch: !shell, toolLimit: 1 },
       );
@@ -126,6 +155,7 @@ export class ProvidersController {
         }
       }
       if (localId) {
+        phase = 'returning the synthetic Shell result';
         const response = await run.response;
         messages.push(...response.messages.filter((message) => message.role === 'assistant'), {
           role: 'tool',
@@ -147,21 +177,32 @@ export class ProvidersController {
           messages,
           signal,
           primary,
-          'Report the verified synthetic shell result.',
+          'Reply with the exact stdout from the synthetic shell result.',
           tools,
           undefined,
           true,
         );
+        let text = '';
         for await (const part of continuation.stream) {
           if (part.type === 'error') throw part.error;
-          if (part.type === 'text-delta') verified = true;
+          if (part.type === 'text-delta') text += part.text;
         }
+        verified = text.includes(marker);
       }
-      if (!verified) throw new Error('Missing native runtime result.');
+      if (!verified)
+        throw new ToolError(
+          'CAPABILITY_UNAVAILABLE',
+          'The selected model did not return the expected tool result. Check its Responses API tool support and retry.',
+        );
       return { feature, verified: true };
-    } catch {
+    } catch (error) {
+      const message = signal.aborted
+        ? 'The request timed out. Check the connection and retry.'
+        : error instanceof ToolError
+          ? error.message
+          : providerError(error);
       throw new BadGatewayException(
-        'The configured OpenAI primary did not pass the runtime probe. Check model and account capabilities.',
+        `${label} verification failed while ${phase}. ${message}`,
       );
     } finally {
       await runtime.close();
@@ -304,7 +345,7 @@ export class ProvidersController {
             }),
           }),
         },
-        'verify_connection',
+        { name: 'verify_connection' },
       );
       for await (const event of probe.stream) {
         if (event.type === 'error') throw event.error;

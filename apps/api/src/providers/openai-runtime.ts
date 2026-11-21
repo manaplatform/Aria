@@ -16,7 +16,7 @@ import { ToolError } from '../conductor/capability-host';
 const resourceId = z.object({
   id: z
     .string()
-    .regex(/^[a-z][a-z_]*_[A-Za-z0-9_-]+$/i)
+    .regex(/^[a-z][a-z_]*[-_][A-Za-z0-9_-]+$/i)
     .max(100),
 });
 const status = z.object({ status: z.string().max(100) });

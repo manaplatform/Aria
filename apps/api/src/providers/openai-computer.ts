@@ -104,7 +104,7 @@ export async function verifyComputerTransport(
   ];
   const [color, encoded] = probeImages[randomInt(probeImages.length)];
   const bytes = new Uint8Array(Buffer.from(encoded, 'base64'));
-  const first = ai.generate(messages, signal, primary, system, tools, name);
+  const first = ai.generate(messages, signal, primary, system, tools, { name });
   let id: string | undefined;
   for await (const event of first.stream) {
     if (event.type === 'error') throw event.error;

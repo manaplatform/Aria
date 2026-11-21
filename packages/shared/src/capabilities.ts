@@ -5,6 +5,7 @@ import {
   runtimeResultSchema,
 } from './execution-runtime.js';
 import { identifier } from './model-registry.js';
+import { programSettingsSchema, type ProgramSettings } from './programmatic.js';
 
 export const capabilityId = z
   .string()
@@ -45,6 +46,8 @@ export const toolPolicySchema = z.strictObject({
   computerVirtual: z.boolean().optional(),
   computerLocal: z.boolean().optional(),
   nativeRuntime: z.array(openAIRuntimeFeatureSchema).max(5).optional(),
+  programming: programSettingsSchema.optional(),
+  nativeProgramVerified: z.boolean().optional(),
   skills: z.array(skillSummarySchema).max(128),
 });
 export const defaultToolPolicy: ToolPolicy = {
@@ -70,6 +73,7 @@ export interface ToolSummary {
   permission: string;
   available: boolean;
   reason?: string;
+  programmatic?: ('managed' | 'openai-responses')[];
 }
 
 export interface SkillPreview {
@@ -102,6 +106,11 @@ export const toolProblemSchema = z.strictObject({
     'TIMEOUT',
     'EXECUTION_FAILED',
     'CANCELLED',
+    'INVALID_PROGRAM',
+    'INVALID_TOOL_OUTPUT',
+    'CALLER_MISMATCH',
+    'CONTINUATION_FAILED',
+    'INVALID_REFERENCE',
   ]),
   message: z.string().max(2000),
 });
@@ -121,6 +130,8 @@ export interface ToolSettings {
   nativeVerified: boolean;
   tools: ToolSummary[];
   skills: SkillSummary[];
+  programming?: ProgramSettings;
+  nativeProgramVerified?: boolean;
 }
 
 const scope = {

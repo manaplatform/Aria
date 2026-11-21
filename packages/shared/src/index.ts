@@ -6,7 +6,9 @@ import type {
   RuntimeSettings,
 } from './execution-runtime.js';
 import type { SkillRef, SkillPreview, ToolDiscovery, ToolSettings } from './capabilities.js';
+import type { ProgramSettings } from './programmatic.js';
 export * from './capabilities.js';
+export * from './programmatic.js';
 import type { BrowserCommand, BrowserLayout, BrowserState } from './browser.js';
 import type {
   ComputerAction,
@@ -423,6 +425,7 @@ export interface DesktopBridge {
   documentEvidence(conversationId: string, id: string): Promise<DocumentEvidence>;
   setToolEnabled(id: string, enabled: boolean): Promise<ToolSettings>;
   setToolDiscovery(mode: ToolDiscovery): Promise<ToolSettings>;
+  setProgramSettings(settings: ProgramSettings): Promise<ToolSettings>;
   previewSkill(kind: 'directory' | 'zip'): Promise<SkillPreview | null>;
   approveSkill(token: string): Promise<ToolSettings>;
   manageSkill(skill: SkillRef, action: 'enable' | 'disable' | 'remove'): Promise<ToolSettings>;
@@ -436,6 +439,7 @@ export interface DesktopBridge {
   importRegistryEnvironment(): Promise<RegistrySettings>;
   importDroppedFiles(files: File[]): Promise<MediaAsset[]>;
   chooseMedia(kind: 'image' | 'audio' | 'text' | 'any'): Promise<MediaAsset[]>;
+  captureScreen(): Promise<MediaAsset[]>;
   exportMedia(id: string): Promise<void>;
   startLive(request: LiveRequest): Promise<void>;
   sendLiveAudio(sessionId: string, audio: Uint8Array): void;

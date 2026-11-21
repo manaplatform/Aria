@@ -123,6 +123,50 @@ test('opens directly into chat without a project and restores appearance, sideba
     JSON.parse(await fs.readFile(path.join(temporary, 'aria-v3.json'), 'utf8')).workspaces,
   ).toEqual([]);
 });
+
+test('captures the approved full display into the originating draft for review', async () => {
+  test.skip(process.platform !== 'darwin' && process.platform !== 'win32');
+  await launch();
+  await app.evaluate(({ BrowserWindow, desktopCapturer, dialog, nativeImage, screen, systemPreferences }) => {
+    const display = screen.getPrimaryDisplay();
+    const fakeImage = nativeImage.createFromBitmap(Buffer.alloc(96 * 64 * 4, 255), {
+      width: 96,
+      height: 64,
+    });
+    let approved = false;
+    let nextResponse = 0;
+    dialog.showMessageBox = (async () => {
+      approved = nextResponse === 1;
+      nextResponse = 1;
+      return { response: approved ? 1 : 0, checkboxChecked: false };
+    }) as typeof dialog.showMessageBox;
+    screen.getAllDisplays = () => [display];
+    systemPreferences.getMediaAccessStatus = () => 'granted';
+    desktopCapturer.getSources = async ({ types }) => {
+      if (!approved || types.join() !== 'screen') throw new Error('Unauthorized screenshot');
+      const empty = nativeImage.createEmpty();
+      return [
+        { id: 'other', name: 'Other', display_id: 'other', thumbnail: empty, appIcon: empty },
+        { id: 'selected', name: 'Selected', display_id: String(display.id), thumbnail: fakeImage, appIcon: empty },
+      ];
+    };
+    BrowserWindow.getAllWindows()[0].focus();
+  });
+  const share = page.getByRole('button', { name: 'Share full screen', exact: true });
+  const remove = page.getByRole('button', { name: 'Remove Screen capture.jpg', exact: true });
+  await share.click();
+  await expect(share).toBeEnabled();
+  await expect(remove).toHaveCount(0);
+  await expect(page.getByRole('alert')).toHaveCount(0);
+  await share.click();
+  await expect(remove).toBeVisible();
+  await expect(page.locator('.composer-attachments img')).toHaveJSProperty('naturalWidth', 96);
+  await expect(page.getByRole('button', { name: 'Send message', exact: true })).toBeEnabled();
+  await expect(page.locator('.from-user')).toHaveCount(0);
+  await remove.click();
+  await expect(remove).toHaveCount(0);
+});
+
 test('streams through the managed NestJS API, renders Markdown, manages conversations, and stops background replies', async () => {
   await launch();
   await send('Help me think');

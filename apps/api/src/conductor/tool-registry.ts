@@ -33,6 +33,8 @@ import { OpenAIRuntime, nativeFeatureName } from '../providers/openai-runtime';
 import type { ResearchRun } from '../web/web.service';
 import { CapabilityHost, ToolError } from './capability-host';
 import { RunError, type RunAttachment, type RunFile } from './run-assets';
+import { programRequestSchema, programStatus, type ProgramRequest } from '@aria/shared';
+import { ExecutionScheduler } from './scheduler';
 
 type Registry = Awaited<ReturnType<ModelRegistry['resolve']>>;
 export type StepInputs = { text: string[]; files: RunFile[] };
@@ -47,6 +49,7 @@ export type StepValue = {
   privateContent?: boolean;
   executionDetails?: string;
   commandProblem?: z.infer<typeof runtimeResultSchema>['commandProblem'];
+  programStatus?: z.infer<typeof programStatus>;
 };
 
 const resultSchema = z.strictObject({
@@ -70,6 +73,7 @@ const resultSchema = z.strictObject({
   privateContent: z.boolean().optional(),
   executionDetails: z.string().max(12_000).optional(),
   commandProblem: runtimeResultSchema.shape.commandProblem,
+  programStatus: programStatus.optional(),
 });
 
 const dependsOn = z
@@ -96,6 +100,7 @@ export interface ToolContext {
   computer?: { sessionId: string; mode: 'aria' | 'openai-responses'; observationId?: string };
   computerCall?: ComputerProviderCall;
   runtime?: { requestId: string; conversationId: string; assistantMessageId: string };
+  runProgram?: (input: ProgramRequest, stepId: string, signal: AbortSignal) => Promise<StepValue>;
 }
 
 type Invocation = {
@@ -106,6 +111,7 @@ type Invocation = {
   signal: AbortSignal;
   approval: () => void;
   callId: string;
+  programId?: string;
 };
 
 export interface ToolDescriptor<Input = unknown, Output extends StepValue = StepValue> {
@@ -126,6 +132,15 @@ export interface ToolDescriptor<Input = unknown, Output extends StepValue = Step
   deferred: boolean;
   modes: readonly ('direct' | 'programmatic')[];
   programmaticEligible: boolean;
+  program?: {
+    backends: readonly ('managed' | 'openai-responses')[];
+    scope: 'public' | 'private';
+    parallel: boolean;
+    approval?: 'desktop';
+    retry: 'never' | 'verified-read';
+    lock?: 'sessionId' | 'tabId';
+    argument?: (input: unknown, context: ToolContext) => boolean;
+  };
   artifacts: boolean;
   citations: boolean;
   repeatable?: boolean;
@@ -289,11 +304,13 @@ function summarize(descriptor: ToolDescriptor, available: boolean, reason?: stri
     permission: descriptor.permission,
     available,
     reason,
+    ...(descriptor.program && { programmatic: [...descriptor.program.backends] }),
   };
 }
 
 @Injectable()
 export class ToolRegistry {
+  readonly scheduler = new ExecutionScheduler();
   private readonly entries = new Map<string, ToolDescriptor>();
   private readonly wire = new Map<string, string>();
   private readonly namespaces = new Map<string, Map<string, ToolDescriptor>>();
@@ -306,6 +323,26 @@ export class ToolRegistry {
     @Inject(ModelRegistry) private readonly models: ModelRegistry,
     @Inject(CapabilityHost) readonly host: CapabilityHost,
   ) {
+    this.register({
+      ...base,
+      id: 'programs.run',
+      name: 'Run a JavaScript tool program',
+      description: 'Coordinate loaded tools using bounded async JavaScript. Use tools.invoke(toolId, arguments) and return a structured program result.',
+      input: programRequestSchema,
+      output: 'data',
+      capability: 'programs.run',
+      effect: 'local',
+      dependency: 'local',
+      permission: 'Verified offline program runner and current tool grants',
+      repeatable: true,
+      available: (context) =>
+        Boolean(context.runtime && this.host.current.programming?.backend === 'managed'),
+      execute: (input, { context, step, signal }) => {
+        if (!context.runProgram)
+          throw new ToolError('CAPABILITY_UNAVAILABLE', 'The managed program runner is unavailable.');
+        return context.runProgram(input, step.id, signal);
+      },
+    });
     this.register({
       ...base,
       id: 'files.read_attachment',
@@ -394,6 +431,45 @@ export class ToolRegistry {
       z.ZodType<Record<string, unknown>>,
     ][]) {
       const [name, description, effect] = runtimeDescriptions[operation];
+      const program: ToolDescriptor['program'] =
+        operation === 'knowledge.search' || operation === 'files.read_document'
+          ? {
+              backends: ['managed'],
+              scope: 'private',
+              parallel: false,
+              approval: 'desktop',
+              retry: 'verified-read',
+              argument: (input) =>
+                operation !== 'knowledge.search' ||
+                ['keyword', 'phrase'].includes((input as { mode?: string }).mode ?? ''),
+            }
+          : operation === 'skills.run_script' || operation === 'artifacts.publish'
+            ? {
+                backends: ['managed'],
+                scope: 'private',
+                parallel: false,
+                retry: 'never',
+                lock: 'sessionId',
+                ...(operation === 'skills.run_script' && { approval: 'desktop' }),
+                argument: (_input, context) =>
+                  context.native?.active.shell?.kind !== 'hosted',
+              }
+            : operation === 'computer.observe' || operation === 'computer.inspect'
+              ? {
+                  backends: ['managed'],
+                  scope: 'private',
+                  parallel: false,
+                  retry: 'verified-read',
+                  ...(operation === 'computer.observe' && {
+                    lock: 'sessionId',
+                    argument: (input: unknown, context: ToolContext) => {
+                      const args = computerOperations['computer.observe'].safeParse(input);
+                      return args.success && args.data.format === 'structured' &&
+                        args.data.sessionId === context.computer?.sessionId;
+                    },
+                  }),
+                }
+              : undefined;
       this.register({
         ...base,
         id: operation,
@@ -407,7 +483,7 @@ export class ToolRegistry {
         permission: 'Authorized desktop conversation runtime',
         timeoutMs: executionLimits.operationMs + 1000,
         repeatable: operation === 'computer.observe' || operation === 'computer.act',
-        programmaticEligible: operation === 'computer.inspect' || operation === 'computer.observe',
+        ...(program && { program, programmaticEligible: true, modes: ['direct', 'programmatic'] }),
         artifacts: operation === 'artifacts.publish' || operation === 'computer.transfer',
         citations: operation === 'knowledge.search',
         available: (context) =>
@@ -424,7 +500,7 @@ export class ToolRegistry {
               this.host.current.nativeRuntime?.includes('file-search')),
           ),
         normalize: (input) => ({ args: input }),
-        execute: async (input, { step, callId, context, signal, approval }) => {
+        execute: async (input, { step, callId, context, signal, approval, programId }) => {
           if (!context.runtime)
             throw new ToolError(
               'CAPABILITY_UNAVAILABLE',
@@ -545,6 +621,7 @@ export class ToolRegistry {
               operation,
               callId,
               stepId: step.id,
+              programId,
               input:
                 operation === 'computer.act' && context.computerCall?.callId === callId
                   ? { ...input, provider: context.computerCall }
@@ -673,6 +750,12 @@ export class ToolRegistry {
         'browser_extract',
         'browser_scroll',
       ].includes(op);
+      const program: ToolDescriptor['program'] =
+        ['web_search', 'web_fetch', 'web_find', 'web_read'].includes(op)
+          ? { backends: ['managed', 'openai-responses'], scope: 'public', parallel: true, retry: 'verified-read' }
+          : ['browser_get_page', 'browser_extract'].includes(op)
+            ? { backends: ['managed'], scope: 'public', parallel: false, retry: 'verified-read', lock: 'tabId' }
+            : undefined;
       this.register({
         ...base,
         id: `${browser ? 'browser' : 'web'}.${op}`,
@@ -687,6 +770,7 @@ export class ToolRegistry {
           ? 'AI Browser access and native action approval'
           : 'AI Browser access',
         repeatable: snapshot,
+        ...(program && { program, programmaticEligible: true, modes: ['direct', 'programmatic'] }),
         budget:
           op === 'web_search'
             ? 'searches'
@@ -756,7 +840,13 @@ export class ToolRegistry {
       this.wire.has(wireName) ||
       reserved.includes(wireName) ||
       this.entries.size >= 1024 ||
-      !descriptor.modes.includes('direct')
+      !descriptor.modes.length ||
+      new Set(descriptor.modes).size !== descriptor.modes.length ||
+      descriptor.modes.includes('programmatic') !== Boolean(descriptor.program) ||
+      Boolean(descriptor.program) !== descriptor.programmaticEligible ||
+      (descriptor.program &&
+        (!descriptor.program.backends.length || descriptor.effect === 'consequential' ||
+          descriptor.effect === 'billable' || descriptor.dependency === 'delegate'))
     )
       throw new Error('Invalid or duplicate capability registration.');
     const normalized = descriptor as ToolDescriptor;
@@ -823,6 +913,23 @@ export class ToolRegistry {
       (descriptor.dependency !== 'delegate' ||
         this.models.hasDelegateCandidates(context.registry.config)) &&
       (descriptor.available?.(context) ?? true)
+    );
+  }
+
+  allowedForProgram(
+    descriptor: ToolDescriptor,
+    context: ToolContext,
+    backend: 'managed' | 'openai-responses',
+    input?: unknown,
+  ) {
+    return Boolean(
+      context.runtime &&
+      this.host.current.programming?.backend === backend &&
+      (backend === 'managed' || this.host.current.nativeProgramVerified) &&
+      descriptor.modes.includes('programmatic') &&
+      descriptor.program?.backends.includes(backend) &&
+      this.allowed(descriptor, context) &&
+      (input === undefined || !descriptor.program.argument || descriptor.program.argument(input, context)),
     );
   }
 

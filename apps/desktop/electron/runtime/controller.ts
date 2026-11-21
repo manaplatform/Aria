@@ -26,6 +26,7 @@ import { Knowledge, type SearchFile } from './knowledge';
 import { RemoteEmbeddings } from './remote-embeddings';
 import { DockerSandbox, sandboxImage } from './sandbox';
 import { digest, RuntimeError, RuntimeStore } from './store';
+import { ProgramRuntime } from './programs';
 
 type RuntimeRequest = Extract<CapabilityHostRequest, { type: 'runtime' }>;
 type Grant = (title: string, detail: string, signal: AbortSignal) => Promise<boolean>;
@@ -53,6 +54,7 @@ export class DesktopRuntime {
   readonly knowledge: Knowledge;
   readonly library: DocumentLibrary;
   readonly embeddings: LocalEmbeddings;
+  readonly programs = new ProgramRuntime();
   private engine?: DockerSandbox;
   private readonly busy = new Set<string>();
   private readonly grants = new Map<string, Set<string>>();
@@ -78,7 +80,9 @@ export class DesktopRuntime {
   history(): ExecutionHistoryEntry[] {
     return this.store.db
       .prepare(
-        'SELECT id, operation, state, started, elapsed, exit_code FROM attempts ORDER BY started DESC LIMIT 50',
+        `SELECT id, operation, state, started, elapsed, exit_code FROM attempts
+         UNION ALL SELECT id, 'program.' || backend, state, started, finished - started, NULL FROM programs
+         ORDER BY started DESC LIMIT 50`,
       )
       .all()
       .map((row) => ({
@@ -131,12 +135,31 @@ export class DesktopRuntime {
     };
   }
 
+  verifyProgramImage(image: string, signal: AbortSignal) {
+    return this.programs.probe(this.sandbox(), image, signal);
+  }
+
   async dispatch(request: RuntimeRequest, signal: AbortSignal): Promise<RuntimeResult> {
     if (request.voiceSessionId)
       throw new RuntimeError('PERMISSION_DENIED', 'Open desktop chat to use the runtime.');
     signal.throwIfAborted();
     if (request.operation === 'artifacts.publish') await this.expireArtifacts();
     switch (request.operation) {
+      case 'program.journal': {
+        const provider = this.providerIdentity();
+        if (!provider || this.skills.policy().programming?.backend === 'off')
+          throw new RuntimeError('PERMISSION_DENIED', 'Enable program execution in Tools settings.');
+        this.store.journalProgram(request, provider);
+        return {};
+      }
+      case 'program.start':
+      case 'program.exchange':
+      case 'program.stop': {
+        const settings = this.skills.policy().programming;
+        if (settings?.backend !== 'managed' || !settings.image)
+          throw new RuntimeError('CAPABILITY_UNAVAILABLE', 'Verify an Aria program image in Tools settings.');
+        return this.programs.dispatch(request, this.sandbox(), settings.image, signal);
+      }
       case 'hosted.resources': {
         const ident = z
           .string()
@@ -534,6 +557,9 @@ ${
 
   release(requestId: string) {
     this.grants.delete(requestId);
+    void this.programs.release(requestId);
+    if (this.skills.policy().programming?.backend && this.skills.policy().programming?.backend !== 'off')
+      this.store.interruptPrograms(requestId);
   }
 
   private async search(
@@ -1149,6 +1175,7 @@ ${files
   }
 
   async close() {
+    await this.programs.release();
     this.embeddings.close();
     if (this.sweepTimer) {
       clearInterval(this.sweepTimer);

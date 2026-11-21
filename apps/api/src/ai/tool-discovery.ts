@@ -11,6 +11,8 @@ interface Definition {
   description: string;
   schema: JSONSchema7;
   deferred: boolean;
+  callers?: ('direct' | 'programmatic')[];
+  outputSchema?: JSONSchema7;
 }
 
 type DiscoveryProtocol = {
@@ -38,7 +40,15 @@ const aria: DiscoveryProtocol = {
   }),
   resultFormat: 'text',
   definition: (item) =>
-    tool({ description: item.description, inputSchema: jsonSchema(item.schema), strict: false }),
+    tool({
+      description: item.description, inputSchema: jsonSchema(item.schema), strict: false,
+      ...(item.callers && {
+        providerOptions: { openai: {
+          allowedCallers: item.callers,
+          ...(item.outputSchema && { outputSchema: item.outputSchema as never }),
+        } },
+      }),
+    }),
   selection: (input) => selection.parse(input).ids,
   result: (items) => ({ loaded: items.map(({ id, name }) => ({ id, name })) }),
   prune() {},
@@ -80,6 +90,7 @@ const responses: DiscoveryProtocol = {
         parameters: item.schema,
         strict: false,
         defer_loading: item.deferred,
+        ...(item.callers && { allowed_callers: item.callers, output_schema: item.outputSchema }),
       });
       namespaces.set(name, namespace);
     }
