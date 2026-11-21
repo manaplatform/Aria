@@ -163,12 +163,16 @@ private final class Driver: NSObject, SCContentSharingPickerObserver {
             return target
         }
         let basename = name.lowercased().hasSuffix(".app") ? String(name.dropLast(4)) : name
-        let matches = applicationFolders.flatMap { folder in
-            (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])) ?? []
-        }.filter {
-            $0.pathExtension.lowercased() == "app" &&
-                $0.deletingPathExtension().lastPathComponent.caseInsensitiveCompare(basename) == .orderedSame
-        }.compactMap(installedApp)
+        let candidates: [URL] = applicationFolders.flatMap { folder -> [URL] in
+            (try? FileManager.default.contentsOfDirectory(
+                at: folder, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]
+            )) ?? []
+        }
+        let matchingBundles = candidates.filter { url in
+            url.pathExtension.lowercased() == "app" &&
+                url.deletingPathExtension().lastPathComponent.caseInsensitiveCompare(basename) == .orderedSame
+        }
+        let matches = matchingBundles.compactMap(installedApp)
         guard let match = matches.first, matches.allSatisfy({ $0.url.path == match.url.path }) else { return nil }
         return match
     }

@@ -103,23 +103,38 @@ it('imports a standard ZIP and rejects traversal, symlinks, and expansion beyond
 it('reserves a guarded operation durably and blocks later attempts even when arguments change', async () => {
   const signal = new AbortController().signal;
   const first = new CapabilityStorage(temporary);
-  const concurrent = await Promise.all([
-    first.reserve('chat', 'turn', 'attempt-a', 'same', signal),
-    first.reserve('chat', 'turn', 'attempt-a', 'same', signal),
-  ]);
-  expect(concurrent.filter(Boolean)).toHaveLength(1);
+  try {
+    const concurrent = await Promise.allSettled([
+      first.reserve('chat', 'turn', 'attempt-a', 'same', signal),
+      first.reserve('chat', 'turn', 'attempt-a', 'same', signal),
+    ]);
+    expect(concurrent).toEqual(
+      expect.arrayContaining([
+        { status: 'fulfilled', value: true },
+        { status: 'fulfilled', value: false },
+      ]),
+    );
+  } finally {
+    first.runtimeStore.close();
+  }
+
   const restarted = new CapabilityStorage(temporary);
-  expect(await restarted.reserve('chat', 'turn', 'attempt-a', 'other operation', signal)).toBe(
-    true,
-  );
-  expect(await restarted.reserve('chat', 'turn', 'attempt-b', 'changed arguments', signal)).toBe(
-    false,
-  );
-  expect(await restarted.reserve('chat', 'new turn', 'attempt-b', 'same', signal)).toBe(true);
-  await expect(
-    restarted.reserve('chat', 'cancelled', 'attempt-b', 'same', AbortSignal.abort()),
-  ).rejects.toThrow();
-  expect(await restarted.reserve('chat', 'cancelled', 'attempt-b', 'same', signal)).toBe(true);
+  try {
+    expect(await restarted.reserve('chat', 'turn', 'attempt-a', 'same', signal)).toBe(false);
+    expect(await restarted.reserve('chat', 'turn', 'attempt-b', 'changed arguments', signal)).toBe(
+      false,
+    );
+    expect(await restarted.reserve('chat', 'turn', 'attempt-a', 'other operation', signal)).toBe(
+      true,
+    );
+    expect(await restarted.reserve('chat', 'new turn', 'attempt-b', 'same', signal)).toBe(true);
+    await expect(
+      restarted.reserve('chat', 'cancelled', 'attempt-b', 'same', AbortSignal.abort()),
+    ).rejects.toThrow();
+    expect(await restarted.reserve('chat', 'cancelled', 'attempt-b', 'same', signal)).toBe(true);
+  } finally {
+    restarted.runtimeStore.close();
+  }
 });
 
 it('imports the legacy file fence and denies late receipts after restart', async () => {
