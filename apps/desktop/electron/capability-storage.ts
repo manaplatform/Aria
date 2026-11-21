@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { ZipWriter, Uint8ArrayReader, Uint8ArrayWriter } from '@zip.js/zip.js';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import { MessageChannelMain } from 'electron';
+import { app, MessageChannelMain } from 'electron';
 import { z } from 'zod';
 import {
   builtinSourceSkill,
@@ -84,7 +84,7 @@ export class CapabilityStorage {
   }
 
   async load() {
-    const bundled = path.join(__dirname, '../skills');
+    const bundled = app?.isPackaged ? path.join(process.resourcesPath, 'aria-skills') : path.join(__dirname, '../skills');
     const examples = await Promise.allSettled(
       ['spreadsheet-summary', 'chart-generation', 'pdf-report', 'pdf-inspection'].map((name) =>
         inspectBundle(path.join(bundled, name), 'directory'),

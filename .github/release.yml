@@ -1,0 +1,25 @@
+changelog:
+  exclude:
+    labels: [skip-release-notes]
+    authors: ["github-actions[bot]"]
+  categories:
+    - title: 💥 Breaking Changes
+      labels: [breaking, breaking-change]
+    - title: 🔒 Security
+      labels: [security]
+    - title: ⚡ Performance
+      labels: [performance, perf]
+    - title: 🧠 Aria & Conductor
+      labels: [conductor, aria-conductor]
+    - title: 🖥️ Desktop Experience
+      labels: [desktop, desktop-experience]
+    - title: 📦 Dependencies
+      labels: [dependencies, deps]
+    - title: 🐛 Bug Fixes
+      labels: [bug, bugfix, fix]
+    - title: ✨ New Features
+      labels: [feature]
+    - title: 🚀 Improvements
+      labels: [improvement, enhancement]
+    - title: Other Changes
+      labels: ['*']

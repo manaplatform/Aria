@@ -22,7 +22,11 @@ Main validates named IPC operations and the sender, performs HTTP/SSE requests, 
 
 Unexpected process exit interrupts active requests. Settings offers explicit service restart; requests are never automatically replayed. Closing flushes partial replies and drafts before destroying the window. Application exit shuts down the utility process, with bounded termination fallback. Renderer reload also cancels outstanding requests and restores saved pending replies as interrupted.
 
-Build/predev compiles the API and uses `pnpm deploy --prod` to stage a portable runtime in desktop build output. Only API distribution files and production dependencies are included. This supports repository production launches without a separate Node installation; installer packaging/signing remains separate.
+Build/predev compiles the API and uses `pnpm deploy --prod` to stage the service and its production dependencies. Installer builds materialize that same dependency graph in the application's resources directory. Compiled desktop code, renderer assets, built-in skills, and native helpers ship with Electron. The service uses Electron's embedded Node runtime.
+
+## Desktop updates
+
+Electron main checks public Aria releases and verifies the signed manifest, target metadata, and installer bytes. On Windows it also requires Authenticode trust and a pinned signing certificate. The renderer receives only update status and exposes a fixed action set through trusted IPC. Install and restart uses the existing renderer-save and service-shutdown handshake. [Release verification and trust setup](RELEASING.md)
 
 ## Registry and execution
 

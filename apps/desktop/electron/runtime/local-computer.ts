@@ -173,7 +173,9 @@ export class LocalComputer implements ComputerDriver {
           ? 'aria-macos-computer'
           : undefined;
     if (!file) return;
-    const filename = path.join(__dirname, '..', 'computer-helpers', file);
+    const filename = app.isPackaged
+      ? path.join(process.resourcesPath, 'aria-computer', file)
+      : path.join(__dirname, '..', 'computer-helpers', file);
     return existsSync(filename) ? filename : undefined;
   }
 

@@ -6,6 +6,7 @@ import { Button, Field } from '../ui';
 import { WebBrowserSettings } from './WebBrowserSettings';
 import { ToolSettings } from './ToolSettings';
 import { ModelSettings } from './ModelSettings';
+import { UpdateSettings } from './UpdateSettings';
 
 export default function SettingsView() {
   const preferences = useWorkspaceStore((state) => state.data.preferences);
@@ -58,6 +59,7 @@ export default function SettingsView() {
         <ModelSettings />
         <WebBrowserSettings />
         <ToolSettings />
+        <UpdateSettings />
         <section className="settings-section">
           <div className="settings-section-heading">
             <h2>

@@ -11,10 +11,17 @@
     "lint": "pnpm --filter @aria/desktop lint",
     "test": "pnpm --recursive --sort --if-present run test",
     "licenses:check": "node apps/desktop/scripts/third-party.cjs",
-    "test:electron": "pnpm --filter @aria/desktop build && pnpm --filter @aria/desktop test:electron"
+    "test:electron": "pnpm --filter @aria/desktop build && pnpm --filter @aria/desktop test:electron",
+    "release:check": "node scripts/release/run.mjs check",
+    "release:preview": "node scripts/release/run.mjs preview",
+    "release:notes": "node scripts/release/run.mjs notes",
+    "release:create": "node scripts/release/run.mjs create",
+    "release:test": "node --test scripts/release/*.test.mjs",
+    "release:package": "node scripts/release/package-desktop.mjs"
   },
   "devDependencies": {
     "@types/ws": "^8.18.2",
+    "semver": "7.8.6",
     "ws": "^8.22.2"
   }
 }

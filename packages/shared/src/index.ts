@@ -374,8 +374,24 @@ export interface HealthResult {
   message: string;
   checkedAt: string;
 }
+export type UpdateChannel = 'stable' | 'beta';
+export type UpdateCommand =
+  | { action: 'channel'; channel: UpdateChannel }
+  | { action: 'check' | 'download' | 'install' | 'open-release' };
+export interface UpdateState {
+  version: string;
+  channel: UpdateChannel;
+  status: 'unsupported' | 'idle' | 'checking' | 'current' | 'available' | 'downloading' | 'ready' | 'installing' | 'error';
+  mode: 'install' | 'manual';
+  available?: string;
+  progress?: number;
+  error?: string;
+}
 export interface DesktopBridge {
   platform: string;
+  updateState(): Promise<UpdateState>;
+  updateCommand(command: UpdateCommand): Promise<void>;
+  onUpdateState(callback: (state: UpdateState) => void): () => void;
   onBeforeClose(callback: () => Promise<void>): () => void;
   load(): Promise<InitialState>;
   save(data: LocalData): Promise<void>;

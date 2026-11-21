@@ -1101,7 +1101,34 @@ export class BrowserController {
       ensure();
       return { observation };
     }
-    const capture = await whenActive(contents.capturePage(undefined, { stayHidden: true }), active);
+    // Request a fresh compositor frame from the detached tab. Copying its current
+    // surface with capturePage can stall on Windows when the tab has no visible host.
+    const transport = contents.debugger;
+    if (transport.isAttached())
+      throw new RuntimeError('CAPABILITY_UNAVAILABLE', 'The browser capture channel is busy.');
+    const frameSignal = AbortSignal.any([active, AbortSignal.timeout(5_000)]);
+    let capture: Electron.NativeImage;
+    try {
+      transport.attach('1.3');
+      const { data } = await whenActive(
+        transport.sendCommand('Page.captureScreenshot', {
+          format: 'png',
+          fromSurface: true,
+          captureBeyondViewport: false,
+        }),
+        frameSignal,
+      );
+      capture = nativeImage.createFromBuffer(Buffer.from(data, 'base64'));
+      if (capture.isEmpty()) throw new Error('The browser returned an empty image.');
+    } catch {
+      active.throwIfAborted();
+      throw new RuntimeError(
+        'CAPABILITY_UNAVAILABLE',
+        'The browser could not capture the current viewport. Observe the tab again.',
+      );
+    } finally {
+      if (transport.isAttached()) transport.detach();
+    }
     const size = capture.getSize(1);
     const side = Math.max(size.width, size.height);
     const scaled =

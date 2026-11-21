@@ -1,5 +1,6 @@
 const fs = require('node:fs');
 const path = require('node:path');
+const { createRequire } = require('node:module');
 const desktop = path.resolve(__dirname, '..');
 const root = path.resolve(desktop, '../..');
 
@@ -74,6 +75,31 @@ function packageEntries(directory) {
   });
 }
 
+function dependencyNotices(entry) {
+  const queue = [entry];
+  const seen = new Set(queue);
+  const packages = [];
+  for (const directory of queue) {
+    const manifest = path.join(directory, 'package.json');
+    const { dependencies, optionalDependencies, peerDependencies } = JSON.parse(
+      fs.readFileSync(manifest, 'utf8'),
+    );
+    for (const name of Object.keys({ ...dependencies, ...optionalDependencies, ...peerDependencies })) {
+      const found = createRequire(manifest).resolve.paths(name)?.find((candidate) =>
+        fs.existsSync(path.join(candidate, name, 'package.json')),
+      );
+      if (!found) continue;
+      const location = fs.realpathSync(path.join(found, name));
+      if (seen.has(location)) continue;
+      seen.add(location);
+      queue.push(location);
+      const entry = notice(location);
+      if (entry) packages.push(entry);
+    }
+  }
+  return packages;
+}
+
 function check(release) {
   const dist = path.join(desktop, 'dist');
   const staged = path.join(desktop, 'dist-electron/api/node_modules/.pnpm');
@@ -84,27 +110,7 @@ function check(release) {
     .flatMap((name) => packageEntries(path.join(staged, name, 'node_modules')))
     .map(notice)
     .filter(Boolean);
-  const main = ['zod', 'ws', 'ipaddr.js', 'yaml', 'yauzl']
-    .map((name) =>
-      notice(
-        fs.realpathSync(
-          path.join(
-            name === 'ipaddr.js' ? path.join(root, 'packages/shared') : desktop,
-            'node_modules',
-            name,
-          ),
-        ),
-      ),
-    )
-    .filter(Boolean);
-  const yauzl = fs.realpathSync(path.join(desktop, 'node_modules', 'yauzl'));
-  for (const name of Object.keys(
-    JSON.parse(fs.readFileSync(path.join(yauzl, 'package.json'), 'utf8')).dependencies ?? {},
-  )) {
-    const dependency = require.resolve(`${name}/package.json`, { paths: [yauzl] });
-    const entry = notice(path.dirname(dependency));
-    if (entry) main.push(entry);
-  }
+  const main = dependencyNotices(desktop);
   const packages = [
     ...new Map(
       [...api, ...main, ...renderer].map((entry) => [`${entry.name}@${entry.version}`, entry]),
@@ -115,6 +121,9 @@ function check(release) {
 
   const destination = path.join(dist, 'third-party');
   fs.mkdirSync(destination, { recursive: true });
+  fs.writeFileSync(path.join(destination, 'inventory.json'), JSON.stringify(
+    packages.map(({ name, version, license }) => ({ name, version, license })), null, 2,
+  ));
   fs.copyFileSync(
     path.join(root, 'THIRD_PARTY_NOTICES.md'),
     path.join(destination, 'THIRD_PARTY_NOTICES.md'),

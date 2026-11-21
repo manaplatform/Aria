@@ -5,10 +5,18 @@ import type {
   ChatServiceStatus,
   DesktopBridge,
   LiveEvent,
+  UpdateState,
 } from '@aria/shared';
 
 const bridge: DesktopBridge = {
   platform: process.platform,
+  updateState: () => ipcRenderer.invoke('aria:update-state'),
+  updateCommand: (command) => ipcRenderer.invoke('aria:update-command', command),
+  onUpdateState: (callback) => {
+    const listener = (_event: Electron.IpcRendererEvent, state: UpdateState) => callback(state);
+    ipcRenderer.on('aria:update-state-changed', listener);
+    return () => ipcRenderer.removeListener('aria:update-state-changed', listener);
+  },
   onBeforeClose: (callback) => {
     const listener = () => {
       void callback()

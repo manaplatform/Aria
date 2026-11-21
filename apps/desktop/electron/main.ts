@@ -56,6 +56,7 @@ import { MediaStorage, referencedAssets } from './media-storage';
 import { captureDisplay, chooseDisplay } from './screen-capture';
 import { OperationApproval } from './operation-approval';
 import { MediaService, liveRequestSchema } from './media-service';
+import { DesktopUpdates } from './updates';
 import { chatRequestSchema } from './chat-protocol';
 import {
   checkHealth,
@@ -67,6 +68,8 @@ import {
 } from './project';
 
 app.setName('Aria');
+if (process.platform === 'win32' && app.isPackaged)
+  app.setAppUserModelId('io.github.manaplatform.aria');
 app.commandLine.appendSwitch('disable-quic');
 protocol.registerSchemesAsPrivileged([
   {
@@ -106,6 +109,8 @@ let saving = Promise.resolve();
 let configuring = false;
 let shutdownComplete = false;
 let shutdown: Promise<void> | undefined;
+let updates: DesktopUpdates;
+let installUpdate: (() => void) | undefined;
 let initial: Awaited<ReturnType<LocalStorage['load']>>;
 const string = z.string().max(8000);
 const devServerUrl = process.env.VITE_DEV_SERVER_URL;
@@ -276,6 +281,17 @@ function registerIpc(): void {
       validateSender(event);
       return fn(...args);
     });
+  handle('aria:update-state', () => updates.snapshot);
+  handle('aria:update-command', (input) => {
+    const command = z.union([
+      z.object({ action: z.literal('channel'), channel: z.enum(['stable', 'beta']) }),
+      z.object({ action: z.enum(['check', 'download', 'install', 'open-release']) }),
+    ]).parse(input);
+    return updates.command(command, (perform) => {
+      installUpdate = perform;
+      app.quit();
+    });
+  });
   handle('aria:enable-close-flush', () => {
     closeFlushEnabled = true;
   });
@@ -288,6 +304,8 @@ function registerIpc(): void {
   handle('aria:close-failed', (error) => {
     closePending = false;
     quitting = false;
+    installUpdate = undefined;
+    updates.installCancelled();
     dialog.showErrorBox('Local changes could not be saved', string.parse(error));
   });
   handle('aria:load', () => ({
@@ -952,6 +970,11 @@ app
       }
     }
     const directory = process.env.ARIA_TEST_DATA_DIR || app.getPath('userData');
+    updates = new DesktopUpdates(directory, (state) => {
+      if (mainWindow && !mainWindow.webContents.isDestroyed())
+        mainWindow.webContents.send('aria:update-state-changed', state);
+    });
+    await updates.load();
     storage = new LocalStorage(directory);
     initial = await storage.load();
     assets = new MediaStorage(directory);
@@ -1137,7 +1160,9 @@ app
     chat = new ChatService(
       provider,
       (env) =>
-        utilityProcess.fork(path.join(__dirname, 'api/dist/main.js'), [], {
+        utilityProcess.fork(app.isPackaged
+          ? path.join(process.resourcesPath, 'aria-api', 'dist', 'main.js')
+          : path.join(__dirname, 'api', 'dist', 'main.js'), [], {
           env: env as Record<string, string>,
           stdio: 'ignore',
           serviceName: 'Aria Chat API',
@@ -1270,9 +1295,18 @@ app.on('before-quit', (event) => {
       .then(() => computerRuntime.shutdown())
       .then(() => localComputer.reset())
       .then(() => executionRuntime.close())
-      .finally(() => {
+      .then(() => {
         browser.close();
         shutdownComplete = true;
+        const perform = installUpdate;
+        installUpdate = undefined;
+        if (perform) perform();
+        else app.quit();
+      }, () => {
+        browser.close();
+        shutdownComplete = true;
+        if (installUpdate) dialog.showErrorBox('Update paused', 'Aria could not complete shutdown. Open Aria and try the update again.');
+        installUpdate = undefined;
         app.quit();
       });
   }

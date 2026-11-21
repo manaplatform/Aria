@@ -130,7 +130,7 @@ test('browses from ordinary chat through the managed private port and keeps priv
         .end(
           '<title>Aria research fixture</title><main><h1>Research evidence</h1>' +
             '<p>The sample contains 42 measurements.</p><p hidden>secret-hidden-value</p>' +
-            '<a href="/next">Next page</a><button style="position:absolute;left:100px;top:180px;width:180px;height:40px">Ready for input</button></main>' +
+            '<a href="/next">Next page</a><button style="appearance:none;background:#1e82c8;position:absolute;left:100px;top:180px;width:180px;height:40px">Ready for input</button></main>' +
             '<script>document.querySelector("button").onclick=()=>{document.querySelector("button").textContent="Fixture received input";fetch("/unexpected-action").catch(()=>{})}</script>' +
             `<img src="http://127.0.0.1:${port}/private-canary" alt="">`,
         );
@@ -423,6 +423,8 @@ test('browses from ordinary chat through the managed private port and keeps priv
       }) as typeof show;
     });
     const computerResults: Record<string, unknown> = {};
+    const buttonPoint = { x: 110, y: 190 };
+    let viewport: { width: number; height: number } | undefined;
     const computerTools = [
       'browser.browser_open',
       'computer.open',
@@ -469,7 +471,9 @@ test('browses from ordinary chat through the managed private port and keeps priv
             ],
           },
         };
-      if (id === 'inspect')
+      if (id === 'inspect') {
+        const { width, height, screenshot } = data.observation;
+        viewport = { width, height };
         return {
           name: 'fixture_operations',
           input: {
@@ -481,18 +485,15 @@ test('browses from ordinary chat through the managed private port and keeps priv
                   {
                     type: 'click',
                     button: 'left',
-                    x: Math.round(
-                      (165 * data.observation.screenshot.width) / data.observation.width,
-                    ),
-                    y: Math.round(
-                      (198 * data.observation.screenshot.height) / data.observation.height,
-                    ),
+                    x: Math.round((buttonPoint.x * screenshot.width) / width),
+                    y: Math.round((buttonPoint.y * screenshot.height) / height),
                   },
                 ],
               }),
             ],
           },
         };
+      }
       if (id === 'act') {
         computerResults.outcomes = data.outcomes;
         computerResults.elements = data.observation.state.elements;
@@ -509,16 +510,29 @@ test('browses from ordinary chat through the managed private port and keeps priv
         ]),
       });
     await expect(page.getByRole('region', { name: 'Computer Use' })).toBeVisible();
-    expect(
-      provider.received.some(({ body }) =>
-        body.messages.some(
-          ({ role, content }) =>
-            role === 'tool' &&
-            Array.isArray(content) &&
-            content.some((part) => part.type === 'image_url'),
-        ),
-      ),
-    ).toBe(true);
+    const screenshot = provider.received
+      .filter(({ body }) =>
+        body.messages.some(({ role, content }) => role === 'user' && content === computerPrompt),
+      )
+      .map(({ body }) => body.messages.at(-1))
+      .find((message) => message?.role === 'tool' && Array.isArray(message.content));
+    const dataUrl = Array.isArray(screenshot?.content)
+      ? screenshot.content.find((part) => part.type === 'image_url')?.image_url?.url
+      : undefined;
+    if (!viewport || typeof dataUrl !== 'string')
+      throw new Error('The provider did not receive a browser screenshot.');
+    const buttonPixel = await app.evaluate(
+      ({ nativeImage }, { dataUrl, viewport, point }) => {
+        const frame = nativeImage.createFromDataURL(dataUrl);
+        const { width, height } = frame.getSize();
+        const x = Math.round((point.x * width) / viewport.width);
+        const y = Math.round((point.y * height) / viewport.height);
+        const offset = (y * width + x) * 4;
+        return [...frame.toBitmap().subarray(offset, offset + 4)];
+      },
+      { dataUrl, viewport, point: buttonPoint },
+    );
+    expect(buttonPixel).toEqual([200, 130, 30, 255]);
     expect(traffic).not.toContain('/unexpected-action');
     await page.getByRole('button', { name: 'Take control', exact: true }).click();
     await expect(page.getByRole('region', { name: 'Computer Use' })).toContainText(

@@ -161,3 +161,9 @@ When implementing AI features:
 - Preserve provider protocol semantics in the adapter. Select the exact verified model and backend. Keep semantic routing model-driven and reject unsupported capabilities explicitly.
 - Charge nested calls and continuations to the same turn. Reserve before sending paid or provider-executed work. Use versioned results and observed changes to detect progress. After interruption, use authoritative receipts to reconcile an effect before admitting another attempt.
 - Extend the existing registry, scheduler, scoped ports, and desktop journal before introducing another runtime contract. Test new boundaries through ordinary chat and the relevant built desktop, and record backend-specific verification.
+
+## Desktop releases
+
+- Change the root `package.json` to set the application SemVer. Keep calendar release tags separate from app versions. Release Creator reserves an annotated UTC tag at the exact commit it builds and reuses it on retry.
+- Keep platform builds, signatures, notices, verification, evidence, and release assets in the release pipeline. Production publication requires all required packages and a verified draft. Never rewrite an existing release tag.
+- Keep production publishing and signing on protected default-branch environments. Windows releases use Aria’s self-signed code-signing certificate and documented managed trust. Publish only the public certificate. Use preview, fixture tests, and Actions verification artifacts to test changes. See [release setup and recovery](docs/RELEASING.md).
