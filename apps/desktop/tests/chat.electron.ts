@@ -989,15 +989,16 @@ test('opens an approved installed app from ordinary chat on macOS', async () => 
       { id: 'selected', name: 'Selected', display_id: String(display.id), thumbnail, appIcon: thumbnail },
     ];
     BrowserWindow.getAllWindows()[0].isFocused = () => true;
-    dialog.showMessageBox = async (_window, options) => ({
-      response:
+    dialog.showMessageBox = async (
+      _window: Electron.BaseWindow | Electron.MessageBoxOptions,
+      options?: Electron.MessageBoxOptions,
+    ) => {
+      const approved =
         options?.message === 'Choose a display' ||
         (options?.message === 'Allow this computer action once?' &&
-          options.detail?.includes('/System/Applications/Calculator.app\ncom.apple.calculator'))
-          ? 1
-          : 0,
-      checkboxChecked: false,
-    });
+          options.detail?.includes('/System/Applications/Calculator.app\ncom.apple.calculator'));
+      return { response: approved ? 1 : 0, checkboxChecked: false };
+    };
   });
   await page.getByRole('button', { name: 'Open settings', exact: true }).click();
   await page.getByRole('button', { name: 'Select a full screen', exact: true }).click();
