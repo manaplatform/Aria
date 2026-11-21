@@ -33,9 +33,13 @@ private final class Driver: NSObject, SCContentSharingPickerObserver {
     private var elements: [String: AXUIElement] = [:]
     private var surface: CGRect?
     private var sharedDisplay: CGDirectDisplayID?
+    private var preparedApp: (token: String, display: CGDirectDisplayID, target: InstalledApp)?
 
-    private let messagesPath = "/System/Applications/Messages.app"
-    private let messagesID = "com.apple.MobileSMS"
+    private struct InstalledApp {
+        let url: URL
+        let bundleID: String
+        let fileID: NSObject
+    }
 
     func reply(_ id: String, _ fields: [String: Any]) {
         guard let data = try? JSONSerialization.data(withJSONObject: fields.merging(["id": id]) { first, _ in first }) else { return }
@@ -73,21 +77,40 @@ private final class Driver: NSObject, SCContentSharingPickerObserver {
             if input["requestPointerPermission"] as? Bool == true && !CGPreflightPostEventAccess() {
                 _ = CGRequestPostEventAccess()
             }
-            reply(id, ["approved": true, "displayKey": key, "accessibility": CGPreflightPostEventAccess(), "messages": messagesURL() != nil])
+            reply(id, ["approved": true, "displayKey": key, "accessibility": CGPreflightPostEventAccess(), "applicationLaunch": true])
         case "screen_pointer":
             pointer(id, input)
+        case "resolve_application":
+            preparedApp = nil
+            guard let display = approvedScreen(input), let name = input["application"] as? String,
+                  name.utf16.count <= 120,
+                  name.range(of: #"\A[\p{L}\p{N}][\p{L}\p{M}\p{N} ._&+()'’\-]*\z"#, options: .regularExpression) != nil else {
+                reply(id, ["error": "Select a current display and supply an installed macOS app name or bundle identifier."])
+                return
+            }
+            guard let target = resolveApplication(name) else {
+                reply(id, ["error": "macOS could not identify one installed app with that name. Check Applications or use its bundle identifier."])
+                return
+            }
+            let token = UUID().uuidString
+            preparedApp = (token, display, target)
+            reply(id, ["application": ["token": token, "path": target.url.path, "bundleId": target.bundleID]])
         case "open_application":
-            guard let display = sharedDisplay, screenBounds(display, input) != nil,
-                  let key = screenKey(display), key == input["displayKey"] as? String,
-                  input["application"] as? String == "messages", let url = messagesURL() else {
-                reply(id, ["error": "The selected display or system Messages app is unavailable."])
+            let prepared = preparedApp
+            preparedApp = nil
+            guard let display = approvedScreen(input), let prepared, prepared.display == display,
+                  prepared.token == input["token"] as? String,
+                  let current = installedApp(prepared.target.url),
+                  current.url.path == prepared.target.url.path, current.bundleID == prepared.target.bundleID,
+                  current.fileID.isEqual(prepared.target.fileID) else {
+                reply(id, ["error": "The selected app or display changed before launch. Resolve the app again."])
                 return
             }
             let configuration = NSWorkspace.OpenConfiguration()
             configuration.activates = true
-            NSWorkspace.shared.openApplication(at: url, configuration: configuration) { app, error in
-                let verified = error == nil && app?.bundleIdentifier == self.messagesID &&
-                    app?.bundleURL?.standardizedFileURL.path == self.messagesPath && app?.isTerminated == false
+            NSWorkspace.shared.openApplication(at: current.url, configuration: configuration) { app, error in
+                let verified = error == nil && app?.bundleIdentifier == current.bundleID &&
+                    app?.bundleURL?.resolvingSymlinksInPath().path == current.url.path && app?.isTerminated == false
                 self.reply(id, ["submitted": true, "verified": verified])
             }
         case "observe", "set_value":
@@ -104,10 +127,50 @@ private final class Driver: NSObject, SCContentSharingPickerObserver {
         }
     }
 
-    private func messagesURL() -> URL? {
-        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: messagesID)?.standardizedFileURL,
-              url.path == messagesPath, Bundle(url: url)?.bundleIdentifier == messagesID else { return nil }
-        return url
+    private func approvedScreen(_ input: [String: Any]) -> CGDirectDisplayID? {
+        guard let display = sharedDisplay, screenBounds(display, input) != nil,
+              let key = screenKey(display), key == input["displayKey"] as? String else { return nil }
+        return display
+    }
+
+    private var applicationFolders: [URL] {
+        [FileManager.SearchPathDomainMask.systemDomainMask, .localDomainMask, .userDomainMask]
+            .flatMap { FileManager.default.urls(for: .applicationDirectory, in: $0) }
+            .flatMap { [$0, $0.appendingPathComponent("Utilities", isDirectory: true)] }
+            .map { $0.resolvingSymlinksInPath() }
+    }
+
+    private func installedApp(_ candidate: URL) -> InstalledApp? {
+        let url = candidate.resolvingSymlinksInPath()
+        guard url.pathExtension.lowercased() == "app",
+              applicationFolders.contains(where: { $0.path == url.deletingLastPathComponent().path }),
+              let bundle = Bundle(url: url), let bundleID = bundle.bundleIdentifier,
+              bundle.object(forInfoDictionaryKey: "CFBundlePackageType") as? String == "APPL",
+              let fileID = (try? url.resourceValues(forKeys: [.fileResourceIdentifierKey]))?.fileResourceIdentifier as? NSObject
+        else { return nil }
+        return InstalledApp(url: url, bundleID: bundleID, fileID: fileID)
+    }
+
+    private func resolveApplication(_ name: String) -> InstalledApp? {
+        // Preserve the existing selector for the system Messages app.
+        if name == "messages" {
+            let url = URL(fileURLWithPath: "/System/Applications/Messages.app", isDirectory: true)
+            guard let target = installedApp(url), target.bundleID == "com.apple.MobileSMS" else { return nil }
+            return target
+        }
+        if name.contains("."), let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: name),
+           let target = installedApp(url), target.bundleID == name {
+            return target
+        }
+        let basename = name.lowercased().hasSuffix(".app") ? String(name.dropLast(4)) : name
+        let matches = applicationFolders.flatMap { folder in
+            (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])) ?? []
+        }.filter {
+            $0.pathExtension.lowercased() == "app" &&
+                $0.deletingPathExtension().lastPathComponent.caseInsensitiveCompare(basename) == .orderedSame
+        }.compactMap(installedApp)
+        guard let match = matches.first, matches.allSatisfy({ $0.url.path == match.url.path }) else { return nil }
+        return match
     }
 
     private func screenBounds(_ display: CGDirectDisplayID, _ input: [String: Any]) -> CGRect? {

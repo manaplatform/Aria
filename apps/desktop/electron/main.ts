@@ -4,6 +4,7 @@ import {
   clipboard,
   dialog,
   ipcMain,
+  nativeImage,
   powerMonitor,
   screen,
   shell,
@@ -11,6 +12,7 @@ import {
   utilityProcess,
   protocol,
   type IpcMainInvokeEvent,
+  type NativeImage,
 } from 'electron';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -107,9 +109,15 @@ let shutdown: Promise<void> | undefined;
 let initial: Awaited<ReturnType<LocalStorage['load']>>;
 const string = z.string().max(8000);
 const devServerUrl = process.env.VITE_DEV_SERVER_URL;
+const devLauncher = devServerUrl && process.env.ARIA_DEV_LAUNCHER === '1';
 let closeFlushEnabled = false;
 let closePending = false;
 let quitting = false;
+if (devLauncher) {
+  process.once('disconnect', () => {
+    if (media) app.quit();
+  });
+}
 function trustedUrl(value: string): boolean {
   try {
     return devServerUrl
@@ -432,7 +440,7 @@ function registerIpc(): void {
           if (!identity || !chat.getStatus().configured)
             throw new Error('Configure a primary model before allowing ongoing display access.');
           standingProvider = identity.key;
-          detail = `Allow Aria to send screenshots of the selected display to ${identity.model} at ${new URL(identity.endpoint).origin} and use its mouse controls and supported app launches from any active chat. Access continues after restart until you click Revoke.`;
+          detail = `Allow Aria to send screenshots of the selected display to ${identity.model} at ${new URL(identity.endpoint).origin} and use its mouse controls and built-in desktop shortcuts from any active chat. Aria asks before opening other installed apps. Access continues after restart until you click Revoke.`;
         }
         display = await chooseDisplay(window, 'Select a full screen', detail, true);
         if (!display || selection.signal.aborted) return false;
@@ -856,7 +864,7 @@ function registerIpc(): void {
   );
   handle('aria:end-live', () => media.endLive());
 }
-function createWindow(): void {
+function createWindow(icon: NativeImage | undefined): void {
   closeFlushEnabled = false;
   closePending = false;
   mainWindow = new BrowserWindow({
@@ -865,6 +873,7 @@ function createWindow(): void {
     minWidth: 720,
     minHeight: 520,
     backgroundColor: '#101116',
+    icon,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -931,6 +940,10 @@ function createWindow(): void {
 app
   .whenReady()
   .then(async () => {
+    const iconDirectory = devServerUrl ? '../public' : '../dist';
+    const image = nativeImage.createFromPath(path.join(__dirname, iconDirectory, 'aria-icon.png'));
+    const icon = image.isEmpty() ? undefined : image;
+    if (icon) app.dock?.setIcon(icon);
     if (!app.isPackaged) {
       try {
         process.loadEnvFile(path.resolve(__dirname, '../../..', '.env'));
@@ -1074,7 +1087,8 @@ app
           },
           authenticate: (...args) => browser.authenticateComputerTab(...args),
           authenticationSite: (...args) => browser.computerAuthenticationSite(...args),
-          input: (...args) => browser.actComputerTab(...args),
+          input: (owner, target, id, observation, action, signal) =>
+            browser.actComputerTab(owner, target, id, observation, action, signal),
           owner: (...args) => browser.setComputerOwner(...args),
           close: (...args) => browser.closeComputerTab(...args),
           downloadTarget: (...args) => browser.computerDownloadTarget(...args),
@@ -1228,10 +1242,14 @@ app
       mainWindow?.webContents.send('aria:live-event', event),
     );
     registerIpc();
-    createWindow();
+    if (devLauncher && !process.connected) {
+      app.quit();
+      return;
+    }
+    createWindow(icon);
     void chat.start().then(() => executionRuntime.cleanHostedResources());
     app.on('activate', () => {
-      if (BrowserWindow.getAllWindows().length === 0) createWindow();
+      if (BrowserWindow.getAllWindows().length === 0) createWindow(icon);
     });
   })
   .catch((error) => {

@@ -41,7 +41,14 @@ export const computerStatus = z.enum([
 export const computerAction = z.discriminatedUnion('type', [
   z.strictObject({ type: z.literal('screenshot') }),
   z.strictObject({ type: z.literal('open_file_manager') }),
-  z.strictObject({ type: z.literal('open_application'), application: z.literal('messages') }),
+  z.strictObject({
+    type: z.literal('open_application'),
+    application: z
+      .string()
+      .max(120)
+      .regex(/^[\p{L}\p{N}][\p{L}\p{M}\p{N} ._&+()'’\-]*$/u)
+      .describe('Exact installed macOS app name or bundle identifier'),
+  }),
   z.strictObject({
     type: z.literal('click'),
     ...point,

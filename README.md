@@ -15,6 +15,8 @@ pnpm install
 pnpm dev:desktop
 ```
 
+Vite refreshes the renderer as you edit. After a successful Electron compile, the development launcher closes Aria through its save flow and restarts it with the updated main and preload code.
+
 Aria opens directly into chat. In **Settings → AI Models**, add a connection, enter its endpoint and key, and choose **Discover models**. Enable models you want to use, select a primary that supports text streaming and function calling, and save. Electron manages the local NestJS service.
 
 ## AI Models and Conductor

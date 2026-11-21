@@ -971,6 +971,67 @@ function scriptRuntime(
   });
 }
 
+test('opens an approved installed app from ordinary chat on macOS', async () => {
+  test.skip(
+    process.platform !== 'darwin' || process.env.ARIA_TEST_APP_LAUNCH !== '1',
+    'Requires an interactive macOS desktop and opens Calculator.',
+  );
+  await launch();
+  await app.evaluate(({ BrowserWindow, desktopCapturer, dialog, nativeImage, screen, systemPreferences }) => {
+    const display = screen.getPrimaryDisplay();
+    const thumbnail = nativeImage.createFromBitmap(Buffer.alloc(16 * 12 * 4, 255), {
+      width: 16,
+      height: 12,
+    });
+    screen.getAllDisplays = () => [display];
+    systemPreferences.getMediaAccessStatus = () => 'granted';
+    desktopCapturer.getSources = async () => [
+      { id: 'selected', name: 'Selected', display_id: String(display.id), thumbnail, appIcon: thumbnail },
+    ];
+    BrowserWindow.getAllWindows()[0].isFocused = () => true;
+    dialog.showMessageBox = async (_window, options) => ({
+      response:
+        options?.message === 'Choose a display' ||
+        (options?.message === 'Allow this computer action once?' &&
+          options.detail?.includes('/System/Applications/Calculator.app\ncom.apple.calculator'))
+          ? 1
+          : 0,
+      checkboxChecked: false,
+    });
+  });
+  await page.getByRole('button', { name: 'Open settings', exact: true }).click();
+  await page.getByRole('button', { name: 'Select a full screen', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Change display', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Back to chat', exact: true }).click();
+
+  const prompt = 'Open Calculator.';
+  let sessionId: string;
+  scriptRuntime(prompt, ['computer.open', 'computer.observe', 'computer.act'], (result, step) => {
+    const data = result.data as Record<string, unknown> | undefined;
+    if (step === 0)
+      return { name: 'computer_open', input: { environment: 'local-desktop', mode: 'aria' } };
+    if (step === 1 && typeof data?.sessionId === 'string') {
+      sessionId = data.sessionId;
+      return { name: 'computer_observe', input: { sessionId, format: 'structured' } };
+    }
+    if (step === 2 && data?.observation) {
+      return {
+        name: 'computer_act',
+        input: {
+          sessionId,
+          observationId: (data.observation as { id: string }).id,
+          actions: [{ type: 'open_application', application: 'Calculator' }],
+        },
+      };
+    }
+    const outcomes = data?.outcomes as { action: string; status: string }[] | undefined;
+    if (outcomes?.some(({ action, status }) => action === 'open_application' && status === 'verified'))
+      fixture.finalReply(prompt, 'Calculator opened.');
+  });
+  await send(prompt);
+  await expect(page.locator('.from-assistant .markdown')).toContainText('Calculator opened.');
+});
+
 test('finds document evidence and opens an authorized citation through the built app', async () => {
   await launch();
   const file = path.join(temporary, 'supplier.txt');

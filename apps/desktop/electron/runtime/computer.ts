@@ -66,7 +66,7 @@ export function localPointerPoints(action: LocalPointerAction, frame: ComputerOb
 function describeInput(action: InputAction) {
   switch (action.type) {
     case 'open_application':
-      return 'Open the system Messages app.';
+      return `Open “${action.application}”.`;
     case 'open_file_manager':
       return 'Open the system file manager to your home folder.';
     case 'type':
@@ -97,6 +97,13 @@ export interface ComputerDriver {
   actions?(owner: string, id?: string): ComputerAction['type'][];
   inspectActions?(owner: string, signal: AbortSignal): Promise<ComputerAction['type'][]>;
   standingAccess?(owner: string, id: string, provider: string): boolean;
+  prepareApplication?(
+    owner: string,
+    id: string,
+    observation: ComputerObservation,
+    application: string,
+    signal: AbortSignal,
+  ): Promise<{ token: string; path: string; bundleId: string; requiresApproval: boolean }>;
   pointerFingerprint?(
     capture: Capture,
     action: LocalPointerAction,
@@ -134,6 +141,7 @@ export interface ComputerDriver {
     observation: ComputerObservation,
     action: InputAction,
     signal: AbortSignal,
+    applicationToken?: string,
   ): Promise<void | 'verified'>;
   owner(owner: string, target: string, id: string, user: boolean): void | Promise<void>;
   close(owner: string, target: string, id: string): void | Promise<void>;
@@ -1218,13 +1226,39 @@ export class ComputerRuntime {
         this.note(session, action.type, 'Stopped on changed interface');
         break;
       }
-      const signature = digest(JSON.stringify([session.summary.targetId, expected, action]));
+      this.guard(session, lease, signal);
+      let application;
+      if (action.type === 'open_application') {
+        if (request.programId || !session.driver.prepareApplication)
+          throw new RuntimeError(
+            'PERMISSION_DENIED',
+            'Opening an app requires a direct local desktop action.',
+          );
+        application = await session.driver.prepareApplication(
+          session.summary.conversationId,
+          session.summary.id,
+          reference.observation,
+          action.application,
+          active,
+        );
+        this.guard(session, lease, signal);
+      }
+      const signature = digest(
+        JSON.stringify([
+          session.summary.targetId,
+          expected,
+          action,
+          ...(application ? [application.path, application.bundleId] : []),
+        ]),
+      );
       if (
-        !this.standingAccess(session) &&
+        (application?.requiresApproval || !this.standingAccess(session)) &&
         (localPointer || (action.type !== 'move' && action.type !== 'scroll'))
       ) {
         this.state(session, 'waiting-for-approval', `Approve ${action.type.replaceAll('_', ' ')}`);
-        const consent = describeInput(action);
+        const consent = application
+          ? `Open this installed app?\n${application.path}\n${application.bundleId}`
+          : describeInput(action);
         const launch = action.type === 'open_file_manager' || action.type === 'open_application';
         const detail =
           localPointer && action.type === 'move'
@@ -1273,6 +1307,7 @@ export class ComputerRuntime {
           reference.observation,
           action,
           AbortSignal.any([signal, AbortSignal.timeout(computerLimits.actionMs)]),
+          application?.token,
         );
         const status = result === 'verified' ? 'verified' : 'submitted';
         this.store.finish(attempt, status);

@@ -23,7 +23,14 @@ const response = z.object({
   trusted: z.boolean().optional(),
   submitted: z.boolean().optional(),
   verified: z.boolean().optional(),
-  messages: z.boolean().optional(),
+  applicationLaunch: z.boolean().optional(),
+  application: z
+    .object({
+      token: z.string().uuid(),
+      path: z.string().min(1).max(4096).regex(/^[^\p{Cc}\p{Cf}\p{Zl}\p{Zp}]+$/u),
+      bundleId: z.string().min(1).max(256).regex(/^[A-Za-z0-9.-]+$/),
+    })
+    .optional(),
   displayKey: z.string().min(1).max(256).optional(),
   image: z
     .base64()
@@ -133,7 +140,7 @@ class Helper {
 }
 
 type ScreenTarget = { id: number; label: string; requestPointerPermission?: boolean };
-type ScreenControl = { helper: Helper; displayKey: string; pointer: boolean; messages: boolean };
+type ScreenControl = { helper: Helper; displayKey: string; pointer: boolean; applicationLaunch: boolean };
 const screenActions = ['screenshot', 'open_file_manager'] as const;
 const pointerActions = ['move', 'click', 'double_click', 'drag', 'scroll'] as const;
 type Grant = { owner: string; expires: number; key?: string; revision: string } & (
@@ -227,7 +234,7 @@ export class LocalComputer implements ComputerDriver {
   private screenActions(control?: ScreenControl): ComputerAction['type'][] {
     return [
       ...screenActions,
-      ...(control?.messages ? ['open_application' as const] : []),
+      ...(control?.applicationLaunch ? ['open_application' as const] : []),
       ...(control?.pointer ? pointerActions : []),
     ];
   }
@@ -444,7 +451,7 @@ export class LocalComputer implements ComputerDriver {
           helper,
           displayKey: proof.displayKey,
           pointer: !!proof.accessibility,
-          messages: !!proof.messages,
+          applicationLaunch: !!proof.applicationLaunch,
         };
       }
     } catch {
@@ -463,7 +470,7 @@ export class LocalComputer implements ComputerDriver {
         'The selected display changed. Open a new local desktop session.',
       );
     control.pointer = proof.pointer;
-    control.messages = proof.messages;
+    control.applicationLaunch = proof.applicationLaunch;
   }
 
   private async resolveScreen(displayKey: string, signal: AbortSignal, requestPermission = false) {
@@ -597,10 +604,7 @@ export class LocalComputer implements ComputerDriver {
         height: display.size.height,
         devicePixelRatio: display.scaleFactor,
         title: `Full screen · ${grant.display.label}`,
-        state: {
-          actions: allowed,
-          ...(allowed.includes('open_application') && { applications: ['messages'] }),
-        },
+        state: { actions: allowed },
       };
       if (!image) return { observation, geometryOnly: true };
       signal.throwIfAborted();
@@ -661,6 +665,43 @@ export class LocalComputer implements ComputerDriver {
     return { observation };
   }
 
+  private screenInput(
+    owner: string,
+    id: string,
+    observation: ComputerObservation,
+    type: ComputerAction['type'],
+  ) {
+    const grant = this.grant(owner, id);
+    const control = grant.kind === 'screen' ? grant.control : undefined;
+    if (grant.kind !== 'screen' || !control || !this.screenActions(control).includes(type))
+      throw new RuntimeError(
+        'PERMISSION_DENIED',
+        'The selected display has no verified permission for that action.',
+      );
+    const display = this.selectedDisplay(grant.display.id);
+    if (observation.revision !== grant.revision || grant.key !== displayGeometry(display))
+      throw new RuntimeError(
+        'PERMISSION_DENIED',
+        'The display changed. Observe it again before dispatching input.',
+      );
+    return { helper: control.helper, displayKey: control.displayKey, bounds: this.screenBounds(display) };
+  }
+
+  async prepareApplication(
+    owner: string,
+    id: string,
+    observation: ComputerObservation,
+    application: string,
+    signal: AbortSignal,
+  ) {
+    const { helper, ...display } = this.screenInput(owner, id, observation, 'open_application');
+    const resolved = await helper.run('resolve_application', { ...display, application }, signal);
+    if (!resolved.application)
+      throw new RuntimeError('CAPABILITY_UNAVAILABLE', 'The native helper could not identify the app.');
+    // The native helper pins the legacy selector to the system Messages bundle.
+    return { ...resolved.application, requiresApproval: application !== 'messages' };
+  }
+
   async input(
     owner: string,
     _target: string,
@@ -668,38 +709,26 @@ export class LocalComputer implements ComputerDriver {
     observation: ComputerObservation,
     action: Parameters<ComputerDriver['input']>[4],
     signal: AbortSignal,
+    applicationToken?: string,
   ) {
     const grant = this.grant(owner, id);
     if (
       grant.kind === 'screen' &&
       (isLocalPointerAction(action) || action.type === 'open_application')
     ) {
-      const { control } = grant;
-      if (!control?.helper.alive || !this.actions(owner, id).includes(action.type))
-        throw new RuntimeError(
-          'PERMISSION_DENIED',
-          'The selected display has no verified permission for that action.',
-        );
-      const display = this.selectedDisplay(grant.display.id);
-      if (observation.revision !== grant.revision || grant.key !== displayGeometry(display))
-        throw new RuntimeError(
-          'PERMISSION_DENIED',
-          'The display changed. Observe it again before dispatching input.',
-        );
+      const { helper, ...display } = this.screenInput(owner, id, observation, action.type);
       if (action.type === 'open_application') {
-        const launched = await control.helper.run(
+        if (!applicationToken)
+          throw new RuntimeError('PERMISSION_DENIED', 'Resolve the installed app before launching it.');
+        const launched = await helper.run(
           'open_application',
-          {
-            application: action.application,
-            displayKey: control.displayKey,
-            bounds: this.screenBounds(display),
-          },
+          { ...display, token: applicationToken },
           signal,
         );
-        if (!launched.verified)
+        if (!launched.submitted || !launched.verified)
           throw new RuntimeError(
             'OUTCOME_UNCERTAIN',
-            'The system did not confirm that Messages opened. Observe the desktop before retrying.',
+            'macOS did not confirm the app opened. Inspect the desktop before retrying.',
           );
         return 'verified' as const;
       }
@@ -709,12 +738,11 @@ export class LocalComputer implements ComputerDriver {
         x: (x + 0.5) / frame.width,
         y: (y + 0.5) / frame.height,
       }));
-      const result = await control.helper.run(
+      const result = await helper.run(
         'screen_pointer',
         {
           action: action.type,
-          displayKey: control.displayKey,
-          bounds: this.screenBounds(display),
+          ...display,
           ...(action.type === 'drag' ? { path: normalized } : normalized[0]),
           ...(action.type === 'click' && { button: action.button }),
           ...(action.type === 'scroll' && { scrollX: action.scrollX, scrollY: action.scrollY }),

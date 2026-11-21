@@ -247,6 +247,69 @@ it('shares only the approved display and requests separate permission to open it
 
 const supportsScreenMouse = process.platform === 'darwin' || process.platform === 'win32';
 
+it.runIf(process.platform === 'darwin')(
+  'opens a resolved app only after approval, even with an ongoing display grant',
+  async () => {
+    const token = randomUUID();
+    const target = { token, path: '/Applications/Termius.app', bundleId: 'com.termius-dmg.mac' };
+    nativeCommand.mockImplementation(({ operation, application }) => {
+      if (operation === 'screen_probe')
+        return { approved: true, displayKey: 'first', applicationLaunch: true };
+      if (operation === 'resolve_application') {
+        if (application === 'Termius') return { application: target };
+        return { error: 'macOS could not identify one installed app.' };
+      }
+      return { submitted: true, verified: true };
+    });
+    const { driver, dispatch, signal, approve, close } = await localScreen();
+    try {
+      await driver.prepareScreen('', { id: 12, label: 'Display 1' }, signal, 'fixture');
+      const opened = await dispatch('computer.open', { environment: 'local-desktop', mode: 'aria' });
+      expect(opened.data?.actions).toContain('open_application');
+      const sessionId = String(opened.data?.sessionId);
+      const observe = () => dispatch('computer.observe', { sessionId, format: 'structured' });
+      let observed = await observe();
+      const launch = (application: string) =>
+        dispatch('computer.act', {
+          sessionId,
+          observationId: (observed.data?.observation as { id: string }).id,
+          actions: [{ type: 'open_application', application }],
+        });
+      const launches = () =>
+        nativeCommand.mock.calls.filter(([input]) => input.operation === 'open_application');
+      for (const input of ['/Applications/Termius.app', 'https://example.com', 'Termius; whoami']) {
+        await expect(launch(input)).rejects.toMatchObject({ code: 'INVALID_ARGUMENT' });
+      }
+      await expect(launch('Missing App')).rejects.toThrow('could not identify one installed app');
+      expect(approve).not.toHaveBeenCalled();
+      expect(launches()).toHaveLength(0);
+
+      await expect(launch('Termius')).resolves.toMatchObject({
+        data: { outcomes: [{ action: 'open_application', status: 'declined' }] },
+      });
+      expect(approve).toHaveBeenCalledWith(
+        'Allow this computer action once?',
+        expect.stringContaining('/Applications/Termius.app\ncom.termius-dmg.mac'),
+        expect.any(AbortSignal),
+      );
+      expect(launches()).toHaveLength(0);
+
+      await expect(launch('Termius')).rejects.toMatchObject({ code: 'INVALID_ARGUMENT' });
+      observed = await observe();
+      approve.mockResolvedValueOnce(true);
+      await expect(launch('Termius')).resolves.toMatchObject({
+        data: { outcomes: [{ action: 'open_application', status: 'verified' }] },
+      });
+      expect(launches()).toEqual([
+        [expect.objectContaining({ token, displayKey: 'first', bounds: display.bounds })],
+      ]);
+    } finally {
+      nativeCommand.mockReset();
+      await close();
+    }
+  },
+);
+
 it.runIf(supportsScreenMouse)(
   'restores the display grant across app launches and chats',
   async () => {
@@ -365,9 +428,7 @@ it.runIf(supportsScreenMouse)(
           approved: true,
           displayKey: 'first',
           accessibility: true,
-          messages: process.platform === 'darwin',
         };
-      if (input.operation === 'open_application') return { submitted: true, verified: true };
       if (input.operation === 'screen_pointer') visualVersion++;
       return { submitted: true, verified: input.action === 'move' };
     });
@@ -381,7 +442,6 @@ it.runIf(supportsScreenMouse)(
       expect(opened.data?.actions).toEqual([
         'screenshot',
         'open_file_manager',
-        ...(process.platform === 'darwin' ? ['open_application'] : []),
         'move',
         'click',
         'double_click',
@@ -403,22 +463,6 @@ it.runIf(supportsScreenMouse)(
       await expect(act(id, { type: 'move', x: 2, y: 2 })).rejects.toMatchObject({
         code: 'INVALID_ARGUMENT',
       });
-      await expect(
-        act(id, { type: 'open_application', application: 'other' }),
-      ).rejects.toMatchObject({ code: 'INVALID_ARGUMENT' });
-      if (process.platform === 'darwin') {
-        approve.mockResolvedValueOnce(true);
-        await expect(
-          act(id, { type: 'open_application', application: 'messages' }),
-        ).resolves.toMatchObject({
-          data: { outcomes: [{ action: 'open_application', status: 'verified' }] },
-        });
-        expect(
-          nativeCommand.mock.calls.some(
-            ([input]) => input.operation === 'open_application' && input.application === 'messages',
-          ),
-        ).toBe(true);
-      }
       const pointerCommands = () =>
         nativeCommand.mock.calls
           .map(([input]) => input)
