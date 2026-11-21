@@ -16,6 +16,9 @@ type Command = {
     | 'screenshot'
     | 'computer-state'
     | 'wait-change'
+    | 'play-media'
+    | 'stop-media'
+    | 'media-state'
     | 'upload-target'
     | 'search-results';
   documentId: string;
@@ -53,6 +56,7 @@ const resultSchema = z.strictObject({
   viewport: z.object({ width: z.number(), height: z.number(), dpr: z.number() }).optional(),
   editable: z.boolean().optional(),
   field: z.string().max(80).optional(),
+  playingMedia: z.boolean().optional(),
   results: z
     .array(z.strictObject({ url: z.string().max(2000), title: z.string().max(300) }))
     .max(8)
@@ -66,6 +70,7 @@ function execute(command: Command) {
       documentId: string;
       items: Map<string, { node: Element; signature: string }>;
     };
+    ariaPlayback?: HTMLMediaElement;
   };
   const signature = (node: Element) =>
     JSON.stringify([
@@ -129,6 +134,69 @@ function execute(command: Command) {
       ? item.node
       : undefined;
   };
+  if (command.op === 'stop-media') {
+    world.ariaPlayback?.pause();
+    world.ariaPlayback = undefined;
+    return { playingMedia: false };
+  }
+  if (command.op === 'media-state') {
+    const media = world.ariaPlayback;
+    return {
+      playingMedia: Boolean(media?.isConnected && !media.paused && !media.ended && !media.muted),
+    };
+  }
+  if (command.op === 'play-media') {
+    const candidates = Array.from(
+      document.querySelectorAll<HTMLMediaElement>('audio, video'),
+    ).filter(
+      (media) =>
+        visible(media) &&
+        !media.srcObject &&
+        Boolean(media.currentSrc || media.src || media.querySelector('source[src]')),
+    );
+    if (candidates.length !== 1) return { error: 'MEDIA_UNAVAILABLE' };
+    const [media] = candidates;
+    const previous = world.ariaPlayback;
+    if (previous && previous !== media) previous.pause();
+    world.ariaPlayback = media;
+    media.muted = false;
+    if (!media.volume) media.volume = 0.4;
+    const start = media.currentTime;
+    return new Promise<{ playingMedia?: boolean; error?: string }>((resolve) => {
+      let completed = false;
+      const finish = (success: boolean) => {
+        if (completed) return;
+        completed = true;
+        clearTimeout(timer);
+        media.removeEventListener('timeupdate', progress);
+        media.removeEventListener('error', failed);
+        if (success) resolve({ playingMedia: true });
+        else {
+          if (world.ariaPlayback === media) {
+            media.pause();
+            world.ariaPlayback = undefined;
+          }
+          resolve({ error: 'MEDIA_UNAVAILABLE' });
+        }
+      };
+      const failed = () => finish(false);
+      const progress = () => {
+        if (
+          world.ariaPlayback === media &&
+          media.isConnected &&
+          !media.paused &&
+          !media.ended &&
+          !media.muted &&
+          media.currentTime > start + 0.02
+        )
+          finish(true);
+      };
+      const timer = setTimeout(failed, 4000);
+      media.addEventListener('timeupdate', progress);
+      media.addEventListener('error', failed, { once: true });
+      void media.play().then(progress, failed);
+    });
+  }
   if (command.op === 'search-results') {
     const results: { url: string; title: string }[] = [];
     for (const anchor of document.querySelectorAll<HTMLAnchorElement>(
@@ -390,7 +458,7 @@ export async function inspectPage(contents: WebContents, command: Command) {
         code: `(${execute.toString()})(${JSON.stringify(args)})`,
       },
     ],
-    false,
+    command.op === 'play-media',
   );
   return resultSchema.parse(raw);
 }

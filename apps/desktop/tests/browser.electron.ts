@@ -12,13 +12,48 @@ const host = 'aria-fixture.example';
 const ip = '93.184.216.34';
 const url = `http://${host}/study`;
 
+function testTone() {
+  const rate = 8_000;
+  const samples = rate * 5;
+  const wave = Buffer.alloc(44 + samples * 2);
+  wave.write('RIFF');
+  wave.writeUInt32LE(wave.length - 8, 4);
+  wave.write('WAVEfmt ', 8);
+  wave.writeUInt32LE(16, 16);
+  wave.writeUInt16LE(1, 20);
+  wave.writeUInt16LE(1, 22);
+  wave.writeUInt32LE(rate, 24);
+  wave.writeUInt32LE(rate * 2, 28);
+  wave.writeUInt16LE(2, 32);
+  wave.writeUInt16LE(16, 34);
+  wave.write('data', 36);
+  wave.writeUInt32LE(samples * 2, 40);
+  for (let index = 0; index < samples; index++)
+    wave.writeInt16LE(
+      Math.round(256 * Math.sin((index * 2 * Math.PI * 440) / rate)),
+      44 + index * 2,
+    );
+  return wave;
+}
+
 test('browses from ordinary chat through the managed private port and keeps private destinations out', async () => {
   const provider = await createProviderFixture();
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'aria-browser-electron-'));
   const traffic: string[] = [];
   const site = http.createServer((request, response) => {
     traffic.push(request.url || '');
-    if (request.url === '/redirect') {
+    if (request.url === '/music') {
+      response
+        .writeHead(200, { 'Content-Type': 'text/html' })
+        .end(
+          '<title>Instrumental fixture</title><audio controls autoplay src="/tone.wav"></audio>',
+        );
+    } else if (request.url === '/tone.wav') {
+      const wave = testTone();
+      response
+        .writeHead(200, { 'Content-Type': 'audio/wav', 'Content-Length': wave.length })
+        .end(wave);
+    } else if (request.url === '/redirect') {
       response.writeHead(302, { Location: 'http://127.0.0.1/' }).end();
     } else if (request.url === '/next') {
       response
@@ -63,15 +98,19 @@ test('browses from ordinary chat through the managed private port and keeps priv
               if (
                 address.origin === 'https://search.brave.com' &&
                 address.pathname === '/search' &&
-                address.searchParams.get('q') === 'semaphore definition'
+                ['semaphore definition', 'public instrumental audio'].includes(
+                  address.searchParams.get('q') ?? '',
+                )
               ) {
+                const path =
+                  address.searchParams.get('q') === 'public instrumental audio' ? 'music' : 'study';
                 return new Response(
                   '<title>Aria search fixture</title><main>' +
                     '<div data-type="ad"><div class="result-content"><a href="https://example.com/ad">Ad</a></div></div>' +
                     '<div data-type="web"><div class="result-content">' +
                     '<a href="http://' +
                     host +
-                    '/study">Aria research fixture</a></div></div></main>',
+                    `/${path}">Aria research fixture</a></div></div></main>`,
                   { headers: { 'Content-Type': 'text/html' } },
                 );
               }
@@ -422,6 +461,68 @@ test('browses from ordinary chat through the managed private port and keeps priv
     );
     await page.getByRole('button', { name: 'Close', exact: true }).click();
     await expect(page.getByRole('region', { name: 'Computer Use' })).toBeHidden();
+
+    const playbackPrompt = 'play music';
+    const playbackTools = ['web.web_search', 'browser.browser_open', 'browser.browser_media'];
+    provider.queueTool(playbackPrompt, 'find_capabilities', {
+      ids: playbackTools,
+      kind: 'tools',
+      query: '',
+    });
+    provider.queueTool(playbackPrompt, 'load_capabilities', { ids: playbackTools });
+    provider.queueOperations(playbackPrompt, {
+      steps: [tool('web_search', { query: 'public instrumental audio' })],
+    });
+    let playbackResult: unknown;
+    provider.onToolResult(playbackPrompt, (result) => {
+      if (!Array.isArray(result) || !result[0]) return;
+      const { id, data, status, error } = result[0];
+      if (status !== 'completed') {
+        playbackResult = error;
+        return;
+      }
+      if (id === 'web_search')
+        return {
+          name: 'fixture_operations',
+          input: {
+            steps: [
+              step('open-music', 'browser_open', { sourceId: data.results[0].sourceId }, [id]),
+            ],
+          },
+        };
+      if (id === 'open-music')
+        return {
+          name: 'fixture_operations',
+          input: {
+            steps: [
+              {
+                ...step('play', 'browser_open', { tabId: data.tabId, action: 'play' }, [id]),
+                capability: 'browser_media',
+                target: { kind: 'tool', model: null, tool: 'browser_media' },
+              },
+            ],
+          },
+        };
+      playbackResult = data.status;
+    });
+    await page.getByRole('textbox', { name: 'Message Aria' }).fill(playbackPrompt);
+    await page.getByRole('button', { name: 'Send message', exact: true }).click();
+    await expect.poll(() => playbackResult).toBe('playing');
+    const stopPlayback = page.getByRole('button', { name: 'Stop browser playback' });
+    await expect(stopPlayback).toBeVisible();
+    expect(traffic).toContain('/tone.wav');
+    await stopPlayback.click();
+    await expect(stopPlayback).toBeHidden();
+    expect(
+      await app.evaluate(
+        ({ webContents }, target) =>
+          webContents
+            .getAllWebContents()
+            .find((contents) => contents.getURL() === target)
+            ?.isAudioMuted(),
+        `http://${host}/music`,
+      ),
+    ).toBe(true);
   } finally {
     await app?.close();
     site.closeAllConnections();

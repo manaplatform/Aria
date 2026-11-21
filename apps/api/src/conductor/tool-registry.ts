@@ -159,6 +159,8 @@ const researchDescriptions: Record<ResearchToolId, string> = {
   browser_navigate: 'Navigate an existing AI browser tab to an authorized public source.',
   browser_get_tabs: 'List AI browser tabs that belong to this conversation.',
   browser_get_page: 'Inspect the current public page and its structured controls.',
+  browser_media:
+    'Start or stop audio or video playback in a public AI browser tab. For a request to play music or other audio, use a user-provided URL or a public Web Search result, open that source with browser_open, and play its media here. Reports whether the media advanced.',
   browser_click:
     'Click a referenced page control or follow a link. Consequential clicks require approval.',
   browser_type: 'Fill a referenced non-sensitive field after user approval.',

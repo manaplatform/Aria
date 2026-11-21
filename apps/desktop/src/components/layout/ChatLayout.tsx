@@ -1,12 +1,17 @@
 import { useEffect, useState } from 'react';
 import { useLocation, useNavigate, Outlet } from 'react-router-dom';
-import { Globe2, PanelLeftOpen, Search, Sparkles } from 'lucide-react';
+import { Globe2, PanelLeftOpen, Search, Sparkles, VolumeX } from 'lucide-react';
 import { useWorkspaceStore, flushPersistence } from '../../stores/workspaceStore';
 import { selectChat, useChatStore } from '../../stores/chatStore';
 import { AppSidebar } from './AppSidebar';
 import { BrowserPane, useBrowserSlot } from '../browser/BrowserPane';
 import { ComputerPanel } from '../browser/ComputerPanel';
-import { connectBrowser, setBrowserMode, useBrowserStore } from '../../stores/browserStore';
+import {
+  browserCommand,
+  connectBrowser,
+  setBrowserMode,
+  useBrowserStore,
+} from '../../stores/browserStore';
 import { Button, ErrorState, IconButton, Modal, Toast } from '../ui';
 
 export default function ChatLayout() {
@@ -20,6 +25,7 @@ export default function ChatLayout() {
   const location = useLocation();
   const navigate = useNavigate();
   const browserMode = useBrowserStore((state) => state.mode);
+  const playing = useBrowserStore((state) => state.state.tabs.find((tab) => tab.playingMedia));
   const showBrowser = browserMode !== 'chat' && location.pathname === '/chat';
   const slot = useBrowserSlot(chat.selectedId, showBrowser && !drawer);
   useEffect(connectBrowser, []);
@@ -98,6 +104,14 @@ export default function ChatLayout() {
             </span>
           </div>
           <div className="row">
+            {playing && (
+              <IconButton
+                label="Stop browser playback"
+                onClick={() => void browserCommand({ kind: 'stop-media', tabId: playing.id })}
+              >
+                <VolumeX size={17} />
+              </IconButton>
+            )}
             {location.pathname === '/chat' && window.aria?.browserLayout && (
               <div
                 className="browser-mode-controls"

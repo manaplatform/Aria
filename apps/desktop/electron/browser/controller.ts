@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { setTimeout as sleep } from 'node:timers/promises';
 import {
   dialog,
   nativeImage,
@@ -77,6 +78,7 @@ export class BrowserController {
   private conversationId: string | null = null;
   private window?: BrowserWindow;
   private visible?: Tab;
+  private playback?: { tab: Tab };
   private layout?: BrowserLayout;
   private layoutRevision = -1;
   private disk: BrowserDiskState = {
@@ -137,6 +139,7 @@ export class BrowserController {
   }
 
   resetRenderer() {
+    this.stopPlayback();
     this.layoutRevision = -1;
     this.layout = undefined;
     this.conversationId = null;
@@ -225,6 +228,7 @@ export class BrowserController {
     this.layout = layout;
     this.conversationId = layout.conversationId;
     if (previous !== this.conversationId) {
+      this.stopPlayback();
       this.selected =
         (this.conversationId && this.aiSelected.get(this.conversationId)) || this.personalSelected;
       this.changed();
@@ -399,6 +403,7 @@ export class BrowserController {
       },
     };
     const wc = view.webContents;
+    if (owner) wc.setAudioMuted(true);
     wc.setWebRTCIPHandlingPolicy('disable_non_proxied_udp');
     wc.setWindowOpenHandler(() => ({ action: 'deny' }));
     const check = (event: { url: string; isMainFrame?: boolean; preventDefault: () => void }) => {
@@ -441,12 +446,14 @@ export class BrowserController {
     }
     wc.on('did-start-navigation', ({ isMainFrame }) => {
       if (isMainFrame) {
+        this.stopPlayback(tab);
         tab.documentId = randomUUID();
         tab.runId = undefined;
         tab.state.error = undefined;
       }
     });
     const completed = (url: string) => {
+      this.stopPlayback(tab);
       tab.documentId = randomUUID();
       tab.runId = undefined;
       tab.state.url = webUrlSchema.safeParse(url).success ? url : '';
@@ -539,6 +546,7 @@ export class BrowserController {
       }
     });
     wc.on('render-process-gone', () => {
+      this.stopPlayback(tab);
       tab.lifetime.abort();
       tab.state.crashed = true;
       tab.state.loading = false;
@@ -549,6 +557,7 @@ export class BrowserController {
       this.changed();
     });
     wc.on('destroyed', () => {
+      this.stopPlayback(tab);
       if (this.tabs.has(id) && !tab.state.crashed) {
         tab.lifetime.abort();
         tab.state.crashed = true;
@@ -557,6 +566,15 @@ export class BrowserController {
         this.place();
         this.changed();
       }
+    });
+    wc.on('media-paused', () => {
+      if (this.playback?.tab !== tab || !tab.state.playingMedia) return;
+      const playback = this.playback;
+      void inspectPage(wc, { op: 'media-state', documentId: tab.documentId })
+        .then((value) => {
+          if (this.playback === playback && !value.playingMedia) this.stopPlayback(tab);
+        })
+        .catch(() => undefined);
     });
     this.tabs.set(id, tab);
     this.changed();
@@ -605,6 +623,7 @@ export class BrowserController {
   }
 
   private closeTab(tab: Tab) {
+    this.stopPlayback(tab);
     this.tabs.delete(tab.state.id);
     tab.lifetime.abort();
     if (this.personalSelected === tab.state.id)
@@ -622,6 +641,76 @@ export class BrowserController {
         .then(() => tab.profile.session.clearData())
         .catch(() => undefined);
     this.changed();
+  }
+
+  private stopPlayback(target?: Tab) {
+    const playback = this.playback;
+    if (!playback || (target && target !== playback.tab)) return;
+    this.playback = undefined;
+    const tab = playback.tab;
+    tab.state.playingMedia = false;
+    const contents = tab.view.webContents;
+    if (!contents.isDestroyed()) {
+      contents.setAudioMuted(true);
+      void inspectPage(contents, { op: 'stop-media', documentId: tab.documentId }).catch(
+        () => undefined,
+      );
+    }
+    this.changed();
+  }
+
+  private async playMedia(tab: Tab, signal: AbortSignal) {
+    const contents = tab.view.webContents;
+    const documentId = tab.documentId;
+    const deadline = AbortSignal.any([signal, AbortSignal.timeout(6500)]);
+    const ownsTab = () =>
+      tab.owner === this.conversationId &&
+      !tab.computer &&
+      !tab.privateAuth &&
+      !contents.isDestroyed() &&
+      tab.documentId === documentId &&
+      !contents.isLoadingMainFrame();
+    if (!ownsTab())
+      throw new BrowserError(
+        'TAB_UNAVAILABLE',
+        'Bring the playback conversation to the foreground.',
+      );
+    if (this.playback?.tab === tab && tab.state.playingMedia && contents.isCurrentlyAudible())
+      return;
+    this.stopPlayback();
+    const playback = { tab };
+    this.playback = playback;
+    try {
+      const result = await whenActive(
+        inspectPage(contents, { op: 'play-media', documentId }),
+        deadline,
+      );
+      if (!result.playingMedia || this.playback !== playback || !ownsTab())
+        throw new BrowserError(
+          'MEDIA_UNAVAILABLE',
+          'The page did not start a supported public media player.',
+        );
+      contents.setAudioMuted(false);
+      for (let check = 0; check < 12; check++) {
+        deadline.throwIfAborted();
+        if (this.playback !== playback || !ownsTab()) break;
+        if (contents.isCurrentlyAudible()) {
+          tab.state.playingMedia = true;
+          this.changed();
+          return;
+        }
+        await sleep(120, undefined, { signal: deadline });
+      }
+      throw new BrowserError('MEDIA_UNAVAILABLE', 'The browser did not detect audible playback.');
+    } catch (error) {
+      if (this.playback === playback) this.stopPlayback(tab);
+      if (!signal.aborted && deadline.aborted)
+        throw new BrowserError(
+          'MEDIA_UNAVAILABLE',
+          'The public media player did not start in time.',
+        );
+      throw error;
+    }
   }
 
   private url(input: string) {
@@ -705,6 +794,7 @@ export class BrowserController {
     if (!('tabId' in command)) return;
     const tab = this.tabs.get(command.tabId);
     if (!tab || tab.background || (tab.owner && tab.owner !== this.conversationId)) return;
+    if (command.kind === 'stop-media') return this.stopPlayback(tab);
     if (command.kind === 'close') {
       this.closeTab(tab);
       this.persist();
@@ -866,6 +956,7 @@ export class BrowserController {
       if (!tab.state.url || tab.state.loading)
         throw new RuntimeError('CAPABILITY_UNAVAILABLE', 'Wait until the page finishes loading.');
       tab.computer = { id: sessionId, user: false };
+      this.stopPlayback(tab);
       tab.runId = undefined;
       const source = publicWebUrl(tab.state.url);
       if (source.search || source.hash) tab.restorableComputerUrl = undefined;
@@ -1200,6 +1291,7 @@ export class BrowserController {
       elementId?: string;
       delta?: number;
       query?: string;
+      action?: 'play' | 'stop';
       selection?: boolean;
       value?: string;
       fields?: { elementId: string; value: string }[];
@@ -1281,7 +1373,12 @@ export class BrowserController {
       return output({
         tabs: [...this.tabs.values()]
           .filter((tab) => tab.owner === owner && !tab.background && !tab.privateAuth)
-          .map((tab) => ({ tabId: tab.state.id, url: tab.state.url, title: tab.state.title })),
+          .map((tab) => ({
+            tabId: tab.state.id,
+            url: tab.state.url,
+            title: tab.state.title,
+            playingMedia: !!tab.state.playingMedia,
+          })),
       });
     if (request.op === 'browser_open') {
       if (!args.url) throw new BrowserError('INVALID_URL', 'Use a validated public URL.');
@@ -1311,6 +1408,19 @@ export class BrowserController {
           'Use the tools for this active Computer Use session.',
         );
       const contents = tab.view.webContents;
+      if (request.op === 'browser_media') {
+        if (args.action === 'stop') this.stopPlayback(tab);
+        else await this.playMedia(tab, active);
+        return output(
+          {
+            tabId: tab.state.id,
+            url: tab.state.url,
+            title: tab.state.title,
+            status: tab.state.playingMedia ? 'playing' : 'stopped',
+          },
+          tab,
+        );
+      }
       if (request.op === 'browser_switch_tab') {
         this.select(tab);
         return output({ tabId: tab.state.id });

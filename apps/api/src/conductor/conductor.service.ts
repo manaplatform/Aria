@@ -167,6 +167,7 @@ export class Conductor {
         ...(policy.computerBrowser || policy.computerVirtual || policy.computerLocal
           ? [
               'Use Web Search for research and the structured browser for ordinary navigation and forms. Inspect Computer Use when visual input is needed. Open the exact environment and mode you intend to use. Treat submitted input as an attempt and verify actual completion with a postcondition.',
+              'To play requested audio or music on a public site, use the browser media capability. Use a user-supplied URL or discover a suitable playable source with Web Search. Report playback only after the tool confirms it. Ask a specific question if source choice requires user input, and explain the actual limitation if playback is unavailable.',
             ]
           : []),
         `Preference: ${registry.config.preference}. Available namespaces: ${namespaces.join('; ') || 'none'}.`,
