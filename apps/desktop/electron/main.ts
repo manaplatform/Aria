@@ -14,15 +14,22 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { promises as fs } from 'node:fs';
 import { mkdirSync } from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { LocalStorage, localDataSchema } from './storage';
 import { BrowserController } from './browser/controller';
 import { openBrowserBridge } from './browser/bridge';
+import { CapabilityStorage, openCapabilityBridge } from './capability-storage';
 import { WebSettingsStorage } from './web-settings-storage';
 import { ProviderStorage } from './provider-storage';
 import {
   browserCommandSchema,
+  capabilityId,
+  effectSchema,
+  modelReference,
+  skillRefSchema,
+  toolDiscoverySchema,
+  type RuntimeRegistry,
   browserLayoutSchema,
   webSettingsInputSchema,
   connectionInputSchema,
@@ -59,6 +66,7 @@ if (process.env.ARIA_TEST_DATA_DIR) {
 let mainWindow: BrowserWindow | null = null;
 let storage: LocalStorage;
 let webSettings: WebSettingsStorage;
+let capabilities: CapabilityStorage;
 let browser: BrowserController;
 let provider: ProviderStorage;
 let chat: ChatService;
@@ -133,6 +141,66 @@ async function changeRegistry<T>(save: () => Promise<T>) {
     configuring = false;
   }
 }
+function nativeProof(registry: RuntimeRegistry) {
+  for (const connection of registry.connections) {
+    const model = connection.models.find(
+      (item) => item.enabled && modelReference(connection.id, item.id) === registry.primary,
+    );
+    if (
+      model &&
+      connection.apiKey &&
+      new URL(connection.baseUrl).origin === 'https://api.openai.com'
+    ) {
+      return createHash('sha256')
+        .update(JSON.stringify([connection.baseUrl, model.id, connection.apiKey, 'responses']))
+        .digest('hex');
+    }
+  }
+}
+
+const toolList = z
+  .array(
+    z.strictObject({
+      id: capabilityId,
+      namespace: z.string().max(100),
+      name: z.string().max(200),
+      description: z.string().max(1024),
+      version: z.string().max(100),
+      provenance: z.string().max(100),
+      effect: effectSchema,
+      permission: z.string().max(200),
+      available: z.boolean(),
+      reason: z.string().max(200).optional(),
+    }),
+  )
+  .max(1024);
+
+async function toolSettings() {
+  const registry = await provider.resolve().catch(() => undefined);
+  const policy = capabilities.policy(registry && nativeProof(registry));
+  const response = await chat.http('chat/tools', { signal: AbortSignal.timeout(11_000) });
+  return {
+    discovery: policy.discovery,
+    nativeVerified: policy.nativeVerified ?? false,
+    tools: toolList.parse(await response.json()),
+    skills: capabilities.skills(),
+  };
+}
+
+async function changeCapabilities(change: () => Promise<unknown>) {
+  if (configuring) throw new Error('Wait for settings to finish saving.');
+  configuring = true;
+  try {
+    await chat.cancelAll();
+    await media.close();
+    await change();
+    await chat.restart();
+    return await toolSettings();
+  } finally {
+    configuring = false;
+  }
+}
+
 function registerIpc(): void {
   const handle = (channel: string, fn: (...args: unknown[]) => unknown) =>
     ipcMain.handle(channel, (event, ...args: unknown[]) => {
@@ -268,6 +336,53 @@ function registerIpc(): void {
       configuring = false;
     }
   });
+  handle('aria:tool-settings', toolSettings);
+  handle('aria:set-tool-enabled', (id, enabled) => {
+    const tool = capabilityId.parse(id);
+    const value = z.boolean().parse(enabled);
+    return changeCapabilities(async () => {
+      if (!(await toolSettings()).tools.some((item) => item.id === tool))
+        throw new Error('This tool is no longer registered.');
+      await capabilities.setEnabled(tool, value);
+    });
+  });
+  handle('aria:set-tool-discovery', (input) => {
+    const mode = toolDiscoverySchema.parse(input);
+    return changeCapabilities(async () => {
+      let proof: string | undefined;
+      if (mode === 'openai-responses') {
+        proof = nativeProof(await provider.resolve());
+        if (!proof) throw new Error('Select an official OpenAI primary model in AI Models first.');
+        const response = await chat.http('providers/verify-tool-search', {
+          method: 'POST',
+          signal: AbortSignal.timeout(22_000),
+        });
+        z.strictObject({ verified: z.literal(true) }).parse(await response.json());
+      }
+      await capabilities.setDiscovery(mode, proof);
+    });
+  });
+  handle('aria:preview-skill', async (input) => {
+    const kind = z.enum(['directory', 'zip']).parse(input);
+    if (configuring || !mainWindow) throw new Error('Wait for settings to finish saving.');
+    const selected = await dialog.showOpenDialog(mainWindow, {
+      title: 'Choose an Agent Skill bundle',
+      properties: [kind === 'zip' ? 'openFile' : 'openDirectory'],
+      ...(kind === 'zip' && { filters: [{ name: 'Skill archive', extensions: ['zip'] }] }),
+    });
+    const [file] = selected.filePaths;
+    if (selected.canceled || !file) return null;
+    return capabilities.preview(file, kind);
+  });
+  handle('aria:approve-skill', (token) => {
+    const parsed = z.string().uuid().parse(token);
+    return changeCapabilities(() => capabilities.approve(parsed));
+  });
+  handle('aria:manage-skill', (ref, action) => {
+    const parsed = skillRefSchema.parse(ref);
+    const command = z.enum(['enable', 'disable', 'remove']).parse(action);
+    return changeCapabilities(() => capabilities.manage(parsed, command));
+  });
   handle('aria:chat-status', () => chat.getStatus());
   handle('aria:registry-settings', () => provider.get());
   handle('aria:save-registry', (input) =>
@@ -299,24 +414,28 @@ function registerIpc(): void {
     if (configuring) throw new Error('Wait for connection settings to finish saving.');
     const parsed = chatRequestSchema.parse(input);
     media.assertIdle();
-    if (parsed.attachmentIds?.length) {
-      const messages = initial.data.chat.messages.filter(
-        (message) => message.conversationId === parsed.conversationId,
-      );
-      const assistant = messages.at(-1);
-      const latest = messages.at(-2);
-      if (
-        assistant?.id !== parsed.assistantMessageId ||
-        assistant.requestId !== parsed.requestId ||
-        latest?.role !== 'user' ||
-        parsed.attachmentIds.some(
-          (id) =>
-            !latest.assets?.some((asset) => asset.id === id) &&
-            !latest.operation?.assetIds.includes(id),
-        )
+    const messages = initial.data.chat.messages.filter(
+      (message) => message.conversationId === parsed.conversationId,
+    );
+    const assistant = messages.at(-1);
+    const latest = messages.at(-2);
+    if (
+      assistant?.role !== 'assistant' ||
+      !['pending', 'streaming'].includes(assistant.status) ||
+      assistant.id !== parsed.assistantMessageId ||
+      assistant.requestId !== parsed.requestId ||
+      latest?.role !== 'user' ||
+      latest.content !== parsed.messages.at(-1)?.content
+    )
+      throw new Error('Save this conversation before sending its latest turn.');
+    if (
+      parsed.attachmentIds?.some(
+        (id) =>
+          !latest.assets?.some((asset) => asset.id === id) &&
+          !latest.operation?.assetIds.includes(id),
       )
-        throw new Error('Attach the files to this turn before sending them.');
-    }
+    )
+      throw new Error('Attach the files to this turn before sending them.');
     chat.submit(parsed);
   });
   handle('aria:cancel-chat', (id) => chat.cancel(identifier.parse(id)));
@@ -535,6 +654,8 @@ app
       decrypt: (value: Buffer) => safeStorage.decryptStringAsync(value),
     };
     provider = new ProviderStorage(directory, cipher);
+    capabilities = new CapabilityStorage(directory);
+    await capabilities.load();
     webSettings = new WebSettingsStorage(directory);
     await webSettings.load();
     browser = new BrowserController(directory, () => webSettings.get());
@@ -560,18 +681,40 @@ app
         runtime: () => webSettings.runtime(),
         revision: () => webSettings.revision,
         open: (authorize) =>
-          openBrowserBridge(browser, (request) => {
-            const signal = authorize(request);
-            if (!signal) return;
-            const turn = initial.data.chat.messages.find(
-              (message) =>
-                message.requestId === request.requestId &&
-                message.conversationId === request.conversationId &&
-                message.role === 'assistant' &&
-                ['pending', 'streaming'].includes(message.status),
-            );
-            return turn ? signal : undefined;
-          }),
+          openBrowserBridge(
+            browser,
+            (request) => {
+              const signal = authorize(request);
+              if (!signal) return;
+              const turn = initial.data.chat.messages.find(
+                (message) =>
+                  message.requestId === request.requestId &&
+                  message.conversationId === request.conversationId &&
+                  message.role === 'assistant' &&
+                  ['pending', 'streaming'].includes(message.status),
+              );
+              return turn ? signal : undefined;
+            },
+            (request, fingerprint, signal) => {
+              const assistantId = chat.assistantForTurn(request.requestId);
+              return assistantId
+                ? capabilities.reserve(
+                    request.conversationId,
+                    assistantId,
+                    request.requestId,
+                    fingerprint,
+                    signal,
+                  )
+                : Promise.resolve(false);
+            },
+          ),
+      },
+      {
+        policy: (registry) => capabilities.policy(nativeProof(registry)),
+        open: (revision, authorize) =>
+          openCapabilityBridge(capabilities, revision, (request) =>
+            request.voiceSessionId ? media.authorizeCapability(request) : authorize(request),
+          ),
       },
     );
     media = new MediaService(chat, assets, (event) =>

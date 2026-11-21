@@ -3,6 +3,7 @@ import {
   activitySchema,
   artifactReferenceSchema,
   runInfoSchema,
+  toolProblemSchema,
   type ChatEvent,
 } from '@aria/shared';
 
@@ -57,6 +58,7 @@ export const conductorEventSchema = z.discriminatedUnion('type', [
     interrupted: z.boolean(),
     run: runInfoSchema.optional(),
     settingsHelp: z.boolean().optional(),
+    problem: toolProblemSchema.optional(),
   }),
 ]);
 

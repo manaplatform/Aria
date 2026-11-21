@@ -1,46 +1,29 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { tool, type ModelMessage, type ToolSet } from 'ai';
+import type { JSONSchema7, ModelMessage } from 'ai';
+import { z } from 'zod';
 import {
+  capabilityId,
   conductorLimits,
-  executionBatchSchema,
-  unavailableSchema,
+  modelRefSchema,
+  referenceInput,
+  researchToolArgs,
+  sourceSchema,
+  stepId,
   type ConductorSource,
   type ExecutionStep,
+  type ResearchToolId,
+  type ToolEffect,
+  type ToolSummary,
 } from '@aria/shared';
 import { AiService } from '../ai/ai.service';
 import { MediaService } from '../media/media.service';
-import type { ResolvedModel } from '../providers/model-registry.service';
-import { RunError, type RunFile } from './run-assets';
+import { ModelRegistry, type ResolvedModel } from '../providers/model-registry.service';
+import type { ResearchRun } from '../web/web.service';
+import { CapabilityHost, ToolError } from './capability-host';
+import { RunError, type RunAttachment, type RunFile } from './run-assets';
 
-export const conductorTools: ToolSet = {
-  execute_steps: tool({
-    description:
-      'Execute configured model or tool operations, including image generation and editing. Copy the exact target, capability, and output from a listed eligible operation. Independent steps can run in parallel. Reference results by step ID and include each referenced step in dependsOn.',
-    inputSchema: executionBatchSchema,
-    strict: false,
-  }),
-  report_unavailable: tool({
-    description:
-      'Report that a capability needed to satisfy the request has no eligible configured target.',
-    inputSchema: unavailableSchema,
-    strict: false,
-  }),
-};
-
-export const toolOutputs = {
-  read_attachment: { capability: 'read-file', output: 'text' },
-  create_text_artifact: { capability: 'create-file', output: 'file' },
-} as const;
-export const modelOutputs = {
-  chat: 'text',
-  vision: 'text',
-  image: 'image',
-  'image-edit': 'image',
-  speech: 'audio',
-  transcription: 'text',
-} as const;
-
-type StepInputs = { text: string[]; files: RunFile[] };
+type Registry = Awaited<ReturnType<ModelRegistry['resolve']>>;
+export type StepInputs = { text: string[]; files: RunFile[] };
 export type StepValue = {
   text?: string;
   file?: RunFile;
@@ -48,50 +31,414 @@ export type StepValue = {
   data?: Record<string, unknown>;
 };
 
+const resultSchema = z.strictObject({
+  text: z.string().optional(),
+  file: z
+    .custom<RunFile>((value) => {
+      const file = value as RunFile | undefined;
+      return (
+        !!file &&
+        typeof file.name === 'string' &&
+        typeof file.mimeType === 'string' &&
+        Buffer.isBuffer(file.bytes)
+      );
+    })
+    .optional(),
+  sources: z.array(sourceSchema).max(8).optional(),
+  data: z.record(z.string(), z.unknown()).optional(),
+});
+
+const dependsOn = z
+  .array(stepId)
+  .max(conductorLimits.steps)
+  .optional()
+  .describe('Execution IDs of earlier successful calls that produced referenced data.');
+const withDependencies = { dependsOn };
+const instructions = z.string().trim().min(1).max(4000);
+const textInput = z.string().min(1).max(16000);
+const delegateSchema = z.strictObject({
+  modelRef: modelRefSchema,
+  instructions,
+  inputs: z.array(referenceInput).max(8).optional(),
+  ...withDependencies,
+});
+
+export interface ToolContext {
+  registry: Registry;
+  research: ResearchRun;
+  attachments: Map<string, RunAttachment>;
+  privateContent: boolean;
+}
+
+type Invocation = {
+  step: ExecutionStep;
+  context: ToolContext;
+  model?: ResolvedModel;
+  inputs: StepInputs;
+  signal: AbortSignal;
+  approval: () => void;
+};
+
+export interface ToolDescriptor<Input = unknown, Output extends StepValue = StepValue> {
+  id: string;
+  name: string;
+  description: string;
+  version: string;
+  provenance: string;
+  input: z.ZodType<Input>;
+  outputSchema: z.ZodType<Output>;
+  capability: ExecutionStep['capability'];
+  output: ExecutionStep['output'];
+  effect: ToolEffect;
+  permission: string;
+  dependency: 'local' | 'browser' | 'delegate';
+  requiredModelCapabilities: readonly string[];
+  timeoutMs: number;
+  deferred: boolean;
+  modes: readonly ('direct' | 'programmatic')[];
+  programmaticEligible: boolean;
+  artifacts: boolean;
+  citations: boolean;
+  repeatable?: boolean;
+  budget?: 'searches' | 'fetches' | 'screenshots';
+  available?: (context: ToolContext) => boolean;
+  normalize?: (input: Input) => Partial<ExecutionStep>;
+  execute: (input: Input, invocation: Invocation) => Promise<Output> | Output;
+}
+
+const base = {
+  version: '1',
+  provenance: 'builtin',
+  outputSchema: resultSchema,
+  timeoutMs: 80_000,
+  deferred: true,
+  programmaticEligible: false,
+  modes: ['direct'] as const,
+  requiredModelCapabilities: [] as const,
+  artifacts: false,
+  citations: false,
+};
+
+const researchDescriptions: Record<ResearchToolId, string> = {
+  web_search: 'Find public webpages about a topic using a natural-language search query.',
+  web_fetch:
+    'Read a public publisher page by search result source ID or a URL supplied by the user.',
+  web_read: 'Read the full bounded text of a fetched publisher document.',
+  web_find: 'Find mentions of a term in a fetched publisher document.',
+  browser_open:
+    'Open a public page in an isolated Aria browser tab using an authorized URL or source.',
+  browser_navigate: 'Navigate an existing AI browser tab to an authorized public source.',
+  browser_get_tabs: 'List AI browser tabs that belong to this conversation.',
+  browser_get_page: 'Inspect the current public page and its structured controls.',
+  browser_click:
+    'Click a referenced page control or follow a link. Consequential clicks require approval.',
+  browser_type: 'Fill a referenced non-sensitive field after user approval.',
+  browser_submit: 'Submit a validated public form after user approval.',
+  browser_extract:
+    'Extract visible publisher content from an inspected page for evidence and citations.',
+  browser_scroll: 'Scroll an AI tab to inspect more of the page.',
+  browser_screenshot: 'Capture the current AI browser page as a PNG artifact.',
+  browser_switch_tab: 'Select another AI browser tab in this conversation.',
+};
+
+const modelDescriptions = {
+  chat: [
+    'Delegate text analysis or a specialized writing task to an explicitly selected chat model.',
+    'text',
+  ],
+  vision: ['Analyze an authorized image or prior image artifact using a vision model.', 'text'],
+  image: ['Generate a new image from a written prompt.', 'image'],
+  'image-edit': ['Edit an authorized image or a previously generated image.', 'image'],
+  speech: ['Render text as a spoken audio artifact.', 'audio'],
+  transcription: ['Transcribe an authorized audio or video attachment to text.', 'text'],
+} as const;
+
+function summarize(descriptor: ToolDescriptor, available: boolean, reason?: string): ToolSummary {
+  return {
+    id: descriptor.id,
+    namespace: descriptor.id.split('.')[0],
+    name: descriptor.name,
+    description: descriptor.description,
+    version: descriptor.version,
+    provenance: descriptor.provenance,
+    effect: descriptor.effect,
+    permission: descriptor.permission,
+    available,
+    reason,
+  };
+}
+
 @Injectable()
 export class ToolRegistry {
+  private readonly entries = new Map<string, ToolDescriptor>();
+  private readonly wire = new Map<string, string>();
+  private readonly namespaces = new Map<string, Map<string, ToolDescriptor>>();
+  private readonly schemas = new WeakMap<ToolDescriptor, JSONSchema7>();
+  revision = 0;
+
   constructor(
     @Inject(AiService) private readonly ai: AiService,
     @Inject(MediaService) private readonly media: MediaService,
-  ) {}
+    @Inject(ModelRegistry) private readonly models: ModelRegistry,
+    @Inject(CapabilityHost) readonly host: CapabilityHost,
+  ) {
+    this.register({
+      ...base,
+      id: 'files.read_attachment',
+      name: 'Read text attachment',
+      description: 'Read an authorized UTF-8 attachment from this turn by its attachment ID.',
+      input: z.strictObject({ attachmentId: z.string().uuid() }),
+      output: 'text',
+      capability: 'read-file',
+      effect: 'read',
+      dependency: 'local',
+      permission: 'Files attached to this turn',
+      available: ({ attachments }) =>
+        [...attachments.values()].some((file) => file.mimeType === 'text/plain'),
+      normalize: ({ attachmentId }) => ({ inputs: [{ kind: 'attachment', id: attachmentId }] }),
+      execute: (_, { inputs }) => {
+        const [file] = inputs.files;
+        if (file?.mimeType !== 'text/plain')
+          throw new RunError('Select one authorized UTF-8 text attachment to read.');
+        return { text: file.bytes.toString('utf8').slice(0, conductorLimits.resultCharacters) };
+      },
+    });
+    this.register({
+      ...base,
+      id: 'files.create_text_artifact',
+      name: 'Create text artifact',
+      description: 'Create a downloadable UTF-8 text, Markdown, CSV, TSV, or JSON artifact.',
+      input: z
+        .strictObject({
+          filename: z.string().regex(/^(?!\.)[\p{L}\p{N} _.-]{1,100}\.(txt|md|csv|tsv|json)$/u),
+          text: textInput.optional(),
+          resultId: stepId.optional(),
+          ...withDependencies,
+        })
+        .refine(({ text, resultId }) => Boolean(text?.trim()) !== Boolean(resultId)),
+      output: 'file',
+      capability: 'create-file',
+      effect: 'local',
+      dependency: 'local',
+      permission: 'Save an artifact in this conversation',
+      artifacts: true,
+      normalize: ({ filename, text, resultId, dependsOn }) => ({
+        instructions: filename,
+        dependsOn: dependsOn ?? [],
+        inputs: resultId ? [{ kind: 'result', stepId: resultId }] : [{ kind: 'text', text: text! }],
+      }),
+      execute: (_, { step, inputs }) => {
+        if (inputs.files.length || !inputs.text.join('').trim())
+          throw new RunError('Provide or reference text content for the artifact.');
+        return {
+          file: {
+            name: step.instructions,
+            mimeType: 'text/plain',
+            bytes: Buffer.from(inputs.text.join('\n')),
+          },
+        };
+      },
+    });
 
-  async invoke(
+    for (const op of Object.keys(researchToolArgs) as ResearchToolId[]) {
+      const browser = op.startsWith('browser_');
+      const consequential = ['browser_click', 'browser_type', 'browser_submit'].includes(op);
+      const snapshot = [
+        'browser_get_page',
+        'browser_get_tabs',
+        'browser_extract',
+        'browser_scroll',
+      ].includes(op);
+      this.register({
+        ...base,
+        id: `${browser ? 'browser' : 'web'}.${op}`,
+        name: op.replaceAll('_', ' '),
+        description: researchDescriptions[op],
+        input: z.strictObject({ args: researchToolArgs[op], ...withDependencies }),
+        capability: op === 'web_search' ? 'web-search' : op,
+        output: op === 'browser_screenshot' ? 'image' : op === 'web_read' ? 'text' : 'data',
+        effect: consequential ? 'consequential' : browser ? 'local' : 'read',
+        dependency: 'browser',
+        permission: consequential
+          ? 'AI Browser access and native action approval'
+          : 'AI Browser access',
+        repeatable: snapshot,
+        budget:
+          op === 'web_search'
+            ? 'searches'
+            : op === 'web_fetch'
+              ? 'fetches'
+              : op === 'browser_screenshot'
+                ? 'screenshots'
+                : undefined,
+        artifacts: op === 'browser_screenshot',
+        citations: ['web_fetch', 'web_find', 'web_read', 'browser_extract'].includes(op),
+        normalize: ({ args, dependsOn }) => ({ args, dependsOn: dependsOn ?? [] }),
+        execute: ({ args }, { context, step, signal, approval }) =>
+          context.research.invoke(op, args, step, signal, approval),
+      });
+    }
+
+    for (const [capability, [description, output]] of Object.entries(modelDescriptions) as [
+      keyof typeof modelDescriptions,
+      (typeof modelDescriptions)[keyof typeof modelDescriptions],
+    ][]) {
+      const namespace = capability === 'chat' || capability === 'vision' ? 'models' : 'media';
+      this.register({
+        ...base,
+        id: `${namespace}.${capability.replace('-', '_')}`,
+        name: capability.replace('-', ' '),
+        description,
+        input: delegateSchema,
+        capability,
+        output,
+        effect: 'billable',
+        dependency: 'delegate',
+        requiredModelCapabilities: [capability],
+        permission: 'Enabled delegated model and configured transfer policy',
+        timeoutMs: 180_000,
+        artifacts: output !== 'text',
+        normalize: ({ modelRef, instructions, inputs, dependsOn }) => ({
+          target: { kind: 'model', model: modelRef },
+          instructions,
+          inputs: inputs ?? [],
+          dependsOn: dependsOn ?? [],
+        }),
+        execute: (_, { step, inputs, signal, model }) => {
+          if (!model)
+            throw new ToolError('CAPABILITY_UNAVAILABLE', 'The selected model is unavailable.');
+          return this.invokeModel(step, inputs, signal, model);
+        },
+      });
+    }
+  }
+
+  register<Input, Output extends StepValue>(descriptor: ToolDescriptor<Input, Output>) {
+    const { id } = descriptor;
+    const wireName = this.wireName(id);
+    const namespace = id.split('.')[0];
+    const reserved = [
+      'find_capabilities',
+      'load_capabilities',
+      'tool_search',
+      'report_unavailable',
+      'load_skill',
+      'read_skill_resource',
+    ];
+    if (
+      !capabilityId.safeParse(id).success ||
+      wireName.length > 64 ||
+      this.entries.has(id) ||
+      this.wire.has(wireName) ||
+      reserved.includes(wireName) ||
+      this.entries.size >= 1024 ||
+      !descriptor.modes.includes('direct')
+    )
+      throw new Error('Invalid or duplicate capability registration.');
+    const normalized = descriptor as ToolDescriptor;
+    const schema = z.toJSONSchema(descriptor.input, {
+      unrepresentable: 'any',
+      target: 'draft-7',
+    }) as JSONSchema7;
+    if (
+      Buffer.byteLength(JSON.stringify(schema)) > 16_000 ||
+      descriptor.description.length > 1024 ||
+      descriptor.name.length > 200
+    )
+      throw new Error('Capability metadata or schema exceeds its limit.');
+    this.schemas.set(normalized, schema);
+    const group = this.namespaces.get(namespace) ?? new Map<string, ToolDescriptor>();
+    group.set(id, normalized);
+    this.namespaces.set(namespace, group);
+    this.entries.set(id, normalized);
+    this.wire.set(wireName, id);
+    this.revision++;
+    return () => {
+      if (this.entries.get(id) !== descriptor) return;
+      this.entries.delete(id);
+      this.wire.delete(wireName);
+      group.delete(id);
+      if (group.size === 0) this.namespaces.delete(namespace);
+      this.revision++;
+    };
+  }
+
+  wireName(id: string) {
+    return id.replaceAll('.', '_');
+  }
+
+  get(id: string) {
+    return this.entries.get(id);
+  }
+
+  namespaceInfo(context: ToolContext) {
+    const items: string[] = [];
+    for (const [namespace, entries] of this.namespaces) {
+      const representative = [...entries.values()].find((descriptor) =>
+        this.allowed(descriptor, context),
+      );
+      if (representative) items.push(`${namespace} (${representative.name})`);
+      if (items.length >= 12) break;
+    }
+    return items;
+  }
+
+  schema(descriptor: ToolDescriptor) {
+    const schema = this.schemas.get(descriptor);
+    if (!schema)
+      throw new ToolError('CAPABILITY_UNAVAILABLE', 'The selected schema is unavailable.');
+    return schema;
+  }
+
+  allowed(descriptor: ToolDescriptor, context: ToolContext) {
+    return (
+      this.entries.get(descriptor.id) === descriptor &&
+      !this.host.current.disabled.includes(descriptor.id) &&
+      (descriptor.dependency !== 'browser' ||
+        (context.research.native && !context.privateContent)) &&
+      (descriptor.dependency !== 'delegate' ||
+        this.models.hasDelegateCandidates(context.registry.config)) &&
+      (descriptor.available?.(context) ?? true)
+    );
+  }
+
+  cards(context: ToolContext) {
+    return [...this.entries.values()]
+      .filter((descriptor) => this.allowed(descriptor, context))
+      .map((descriptor) => summarize(descriptor, true));
+  }
+
+  settings(registry: Registry | undefined, browserAvailable: boolean) {
+    return [...this.entries.values()].map((descriptor) => {
+      const reason = this.host.current.disabled.includes(descriptor.id)
+        ? 'Disabled in Tools settings.'
+        : descriptor.dependency === 'browser' && !browserAvailable
+          ? 'Enable AI Browser in Web & Browser.'
+          : descriptor.dependency === 'delegate' &&
+              ![...(registry?.models.values() ?? [])].some(
+                (model) =>
+                  model.delegate &&
+                  descriptor.requiredModelCapabilities.every((cap) =>
+                    model.capabilities.some((value) => cap === value),
+                  ),
+              )
+            ? 'Configure an eligible delegated model in AI Models.'
+            : undefined;
+      return summarize(descriptor, !reason, reason);
+    });
+  }
+
+  async delegates(context: ToolContext, signal: AbortSignal) {
+    return this.models.resolve(signal, context.registry.config);
+  }
+
+  private async invokeModel(
     step: ExecutionStep,
     input: StepInputs,
     signal: AbortSignal,
-    model?: ResolvedModel,
+    model: ResolvedModel,
   ): Promise<StepValue> {
     const text = [step.instructions, ...input.text].join('\n\n');
-    if (step.target.kind === 'tool') {
-      switch (step.target.tool) {
-        case 'read_attachment':
-          if (
-            input.files.length !== 1 ||
-            input.files[0].mimeType !== 'text/plain' ||
-            input.text.length
-          )
-            throw new RunError('Select one authorized UTF-8 text attachment to read.');
-          return {
-            text: input.files[0].bytes.toString('utf8').slice(0, conductorLimits.resultCharacters),
-          };
-        case 'create_text_artifact': {
-          const name = step.instructions.trim();
-          if (
-            !/^[\p{L}\p{N} _.-]{1,100}\.(txt|md|csv|tsv|json)$/u.test(name) ||
-            name.startsWith('.') ||
-            input.files.length ||
-            !input.text.join('').trim()
-          )
-            throw new RunError(
-              'Provide a filename with a supported text extension and text content.',
-            );
-          return {
-            file: { name, mimeType: 'text/plain', bytes: Buffer.from(input.text.join('\n')) },
-          };
-        }
-      }
-    }
-    if (!model) throw new RunError('The selected model is unavailable.');
     if (step.capability === 'chat' || step.capability === 'vision') {
       if (
         step.capability === 'chat'

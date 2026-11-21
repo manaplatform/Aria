@@ -4,6 +4,7 @@ import { ArrowLeft, ArrowUpRight, Check, Monitor, Moon, Sun, UserRound } from 'l
 import { useWorkspaceStore } from '../../stores/workspaceStore';
 import { Button, Field } from '../ui';
 import { WebBrowserSettings } from './WebBrowserSettings';
+import { ToolSettings } from './ToolSettings';
 import { ModelSettings } from './ModelSettings';
 
 export default function SettingsView() {
@@ -13,7 +14,7 @@ export default function SettingsView() {
   const navigate = useNavigate();
   const { hash } = useLocation();
   useEffect(() => {
-    if (hash === '#ai-models' || hash === '#web-browser')
+    if (['#ai-models', '#web-browser', '#tools', '#skills'].includes(hash))
       document.getElementById(hash.slice(1))?.scrollIntoView?.();
   }, [hash]);
   const modifier = window.aria?.platform === 'darwin' ? '⌘' : 'Ctrl';
@@ -56,6 +57,7 @@ export default function SettingsView() {
         </section>
         <ModelSettings />
         <WebBrowserSettings />
+        <ToolSettings />
         <section className="settings-section">
           <div className="settings-section-heading">
             <h2>

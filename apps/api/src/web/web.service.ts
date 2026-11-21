@@ -12,6 +12,7 @@ import {
   type ResearchToolId,
   type RuntimeWeb,
 } from '@aria/shared';
+import { ToolError } from '../conductor/capability-host';
 import { RunError, type RunFile } from '../conductor/run-assets';
 import { BrowserPortClient } from './browser-port.client';
 
@@ -59,7 +60,11 @@ export class ResearchRun {
   ) {}
 
   get native() {
-    return this.policy.enabled && this.policy.aiBrowser && !!this.browser;
+    return (
+      this.policy.enabled &&
+      this.policy.aiBrowser &&
+      Boolean(this.browser && this.browser.available !== false)
+    );
   }
 
   observeSources(sources: ConductorSource[], producer: string) {
@@ -104,6 +109,7 @@ export class ResearchRun {
     args: Record<string, unknown>,
     step: ExecutionStep,
     signal: AbortSignal,
+    approval?: () => void,
   ) {
     if (!this.native || !this.browser)
       throw new RunError('Allow Aria to search and browse in Settings → Web & Browser.');
@@ -116,8 +122,17 @@ export class ResearchRun {
         args,
       },
       signal,
+      ...(approval ? [approval] : []),
     );
-    if (!result.ok) throw new RunError(result.message);
+    if (!result.ok) {
+      const code =
+        result.code === 'DUPLICATE_DISPATCH'
+          ? result.code
+          : result.code.startsWith('APPROVAL')
+            ? 'PERMISSION_DENIED'
+            : 'EXECUTION_FAILED';
+      throw new ToolError(code, result.message);
+    }
     return result;
   }
 
@@ -138,10 +153,11 @@ export class ResearchRun {
     args: Record<string, unknown>,
     step: ExecutionStep,
     signal: AbortSignal,
+    approval?: () => void,
   ): Promise<ResearchResult> {
     try {
       if (op === 'web_search') {
-        const response = await this.browse(op, args, step, signal);
+        const response = await this.browse(op, args, step, signal, approval);
         const { results } = browserSearchResultsSchema.parse(JSON.parse(response.text));
         const seen = new Set<string>();
         const links = results.flatMap(({ url: raw, title }) => {
@@ -156,7 +172,7 @@ export class ResearchRun {
       }
       if (op === 'web_fetch') {
         const url = this.destination(args, step.dependsOn);
-        const result = await this.browse(op, { url }, step, signal);
+        const result = await this.browse(op, { url }, step, signal, approval);
         const page: unknown = JSON.parse(result.text);
         const text =
           page && typeof page === 'object' && 'text' in page && typeof page.text === 'string'
@@ -201,7 +217,7 @@ export class ResearchRun {
           ...(args.tabId ? { tabId: args.tabId } : {}),
           url: this.destination(args, step.dependsOn),
         };
-      const result = await this.browse(op, browserArgs, step, signal);
+      const result = await this.browse(op, browserArgs, step, signal, approval);
       const json = JSON.parse(result.text) as Record<string, unknown>;
       this.observeBrowserRefs(json, step.id);
       let sources: ConductorSource[] | undefined;
@@ -232,11 +248,7 @@ export class ResearchRun {
     } catch (error) {
       if (error instanceof RunError) throw error;
       if (signal.aborted) throw error;
-      throw new RunError(
-        error instanceof Error && error.name !== 'ZodError'
-          ? error.message.slice(0, 250)
-          : 'The web tool returned an unexpected response.',
-      );
+      throw new RunError('The web operation did not return a usable response.');
     }
   }
 

@@ -76,7 +76,7 @@ function check(release) {
     .flatMap((name) => packageEntries(path.join(staged, name, 'node_modules')))
     .map(notice)
     .filter(Boolean);
-  const main = ['zod', 'ws', 'ipaddr.js']
+  const main = ['zod', 'ws', 'ipaddr.js', 'yaml', 'yauzl']
     .map((name) =>
       notice(
         fs.realpathSync(
@@ -89,6 +89,14 @@ function check(release) {
       ),
     )
     .filter(Boolean);
+  const yauzl = fs.realpathSync(path.join(desktop, 'node_modules', 'yauzl'));
+  for (const name of Object.keys(
+    JSON.parse(fs.readFileSync(path.join(yauzl, 'package.json'), 'utf8')).dependencies ?? {},
+  )) {
+    const dependency = require.resolve(`${name}/package.json`, { paths: [yauzl] });
+    const entry = notice(path.dirname(dependency));
+    if (entry) main.push(entry);
+  }
   const packages = [
     ...new Map(
       [...api, ...main, ...renderer].map((entry) => [`${entry.name}@${entry.version}`, entry]),

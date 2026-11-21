@@ -343,10 +343,10 @@ test('corrects a rejected chat-model target and creates a dancing panda with the
   const id = await enableFixtureModels(['gpt-image-2.6-flare']);
   const prompt = 'Make a panda image dancing';
   const instructions = 'Create an image of a panda dancing.';
-  fixture.queueTool(prompt, 'execute_steps', {
+  fixture.queueOperations(prompt, {
     steps: [planned(`${id}:fixture-model`, 'image', 'image', { instructions })],
   });
-  fixture.continueWithTool(prompt, 'execute_steps', {
+  fixture.continueWithOperations(prompt, {
     steps: [planned(`${id}:gpt-image-2.6-flare`, 'image', 'image', { instructions })],
   });
   const count = fixture.mediaReceived.length;
@@ -368,7 +368,7 @@ test('creates and edits an image, transcribes audio, and restores artifacts and 
   await launch();
   const id = await enableFixtureModels(['gpt-image-2.6-flare', 'gpt-transcribe', 'tts-1']);
   expect(await page.getByRole('combobox').count()).toBe(0);
-  fixture.queueTool('A calm mountain', 'execute_steps', {
+  fixture.queueOperations('A calm mountain', {
     steps: [planned(`${id}:gpt-image-2.6-flare`, 'image', 'image')],
   });
   await send('A calm mountain');
@@ -393,7 +393,7 @@ test('creates and edits an image, transcribes audio, and restores artifacts and 
   await page.getByRole('button', { name: 'Use image', exact: true }).click();
   const imageId = new URL((await image.getAttribute('src'))!).pathname.slice(1);
   expect(imageId).toBeTruthy();
-  fixture.queueTool('Add a little snow', 'execute_steps', {
+  fixture.queueOperations('Add a little snow', {
     steps: [
       planned(`${id}:gpt-image-2.6-flare`, 'image-edit', 'image', {
         inputs: [{ kind: 'attachment', id: imageId }],
@@ -426,7 +426,7 @@ test('creates and edits an image, transcribes audio, and restores artifacts and 
     return data.chat.conversations.find((conversation) => conversation.id === data.chat.selectedId)!
       .attachments![0].id;
   });
-  fixture.queueTool('Transcribe and read this', 'execute_steps', {
+  fixture.queueOperations('Transcribe and read this', {
     steps: [
       planned(`${id}:gpt-transcribe`, 'transcription', 'text', {
         id: 'transcript',
@@ -438,6 +438,7 @@ test('creates and edits an image, transcribes audio, and restores artifacts and 
       }),
     ],
   });
+  fixture.finalReply('Transcribe and read this', 'A transcript from the uploaded audio.');
   await send('Transcribe and read this');
   await expect(page.locator('.from-assistant').last()).toContainText(
     'A transcript from the uploaded audio.',
@@ -456,7 +457,7 @@ test('cancels delegated generation and labels another billed attempt explicitly'
   const id = await enableFixtureModels(['gpt-image-2.6-flare']);
   const cancelled = fixture.cancelled;
   const count = fixture.mediaReceived.length;
-  fixture.queueTool('Generate a mountain', 'execute_steps', {
+  fixture.queueOperations('Generate a mountain', {
     steps: [
       planned(`${id}:gpt-image-2.6-flare`, 'image', 'image', { instructions: '[slow] mountain' }),
     ],
@@ -467,7 +468,7 @@ test('cancels delegated generation and labels another billed attempt explicitly'
   await expect(page.locator('.from-assistant[data-status="stopped"]')).toHaveCount(1);
   await expect.poll(() => fixture.cancelled).toBeGreaterThan(cancelled);
 
-  fixture.queueTool('Generate a harbor', 'execute_steps', {
+  fixture.queueOperations('Generate a harbor', {
     steps: [
       planned(`${id}:gpt-image-2.6-flare`, 'image', 'image', { instructions: '[fail] harbor' }),
     ],
@@ -476,13 +477,27 @@ test('cancels delegated generation and labels another billed attempt explicitly'
   await expect(page.locator('.from-assistant[data-status="failed"]')).toHaveCount(1);
   await expect(page.getByRole('alert')).not.toContainText('secret-response-text');
   await expect(page.getByRole('button', { name: 'Send again', exact: true })).toBeVisible();
+  await app.close();
+  await launch();
+  fixture.queueOperations('Generate a harbor', {
+    steps: [
+      planned(`${id}:gpt-image-2.6-flare`, 'image', 'image', {
+        instructions: 'Changed retry prompt',
+      }),
+    ],
+  });
+  await page.getByRole('button', { name: 'Send again', exact: true }).click();
+  await expect(page.getByRole('alert')).toContainText(
+    'An earlier dispatch may already have taken effect',
+  );
+  expect(fixture.mediaReceived).toHaveLength(count + 2);
 });
 
 test('uses a synthetic microphone, delegates once into the primary, and preserves captions and audio', async () => {
   await launch(true, false, true, true);
   const id = await enableFixtureModels(['gpt-live-1'], true);
   const count = fixture.received.length;
-  fixture.queueTool('Hello from my microphone.', 'execute_steps', {
+  fixture.queueOperations('Hello from my microphone.', {
     steps: [planned(`${id}:fixture-model`, 'chat', 'text')],
   });
   await page.getByRole('button', { name: 'Start live voice conversation', exact: true }).click();
@@ -491,7 +506,7 @@ test('uses a synthetic microphone, delegates once into the primary, and preserve
     'Hello from GPT-Live.',
   );
   await expect(page.locator('.conductor-activity')).toBeVisible();
-  await expect.poll(() => fixture.received.length).toBe(count + 3);
+  await expect.poll(() => fixture.received.length).toBe(count + 5);
   expect(fixture.received.slice(count).every((item) => item.body.model === 'fixture-model')).toBe(
     true,
   );
@@ -515,4 +530,71 @@ test('uses a synthetic microphone, delegates once into the primary, and preserve
   );
   await expect(page.locator('.from-assistant audio')).toBeVisible();
   await expect(page.locator('.conductor-activity')).toBeVisible();
+});
+
+test('approves a local skill in Settings and reads only its scoped resources through chat', async () => {
+  await launch();
+  const folder = path.join(temporary, 'review-notes');
+  await fs.mkdir(path.join(folder, 'references'), { recursive: true });
+  await fs.writeFile(
+    path.join(folder, 'SKILL.md'),
+    '---\nname: review-notes\ndescription: Evaluate notes for unsupported statements.\n---\nRead the checklist on request.\n',
+  );
+  await fs.writeFile(
+    path.join(folder, 'references', 'checklist.md'),
+    'Check independent evidence.',
+  );
+  await app.evaluate(({ dialog }, filePath) => {
+    dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [filePath] });
+  }, folder);
+  await page.getByRole('button', { name: 'Open settings', exact: true }).click();
+  await page.getByRole('button', { name: 'Choose skill folder', exact: true }).click();
+  await expect(page.getByRole('group', { name: 'Review skill bundle' })).toContainText(
+    'review-notes',
+  );
+  await page.getByRole('button', { name: 'Approve and install', exact: true }).click();
+  await expect(
+    page.getByRole('button', { name: 'Disable review-notes', exact: true }),
+  ).toBeVisible();
+  const { skills } = await page.evaluate(() => window.aria!.toolSettings());
+  const skill = skills.find((item) => item.name === 'review-notes')!;
+  const prompt = 'Use the installed notes review checklist.';
+  fixture.queueTool(prompt, 'find_capabilities', {
+    kind: 'skills',
+    query: 'review notes checklist',
+  });
+  fixture.queueTool(prompt, 'load_skill', { id: skill.id, version: skill.version });
+  fixture.onToolResult(prompt, (result) => {
+    const resources = (result as { resources?: { id: string }[] }).resources;
+    if (!resources?.length) return;
+    return {
+      name: 'read_skill_resource',
+      input: {
+        id: skill.id,
+        version: skill.version,
+        resourceId: resources[0].id,
+      },
+    };
+  });
+  await page.getByRole('button', { name: 'Back to chat', exact: true }).click();
+  const initial = fixture.received.length;
+  await send(prompt);
+  await expect(page.locator('.from-assistant[data-status="completed"]')).toHaveCount(1);
+  await expect(page.locator('.from-assistant .markdown')).toContainText(
+    'Check independent evidence.',
+  );
+  await page.getByText(/Conductor activity/).click();
+  await expect(page.getByText(/Reading a skill resource/)).toBeVisible();
+  expect(JSON.stringify(fixture.received[initial].body)).not.toContain(
+    'Check independent evidence.',
+  );
+  await page.getByRole('button', { name: 'Open settings', exact: true }).click();
+  await page.getByRole('button', { name: 'Disable review-notes', exact: true }).click();
+  await expect(
+    page.getByRole('button', { name: 'Enable review-notes', exact: true }),
+  ).toBeVisible();
+  await app.close();
+  await launch();
+  const restored = await page.evaluate(() => window.aria!.toolSettings());
+  expect(restored.skills.find((item) => item.name === 'review-notes')?.enabled).toBe(false);
 });

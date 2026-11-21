@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import { endActivity } from '@aria/shared';
+import { conductorLimits, endActivity } from '@aria/shared';
 import type {
   ChatData,
   ChatEvent,
@@ -114,7 +114,7 @@ export function applyChatEvent(event: ChatEvent): void {
             ? activity.map((item) =>
                 item.stepId === event.activity.stepId ? event.activity : item,
               )
-            : [...activity, event.activity].slice(0, 12),
+            : [...activity, event.activity].slice(0, conductorLimits.activity),
         };
       }
       if (event.type === 'artifact') return next;

@@ -30,7 +30,9 @@ export function ChatMessage({
   ];
   const research =
     message.activity?.some(({ capability }) => /^web[-_]|^browser_/.test(capability)) ?? false;
-  const activeStep = message.activity?.find((step) => step.status === 'running');
+  const activeStep = message.activity?.find((step) =>
+    ['running', 'approval', 'processing'].includes(step.status),
+  );
 
   return (
     <article
@@ -65,14 +67,20 @@ export function ChatMessage({
       {message.activity?.length ? (
         <details className="conductor-activity">
           <summary>
-            <Activity size={13} aria-hidden="true" /> {activeStep?.summary || 'Conductor activity'}{' '}
+            <Activity size={13} aria-hidden="true" />{' '}
+            {activeStep?.status === 'approval'
+              ? 'Waiting for approval'
+              : activeStep?.status === 'processing'
+                ? 'Processing results'
+                : activeStep?.summary || 'Conductor activity'}{' '}
             · {message.activity.length}
           </summary>
           <ul>
             {message.activity.map((step) => (
               <li key={step.stepId}>
                 <span>
-                  {step.summary} · {step.status}
+                  {step.summary} ·{' '}
+                  {step.status === 'approval' ? 'Waiting for approval' : step.status}
                 </span>
                 <small>
                   {step.target} · {step.capability}
@@ -80,6 +88,8 @@ export function ChatMessage({
                     ? ` · ${(step.durationMs / 1000).toFixed(1)} s`
                     : ''}
                 </small>
+                {step.inputSummary && <small>{step.inputSummary}</small>}
+                {step.resultSummary && <small>{step.resultSummary}</small>}
                 {step.error && <small>{step.error}</small>}
               </li>
             ))}
@@ -120,7 +130,8 @@ export function ChatMessage({
                 {attempt.outcome} · {attempt.run.primaryName ?? attempt.run.primary}
                 {attempt.activity.map((step) => (
                   <small key={step.stepId}>
-                    {step.summary} · {step.status}
+                    {step.summary} ·{' '}
+                    {step.status === 'approval' ? 'Waiting for approval' : step.status}
                   </small>
                 ))}
               </li>

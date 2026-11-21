@@ -145,19 +145,19 @@ test('browses from ordinary chat through the managed private port and keeps priv
       output: 'data',
     });
     const resultSeen: string[] = [];
-    provider.queueTool(prompt, 'execute_steps', { steps: [step('open', 'browser_open', { url })] });
+    provider.queueOperations(prompt, { steps: [step('open', 'browser_open', { url })] });
     provider.onToolResult(prompt, (result) => {
       if (!Array.isArray(result) || !result[0]?.data) return;
       const { id, data } = result[0];
       resultSeen.push(id);
       if (id === 'open')
         return {
-          name: 'execute_steps',
+          name: 'fixture_operations',
           input: { steps: [step('observe', 'browser_get_page', { tabId: data.tabId }, [id])] },
         };
       if (id === 'observe')
         return {
-          name: 'execute_steps',
+          name: 'fixture_operations',
           input: {
             steps: [
               step(
@@ -253,7 +253,7 @@ test('browses from ordinary chat through the managed private port and keeps priv
       output: 'data',
     });
     const searchResults: string[] = [];
-    provider.queueTool(lookup, 'execute_steps', {
+    provider.queueOperations(lookup, {
       steps: [step('guess', 'browser_open', { url: 'https://example.com/guessed' })],
     });
     provider.onToolResult(lookup, (result) => {
@@ -262,7 +262,7 @@ test('browses from ordinary chat through the managed private port and keeps priv
       if (step.id === 'guess' && step.status === 'failed') {
         searchResults.push(step.error);
         return {
-          name: 'execute_steps',
+          name: 'fixture_operations',
           input: { steps: [tool('web_search', { query: 'semaphore definition' })] },
         };
       }
@@ -273,7 +273,7 @@ test('browses from ordinary chat through the managed private port and keeps priv
       ) {
         searchResults.push(step.data.results[0].url);
         return {
-          name: 'execute_steps',
+          name: 'fixture_operations',
           input: {
             steps: [tool('web_fetch', { sourceId: step.data.results[0].sourceId }, ['web_search'])],
           },

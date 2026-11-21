@@ -1,3 +1,5 @@
+import type { SkillRef, SkillPreview, ToolDiscovery, ToolSettings } from './capabilities.js';
+export * from './capabilities.js';
 import type { BrowserCommand, BrowserLayout, BrowserState } from './browser.js';
 import type { WebSettings, WebSettingsInput } from './web.js';
 export * from './browser.js';
@@ -370,6 +372,12 @@ export interface DesktopBridge {
   onBrowserState(callback: (state: BrowserState) => void): () => void;
   webSettings(): Promise<WebSettings>;
   saveWebSettings(input: WebSettingsInput): Promise<WebSettings>;
+  toolSettings(): Promise<ToolSettings>;
+  setToolEnabled(id: string, enabled: boolean): Promise<ToolSettings>;
+  setToolDiscovery(mode: ToolDiscovery): Promise<ToolSettings>;
+  previewSkill(kind: 'directory' | 'zip'): Promise<SkillPreview | null>;
+  approveSkill(token: string): Promise<ToolSettings>;
+  manageSkill(skill: SkillRef, action: 'enable' | 'disable' | 'remove'): Promise<ToolSettings>;
   chatStatus(): Promise<ChatServiceStatus>;
   onChatStatus(callback: (status: ChatServiceStatus) => void): () => void;
   restartChatService(): Promise<void>;

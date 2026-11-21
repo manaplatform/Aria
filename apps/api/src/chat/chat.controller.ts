@@ -18,6 +18,8 @@ import { FilesInterceptor } from '@nestjs/platform-express';
 import type { Request, Response } from 'express';
 import { artifactReferenceSchema, identifier } from '@aria/shared';
 import { Conductor } from '../conductor/conductor.service';
+import { ToolRegistry } from '../conductor/tool-registry';
+import { WebService } from '../web/web.service';
 import { RunAssets, RunError } from '../conductor/run-assets';
 import { ModelRegistry } from '../providers/model-registry.service';
 import { ChatRequestDto, AttachmentMetadataDto } from './chat.dto';
@@ -30,11 +32,22 @@ export class ChatController {
     @Inject(ModelRegistry) private readonly registry: ModelRegistry,
     @Inject(Conductor) private readonly conductor: Conductor,
     @Inject(RunAssets) private readonly assets: RunAssets,
+    @Inject(ToolRegistry) private readonly tools: ToolRegistry,
+    @Inject(WebService) private readonly web: WebService,
   ) {}
 
   @Get('capabilities')
   capabilities() {
     return this.registry.status();
+  }
+
+  @Get('tools')
+  async toolSettings() {
+    const registry = await this.registry
+      .resolve(AbortSignal.timeout(10_000))
+      .catch(() => undefined);
+    const web = this.web.scope({ requestId: '', conversationId: '', messages: [] }, true);
+    return this.tools.settings(registry, web.native);
   }
 
   @Post(':requestId/attachments')

@@ -1,6 +1,11 @@
 import { Injectable } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
-import { browserResponseSchema, type BrowserRequest, type BrowserResponse } from '@aria/shared';
+import {
+  browserProgressSchema,
+  browserResponseSchema,
+  type BrowserRequest,
+  type BrowserResponse,
+} from '@aria/shared';
 
 export interface BrowserPort {
   start(): void;
@@ -17,6 +22,7 @@ export class BrowserPortClient {
     string,
     {
       request: BrowserRequest;
+      approval?: () => void;
       settle: (response?: BrowserResponse, error?: Error) => void;
     }
   >();
@@ -30,6 +36,28 @@ export class BrowserPortClient {
     this.connection = connection;
     port.on('message', ({ data }) => {
       if (this.connection !== connection) return;
+      const progress = browserProgressSchema.safeParse(data);
+      if (progress.success) {
+        const {
+          operationId,
+          requestId,
+          conversationId,
+          generation: observed,
+          stepId,
+          op,
+        } = progress.data;
+        const entry = this.pending.get(operationId);
+        if (
+          entry &&
+          observed === generation &&
+          entry.request.requestId === requestId &&
+          entry.request.conversationId === conversationId &&
+          entry.request.stepId === stepId &&
+          entry.request.op === op
+        )
+          entry.approval?.();
+        return;
+      }
       const parsed = browserResponseSchema.safeParse(data);
       if (!parsed.success) return;
       const response = parsed.data;
@@ -59,6 +87,7 @@ export class BrowserPortClient {
   invoke(
     input: Omit<BrowserRequest, 'v' | 'generation' | 'operationId' | 'deadline'>,
     signal: AbortSignal,
+    approval?: () => void,
   ) {
     signal.throwIfAborted();
     const connection = this.connection;
@@ -97,7 +126,7 @@ export class BrowserPortClient {
         else reject(error);
       };
       const timer = setTimeout(cancel, 80_000);
-      this.pending.set(request.operationId, { request, settle });
+      this.pending.set(request.operationId, { request, settle, approval });
       signal.addEventListener('abort', cancel, { once: true });
       try {
         connection.port.postMessage(request);

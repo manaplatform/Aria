@@ -1,11 +1,19 @@
 import { Injectable } from '@nestjs/common';
 import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
-import { createOpenAI } from '@ai-sdk/openai';
+import { createOpenAI, openai } from '@ai-sdk/openai';
 import { streamText, type ModelMessage, type ToolSet } from 'ai';
 import type { Connection } from '../providers/providers.service';
 
 export const DEFAULT_SYSTEM_PROMPT =
   'You are Aria, a thoughtful, helpful general-purpose AI assistant. Answer clearly and naturally. Use Markdown when it improves readability.';
+
+export function nativeToolSearch(parameters: Record<string, unknown>): ToolSet[string] {
+  return openai.tools.toolSearch({
+    execution: 'client',
+    description: 'Load selected authorized tool schemas by their discovered IDs.',
+    parameters,
+  });
+}
 
 @Injectable()
 export class AiService {
@@ -37,6 +45,7 @@ export class AiService {
     system: string,
     tools?: ToolSet,
     forcedTool?: string,
+    disableTools = false,
   ): ReturnType<typeof streamText<ToolSet>> {
     const official = new URL(target.connection.baseUrl).origin === 'https://api.openai.com';
     return streamText({
@@ -49,7 +58,14 @@ export class AiService {
       system,
       messages,
       ...(tools
-        ? { tools, toolChoice: forcedTool ? { type: 'tool', toolName: forcedTool } : 'auto' }
+        ? {
+            tools,
+            toolChoice: disableTools
+              ? 'none'
+              : forcedTool
+                ? { type: 'tool', toolName: forcedTool }
+                : 'auto',
+          }
         : {}),
       abortSignal: signal,
       maxRetries: 0,

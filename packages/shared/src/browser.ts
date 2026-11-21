@@ -72,6 +72,9 @@ export const browserResponseSchema = z.strictObject({
     }),
   ]),
 });
+export const browserProgressSchema = browserResponseSchema.omit({ result: true }).extend({
+  progress: z.literal('approval'),
+});
 export const browserCancelSchema = z.strictObject({
   generation: webReference,
   operationId: webReference,

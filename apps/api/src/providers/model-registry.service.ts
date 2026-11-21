@@ -113,7 +113,24 @@ export class ModelRegistry {
     };
   }
 
-  async resolve(signal: AbortSignal, config = this.configuration(), includeLive = false) {
+  hasDelegateCandidates(config: RuntimeRegistry) {
+    const primary = config.connections.find((connection) =>
+      connection.models.some((model) => modelReference(connection.id, model.id) === config.primary),
+    );
+    return config.connections.some(
+      (connection) =>
+        connection.apiKey &&
+        (connection === primary || config.crossConnection) &&
+        connection.models.some((model) => model.enabled && model.delegate),
+    );
+  }
+
+  async resolve(
+    signal: AbortSignal,
+    config = this.configuration(),
+    includeLive = false,
+    primaryOnly = false,
+  ) {
     const primaryConnection = config.connections.find((connection) =>
       connection.models.some(
         (model) => model.enabled && modelReference(connection.id, model.id) === config.primary,
@@ -126,7 +143,7 @@ export class ModelRegistry {
     const connections = config.connections.filter(
       (connection) =>
         connection.apiKey &&
-        (connection.id === primaryConnection.id || config.crossConnection) &&
+        (connection.id === primaryConnection.id || (!primaryOnly && config.crossConnection)) &&
         (connection.id === primaryConnection.id ||
           connection.models.some(
             (model) =>

@@ -17,6 +17,7 @@ export interface BrowserBridgeSession {
 export function openBrowserBridge(
   browser: BrowserController,
   authorize: (request: BrowserRequest) => AbortSignal | undefined,
+  reserve?: (request: BrowserRequest, fingerprint: string, signal: AbortSignal) => Promise<boolean>,
 ): BrowserBridgeSession {
   const { port1, port2 } = new MessageChannelMain();
   const generation = randomUUID();
@@ -92,7 +93,22 @@ export function openBrowserBridge(
     active.set(request.operationId, controller);
     const signal = AbortSignal.any([controller.signal, parent, AbortSignal.timeout(remaining)]);
     void browser
-      .execute(request, signal)
+      .execute(request, signal, {
+        approval: () => {
+          if (!closed && !signal.aborted)
+            port1.postMessage({
+              v,
+              generation,
+              operationId,
+              requestId,
+              conversationId,
+              stepId,
+              op,
+              progress: 'approval',
+            });
+        },
+        reserve: (fingerprint) => reserve?.(request, fingerprint, signal) ?? Promise.resolve(false),
+      })
       .then(
         (result) => {
           if (!signal.aborted && active.get(request.operationId) === controller) send(result);

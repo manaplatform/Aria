@@ -9,3 +9,11 @@ AI DOM inspection runs fixed code in an isolated world. Node references are scop
 Conductor exposes only tools enabled for the run. Browser search uses the Brave website and sends no search API credentials. Search discoveries are transient. Publisher reads provide provenance used for persistent citations. Saved web policy, browser history, and session state live outside model configuration and conversation history. Approval payloads and AI page bodies are transient. Explicit screenshots use the existing artifact store and conversation retention.
 
 Automated fixtures should cover network denial, managed browser requests, source history, cancellation, and process isolation on the built macOS and Windows desktop. Local fixtures are evidence for those test cases. Public-site smoke tests, live provider acceptance, and third-party redistribution review are separate release checks. Validate the latest available security patch for the Electron series before shipping a build.
+
+## Tool authorization and retry
+
+The tool registry evaluates policy at discovery, definition load, and dispatch. Electron main hosts skill imports, native browser approvals, and the durable dispatch journal. The managed service gets a scoped port for approved resource reads and dispatch reservations. Each request is matched to the current service generation, policy revision, and active text turn or Live Voice session.
+
+Before an approved consequential action or billable model operation runs, the runtime records its reservation under the saved logical turn. A retry with the same logical turn cannot dispatch external actions after a previous attempt may have dispatched one. A fresh user turn can authorize a new action. A timeout after dispatch may leave the remote result uncertain. The journal stores hashes and attempt ownership, without tool inputs or approval values.
+
+Verify with the built macOS and Windows Electron suites, the API's native wire fixtures, and a live configured Responses smoke test where credentials are available. Test malformed archives, private-resource transfer restrictions, revocation, cancellation, and recovery after a reservation.

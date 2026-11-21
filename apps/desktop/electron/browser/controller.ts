@@ -751,7 +751,11 @@ export class BrowserController {
     }
   }
 
-  async execute(request: BrowserRequest, signal: AbortSignal) {
+  async execute(
+    request: BrowserRequest,
+    signal: AbortSignal,
+    lifecycle?: { approval(): void; reserve(fingerprint: string): Promise<boolean> },
+  ) {
     signal.throwIfAborted();
     if (!this.policy().enabled || !this.policy().aiBrowser)
       throw new BrowserError('UNAVAILABLE', 'AI browsing is disabled in Settings.');
@@ -972,7 +976,14 @@ export class BrowserController {
           plan.action,
           [...fields].map(([key, value]) => `${key}: ${value}`).join('\n'),
           active,
+          lifecycle?.approval,
         );
+        snapshot();
+        if (!(await lifecycle?.reserve(digest)))
+          throw new BrowserError(
+            'DUPLICATE_DISPATCH',
+            'An earlier dispatch may already have taken effect. Check the website.',
+          );
         snapshot();
         const permit = {
           contentsId: contents.id,
@@ -1030,7 +1041,18 @@ export class BrowserController {
         tab.state.url,
         `${observed.element?.label || observed.element?.tag || 'Page control'}${args.value === undefined ? '' : `\nValue: ${args.value}`}`,
         active,
+        lifecycle?.approval,
       );
+      const digest = createHash('sha256')
+        .update(JSON.stringify([request.op, tab.state.url, observed.fingerprint, args.value]))
+        .digest('hex');
+      snapshot();
+      if (!(await lifecycle?.reserve(digest)))
+        throw new BrowserError(
+          'DUPLICATE_DISPATCH',
+          'An earlier dispatch may already have taken effect. Check the website.',
+        );
+      snapshot();
       await inspect(
         {
           ...action,
@@ -1052,6 +1074,7 @@ export class BrowserController {
     destination: string,
     detail: string,
     signal: AbortSignal,
+    pending?: () => void,
   ) {
     if (
       !this.window ||
@@ -1065,6 +1088,7 @@ export class BrowserController {
       );
     const documentId = tab.documentId;
     const deadline = AbortSignal.any([signal, AbortSignal.timeout(60_000)]);
+    pending?.();
     const decision = await whenActive(
       dialog.showMessageBox(this.window, {
         message: action,

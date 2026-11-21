@@ -1,11 +1,14 @@
 import { z } from 'zod';
+import { capabilityId, type ToolProblem } from './capabilities.js';
 import { browserOps, browserToolArgs } from './browser.js';
 import { webToolArgs } from './web.js';
 import { identifier, modelCapabilitySchema, modelRefSchema } from './model-registry.js';
 
 export const conductorLimits = {
   milliseconds: 300_000,
-  primaryCalls: 6,
+  primaryCalls: 12,
+  controlCalls: 6,
+  activity: 24,
   steps: 12,
   parallel: 3,
   turns: 4,
@@ -33,7 +36,7 @@ export const stepId = z
   .min(1)
   .max(64)
   .regex(/^[a-zA-Z0-9_-]+$/);
-const referenceInput = z.discriminatedUnion('kind', [
+export const referenceInput = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('text'), text: z.string().max(16_000) }).strict(),
   z.object({ kind: z.literal('attachment'), id: z.string().uuid() }).strict(),
   z.object({ kind: z.literal('result'), stepId }).strict(),
@@ -53,7 +56,7 @@ export const executionStepSchema = z
       z
         .object({
           kind: z.literal('tool'),
-          tool: z.enum(toolIds),
+          tool: z.union([z.enum(toolIds), capabilityId]),
           model: modelRefSchema.nullable().describe('Use null for local tools.'),
         })
         .strict(),
@@ -61,6 +64,7 @@ export const executionStepSchema = z
     capability: z.union([
       modelCapabilitySchema,
       z.enum(['read-file', 'create-file', ...localWebToolIds]),
+      capabilityId,
     ]),
     instructions: z.string().trim().min(1).max(4000),
     args: z
@@ -73,16 +77,6 @@ export const executionStepSchema = z
     dependsOn: z.array(stepId).max(conductorLimits.steps),
     output: z.enum(outputKinds),
     summary: z.string().trim().min(1).max(200),
-  })
-  .strict();
-export const executionBatchSchema = z
-  .object({
-    steps: z.array(executionStepSchema).min(1).max(conductorLimits.steps),
-  })
-  .strict();
-export const unavailableSchema = z
-  .object({
-    capability: executionStepSchema.shape.capability,
   })
   .strict();
 export const sourceSchema = z
@@ -124,7 +118,19 @@ export const activitySchema = z
     capability: executionStepSchema.shape.capability,
     target: z.string().max(310),
     summary: z.string().max(200),
-    status: z.enum(['queued', 'running', 'completed', 'failed', 'blocked', 'cancelled']),
+    status: z.enum([
+      'queued',
+      'running',
+      'approval',
+      'processing',
+      'completed',
+      'failed',
+      'blocked',
+      'cancelled',
+    ]),
+    callId: z.string().max(256).optional(),
+    inputSummary: z.string().max(200).optional(),
+    resultSummary: z.string().max(200).optional(),
     at: z.number().int().nonnegative(),
     durationMs: z.number().int().nonnegative().optional(),
     error: z.string().max(400).optional(),
@@ -144,14 +150,16 @@ export const conductorAttemptSchema = z
   .object({
     requestId: identifier,
     run: runInfoSchema,
-    activity: z.array(activitySchema).max(conductorLimits.steps),
+    activity: z.array(activitySchema).max(conductorLimits.activity),
     outcome: z.enum(['completed', 'failed', 'interrupted', 'stopped']),
   })
   .strict();
 export type ConductorAttempt = z.infer<typeof conductorAttemptSchema>;
 export function endActivity(activity?: ConductorActivity[]): ConductorActivity[] | undefined {
   return activity?.map((step) =>
-    step.status === 'running' || step.status === 'queued' ? { ...step, status: 'cancelled' } : step,
+    ['running', 'queued', 'approval', 'processing'].includes(step.status)
+      ? { ...step, status: 'cancelled' }
+      : step,
   );
 }
 export type ExecutionStep = z.infer<typeof executionStepSchema>;
@@ -172,6 +180,7 @@ export type ConductorEvent =
       interrupted: boolean;
       run?: ConductorRunInfo;
       settingsHelp?: boolean;
+      problem?: ToolProblem;
     }
   | { type: 'stopped' };
 export const chatEventIdentity = z.object({

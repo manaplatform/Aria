@@ -15,6 +15,75 @@ export const fixtureDescriptors: Record<string, Record<string, unknown>> = {
   'unknown-model': {},
 };
 
+type FixtureStep = {
+  id: string;
+  target: { kind: 'model'; model: string } | { kind: 'tool'; tool: string; model: string | null };
+  capability: string;
+  instructions: string;
+  args?: Record<string, unknown>;
+  inputs: (
+    | { kind: 'text'; text: string }
+    | { kind: 'attachment'; id: string }
+    | { kind: 'result'; stepId: string }
+  )[];
+  dependsOn: string[];
+};
+type ToolReply = { name: string; input: unknown; provisional?: string };
+type OperationReply = {
+  name: 'fixture_operations';
+  input: { steps: FixtureStep[] };
+  provisional?: string;
+};
+const isOperations = (reply: ToolReply): reply is OperationReply =>
+  reply.name === 'fixture_operations';
+
+function descriptorId(step: FixtureStep) {
+  if (step.target.kind === 'model')
+    return `${['chat', 'vision'].includes(step.capability) ? 'models' : 'media'}.${step.capability.replace('-', '_')}`;
+  const { tool } = step.target;
+  return `${tool.startsWith('browser_') ? 'browser' : tool.startsWith('web_') ? 'web' : 'files'}.${tool}`;
+}
+
+function invocation(step: FixtureStep, ids: Map<string, string>): ToolReply {
+  const name = descriptorId(step).replaceAll('.', '_');
+  const dependsOn = step.dependsOn.map((id) => ids.get(id) ?? id);
+  if (step.target.kind === 'model') {
+    const inputs = step.inputs.map((input) =>
+      input.kind === 'result' ? { ...input, stepId: ids.get(input.stepId) ?? input.stepId } : input,
+    );
+    return {
+      name,
+      input: { modelRef: step.target.model, instructions: step.instructions, inputs, dependsOn },
+    };
+  }
+  if (step.target.tool === 'read_attachment') {
+    const attachment = step.inputs.find((input) => input.kind === 'attachment');
+    return { name, input: { attachmentId: attachment?.id } };
+  }
+  if (step.target.tool === 'create_text_artifact') {
+    const [input] = step.inputs;
+    return {
+      name,
+      input: {
+        filename: step.instructions,
+        dependsOn,
+        ...(input?.kind === 'result'
+          ? { resultId: ids.get(input.stepId) ?? input.stepId }
+          : { text: input?.kind === 'text' ? input.text : undefined }),
+      },
+    };
+  }
+  return { name, input: { args: step.args ?? {}, dependsOn } };
+}
+
+type OperationState = {
+  pending: FixtureStep[];
+  dispatched: FixtureStep[];
+  ids: Map<string, string>;
+  provisional?: string;
+  phase?: 'search' | 'load' | 'execute';
+};
+
 /** Test-only OpenAI-compatible server. Never imported by application builds. */
 export async function createProviderFixture() {
   const received: {
@@ -32,9 +101,11 @@ export async function createProviderFixture() {
   const voiceReceived: Record<string, unknown>[] = [];
   let models = Object.keys(fixtureDescriptors);
   const toolReplies = new Map<string, { name: string; input: unknown; provisional?: string }[]>();
-  type ToolReply = { name: string; input: unknown };
   const continuedReplies = new Map<string, ToolReply>();
   const toolResultReplies = new Map<string, (result: unknown) => ToolReply | undefined>();
+  const operations = new Map<string, OperationState>();
+  const finalReplies = new Map<string, string>();
+  let callSequence = 0;
   let livePrompt = 'Hello from my microphone.';
   let catalogStatus = 200;
   let cancelled = 0;
@@ -142,32 +213,108 @@ export async function createProviderFixture() {
       (body.tool_choice.function as { name: string }).name === 'verify_connection';
     const userPrompt =
       [...body.messages].reverse().find((item) => item.role === 'user')?.content ?? '';
+    const latestResults: {
+      id?: string;
+      items?: { id: string }[];
+      problem?: { message: string };
+      error?: string;
+    }[] = [];
+    for (
+      let index = body.messages.length - 1;
+      index >= 0 && body.messages[index].role === 'tool';
+      index--
+    )
+      latestResults.unshift(JSON.parse(body.messages[index].content));
     const continuation = last?.role === 'tool' && continuedReplies.get(userPrompt);
-    if (continuation) continuedReplies.delete(userPrompt);
-    const script = configuredTool
-      ? { name: 'verify_connection', input: { ok: true } }
-      : body.tools?.length
-        ? continuation ||
-          (last?.role === 'tool' && toolResultReplies.get(userPrompt)?.(JSON.parse(prompt))) ||
-          toolReplies.get(prompt)?.shift()
-        : undefined;
-    if (script) {
+    let script: ToolReply | undefined;
+    let scripts: ToolReply[] | undefined;
+    let operation = operations.get(userPrompt);
+    if (operation && last?.role !== 'tool') {
+      operations.delete(userPrompt);
+      operation = undefined;
+    }
+    if (operation?.phase === 'execute') {
+      const observed = operation.dispatched.map((step, index) => {
+        const result = latestResults[index] ?? {};
+        if (typeof result.id === 'string') operation!.ids.set(step.id, result.id);
+        return { ...result, id: step.id, error: result.problem?.message ?? result.error };
+      });
+      operation.dispatched = [];
+      if (!operation.pending.length) {
+        script = continuation || toolResultReplies.get(userPrompt)?.(observed);
+        if (continuation) continuedReplies.delete(userPrompt);
+        operation.phase = undefined;
+      }
+    } else if (!operation && body.tools?.length && !configuredTool) {
+      script =
+        continuation ||
+        (last?.role === 'tool' && toolResultReplies.get(userPrompt)?.(latestResults[0])) ||
+        toolReplies.get(userPrompt)?.shift();
+      if (continuation) continuedReplies.delete(userPrompt);
+    }
+    if (configuredTool) script = { name: 'verify_connection', input: { ok: true } };
+    if (script && isOperations(script)) {
+      operation ??= { pending: [], dispatched: [], ids: new Map() };
+      operation.pending = [...script.input.steps];
+      operation.provisional = script.provisional;
+      operations.set(userPrompt, operation);
+      script = undefined;
+    }
+    if (operation?.pending.length && !script) {
+      const listed = new Set(
+        (body.tools ?? []).flatMap((tool) => {
+          const entry = tool as { function?: { name?: string } };
+          return entry.function?.name ? [entry.function.name] : [];
+        }),
+      );
+      const ready = operation.pending.filter((step) =>
+        operation!.pending.every((candidate) => !step.dependsOn.includes(candidate.id)),
+      );
+      const group = ready.length ? ready : [operation.pending[0]];
+      const missing = [...new Set(group.map(descriptorId))].filter(
+        (id) => !listed.has(id.replaceAll('.', '_')),
+      );
+      if (missing.length && operation.phase === 'search') {
+        const found = new Set(
+          (latestResults[0]?.items ?? []).map((item: { id: string }) => item.id),
+        );
+        const ids = missing.filter((id) => found.has(id)).slice(0, 4);
+        if (ids.length) {
+          script = { name: 'load_capabilities', input: { ids } };
+          operation.phase = 'load';
+        } else {
+          script = { name: 'report_unavailable', input: { capability: group[0].capability } };
+          operations.delete(userPrompt);
+        }
+      } else if (missing.length) {
+        script = {
+          name: 'find_capabilities',
+          input: { query: '', ids: missing.slice(0, 8), kind: 'tools' },
+          provisional: operation.provisional,
+        };
+        operation.phase = 'search';
+        operation.provisional = undefined;
+      } else {
+        scripts = group.map((step) => invocation(step, operation!.ids));
+        operation.dispatched = group;
+        operation.pending = operation.pending.filter((step) => !group.includes(step));
+        operation.phase = 'execute';
+      }
+    }
+    if (!operation?.pending.length && !scripts && !script) operations.delete(userPrompt);
+    scripts ??= script ? [script] : undefined;
+    if (scripts?.length) {
       response.writeHead(200, { 'Content-Type': 'text/event-stream' });
       for (const [delta, finish_reason] of [
-        [
-          { role: 'assistant', content: 'provisional' in script ? script.provisional || '' : '' },
-          null,
-        ],
+        [{ role: 'assistant', content: script?.provisional ?? '' }, null],
         [
           {
-            tool_calls: [
-              {
-                index: 0,
-                id: 'tool-fixture-1',
-                type: 'function',
-                function: { name: script.name, arguments: JSON.stringify(script.input) },
-              },
-            ],
+            tool_calls: scripts.map((reply, index) => ({
+              index,
+              id: `tool-fixture-${++callSequence}`,
+              type: 'function',
+              function: { name: reply.name, arguments: JSON.stringify(reply.input) },
+            })),
           },
           null,
         ],
@@ -194,7 +341,8 @@ export async function createProviderFixture() {
     }
     response.writeHead(200, { 'Content-Type': 'text/event-stream' });
     const answer =
-      last?.role === 'tool'
+      finalReplies.get(userPrompt) ??
+      (last?.role === 'tool'
         ? `Result: ${prompt}`
         : prompt.includes('[long]')
           ? Array.from(
@@ -202,7 +350,7 @@ export async function createProviderFixture() {
               (_, index) =>
                 `Paragraph ${index + 1}. A useful explanation with enough detail to exercise the reading position.\n\n`,
             ).join('')
-          : `Hello from the test provider, 🌙.\n\nHere is a **streamed response** to “${prompt}”.\n\n| Idea | Next step |\n| --- | --- |\n| A little clarity | Start a conversation |\n\n\`\`\`typescript\nconst greeting = 'Hello, Aria';\n\`\`\``;
+          : `Hello from the test provider, 🌙.\n\nHere is a **streamed response** to “${prompt}”.\n\n| Idea | Next step |\n| --- | --- |\n| A little clarity | Start a conversation |\n\n\`\`\`typescript\nconst greeting = 'Hello, Aria';\n\`\`\``);
     const chunks = answer.match(/[\s\S]{1,18}/gu) ?? [];
     let index = 0;
     const send = (delta: unknown, finish: string | null = null) =>
@@ -291,12 +439,20 @@ export async function createProviderFixture() {
     voiceReceived,
     png,
     wav,
+    queueOperations: (prompt: string, input: { steps: FixtureStep[] }, provisional?: string) =>
+      toolReplies.set(prompt, [
+        ...(toolReplies.get(prompt) ?? []),
+        { name: 'fixture_operations', input, provisional },
+      ]),
+    continueWithOperations: (prompt: string, input: { steps: FixtureStep[] }) =>
+      continuedReplies.set(prompt, { name: 'fixture_operations', input }),
     queueTool: (prompt: string, name: string, input: unknown, provisional?: string) =>
       toolReplies.set(prompt, [...(toolReplies.get(prompt) ?? []), { name, input, provisional }]),
     continueWithTool: (prompt: string, name: string, input: unknown) =>
       continuedReplies.set(prompt, { name, input }),
     onToolResult: (prompt: string, handler: (result: unknown) => ToolReply | undefined) =>
       toolResultReplies.set(prompt, handler),
+    finalReply: (prompt: string, answer: string) => finalReplies.set(prompt, answer),
     setLivePrompt: (value: string) => {
       livePrompt = value;
     },

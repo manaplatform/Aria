@@ -124,3 +124,12 @@ When implementing AI features:
 - Require trusted user authorization for consequential browser actions. Apply public-network policy to page retrieval and Chromium egress. Keep personal sessions and credentials outside AI tool access.
 - Preserve conversation and settings data, and verify actual built macOS and Windows behavior when changing browser or process boundaries.
 - Update architecture, permissions, and test documentation when these boundaries change. Preserve third-party notices and add the standard MIT license and package metadata only after confirming authority to license the first-party work.
+
+## Conductor tools and skills
+
+- Conductor is the central orchestration authority. The configured primary chat model decides whether to answer directly, discover a tool, load a skill, invoke an authorized capability, or ask the user for information.
+- Register every tool with the shared registry and execution lifecycle. Declare its schema, permissions, provenance, side effects, dependencies, supported modes, and capability requirements. Add integration tests for its normal entry point and permission enforcement.
+- Keep Tool Search optional and model-driven. Load tool definitions, skill bodies, and skill resources progressively. Ordinary chat must work without tool invocation or project selection.
+- Keep semantic selection in the model. Hardcoded intent routing, model-name rules in the execution loop, and silent provider, model, or tool substitutions are prohibited.
+- Establish provider support from authenticated and validated capability evidence, explicit configuration, or a supported probe. Handle provider-specific protocol details in adapters.
+- Enforce authorization again at dispatch. Model decisions, tool outputs, and skill instructions grant no permissions. Keep approvals, scoped credentials, and dispatch protection in the trusted runtime.

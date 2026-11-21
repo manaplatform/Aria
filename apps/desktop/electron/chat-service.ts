@@ -11,6 +11,8 @@ import {
   type ChatServiceStatus,
   type MediaAsset,
   type RuntimeRegistry,
+  type CapabilityHostRequest,
+  type ToolPolicy,
 } from '@aria/shared';
 import { z } from 'zod';
 import WebSocket from 'ws';
@@ -26,6 +28,14 @@ interface BrowserIntegration {
   open(authorize: (request: BrowserRequest) => AbortSignal | undefined): BrowserBridgeSession;
 }
 
+interface CapabilityIntegration {
+  policy(registry: RuntimeRegistry): ToolPolicy;
+  open(
+    revision: string,
+    authorize: (request: CapabilityHostRequest) => AbortSignal | undefined,
+  ): Pick<BrowserBridgeSession, 'port' | 'close'>;
+}
+
 interface ActiveRequest {
   request: ChatRequest;
   controller: AbortController;
@@ -38,6 +48,7 @@ interface ActiveRequest {
 export class ChatService {
   private child?: UtilityProcess;
   private browserSession?: BrowserBridgeSession;
+  private capabilitySession?: Pick<BrowserBridgeSession, 'port' | 'close'>;
   private url = '';
   private token = '';
   private generation = 0;
@@ -51,6 +62,7 @@ export class ChatService {
     private readonly emitStatus: (status: ChatServiceStatus) => void,
     private readonly assets?: MediaStorage,
     private readonly browser?: BrowserIntegration,
+    private readonly capabilities?: CapabilityIntegration,
   ) {}
   getStatus(): ChatServiceStatus {
     return { ...this.status };
@@ -89,11 +101,12 @@ export class ChatService {
       }
       const registryRevision = registry.revision;
       const web = await this.browser?.runtime();
-      if (this.browser)
+      const tools = this.capabilities?.policy(registry);
+      if (this.browser || tools)
         registry = {
           ...registry,
           revision: createHash('sha256')
-            .update(JSON.stringify([registry.revision, this.browser.revision()]))
+            .update(JSON.stringify([registry.revision, this.browser?.revision(), tools?.revision]))
             .digest('hex'),
         };
       if (generation !== this.generation) return;
@@ -114,6 +127,14 @@ export class ChatService {
         return undefined;
       });
       this.browserSession = native;
+      const capabilityPort =
+        tools &&
+        this.capabilities?.open(tools.revision, (request) => {
+          if (generation !== this.generation) return;
+          return this.activeTurn(request);
+        });
+      this.capabilitySession = capabilityPort;
+      const transfer = [native?.port, capabilityPort?.port].filter((port) => port !== undefined);
       let sentConfiguration = false;
       const port = await new Promise<number>((resolve, reject) => {
         const timer = setTimeout(() => {
@@ -130,8 +151,13 @@ export class ChatService {
             if (sentConfiguration) return;
             sentConfiguration = true;
             child.postMessage(
-              { registry, ...(web && { web }), browserGeneration: native?.generation },
-              native ? [native.port] : undefined,
+              {
+                registry,
+                ...(web && { web }),
+                ...(tools && { tools }),
+                browserGeneration: native?.generation,
+              },
+              transfer,
             );
             return;
           }
@@ -162,6 +188,7 @@ export class ChatService {
       this.url = `http://127.0.0.1:${port}`;
       child.once('exit', () => {
         native?.close();
+        capabilityPort?.close();
         if (generation !== this.generation) return;
         ++this.generation;
         this.child = undefined;
@@ -197,6 +224,7 @@ export class ChatService {
     } catch (error) {
       if (generation === this.generation) {
         this.browserSession?.close();
+        this.capabilitySession?.close();
         this.child?.kill();
         this.url = '';
         this.setStatus({
@@ -271,6 +299,20 @@ export class ChatService {
     this.requests.set(request.requestId, active);
     active.done = this.consume(active);
     return active;
+  }
+  activeTurn(request: { requestId: string; conversationId: string; assistantMessageId?: string }) {
+    const turn = this.requests.get(request.requestId);
+    if (
+      !turn ||
+      turn.stopped ||
+      turn.request.conversationId !== request.conversationId ||
+      (request.assistantMessageId && turn.request.assistantMessageId !== request.assistantMessageId)
+    )
+      return;
+    return turn.controller.signal;
+  }
+  assistantForTurn(requestId: string) {
+    return this.requests.get(requestId)?.request.assistantMessageId;
   }
   submit(input: ChatRequest): void {
     this.begin(input);
@@ -441,6 +483,7 @@ export class ChatService {
     if (this.starting) await this.starting;
     ++this.generation;
     this.browserSession?.close();
+    this.capabilitySession?.close();
     this.child?.kill();
     this.child = undefined;
     this.url = '';
@@ -450,6 +493,7 @@ export class ChatService {
     ++this.generation;
     await this.cancelAll();
     this.browserSession?.close();
+    this.capabilitySession?.close();
     const child = this.child;
     this.child = undefined;
     if (!child) return;

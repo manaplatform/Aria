@@ -160,7 +160,7 @@ async function submit(
         .status,
     ).toBe(201);
   }
-  if (steps) fixture.queueTool(content, 'execute_steps', { steps }, 'Preparing your request.');
+  if (steps) fixture.queueOperations(content, { steps }, 'Preparing your request.');
   const response = await fetch(`${url}/chat/stream`, {
     method: 'POST',
     headers: jsonHeaders,
@@ -204,10 +204,12 @@ it('uses the same primary for semantic routing and synthesis and reuses image ge
   expect(generation.events.map((event) => event.type)).toContain('reset');
   expect(generation.events.at(-1)?.type).toBe('completed');
   expect(generation.bytes).toEqual([fixture.png]);
-  expect(fixture.received.slice(count).map((call) => call.body.model)).toEqual([
-    'fixture-model',
-    'fixture-model',
-  ]);
+  expect(fixture.received.slice(count).map((call) => call.body.model)).toEqual(
+    Array(4).fill('fixture-model'),
+  );
+  const requestTools = fixture.received.slice(count).map((call) => JSON.stringify(call.body.tools));
+  expect(requestTools[0]).not.toContain('media_image');
+  expect(requestTools[2]).toContain('media_image');
 
   const reference = file('reference.png', 'image/png', fixture.png);
   const edit = await read(
@@ -239,7 +241,7 @@ it.each([
     registry.install(snapshot);
     const prompt = `Make a panda image dancing (${target})`;
     const instructions = 'Create an image of a happy panda dancing.';
-    fixture.continueWithTool(prompt, 'execute_steps', {
+    fixture.continueWithOperations(prompt, {
       steps: [step('panda', 'gpt-image-2.6-flare', 'image', 'image', { instructions })],
     });
     const count = fixture.mediaReceived.length;
@@ -263,16 +265,17 @@ it.each([
       prompt: instructions,
     });
     const calls = fixture.received.slice(primaryCalls);
-    expect(calls.map((call) => call.body.model)).toEqual(Array(3).fill('fixture-model'));
-    expect(calls[1].body.messages.at(-1)?.content).toContain('No operation started');
-    expect(calls[0].body.messages[0].content).toContain(
-      JSON.stringify({
-        capability: 'image',
-        output: 'image',
-        target: { kind: 'model', model: fixtureRef('gpt-image-2.6-flare') },
-      }),
-    );
-    expect(result.events.filter((event) => event.type === 'activity')).toHaveLength(3);
+    expect(calls.map((call) => call.body.model)).toEqual(Array(5).fill('fixture-model'));
+    expect(calls[3].body.messages.at(-1)?.content).toContain('No operation started');
+    expect(calls[1].body.messages.at(-1)?.content).toContain(fixtureRef('gpt-image-2.6-flare'));
+    expect(
+      result.events.some(
+        (event) =>
+          event.type === 'activity' &&
+          event.activity.status === 'completed' &&
+          event.activity.target.includes('gpt-image-2.6-flare'),
+      ),
+    ).toBe(true);
   },
 );
 it('waits for a corrected primary decision after a target rejection without automatically choosing a model', async () => {
@@ -394,12 +397,12 @@ it('rejects a disabled target, a cycle, and a fabricated attachment before dispa
   const disabled = await read('Draw the first scene', [
     step('image', 'gpt-image-2.6-flare', 'image', 'image'),
   ]);
-  expect(disabled.text).toContain('unavailable for this capability');
+  expect(disabled.text).toContain('Enable a compatible image');
   const cyclic = await read('Handle these tasks', [
     step('a', 'test-model', 'chat', 'text', { dependsOn: ['b'] }),
     step('b', 'test-model', 'chat', 'text', { dependsOn: ['a'] }),
   ]);
-  expect(cyclic.text).toContain('cyclic dependency');
+  expect(cyclic.text).toContain('Reference only successful execution IDs');
   const fabricated = await read('Analyze that file', [
     step('vision', 'test-model', 'vision', 'text', {
       inputs: [{ kind: 'attachment', id: randomUUID() }],
@@ -468,7 +471,7 @@ it('blocks a model-requested replacement after a failed provider operation', asy
   });
   registry.install(snapshot);
   const prompt = 'Design a coastal illustration';
-  fixture.continueWithTool(prompt, 'execute_steps', {
+  fixture.continueWithOperations(prompt, {
     steps: [
       step('replacement', 'gpt-image-2.6-flare', 'image', 'image', {
         target: { kind: 'model', model: `${secondId}:gpt-image-2.6-flare` },
@@ -497,7 +500,7 @@ it('reads a native text attachment and prevents its contents from crossing conne
   registry.install(snapshot);
   const prompt = 'Read the note and consider the next action';
   const attachment = file('notes.txt', 'text/plain', Buffer.from('Private attachment contents'));
-  fixture.continueWithTool(prompt, 'execute_steps', {
+  fixture.continueWithOperations(prompt, {
     steps: [
       step('share', 'test-model', 'chat', 'text', {
         target: { kind: 'model', model: `${secondId}:test-model` },
@@ -522,7 +525,7 @@ it('reads a native text attachment and prevents its contents from crossing conne
       .slice(count)
       .every((request) => request.authorization === 'Bearer test-only-key'),
   ).toBe(true);
-  expect(fixture.received.slice(count)[1]?.body.messages.at(-1)?.content).toContain(
+  expect(fixture.received.slice(count)[3]?.body.messages.at(-1)?.content).toContain(
     'Private attachment contents',
   );
 });
