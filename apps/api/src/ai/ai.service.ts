@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
 import { createOpenAI, openai } from '@ai-sdk/openai';
 import { streamText, type ModelMessage, type ToolSet } from 'ai';
+import { modelOutputLimit } from '@aria/shared';
 import type { Connection } from '../providers/providers.service';
 import type { OpenAIProgramTransport } from '../providers/openai-program';
 
@@ -55,7 +56,7 @@ export class AiService {
   generate(
     messages: ModelMessage[],
     signal: AbortSignal,
-    target: { id: string; connection: Pick<Connection, 'apiKey' | 'baseUrl'> },
+    target: { id: string; contextTokens?: number; connection: Pick<Connection, 'apiKey' | 'baseUrl'> },
     system: string,
     tools?: ToolSet,
     forcedTool?: 'required' | { name: string },
@@ -68,6 +69,7 @@ export class AiService {
     },
   ): ReturnType<typeof streamText<ToolSet>> {
     const official = new URL(target.connection.baseUrl).origin === 'https://api.openai.com';
+    const outputLimit = modelOutputLimit(target.contextTokens);
     return streamText({
       model: this.model(target.connection, target.id, nativeOptions?.computerImages === true,
         nativeOptions?.program && { transport: nativeOptions.program, system }),
@@ -102,7 +104,7 @@ export class AiService {
       maxRetries: 0,
       streamRetries: 0,
       onError: () => undefined,
-      maxOutputTokens: forcedTool ? 512 : 4096,
+      maxOutputTokens: forcedTool ? Math.min(512, outputLimit) : outputLimit,
     });
   }
 }

@@ -172,10 +172,11 @@ export class ModelRegistry {
         const capabilities = capabilitiesFor(connection, descriptor, policy.declared);
         const ref = modelReference(connection.id, policy.id);
         models.set(ref, {
-          ...descriptor,
+          ...(descriptor.source === 'provider' ? descriptor : { id: descriptor.id, source: descriptor.source }),
           ref,
           connection,
           capabilities,
+          transport: descriptor.source === 'provider' ? descriptor.transport : policy.transport,
           delegate: policy.delegate,
           primaryEligible:
             capabilities.includes('chat') &&

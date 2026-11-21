@@ -38,6 +38,7 @@ export const providerEndpointSchema = z
     }
   }, 'Enter a valid provider endpoint without credentials, query, or fragment.');
 export const capabilityList = z.array(modelCapabilitySchema).max(modelCapabilities.length);
+export const modelTransportSchema = z.enum(['realtime', 'speech-api', 'inline-png', 'base64-image']);
 
 export const modelPolicySchema = z
   .object({
@@ -45,6 +46,7 @@ export const modelPolicySchema = z
     enabled: z.boolean(),
     delegate: z.boolean(),
     declared: capabilityList,
+    transport: modelTransportSchema.optional(),
   })
   .strict();
 export const connectionSchema = z
@@ -132,7 +134,7 @@ export interface DiscoveredModel {
   id: string;
   capabilities: ModelCapability[];
   source: 'provider' | 'documentation' | 'unknown';
-  transport?: 'realtime' | 'speech-api' | 'inline-png' | 'base64-image';
+  transport?: z.infer<typeof modelTransportSchema>;
   voices?: string[];
   contextTokens?: number;
   inputCost?: number;

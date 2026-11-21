@@ -70,6 +70,10 @@ export class OpenAIProgramTransport {
     return Boolean(this.previous);
   }
 
+  get storedResponseId() {
+    return this.retention === 'stored' ? this.previous?.id : undefined;
+  }
+
   begin(tools: ReadonlyMap<string, ProgramWireTool>) {
     this.exposed = new Map(tools);
     this.finished.clear();

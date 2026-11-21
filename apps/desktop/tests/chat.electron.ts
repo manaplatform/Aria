@@ -155,7 +155,7 @@ test('captures the approved full display into the originating draft for review',
         { id: 'selected', name: 'Selected', display_id: String(display.id), thumbnail: fakeImage, appIcon: empty },
       ];
     };
-    BrowserWindow.getAllWindows()[0].focus();
+    BrowserWindow.getAllWindows()[0].isFocused = () => true;
   });
   const share = page.getByRole('button', { name: 'Share full screen', exact: true });
   const remove = page.getByRole('button', { name: 'Remove Screen capture.jpg', exact: true });
@@ -192,7 +192,7 @@ test('selects and revokes a full screen in Settings from an unsent chat', async 
       if (!selected) throw new Error('Capture before display selection');
       return [{ id: 'selected', name: 'Display', display_id: String(display.id), thumbnail, appIcon: thumbnail }];
     };
-    BrowserWindow.getAllWindows()[0].focus();
+    BrowserWindow.getAllWindows()[0].isFocused = () => false;
   });
   await page.getByRole('textbox', { name: 'Message Aria' }).fill('Unsent draft');
   await page.getByRole('button', { name: 'Open settings', exact: true }).click();
@@ -200,13 +200,13 @@ test('selects and revokes a full screen in Settings from an unsent chat', async 
   const select = page.getByRole('button', { name: 'Select a full screen', exact: true });
   await expect(select).toBeEnabled();
   await select.click();
+  await expect(page.getByText('Focus Aria before selecting a display.')).toBeVisible();
+  await app.evaluate(({ BrowserWindow }) => {
+    BrowserWindow.getAllWindows()[0].isFocused = () => true;
+  });
+  await select.click();
   await expect(page.getByText('Start a local desktop session in this chat within two minutes.')).toBeVisible();
   await page.getByRole('checkbox', { name: 'Allow access until revoked', exact: true }).check();
-  await app.evaluate(({ app, BrowserWindow }) => {
-    if (process.platform === 'darwin') app.focus({ steal: true });
-    BrowserWindow.getAllWindows()[0].focus();
-  });
-  await expect.poll(() => app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].isFocused())).toBe(true);
   await select.click();
   await expect(page.getByText('This chat can use the selected display until you click Revoke or quit Aria.')).toBeVisible();
   await page.getByRole('button', { name: 'Revoke', exact: true }).click();

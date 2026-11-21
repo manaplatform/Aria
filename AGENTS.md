@@ -115,6 +115,7 @@ When implementing AI features:
 - Model selection belongs in Settings. A separate routing model, keyword-based intent classifier, static task-to-model mapping, provider preference order, or fallback provider/model violates this architecture.
 - Return actionable errors for configuration, capability, and invocation failures. An explicit retry uses the same authorized configuration.
 - Application code validates every model request and enforces permissions, input provenance, dependency rules, cancellation, deduplication, and resource limits. Provider and tool output is untrusted. Show concise decision summaries and keep hidden reasoning and credentials private.
+- Start ordinary chat with the selected primary. Investigation, planning, verification, discovery, and program execution are optional decisions driven by the task and observed results. Spend inference on semantic decisions. Use deterministic code for validation, scheduling, accounting, and result projection.
 
 ## Native web and browser
 
@@ -133,6 +134,7 @@ When implementing AI features:
 - Keep semantic selection in the model. Hardcoded intent routing, model-name rules in the execution loop, and silent provider, model, or tool substitutions are prohibited.
 - Establish provider support from authenticated and validated capability evidence, explicit configuration, or a supported probe. Handle provider-specific protocol details in adapters.
 - Enforce authorization again at dispatch. Model decisions, tool outputs, and skill instructions grant no permissions. Keep approvals, scoped credentials, and dispatch protection in the trusted runtime.
+- Build managed chat context from saved conversation records. Carry private provenance into direct and nested execution. Keep evidence receipts and published artifacts independent of activity presentation limits.
 
 ## Conductor execution and knowledge
 
@@ -157,3 +159,5 @@ When implementing AI features:
 - Execute generated code and executable skill resources inside a verified isolation boundary. Programs receive only scoped bindings, consume the parent budgets, and cannot expand permissions or launch nested programs.
 - Verify program results, evidence, and artifact references against trusted receipts. Keep program fingerprints, hidden provider state, and credentials out of renderer events. Journal reservations and outcomes and fence interrupted work before considering any retry.
 - Preserve provider protocol semantics in the adapter. Select the exact verified model and backend. Keep semantic routing model-driven and reject unsupported capabilities explicitly.
+- Charge nested calls and continuations to the same turn. Reserve before sending paid or provider-executed work. Use versioned results and observed changes to detect progress. After interruption, use authoritative receipts to reconcile an effect before admitting another attempt.
+- Extend the existing registry, scheduler, scoped ports, and desktop journal before introducing another runtime contract. Test new boundaries through ordinary chat and the relevant built desktop, and record backend-specific verification.

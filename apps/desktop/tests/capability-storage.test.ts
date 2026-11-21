@@ -3,9 +3,11 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { crc32 } from 'node:zlib';
-import { afterEach, beforeEach, expect, it } from 'vitest';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { CapabilityStorage } from '../electron/capability-storage';
 import { inspectBundle } from '../electron/skill-bundles';
+import { digest } from '../electron/runtime/store';
+import { OperationApproval } from '../electron/operation-approval';
 
 const instructions = 'Use the following method and reference the approved checklist.';
 const manifest = `---\nname: review-notes\ndescription: Review notes for unsupported claims.\nmetadata:\n  aria.dependencies: sources\n---\n${instructions}\n`;
@@ -105,7 +107,7 @@ it('reserves a guarded operation durably and blocks later attempts even when arg
     first.reserve('chat', 'turn', 'attempt-a', 'same', signal),
     first.reserve('chat', 'turn', 'attempt-a', 'same', signal),
   ]);
-  expect(concurrent).toEqual([true, false]);
+  expect(concurrent.filter(Boolean)).toHaveLength(1);
   const restarted = new CapabilityStorage(temporary);
   expect(await restarted.reserve('chat', 'turn', 'attempt-a', 'other operation', signal)).toBe(
     true,
@@ -118,6 +120,57 @@ it('reserves a guarded operation durably and blocks later attempts even when arg
     restarted.reserve('chat', 'cancelled', 'attempt-b', 'same', AbortSignal.abort()),
   ).rejects.toThrow();
   expect(await restarted.reserve('chat', 'cancelled', 'attempt-b', 'same', signal)).toBe(true);
+});
+
+it('imports the legacy file fence and denies late receipts after restart', async () => {
+  const directory = path.join(temporary, 'tool-dispatch', digest('chat'), digest('turn'));
+  await fs.mkdir(directory, { recursive: true });
+  await fs.writeFile(path.join(directory, 'attempt'), digest('previous'));
+  await fs.writeFile(path.join(directory, digest('legacy-effect')), '');
+  const storage = new CapabilityStorage(temporary);
+  const signal = new AbortController().signal;
+  try {
+    expect(await storage.reserve('chat', 'turn', 'next', 'changed', signal)).toBe(false);
+    expect(await storage.reserve('chat', 'turn', 'previous', 'legacy-effect', signal)).toBe(false);
+    expect(await storage.reserve('chat', 'other', 'current', 'result', signal)).toBe(true);
+    storage.runtimeStore.close();
+    expect(storage.runtimeStore.settleDispatch('chat', 'other', 'current', 'result', 'completed')).toBe(false);
+    expect(storage.runtimeStore.db.prepare("SELECT state FROM dispatch_receipts WHERE request = 'current'").get())
+      .toMatchObject({ state: 'uncertain' });
+  } finally {
+    storage.runtimeStore.close();
+  }
+});
+
+it('deduplicates pending approval within an operation and skips cancelled prompts', async () => {
+  let confirm!: (allowed: boolean) => void;
+  const prompt = vi.fn(() => new Promise<boolean>((resolve) => { confirm = resolve; }));
+  const approval = new OperationApproval(prompt);
+  const foreground = new AbortController();
+  const pending = new AbortController();
+  const first = approval.approve('Approve operation', 'Destination A', foreground.signal);
+  const duplicate = approval.approve('Approve operation', 'Destination A', foreground.signal);
+  const next = approval.approve('Approve operation', 'Destination B', pending.signal);
+  await Promise.resolve();
+  pending.abort();
+  await expect(next).resolves.toBe(false);
+  confirm(true);
+  await expect(Promise.all([first, duplicate])).resolves.toEqual([true, true]);
+  expect(prompt).toHaveBeenCalledTimes(1);
+});
+
+it('fences all waiters when an active approval is revoked', async () => {
+  let complete!: (value: boolean) => void;
+  const prompt = vi.fn(() => new Promise<boolean>((resolve) => { complete = resolve; }));
+  const approval = new OperationApproval(prompt);
+  const scope = new AbortController();
+  const decision = approval.approve('Approve operation', 'Destination', scope.signal);
+  const duplicate = approval.approve('Approve operation', 'Destination', scope.signal);
+  await Promise.resolve();
+  scope.abort();
+  await expect(Promise.all([decision, duplicate])).resolves.toEqual([false, false]);
+  complete(true);
+  expect(prompt).toHaveBeenCalledTimes(1);
 });
 
 function archive(files: { name: string; data: Buffer; mode?: number }[]) {

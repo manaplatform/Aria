@@ -63,6 +63,8 @@ const bridge: DesktopBridge = {
   superviseProgram: (request, conversation, id, pause) =>
     ipcRenderer.invoke('aria:supervise-program', request, conversation, id, pause),
   inspectProgramResult: (conversation, id) => ipcRenderer.invoke('aria:inspect-program-result', conversation, id),
+  recoverStoredResponse: (conversation, message, request) =>
+    ipcRenderer.invoke('aria:recover-stored-response', conversation, message, request),
   executionHistory: () => ipcRenderer.invoke('aria:execution-history'),
   runtimeSettings: () => ipcRenderer.invoke('aria:runtime-settings'),
   saveRuntimeSettings: (settings) => ipcRenderer.invoke('aria:save-runtime-settings', settings),

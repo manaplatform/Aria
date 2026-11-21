@@ -86,6 +86,7 @@ export class Conductor {
     let toolContext: import('./tool-registry').ToolContext | undefined;
     let hosted: HostedProgramTurn | undefined;
     let budget: TurnBudget | undefined;
+    let storedResponses = false;
     const runInfo = () =>
       primary
         ? {
@@ -94,6 +95,7 @@ export class Conductor {
             revision,
             billableChildStarted: engine?.billableChildStarted ?? false,
             ...(toolContext?.privateContent && { privateContent: true }),
+            ...(storedResponses && { storedResponses: true }),
             usage: {
               providerRequests: budget?.providerRequests ?? 0,
               responseContinuations: budget?.responseContinuations ?? 0,
@@ -143,16 +145,13 @@ export class Conductor {
           ? 'openai-responses'
           : 'aria';
       const protocol = discoveryProtocol(mode);
-      if (
-        !protocol.supports(
+      const discoveryProblem = !protocol.supports(
           registry.primary.connection.baseUrl,
           process.env.ARIA_MANAGED !== '1' || policy.nativeVerified === true,
-        )
-      )
-        throw new ToolError(
+        ) ? new ToolError(
           'CAPABILITY_UNAVAILABLE',
           'OpenAI Tool Search requires a verified official Responses model. Review Tools settings.',
-        );
+        ) : undefined;
       engine = new ExecutionEngine(
         request,
         context,
@@ -170,9 +169,12 @@ export class Conductor {
         emit,
         protocol,
         voiceSessionId,
+        discoveryProblem,
       );
       const programming = context.runtime && policy.programming?.backend !== 'off'
         ? policy.programming : undefined;
+      storedResponses = programming?.backend === 'openai-responses' &&
+        programming.continuation === 'stored' && policy.nativeProgramVerified === true;
       const broker = programming && new ProgramBroker(engine, this.tools, emit, signal);
       if (broker) context.readProgramResult = (id, offset) => broker.read(id, offset);
       if (programming?.backend === 'managed' && broker)
@@ -189,6 +191,7 @@ export class Conductor {
         registry.config.systemPrompt || DEFAULT_SYSTEM_PROMPT,
         ...(process.env.ARIA_MANAGED === '1' && !voiceSessionId ? [replyFormattingPrompt] : []),
         'Answer directly when the request needs no external evidence or action. Discover tools only when their functionality is needed. Use relevant skills for specialized procedures and read supporting resources as needed. Choose authorized targets and actions based on this conversation and observed results. Ask the user when a needed detail is missing.',
+        ...(discoveryProblem ? [discoveryProblem.message] : []),
         'Use find_capabilities for metadata, then load the relevant tool schemas by ID. For model operations, choose an exact discovered modelRef and delegate the minimum context. Refer to preceding results by execution ID. URLs for browser navigation and publisher reads require user or tool provenance. Cite publisher evidence using its returned links. Wait for any required approval and verify consequential outcomes where possible.',
         ...(context.runtime
           ? [
@@ -269,6 +272,7 @@ export class Conductor {
         historicalMessages = prepared.historicalMessages;
         signal.throwIfAborted();
         const settleNative = budget.native(nativeLimit);
+        const nativeReceipt = nativeLimit ? await engine.reserveNative(budget.providerRequests) : undefined;
         let nativeCompleted = 0;
         const response = this.ai.generate(
           messages,
@@ -301,14 +305,10 @@ export class Conductor {
             }
             if (part.type === 'raw') hosted?.transport.accept(part.rawValue);
             if (part.type === 'tool-call') {
-              if (part.providerExecuted && nativeComputerActive && part.toolName === 'computer_use')
-                throw new ToolError(
-                  'CAPABILITY_UNAVAILABLE',
-                  'The configured primary returned a Computer Use protocol that Aria has not authorized.',
-                );
               if (!part.providerExecuted) calls.push(part);
-              else if (part.toolName === hostedProgramName && !hosted)
-                throw new ToolError('CALLER_MISMATCH', 'The provider returned an unauthorized program.');
+              else if (!Object.hasOwn(nativeTools, part.toolName) &&
+                !(part.toolName === hostedProgramName && hosted && hostedBindings.size))
+                throw new ToolError('CALLER_MISMATCH', 'The provider returned an unreserved hosted operation.');
             }
             if (part.type === 'tool-result') {
               const hostedSearch = part.toolName === 'aria_native_file_search' && active?.search &&
@@ -350,6 +350,7 @@ export class Conductor {
                     at: Date.now(),
                     capability: hostedSearch ? 'knowledge.prepare_search' : 'shell.run',
                     target: 'OpenAI Responses',
+                    effect: hostedShell ? 'billable' : 'read',
                     summary: hostedSearch ? 'Search hosted documents' : 'Run hosted shell commands',
                     status: 'completed',
                     evidence: checked?.evidence,
@@ -366,7 +367,8 @@ export class Conductor {
               throw new ToolError('BUDGET_EXCEEDED', 'The primary returned too many tool calls.');
           }
         } catch (error) {
-          if (protocol.rejected(error))
+          if (nativeReceipt) await nativeReceipt('uncertain').catch(() => undefined);
+          if (!discoveryProblem && protocol.rejected(error))
             throw new ToolError(
               'CAPABILITY_UNAVAILABLE',
               'The primary rejected this native Tool Search request. Review the model and discovery mode in Tools settings.',
@@ -376,11 +378,27 @@ export class Conductor {
         signal.throwIfAborted();
         prepared.settle(await response.usage);
         settleNative(nativeCompleted);
+        if (nativeReceipt) await nativeReceipt('completed');
         const previousProgramProblem = hosted?.outcome;
         await hosted?.receive(calls.map(({ toolCallId }) => toolCallId));
         if (hosted) {
           engine.partial ||= hosted.partial;
           if (hosted.outcome) problem = hosted.outcome;
+          const responseId = hosted.transport.storedResponseId;
+          if (context.runtime && responseId && /^resp_[A-Za-z0-9_-]{1,240}$/.test(responseId)) {
+            const final = Boolean(hosted.finalText && hosted.final && !hosted.pending && !calls.length &&
+              !engine.failed && !engine.partial && !problem);
+            await this.tools.host.runtime({
+              ...context.runtime, type: 'runtime', operation: 'program.checkpoint',
+              revision: policy.revision, stepId: requestId, callId: requestId,
+              primary: {
+                connectionId: registry.primary.connection.id,
+                model: registry.primary.id,
+                endpoint: registry.primary.connection.baseUrl,
+              },
+              input: { responseId, final, privateContent: context.privateContent },
+            }, AbortSignal.any([signal, AbortSignal.timeout(2000)])).catch(() => undefined);
+          }
           if (!calls.length && (!hosted.final || hosted.pending || hosted.outcome !== previousProgramProblem)) {
             hosted.transport.addResults([]);
             if (synthesis)
@@ -532,7 +550,7 @@ export class Conductor {
           if (Object.hasOwn(exposed, call.toolName) && turn.isControl(call.toolName)) {
             const result = await turn.control(call.toolName, call.input, call.toolCallId);
             append(call, result.value, turn.resultFormat(call.toolName) === 'json');
-            problem = result.error
+            problem = result.error && !(unavailable && problem)
               ? { code: result.error.code, message: result.error.message }
               : problem;
             unavailable ||= result.unavailable ?? false;
@@ -625,7 +643,7 @@ export class Conductor {
           };
           const first = allowed(call);
           if (!first) {
-            problem = {
+            problem = unavailable && problem ? problem : {
               code: 'CAPABILITY_UNAVAILABLE',
               message: 'Discover and load the tool before invoking it.',
             };

@@ -61,6 +61,7 @@ export class CapabilityTurn {
     private readonly emit: (event: ConductorEvent) => void,
     private readonly protocol: ReturnType<typeof discoveryProtocol>,
     private readonly voiceSessionId?: string,
+    private readonly discoveryProblem?: ToolError,
   ) {}
 
   delegates = () => (this.delegateSnapshot ??= this.registry.delegates(this.context, this.signal));
@@ -122,8 +123,9 @@ export class CapabilityTurn {
           'Find authorized tool and skill metadata for a task. Use an empty query and a namespace or kind to browse. For delegated models, use modelQuery or modelOffset to refine the exact model targets. This does not execute an operation.',
         inputSchema: findInput,
       }),
-      [this.protocol.name]: this.protocol.apiTool,
+      ...(!this.discoveryProblem && { [this.protocol.name]: this.protocol.apiTool }),
     };
+    if (this.discoveryProblem) return tools;
     if (this.registry.host.current.skills.some((skill) => skill.enabled)) {
       tools.load_skill = tool({
         description:
@@ -190,6 +192,7 @@ export class CapabilityTurn {
     try {
       this.signal.throwIfAborted();
       this.context.budget.control();
+      if (this.discoveryProblem) throw this.discoveryProblem;
       let value: object;
       if (name === 'find_capabilities') {
         const query = findInput.parse(raw);
@@ -218,6 +221,8 @@ export class CapabilityTurn {
           resource?.offset,
         );
         resultSummary = resource ? 'Skill resource returned' : 'Skill instructions loaded';
+      } else {
+        throw new ToolError('CAPABILITY_UNAVAILABLE', 'This discovery operation is unavailable.');
       }
       activity('completed');
       return { value };
@@ -235,7 +240,11 @@ export class CapabilityTurn {
       activity('failed', error.message);
       if (name === this.protocol.name && this.protocol.emptyResult)
         return { value: this.protocol.emptyResult, error };
-      return { value: { error: { code: error.code, message: error.message } }, error };
+      return {
+        value: { error: { code: error.code, message: error.message } },
+        error,
+        ...(error.code === 'CAPABILITY_UNAVAILABLE' && { unavailable: true }),
+      };
     }
   }
 

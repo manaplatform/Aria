@@ -12,6 +12,71 @@ const host = 'aria-fixture.example';
 const ip = '93.184.216.34';
 const url = `http://${host}/study`;
 
+test('reads a public publisher and searches Brave through the built browser', async () => {
+  test.skip(process.env.ARIA_RUN_PUBLIC_BROWSER_SMOKE !== '1', 'Requires reachable public sites.');
+  const provider = await createProviderFixture();
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'aria-public-browser-'));
+  let app: ElectronApplication | undefined;
+  try {
+    const env = {
+      ...process.env,
+      ARIA_TEST_DATA_DIR: directory,
+      OPENAI_BASE_URL: provider.baseUrl,
+      OPENAI_MODEL: 'fixture-model',
+      OPENAI_API_KEY: 'test-only-key',
+    };
+    delete (env as NodeJS.ProcessEnv).VITE_DEV_SERVER_URL;
+    delete (env as NodeJS.ProcessEnv).ELECTRON_RUN_AS_NODE;
+    app = await electron.launch({ args: [root], env });
+    const page = await app.firstWindow();
+    await expect.poll(() => page.evaluate(() => window.aria!.chatStatus()), { timeout: 20_000 })
+      .toMatchObject({ state: 'ready' });
+    await page.evaluate(async () => {
+      await window.aria!.importRegistryEnvironment();
+      const { warning, ...policy } = await window.aria!.webSettings();
+      if (warning) throw new Error('Could not load temporary web settings.');
+      await window.aria!.saveWebSettings({ ...policy, aiBrowser: true });
+    });
+    await expect.poll(() => page.evaluate(() => window.aria!.chatStatus()))
+      .toMatchObject({ state: 'ready', configured: true });
+    const ask = async (prompt: string, step: ExecutionStep) => {
+      provider.queueOperations(prompt, { steps: [step] });
+      let received: unknown;
+      provider.onToolResult(prompt, (value) => {
+        received = value;
+        return undefined;
+      });
+      await page.getByRole('textbox', { name: 'Message Aria' }).fill(prompt);
+      await page.getByRole('button', { name: 'Send message', exact: true }).click();
+      await expect.poll(() => received, { timeout: 25_000 }).toBeDefined();
+      return received;
+    };
+    const publisher = 'https://example.com/';
+    const fetched = await ask(`Read ${publisher}`, {
+      id: 'publisher', target: { kind: 'tool', tool: 'web_fetch', model: null },
+      capability: 'web_fetch', instructions: 'Read the public publisher', summary: 'Read publisher',
+      inputs: [], dependsOn: [], output: 'data', args: { url: publisher },
+    });
+    expect(fetched).toEqual([expect.objectContaining({
+      status: 'completed',
+      sources: [expect.objectContaining({ url: publisher, title: 'Example Domain' })],
+    })]);
+    await expect(page.locator('.from-assistant').last()).toHaveAttribute('data-status', 'completed');
+    const searched = await ask('Search for the IANA example domains page', {
+      id: 'search', target: { kind: 'tool', tool: 'web_search', model: null },
+      capability: 'web-search', instructions: 'Search for IANA example domains', summary: 'Search the web',
+      inputs: [], dependsOn: [], output: 'data', args: { query: 'IANA example domains' },
+    });
+    expect(searched).toEqual([expect.objectContaining({
+      status: 'completed', data: expect.objectContaining({ status: 'results', results: expect.any(Array) }),
+    })]);
+  } finally {
+    await app?.close();
+    await provider.close();
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
 function testTone() {
   const rate = 8_000;
   const samples = rate * 5;

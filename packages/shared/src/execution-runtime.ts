@@ -141,6 +141,7 @@ export const runtimeCallSchema = z.strictObject({
     z.literal('program.exchange'),
     z.literal('program.stop'),
     z.literal('program.journal'),
+    z.literal('program.checkpoint'),
   ]),
   stepId: id,
   callId: z.string().min(1).max(256),

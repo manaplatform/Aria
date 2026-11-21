@@ -18,6 +18,8 @@ const require = createRequire(import.meta.url);
 const { createApi } = require('../dist/main.js') as typeof import('../src/main');
 const { ToolRegistry } =
   require('../dist/conductor/tool-registry.js') as typeof import('../src/conductor/tool-registry');
+const { ModelRegistry } =
+  require('../dist/providers/model-registry.service.js') as typeof import('../src/providers/model-registry.service');
 
 const { CapabilityHost } =
   require('../dist/conductor/capability-host.js') as typeof import('../src/conductor/capability-host');
@@ -50,7 +52,7 @@ afterEach(async () => {
   vi.unstubAllEnvs();
 });
 
-async function chat(content: string) {
+async function chat(content: string, privateHistory = false) {
   const response = await fetch(url + '/chat/stream', {
     method: 'POST',
     headers,
@@ -58,6 +60,7 @@ async function chat(content: string) {
       requestId: randomUUID(),
       conversationId: 'chat',
       assistantMessageId: randomUUID(),
+      programPrivateHistory: privateHistory,
       messages: [{ role: 'user', content }],
     }),
   });
@@ -269,8 +272,17 @@ it.each([
     expect(params[3].previous_response_id).toBe('resp_2');
     expect(params[4].input).toEqual([]);
   }
-  expect(journal.map(({ input }) => input.action)).toEqual(['open', 'reserve', 'receipt', 'finish']);
+  expect(journal.filter(({ operation }) => operation === 'program.journal')
+    .map(({ input }) => input.action)).toEqual(['open', 'reserve', 'receipt', 'finish']);
+  const checkpoints = journal.filter(({ operation }) => operation === 'program.checkpoint');
+  if (continuation === 'stateless') expect(checkpoints).toHaveLength(0);
+  else expect(checkpoints.map(({ input }) => input)).toEqual([
+    { responseId: 'resp_2', final: false, privateContent: false },
+    { responseId: 'resp_3', final: false, privateContent: false },
+    { responseId: 'resp_4', final: true, privateContent: false },
+  ]);
   expect(JSON.stringify(events)).not.toContain('opaque-state');
+  expect(JSON.stringify(events)).not.toContain('resp_4');
 });
 
 it.each(['Hello there', 'Why are some clouds gray?'])(
@@ -357,11 +369,47 @@ it('loads a relevant skill and combines it with registered work', async () => {
 
 it('returns a structured capability error for an incompatible native configuration without fallback', async () => {
   vi.stubEnv('ARIA_TOOL_DISCOVERY', 'openai-responses');
+  expect((await chat('Hello')).at(-1)).toMatchObject({ type: 'completed' });
+  fixture.queueTool('Use a tool', 'find_capabilities', { query: 'temperature' });
   expect((await chat('Use a tool')).at(-1)).toMatchObject({
     type: 'failed',
     problem: { code: 'CAPABILITY_UNAVAILABLE' },
   });
+  expect(fixture.received).toHaveLength(3);
+  expect(JSON.stringify(fixture.received.map(({ body }) => body.tools))).not.toMatch(/tool_search|load_capabilities/);
+});
+
+it('rejects an unavailable exact tool from discovery without loading it', async () => {
+  fixture.queueTool('Find the unavailable connector', 'find_capabilities', {
+    query: 'coding', ids: ['coding.mana_agent'],
+  });
+  const events = await chat('Find the unavailable connector');
+  expect(events.at(-1)).toMatchObject({
+    type: 'failed', settingsHelp: true, problem: { code: 'CAPABILITY_UNAVAILABLE' },
+  });
+  expect(fixture.received).toHaveLength(2);
+});
+
+it('rejects a spending-capped turn before sending an unpriced model request', async () => {
+  const configuration = app.get(ModelRegistry).configuration();
+  app.get(ModelRegistry).install({ ...configuration, spendingLimitUsdMicros: 1000 });
+  const events = await chat('Hello');
+  expect(events.at(-1)).toMatchObject({
+    type: 'failed', problem: { code: 'CAPABILITY_UNAVAILABLE', message: expect.stringContaining('verified rate') },
+  });
   expect(fixture.received).toHaveLength(0);
+});
+
+it('reports non-progress to the same primary after repeated identical discovery', async () => {
+  const prompt = 'Find the reference';
+  const input = { query: 'reference', ids: ['example.lookup'] };
+  registerExample();
+  for (let index = 0; index < 3; index++)
+    fixture.queueTool(prompt, 'find_capabilities', input);
+  const events = await chat(prompt);
+  expect(events.at(-1)).toMatchObject({ type: 'completed', partial: true });
+  expect(fixture.received).toHaveLength(4);
+  expect(JSON.stringify(fixture.received.at(-1)?.body.messages)).toContain('NO_PROGRESS');
 });
 
 it('uses native client search then replays only the selected namespace with the same call ID', async () => {
@@ -525,6 +573,14 @@ it('revokes outbound tools after an approved imported skill returns private inst
   expect(browserDispatch).not.toHaveBeenCalled();
   expect(JSON.stringify(fixture.received[2].body.tools)).toContain('web_web_search');
   expect(JSON.stringify(fixture.received[3].body.tools)).not.toContain('web_web_search');
+  fixture.queueTool('Continue the private note', 'find_capabilities', {
+    query: 'search', ids: ['web.web_search'],
+  });
+  expect((await chat('Continue the private note', true)).at(-1)).toMatchObject({
+    type: 'failed',
+    problem: { code: 'CAPABILITY_UNAVAILABLE', message: expect.stringContaining('private') },
+  });
+  expect(browserDispatch).not.toHaveBeenCalled();
 });
 
 const liveEnabled = process.env.ARIA_RUN_MODEL_EVALS === '1';

@@ -431,6 +431,8 @@ export interface DesktopBridge {
   setProgramSettings(settings: ProgramSettings): Promise<ToolSettings>;
   superviseProgram(requestId: string, conversationId: string, id: string, pause: boolean): Promise<void>;
   inspectProgramResult(conversationId: string, id: string): Promise<string>;
+  recoverStoredResponse(conversationId: string, messageId: string, requestId: string):
+    Promise<{ content: string; privateContent: boolean }>;
   previewSkill(kind: 'directory' | 'zip'): Promise<SkillPreview | null>;
   approveSkill(token: string): Promise<ToolSettings>;
   manageSkill(skill: SkillRef, action: 'enable' | 'disable' | 'remove'): Promise<ToolSettings>;

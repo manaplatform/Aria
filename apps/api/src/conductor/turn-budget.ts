@@ -1,9 +1,7 @@
 import { asSchema, type LanguageModelUsage, type ModelMessage, type ToolSet } from 'ai';
-import { conductorLimits } from '@aria/shared';
+import { conductorLimits, modelOutputLimit } from '@aria/shared';
 import type { ResolvedModel } from '../providers/model-registry.service';
 import { ToolError } from './capability-host';
-
-export const modelOutputTokens = 4096;
 
 function exceeds(resource: string): never {
   throw new ToolError('BUDGET_EXCEEDED', `The turn reached its ${resource} limit.`);
@@ -27,6 +25,9 @@ export class TurnBudget {
   private inputReserved = 0;
   private outputReserved = 0;
   private cost = 0;
+  private readonly artifacts = new Set<string>();
+  private artifactBytes = 0;
+  private pendingArtifacts = 0;
   providerRequests = 0;
   responseContinuations = 0;
   controlCalls = 0;
@@ -47,7 +48,6 @@ export class TurnBudget {
 
   control() {
     if (this.controlCalls >= conductorLimits.controlCalls) exceeds('discovery and skill');
-    this.step();
     this.controlCalls++;
   }
 
@@ -60,11 +60,28 @@ export class TurnBudget {
     };
   }
 
-  media() {
+  rejectUnpriced(operation: string) {
     if (this.spendingLimit !== undefined)
-      throw new ToolError('CAPABILITY_UNAVAILABLE', 'This media operation has no verified rate for your turn spending cap.');
+      throw new ToolError('CAPABILITY_UNAVAILABLE', `${operation} has no verified rate for your turn spending cap.`);
+  }
+
+  media() {
+    this.rejectUnpriced('This media operation');
     if (!this.remainingRequests) exceeds('model request');
     this.providerRequests++;
+  }
+
+  artifact() {
+    if (this.artifacts.size + this.pendingArtifacts >= conductorLimits.artifacts)
+      exceeds('artifact count');
+    this.pendingArtifacts++;
+    return (published?: { id: string; size: number }) => {
+      this.pendingArtifacts--;
+      if (!published || this.artifacts.has(published.id)) return;
+      if (this.artifactBytes + published.size > conductorLimits.artifactBytes) exceeds('artifact storage');
+      this.artifacts.add(published.id);
+      this.artifactBytes += published.size;
+    };
   }
 
   async prepare(
@@ -83,7 +100,7 @@ export class TurnBudget {
     const ceiling = Math.min(
       model.contextTokens ?? conductorLimits.contextTokens,
       conductorLimits.contextTokens,
-    ) - modelOutputTokens;
+    ) - modelOutputLimit(model.contextTokens);
     while (input > ceiling && historicalMessages >= 2) {
       messages.splice(0, 2);
       historicalMessages -= 2;
@@ -94,7 +111,7 @@ export class TurnBudget {
   }
 
   model(model: ResolvedModel, input: number, continuation = false, textOnly = true) {
-    const output = modelOutputTokens;
+    const output = modelOutputLimit(model.contextTokens);
     if (input + output > (model.contextTokens ?? conductorLimits.contextTokens))
       exceeds('model context');
     if (!this.remainingRequests) exceeds('model request');

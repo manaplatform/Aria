@@ -132,5 +132,5 @@ it('shows documented capabilities and distinguishes known unsupported operations
   expect(screen.getByText('No supported Aria operations')).toBeVisible();
   expect(screen.queryByText('Unknown capabilities')).toBeNull();
   expect(screen.queryByText('Provider catalog lists only the ID')).toBeNull();
-  expect(screen.queryByRole('button', { name: 'Capabilities' })).toBeNull();
+  expect(screen.getAllByRole('button', { name: 'Capabilities' })).toHaveLength(1);
 });

@@ -57,7 +57,6 @@ function describeModel(item: Record<string, unknown>, baseUrl: string): Discover
   const transport = item.transport;
   const pricing = textPricingSchema.safeParse(item.textPricing);
   return {
-    ...documented,
     id,
     capabilities: [...new Set(capabilities)],
     source: 'provider',

@@ -444,6 +444,7 @@ export class ChatService {
               },
               controller.signal,
             );
+          if (active.stopped) break;
           this.recentlyPublished(asset.id);
           if (this.newlyPublished.size >= 128) {
             const oldest = this.newlyPublished.keys().next().value;

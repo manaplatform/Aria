@@ -593,6 +593,20 @@ export class ToolRegistry {
               'CAPABILITY_UNAVAILABLE',
               'Verify the exact OpenAI runtime mode in Tools settings first.',
             );
+          const nativeComputer = operation === 'computer.open' && input.mode === 'openai-responses';
+          if (nativeFeature === 'hosted-shell' || nativeFeature === 'file-search' || nativeComputer)
+            context.budget.rejectUnpriced('This provider-native operation');
+          if ((nativeFeature || nativeComputer) &&
+            (this.host.current.discovery === 'openai-responses' ||
+              (nativeComputer && context.native &&
+                (context.native.active.search || context.native.active.shell)) ||
+              (nativeFeature && context.computer?.mode === 'openai-responses') ||
+              (nativeFeature === 'file-search' && context.native?.active.shell) ||
+              (nativeFeature && nativeFeature !== 'file-search' && context.native?.active.search)))
+            throw new ToolError(
+              'CAPABILITY_UNAVAILABLE',
+              'This combination of native tools has no verified protocol. Select one native runtime and Aria discovery.',
+            );
           if (
             operation === 'shell.open' &&
             context.native?.active.shell &&
@@ -710,7 +724,6 @@ export class ToolRegistry {
                   )
                   .then((result) => result.data),
               );
-              if (needsUpload) await context.native.recover(signal);
             }
             if (needsUpload) {
               const versions = z.record(z.string(), z.string()).parse(data?.versions);

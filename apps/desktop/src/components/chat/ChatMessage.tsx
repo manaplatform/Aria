@@ -2,7 +2,7 @@ import { useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Activity, ExternalLink, RotateCcw } from 'lucide-react';
 import type { ChatMessage as Message, ConductorActivity } from '@aria/shared';
-import { generating, regenerateChat, useChatStore } from '../../stores/chatStore';
+import { generating, regenerateChat, updateChat, useChatStore } from '../../stores/chatStore';
 import { AriaMark } from '../layout/AriaMark';
 import { Button, CopyButton } from '../ui';
 import { desktop, errorMessage, openExternal } from '../../services/desktop';
@@ -84,6 +84,53 @@ function SavedProgramResult({ conversation, id }: { conversation: string; id: st
   );
 }
 
+
+function ActivityList({ steps, message, live }: {
+  steps: ConductorActivity[];
+  message: Message;
+  live?: boolean;
+}) {
+  const ids = new Set(steps.map(({ stepId }) => stepId));
+  const groups: ConductorActivity[][] = [];
+  for (const step of steps) {
+    if (step.parentStepId && ids.has(step.parentStepId)) continue;
+    const previous = groups.at(-1);
+    const head = previous?.[0];
+    if (head && step.status === 'completed' && head.status === step.status &&
+      (step.capability === 'conductor.discovery' || step.capability === 'conductor.skills') &&
+      head.capability === step.capability && head.summary === step.summary) previous.push(step);
+    else groups.push([step]);
+  }
+  const row = (step: ConductorActivity) => {
+    const children = steps.filter(({ parentStepId }) => parentStepId === step.stepId);
+    return (
+      <ActivityRow key={step.stepId} step={step}>
+        {live && step.capability === 'programs.run' && step.target === 'Aria isolated JavaScript' &&
+          step.status === 'running' && <ProgramControls message={message} id={step.stepId} />}
+        {step.programResultSaved && <SavedProgramResult conversation={message.conversationId} id={step.stepId} />}
+        {children.length > 0 && (
+          <details>
+            <summary>{children.length} tool {children.length === 1 ? 'call' : 'calls'}</summary>
+            <ul>{children.map((child) => <ActivityRow key={child.stepId} step={child} />)}</ul>
+          </details>
+        )}
+      </ActivityRow>
+    );
+  };
+  return (
+    <ul>
+      {groups.map(([first, ...rest]) => rest.length ? (
+        <li key={first.stepId}>
+          <details>
+            <summary>{first.summary} · {rest.length + 1} calls</summary>
+            <ul>{[first, ...rest].map(row)}</ul>
+          </details>
+        </li>
+      ) : row(first))}
+    </ul>
+  );
+}
+
 export function ChatMessage({
   message,
   last,
@@ -96,6 +143,7 @@ export function ChatMessage({
   name: string;
 }) {
   const [selectedEvidence, setSelectedEvidence] = useState<string | null>(null);
+  const [recovery, setRecovery] = useState<{ pending: boolean; error?: string }>({ pending: false });
   const evidence = useMemo(
     () => [
       ...new Map(
@@ -169,26 +217,7 @@ export function ChatMessage({
                 : activeStep?.summary || 'Conductor activity'}{' '}
             · {message.activity.length}
           </summary>
-          <ul>
-            {message.activity
-              .filter((step) => !step.parentStepId || !message.activity?.some(({ stepId }) => stepId === step.parentStepId))
-              .map((step) => {
-                const child = message.activity?.filter(({ parentStepId }) => parentStepId === step.stepId) ?? [];
-                return (
-                  <ActivityRow key={step.stepId} step={step}>
-                    {step.capability === 'programs.run' && step.target === 'Aria isolated JavaScript' &&
-                      step.status === 'running' && busy && <ProgramControls message={message} id={step.stepId} />}
-                    {step.programResultSaved && <SavedProgramResult conversation={message.conversationId} id={step.stepId} />}
-                    {child.length > 0 && (
-                      <details>
-                        <summary>{child.length} tool {child.length === 1 ? 'call' : 'calls'}</summary>
-                        <ul>{child.map((item) => <ActivityRow key={item.stepId} step={item} />)}</ul>
-                      </details>
-                    )}
-                  </ActivityRow>
-                );
-              })}
-          </ul>
+          <ActivityList steps={message.activity} message={message} live={busy} />
         </details>
       ) : null}
       {evidence.length > 0 && (
@@ -231,12 +260,7 @@ export function ChatMessage({
             {message.attempts.map((attempt) => (
               <li key={attempt.requestId}>
                 {attempt.outcome} · {attempt.run.primaryName ?? attempt.run.primary}
-                {attempt.activity.map((step) => (
-                  <small key={step.stepId}>
-                    {step.summary} ·{' '}
-                    {step.status === 'approval' ? 'Waiting for approval' : step.status}
-                  </small>
-                ))}
+                <ActivityList steps={attempt.activity} message={message} />
               </li>
             ))}
           </ul>
@@ -289,8 +313,33 @@ export function ChatMessage({
         </Link>
       )}
       {message.status === 'stopped' && <p className="chat-response-note">Response stopped</p>}
+      {recovery.error && <p className="chat-response-error" role="alert">{recovery.error}</p>}
       {!busy && (
         <div className="chat-message-actions">
+          {message.status === 'interrupted' && message.run?.storedResponses && (
+            <Button variant="ghost" size="sm" disabled={recovery.pending} onClick={async () => {
+              setRecovery({ pending: true });
+              try {
+                const result = await desktop().recoverStoredResponse(message.conversationId, message.id, message.requestId);
+                updateChat((current) => ({
+                  ...current,
+                  messages: current.messages.map((item) =>
+                    item.id === message.id && item.requestId === message.requestId && item.status === 'interrupted'
+                      ? {
+                          ...item, content: result.content, status: 'completed', error: undefined,
+                          retryConfirmed: false,
+                          run: item.run && { ...item.run, privateContent: result.privateContent },
+                        }
+                      : item),
+                }));
+                setRecovery({ pending: false });
+              } catch (error) {
+                setRecovery({ pending: false, error: errorMessage(error) });
+              }
+            }}>
+              {recovery.pending ? 'Checking stored response…' : 'Recover stored response'}
+            </Button>
+          )}
           {message.content && (
             <CopyButton
               text={message.content}

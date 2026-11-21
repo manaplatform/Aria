@@ -51,6 +51,7 @@ import { LocalComputer } from './runtime/local-computer';
 import { openAIRuntimeFeatureSchema, runtimeSettingsSchema } from '@aria/shared';
 import { MediaStorage, referencedAssets } from './media-storage';
 import { captureDisplay, chooseDisplay } from './screen-capture';
+import { OperationApproval } from './operation-approval';
 import { MediaService, liveRequestSchema } from './media-service';
 import { chatRequestSchema } from './chat-protocol';
 import {
@@ -714,6 +715,19 @@ function registerIpc(): void {
   handle('aria:inspect-program-result', (conversation, id) =>
     executionRuntime.inspectProgramResult(identifier.parse(conversation), z.string().uuid().parse(id)),
   );
+  handle('aria:recover-stored-response', async (conversation, message, request) => {
+    const conversationId = identifier.parse(conversation);
+    const messageId = identifier.parse(message);
+    const requestId = identifier.parse(request);
+    const eligible = () => initial.data.chat.messages.some((item) =>
+      item.conversationId === conversationId && item.id === messageId &&
+      item.requestId === requestId && item.status === 'interrupted' && item.run?.storedResponses);
+    if (!eligible()) throw new Error('The stored response does not belong to an interrupted turn.');
+    chat.assertConversationIdle(conversationId);
+    const result = await executionRuntime.recoverStoredResponse(conversationId, messageId, requestId);
+    if (!eligible()) throw new Error('The interrupted turn changed during recovery.');
+    return result;
+  });
   async function importFiles(filenames: string[], kind: 'image' | 'audio' | 'text' | 'any') {
     if (filenames.length > 4 || filenames.some((file) => !path.isAbsolute(file)))
       throw new Error('Choose up to four files from your device.');
@@ -950,7 +964,7 @@ app
     provider = new ProviderStorage(directory, cipher);
     capabilities = new CapabilityStorage(directory);
     await capabilities.load();
-    const approve = async (message: string, detail: string, signal: AbortSignal) => {
+    const approvals = new OperationApproval(async (message, detail, signal) => {
       signal.throwIfAborted();
       if (!mainWindow || mainWindow.isDestroyed()) return false;
       const { response } = await dialog.showMessageBox(mainWindow, {
@@ -964,7 +978,11 @@ app
         signal,
       });
       return response === 1 && !signal.aborted;
-    };
+    }, {
+      begin: (scope, fingerprint) => capabilities.runtimeStore.beginApproval(scope, fingerprint),
+      finish: (id, decision) => capabilities.runtimeStore.finishApproval(id, decision),
+    });
+    const approve = approvals.approve.bind(approvals);
     executionRuntime = new DesktopRuntime(
       directory,
       assets,
@@ -1094,9 +1112,15 @@ app
                     request.requestId,
                     fingerprint,
                     signal,
+                    { id: `browser.${request.op}`, stepId: request.stepId,
+                      callId: request.operationId, revision: webSettings.revision },
                   )
                 : Promise.resolve(false);
             },
+            (request, work) => approvals.within({
+              conversation: request.conversationId, request: request.requestId, step: request.stepId,
+              operation: request.op, binding: [webSettings.revision, request.args],
+            }, work),
           ),
       },
       {
@@ -1137,9 +1161,13 @@ app
             (request, signal) => {
               if (request.programId)
                 executionRuntime.store.assertProgramChild(request, chat.executionIdentity());
-              return request.operation.startsWith('computer.')
+              return approvals.within({
+                conversation: request.conversationId, request: request.requestId, step: request.stepId,
+                operation: request.operation,
+                binding: [request.revision, request.primary, request.input, request.programId],
+              }, () => request.operation.startsWith('computer.')
                 ? computerRuntime.dispatch(request, signal)
-                : executionRuntime.dispatch(request, signal);
+                : executionRuntime.dispatch(request, signal));
             },
           ),
       },
@@ -1149,7 +1177,7 @@ app
     );
     registerIpc();
     createWindow();
-    void chat.start();
+    void chat.start().then(() => executionRuntime.cleanHostedResources());
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow();
     });

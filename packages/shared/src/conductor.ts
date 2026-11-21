@@ -56,12 +56,18 @@ export const conductorLimits = {
   searches: 2,
   inputTokens: 600_000,
   outputTokens: 65_536,
+  maxModelOutputTokens: 4096,
   contextTokens: 160_000,
   resultCharacters: 12_000,
   attachmentBytes: 80_000_000,
   artifactBytes: 64_000_000,
   artifacts: 4,
 } as const;
+
+export function modelOutputLimit(contextTokens?: number) {
+  if (contextTokens === undefined) return conductorLimits.maxModelOutputTokens;
+  return Math.min(conductorLimits.maxModelOutputTokens, Math.max(1, Math.floor(contextTokens / 4)));
+}
 export const toolIds = [
   'read_attachment',
   'create_text_artifact',
@@ -201,6 +207,7 @@ export const runInfoSchema = z
     primaryName: z.string().max(310).optional(),
     billableChildStarted: z.boolean(),
     privateContent: z.boolean().optional(),
+    storedResponses: z.boolean().optional(),
     usage: z.strictObject({
       providerRequests: z.number().int().nonnegative(),
       responseContinuations: z.number().int().nonnegative(),

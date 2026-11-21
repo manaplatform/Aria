@@ -21,7 +21,7 @@ Loaded descriptors define caller modes and program eligibility. Conductor checks
 
 Managed programs can pause at the tool dispatch boundary and resume from chat activity while the turn is active. Child calls already dispatched can settle. Stop cancels the chat and fences new dispatch. Programs preserve verified evidence and artifacts and return a structured complete, partial, failed, cancelled, or uncertain result.
 
-SQLite schema version 4 adds program and child metadata and encrypted, conversation-scoped program results. Conversations and existing execution and document records are preserved. Completed or partial results can be inspected from activity for up to 24 hours when OS encryption is available. Interrupted reservations become uncertain and are fenced from silent replay. OpenAI response IDs, opaque fingerprints, raw replay state, and JavaScript source are kept out of activity and logs. Live continuation works inside the active turn. Crash-time replay tokens remain in memory, so an interrupted hosted program cannot be reattached from history.
+SQLite v4 introduced encrypted, conversation-scoped program results. Schema v5 imports legacy dispatch fences into SQLite, and v6 adds encrypted Stored Responses checkpoints. Completed or partial saved program results can be inspected from activity for up to 24 hours when OS encryption is available. Interrupted reservations become uncertain. An interrupted turn can recover a final Stored response from the same OpenAI scope when Conductor already verified completion. Outstanding work requires review of the available receipts. Stateless replay data stays in turn memory. Provider IDs, opaque fingerprints, and program source stay out of activity and logs.
 
 ## Six-tool audit
 

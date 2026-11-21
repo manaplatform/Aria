@@ -581,9 +581,10 @@ function ConnectionCard({
           };
           const discovered = descriptors.get(id);
           const unknown = discovered && discovered.source !== 'provider';
-          const unsupported = discovered && !unknown && !discovered.capabilities.length;
+          const unsupported = discovered && discovered.source !== 'unknown' && !discovered.capabilities.length;
           const missing = Boolean(catalog.models && !discovered);
-          const capabilities = unknown ? model.declared : (discovered?.capabilities ?? []);
+          const capabilities = model.declared.length && unknown
+            ? model.declared : (discovered?.capabilities ?? []);
           return (
             <li key={id}>
               <div className="registry-model-row">
@@ -638,7 +639,7 @@ function ConnectionCard({
                   />{' '}
                   Delegation
                 </label>
-                {unknown && (
+                {unknown && !unsupported && (
                   <Button
                     type="button"
                     variant="ghost"
@@ -650,7 +651,7 @@ function ConnectionCard({
                   </Button>
                 )}
               </div>
-              {expanded === id && unknown && (
+              {expanded === id && unknown && !unsupported && (
                 <div className="registry-declarations">
                   {modelCapabilities
                     .filter(
@@ -674,7 +675,8 @@ function ConnectionCard({
                         {labels[capability]}
                       </label>
                     ))}
-                  {model.declared.includes('chat') && model.declared.includes('tools') && (
+                  {((model.declared.includes('chat') && model.declared.includes('tools')) ||
+                    (discovered?.source === 'documentation' && discovered.capabilities.includes('chat'))) && (
                     <Button
                       type="button"
                       size="sm"
@@ -684,6 +686,18 @@ function ConnectionCard({
                     >
                       {verified(id) ? 'Verify again' : 'Verify for primary'}
                     </Button>
+                  )}
+                  {model.declared.some((capability) => ['speech', 'image', 'image-edit'].includes(capability)) && (
+                    <Field label="Media API transport">
+                      <select value={model.transport ?? ''} disabled={disabled} onChange={(event) =>
+                        setModel({ ...model, transport: event.target.value
+                          ? event.target.value as typeof model.transport : undefined })}>
+                        <option value="">Standard API</option>
+                        {model.declared.includes('speech') && <option value="realtime">Realtime speech</option>}
+                        {model.declared.some((capability) => capability === 'image' || capability === 'image-edit') &&
+                          <option value="inline-png">Inline PNG images</option>}
+                      </select>
+                    </Field>
                   )}
                   {verified(id) && <span className="muted">Function calling verified</span>}
                 </div>

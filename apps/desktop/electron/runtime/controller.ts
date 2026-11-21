@@ -4,6 +4,8 @@ import { stripVTControlCharacters } from 'node:util';
 import {
   evidenceSchema,
   executionLimits,
+  modelReference,
+  officialOpenAI,
   programSkillSource,
   programLimits,
   programJournalSchema,
@@ -35,6 +37,11 @@ import { digest, RuntimeError, RuntimeStore } from './store';
 import { ProgramRuntime } from './programs';
 
 type RuntimeRequest = Extract<CapabilityHostRequest, { type: 'runtime' }>;
+const storedCheckpointSchema = z.strictObject({
+  responseId: z.string().regex(/^resp_[A-Za-z0-9_-]{1,240}$/),
+  final: z.boolean(),
+  privateContent: z.boolean(),
+});
 type Grant = (title: string, detail: string, signal: AbortSignal) => Promise<boolean>;
 
 function checked<T>(result: { success: true; data: T } | { success: false }): T {
@@ -67,6 +74,8 @@ export class DesktopRuntime {
   private readonly unavailable = new Set<string>();
   private readonly verified = new Set<string>();
   private sweepTimer?: ReturnType<typeof setInterval>;
+  private hostedCleanup = Promise.resolve();
+  private readonly stopping = new AbortController();
 
   constructor(
     private readonly directory: string,
@@ -162,6 +171,32 @@ export class DesktopRuntime {
     signal.throwIfAborted();
     if (request.operation === 'artifacts.publish') await this.expireArtifacts();
     switch (request.operation) {
+      case 'program.checkpoint': {
+        const input = checked(storedCheckpointSchema.safeParse(request.input));
+        const provider = this.providerIdentity();
+        const settings = this.skills.policy().programming;
+        if (!provider || request.primary.endpoint.replace(/\/$/, '') !== officialOpenAI ||
+          settings?.backend !== 'openai-responses' || settings.continuation !== 'stored' ||
+          !(await this.programCipher.available()))
+          throw new RuntimeError('CAPABILITY_UNAVAILABLE', 'Encrypted stored-response recovery is unavailable.');
+        const payload = await this.programCipher.encrypt(JSON.stringify(input));
+        signal.throwIfAborted();
+        if (provider !== this.providerIdentity())
+          throw new RuntimeError('PERMISSION_DENIED', 'The provider changed before recording this response.');
+        const now = Date.now();
+        this.store.transaction(() => {
+          this.store.db.prepare('DELETE FROM provider_checkpoints WHERE expires <= ?').run(now);
+          this.store.db.prepare(`
+            INSERT INTO provider_checkpoints VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(conversation, turn, request) DO UPDATE SET
+              payload = excluded.payload, expires = excluded.expires
+            WHERE provider_checkpoints.provider = excluded.provider
+              AND provider_checkpoints.revision = excluded.revision
+          `).run(request.conversationId, request.assistantMessageId, request.requestId, provider,
+            request.revision, payload, now + 24 * 60 * 60_000);
+        });
+        return {};
+      }
       case 'program.journal': {
         const provider = this.providerIdentity();
         const settings = this.skills.policy().programming;
@@ -567,7 +602,7 @@ ${
       JSON.stringify([
         request.primary,
         files.map(({ asset, bytes }) => [asset.id, digest(bytes)]).sort(),
-        ...(request.programId ? [request.programId, request.operation, request.input] : []),
+        request.revision, request.operation, request.input, request.programId ?? null,
       ]),
     );
     const grants = this.grants.get(request.requestId) ?? new Set<string>();
@@ -599,6 +634,40 @@ ${
     void this.programs.release(requestId);
     if (this.skills.policy().programming?.backend && this.skills.policy().programming?.backend !== 'off')
       this.store.interruptPrograms(requestId);
+    if (this.store.hasHostedResources(requestId)) this.cleanHostedResources(requestId);
+  }
+
+  cleanHostedResources(requestId?: string) {
+    if (!this.store.hasHostedResources(requestId)) return;
+    this.hostedCleanup = this.hostedCleanup.then(async () => {
+      const identity = this.providerIdentity();
+      if (!identity || this.stopping.signal.aborted) return;
+      const select = this.store.db.prepare(`
+        SELECT path FROM hosted_resources WHERE provider = ?
+          AND (? IS NULL OR request = ?) ORDER BY path LIKE '/files/%', created LIMIT 24
+      `);
+      const rows = select.all(identity, requestId ?? null, requestId ?? null);
+      if (!rows.length) return;
+      const registry = await this.resolveRegistry();
+      const connection = registry.connections.find((item) =>
+        item.baseUrl.replace(/\/$/, '') === officialOpenAI &&
+        item.models.some((model) => modelReference(item.id, model.id) === registry.primary));
+      if (!connection?.apiKey || this.providerIdentity() !== identity) return;
+      for (const row of rows) {
+        if (this.stopping.signal.aborted || this.providerIdentity() !== identity) return;
+        const resource = String(row.path);
+        if (!/^\/(containers|files|vector_stores)\/[A-Za-z0-9_-]{4,100}$/.test(resource)) continue;
+        const response = await fetch(officialOpenAI + resource, {
+          method: 'DELETE', redirect: 'error',
+          headers: { Authorization: `Bearer ${connection.apiKey}` },
+          signal: AbortSignal.any([this.stopping.signal, AbortSignal.timeout(3000)]),
+        }).catch(() => undefined);
+        await response?.body?.cancel().catch(() => undefined);
+        if (response?.ok || response?.status === 404)
+          this.store.db.prepare('DELETE FROM hosted_resources WHERE provider = ? AND path = ?')
+            .run(identity, resource);
+      }
+    }).catch(() => undefined);
   }
 
   private async search(
@@ -608,10 +677,10 @@ ${
   ) {
     const semantic = input.mode === 'semantic' || input.mode === 'hybrid';
     const target = this.store.settings.embeddingTarget;
-    const remote =
-      semantic && target
-        ? RemoteEmbeddings.resolve(await this.resolveRegistry(), target)
-        : undefined;
+    const registry = semantic && target ? await this.resolveRegistry() : undefined;
+    if (registry?.spendingLimitUsdMicros !== undefined)
+      throw new RuntimeError('CAPABILITY_UNAVAILABLE', 'Remote embeddings have no verified rate for your turn spending cap.');
+    const remote = registry && target ? RemoteEmbeddings.resolve(registry, target) : undefined;
     if (semantic && !remote && !(await this.embeddings.available()))
       throw new RuntimeError(
         'CAPABILITY_UNAVAILABLE',
@@ -1177,23 +1246,88 @@ ${files
       SELECT id, version FROM artifacts WHERE conversation = ? AND request = ?
         AND state = 'available' ORDER BY created LIMIT 4
     `);
-    let changed = false;
-    const recovered = await Promise.all(messages.map(async (message) => {
-      if (message.role !== 'assistant' || (message.assets?.length ?? 0) >= 4) return message;
+    let recovered: ChatMessage[] | undefined;
+    for (const [index, message] of messages.entries()) {
+      if (message.role !== 'assistant' || (message.assets?.length ?? 0) >= 4) continue;
       const current = message.assets ?? [];
       const rows = get.all(message.conversationId, message.requestId)
         .filter(({ id }) => !current.some((asset) => asset.id === id));
-      if (!rows.length) return message;
+      if (!rows.length) continue;
       const additions: MediaAsset[] = [];
       for (const row of rows.slice(0, 4 - current.length)) {
         const saved = await this.assets.get(String(row.id)).catch(() => undefined);
         if (saved && digest(saved.bytes) === row.version) additions.push({ ...saved.asset, managed: true });
       }
-      if (!additions.length) return message;
-      changed = true;
-      return { ...message, assets: [...current, ...additions] };
-    }));
-    return changed ? recovered : messages;
+      if (!additions.length) continue;
+      recovered ??= [...messages];
+      recovered[index] = { ...message, assets: [...current, ...additions] };
+    }
+    return recovered ?? messages;
+  }
+
+  async recoverStoredResponse(conversation: string, turn: string, request: string) {
+    const provider = this.providerIdentity();
+    const policy = this.skills.policy();
+    if (!provider || policy.programming?.backend !== 'openai-responses' ||
+      policy.programming.continuation !== 'stored')
+      throw new Error('Stored response recovery requires the original OpenAI configuration.');
+    const row = this.store.db.prepare(`
+      SELECT payload FROM provider_checkpoints WHERE conversation = ? AND turn = ? AND request = ?
+        AND provider = ? AND revision = ? AND expires > ?
+    `).get(conversation, turn, request, provider, policy.revision, Date.now());
+    if (!row || !ArrayBuffer.isView(row.payload) || !(await this.programCipher.available()))
+      throw new Error('The encrypted response checkpoint is unavailable or expired.');
+    const { result } = await this.programCipher.decrypt(Buffer.from(row.payload as Uint8Array));
+    const checkpoint = storedCheckpointSchema.parse(JSON.parse(result));
+    if (!checkpoint.final)
+      throw new Error('The interrupted response has outstanding work. Review its activity before retrying.');
+    const registry = await this.resolveRegistry();
+    const connection = registry.connections.find((item) =>
+      item.baseUrl.replace(/\/$/, '') === officialOpenAI &&
+      item.models.some((model) => modelReference(item.id, model.id) === registry.primary));
+    if (!connection?.apiKey || !registry.primary || this.providerIdentity() !== provider ||
+      this.skills.policy().revision !== policy.revision)
+      throw new Error('The OpenAI configuration changed. The stored response is unavailable.');
+    const reply = await fetch(`${officialOpenAI}/responses/${checkpoint.responseId}`, {
+      headers: { Authorization: `Bearer ${connection.apiKey}` },
+      redirect: 'error',
+      signal: AbortSignal.any([this.stopping.signal, AbortSignal.timeout(10_000)]),
+    }).catch(() => undefined);
+    if (!reply?.ok || !reply.body) {
+      await reply?.body?.cancel().catch(() => undefined);
+      throw new Error('OpenAI could not return the stored response.');
+    }
+    const reader = reply.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if ((size += value.byteLength) > 1_500_000) throw new Error('The stored response exceeded its size limit.');
+        chunks.push(value);
+      }
+    } finally {
+      await reader.cancel().catch(() => undefined);
+    }
+    const entry = z.object({
+      id: z.literal(checkpoint.responseId),
+      status: z.literal('completed'),
+      output: z.array(z.object({ type: z.string() }).passthrough()).max(48),
+    }).safeParse(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+    if (!entry.success || this.providerIdentity() !== provider || this.skills.policy().revision !== policy.revision)
+      throw new Error('The stored response could not be verified.');
+    const text = entry.data.output.filter((item) =>
+      item.type === 'message' && item.role === 'assistant' && item.phase !== 'commentary' &&
+      (item.status === 'completed' || item.status === undefined)).at(-1)?.content;
+    const parts = z.array(z.object({
+      type: z.string(), text: z.string().max(100_000).optional(), refusal: z.string().max(100_000).optional(),
+    })).max(48).safeParse(text);
+    if (!parts.success) throw new Error('The stored response has no verified final message.');
+    const content = parts.data.map((part) =>
+      part.type === 'output_text' ? part.text : part.type === 'refusal' ? part.refusal : '').join('\n').trim();
+    if (!content || content.length > 100_000) throw new Error('The stored response has no usable final message.');
+    return { content, privateContent: checkpoint.privateContent };
   }
 
   evidence(id: string, conversation: string) {
@@ -1239,6 +1373,8 @@ ${files
   }
 
   async close() {
+    this.stopping.abort();
+    await this.hostedCleanup;
     await this.programs.release();
     this.embeddings.close();
     if (this.sweepTimer) {

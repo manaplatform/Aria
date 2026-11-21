@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { setTimeout as wait } from 'node:timers/promises';
 import { openai } from '@ai-sdk/openai';
 import type { ToolSet } from 'ai';
 import { z } from 'zod';
@@ -129,7 +130,10 @@ export class OpenAIRuntime {
     const { id } = resourceId.parse(await this.json(path, 'POST', signal, body));
     const resource = `${path}/${id}`;
     this.resources.add(resource);
-    await this.journal?.({ action: 'register', path: resource }, signal);
+    if (this.journal) {
+      await this.journal({ action: 'register', path: resource }, signal);
+      this.resources.delete(resource);
+    }
     return id;
   }
 
@@ -251,7 +255,7 @@ export class OpenAIRuntime {
         if (current === 'completed') break;
         if (current !== 'in_progress')
           throw new ToolError('EXECUTION_FAILED', 'OpenAI could not index the selected documents.');
-        await new Promise<void>((resolve) => setTimeout(resolve, 600));
+        await wait(600, undefined, { signal });
       }
     }
     this.active.search = { store, scope, versions };

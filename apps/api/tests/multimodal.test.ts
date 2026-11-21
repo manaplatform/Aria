@@ -298,7 +298,7 @@ it('waits for a corrected primary decision after a target rejection without auto
   expect(result.text).toContain('No operation started');
   expect(fixture.mediaReceived).toHaveLength(count);
 });
-it('resolves selected Sunburst image operations from authenticated OpenAI IDs and documented capabilities', async () => {
+it('resolves selected Sunburst image operations from authenticated OpenAI capability metadata', async () => {
   const snapshot = config();
   snapshot.crossConnection = true;
   snapshot.connections[0].models.find((model) => model.id === 'gpt-image-2.6-flare')!.enabled =
@@ -316,7 +316,7 @@ it('resolves selected Sunburst image operations from authenticated OpenAI IDs an
   const nativeFetch = globalThis.fetch;
   const provider = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, options) => {
     if (String(input) === 'https://api.openai.com/v1/models')
-      return Response.json({ data: [{ id: 'gpt-image-2.6-sunburst' }] });
+      return Response.json({ data: [{ id: 'gpt-image-2.6-sunburst', capabilities: ['image'], transport: 'inline-png' }] });
     if (String(input) === 'https://api.openai.com/v1/images/generations') {
       expect(options?.headers).toMatchObject({ Authorization: 'Bearer image-key' });
       expect(JSON.parse(String(options?.body))).toMatchObject({
@@ -569,7 +569,7 @@ it('isolates duplicate provider model IDs by connection and enforces cross-conne
   const call = [...fixture.received].reverse().find((call) => call.body.model === 'test-model');
   expect(call?.body.messages).toHaveLength(2);
 });
-it('executes a documented image model from an ID-only OpenAI catalog without capability declarations', async () => {
+it('requires an explicit image operation and transport for an ID-only provider catalog', async () => {
   const snapshot = config();
   snapshot.crossConnection = true;
   snapshot.connections.push({
@@ -597,11 +597,19 @@ it('executes a documented image model from an ID-only OpenAI catalog without cap
     return nativeFetch(input, options);
   });
 
-  const result = await read('Create a detailed panorama', [
+  const operations = [
     step('panorama', '', 'image', 'image', {
       target: { kind: 'model', model: `${secondId}:gpt-image-2.6-sunburst` },
     }),
-  ]);
+  ];
+  const unavailable = await read('Create a panorama from the ID listing', operations);
+  expect(unavailable.events.at(-1)).toMatchObject({
+    type: 'failed', problem: { code: 'CAPABILITY_UNAVAILABLE' },
+  });
+  snapshot.connections[1].models[0].declared = ['image'];
+  snapshot.connections[1].models[0].transport = 'inline-png';
+  registry.install(snapshot);
+  const result = await read('Create a detailed panorama', operations);
 
   expect(result.events.at(-1)).toMatchObject({ type: 'completed' });
   expect(result.bytes).toEqual([fixture.png]);

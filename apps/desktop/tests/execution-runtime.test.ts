@@ -8,6 +8,37 @@ import { RuntimeStore } from '../electron/runtime/store';
 import { Knowledge, textPassages } from '../electron/runtime/knowledge';
 
 describe('durable runtime', () => {
+  it('migrates a populated v4 runtime and expires approvals on the next startup', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'aria-runtime-migration-'));
+    const store = new RuntimeStore(directory);
+    try {
+      store.db.prepare(
+        "INSERT INTO documents VALUES ('document', 'chat', NULL, 'notes.txt', 'version', 'ready')",
+      ).run();
+      store.db.exec(`
+        DROP TABLE approval_receipts;
+        DROP TABLE provider_checkpoints;
+        DROP TABLE dispatch_receipts;
+        DROP TABLE dispatch_turns;
+        PRAGMA user_version = 4;
+      `);
+      store.close();
+      expect(store.db.prepare('PRAGMA user_version').get()?.user_version).toBe(6);
+      expect(store.db.prepare("SELECT name FROM documents WHERE id = 'document'").get())
+        .toMatchObject({ name: 'notes.txt' });
+      const approval = store.beginApproval({
+        conversation: 'chat', request: 'request', step: 'step', operation: 'browser_submit',
+      }, 'a'.repeat(64));
+      store.close();
+      store.finishApproval(approval, 'approved');
+      expect(store.db.prepare('SELECT state FROM approval_receipts WHERE id = ?').get(approval))
+        .toMatchObject({ state: 'expired' });
+    } finally {
+      store.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it('fences program children by owner and records interrupted reservations as uncertain', async () => {
     const directory = await mkdtemp(path.join(tmpdir(), 'aria-program-journal-'));
     const store = new RuntimeStore(directory);
@@ -69,7 +100,8 @@ describe('durable runtime', () => {
       expect(() => store.begin({ ...scope, requestId: 'retry' }, null, ['stable command'])).toThrow(
         'earlier outcome',
       );
-      expect(() => store.begin(scope, null, ['revised command'])).not.toThrow();
+      expect(() => store.begin(scope, null, ['revised command'])).toThrow('earlier outcome');
+      expect(() => store.begin({ ...scope, assistantMessageId: 'new-turn' }, null, ['revised command'])).not.toThrow();
     } finally {
       store.close();
       await rm(directory, { recursive: true, force: true });

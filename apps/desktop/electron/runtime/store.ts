@@ -39,7 +39,7 @@ export class RuntimeStore {
     try {
       db.exec('PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 2000; PRAGMA journal_mode = WAL;');
       const version = Number(db.prepare('PRAGMA user_version').get()?.user_version);
-      if (version > 5) throw new Error('This runtime profile requires a newer version of Aria.');
+      if (version > 6) throw new Error('This runtime profile requires a newer version of Aria.');
       if (version === 0) {
         db.exec(`
           BEGIN IMMEDIATE;
@@ -178,13 +178,34 @@ export class RuntimeStore {
           COMMIT;
         `);
       }
+      if (version < 6) {
+        db.exec(`
+          BEGIN IMMEDIATE;
+          CREATE TABLE provider_checkpoints (
+            conversation TEXT NOT NULL, turn TEXT NOT NULL, request TEXT NOT NULL,
+            provider TEXT NOT NULL, revision TEXT NOT NULL,
+            payload BLOB NOT NULL, expires INTEGER NOT NULL,
+            PRIMARY KEY(conversation, turn, request)
+          );
+          CREATE TABLE approval_receipts (
+            id TEXT PRIMARY KEY, conversation TEXT NOT NULL, request TEXT NOT NULL,
+            step TEXT NOT NULL, operation TEXT NOT NULL, fingerprint TEXT NOT NULL,
+            state TEXT NOT NULL, created INTEGER NOT NULL, decided INTEGER
+          );
+          CREATE INDEX approval_receipts_conversation ON approval_receipts(conversation, created);
+          PRAGMA user_version = 6;
+          COMMIT;
+        `);
+      }
       db.exec(`
         DELETE FROM program_results WHERE expires <= unixepoch() * 1000;
+        DELETE FROM provider_checkpoints WHERE expires <= unixepoch() * 1000;
         UPDATE program_children SET state = 'uncertain' WHERE state = 'reserved';
         UPDATE programs SET state = 'uncertain' WHERE state = 'running';
         UPDATE attempts SET state = 'uncertain' WHERE state = 'running';
         UPDATE dispatch_receipts SET state = 'uncertain', finished = unixepoch() * 1000
           WHERE state = 'reserved';
+        UPDATE approval_receipts SET state = 'expired', decided = unixepoch() * 1000 WHERE state = 'pending';
         UPDATE sessions SET state = 'cleanup' WHERE state = 'active'
           AND id IN (SELECT session FROM attempts WHERE state = 'uncertain');
         UPDATE computer_sessions SET state = 'recovering', lease = lease + 1
@@ -272,6 +293,24 @@ export class RuntimeStore {
     `).run(Date.now(), request);
   }
 
+  hasHostedResources(request?: string) {
+    return Boolean(this.database?.prepare(`
+      SELECT 1 FROM hosted_resources WHERE (? IS NULL OR request = ?) LIMIT 1
+    `).get(request ?? null, request ?? null));
+  }
+
+  beginApproval(scope: { conversation: string; request: string; step: string; operation: string }, fingerprint: string) {
+    const id = randomUUID();
+    this.db.prepare("INSERT INTO approval_receipts VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, NULL)")
+      .run(id, scope.conversation, scope.request, scope.step, scope.operation, fingerprint, Date.now());
+    return id;
+  }
+
+  finishApproval(id: string, decision: 'approved' | 'declined' | 'cancelled' | 'expired') {
+    this.db.prepare("UPDATE approval_receipts SET state = ?, decided = ? WHERE id = ? AND state = 'pending'")
+      .run(decision, Date.now(), id);
+  }
+
   begin(
     scope: {
       conversationId: string;
@@ -285,6 +324,11 @@ export class RuntimeStore {
     identity: unknown,
   ) {
     const id = randomUUID();
+    if (this.db.prepare(`
+      SELECT 1 FROM attempts WHERE conversation = ? AND turn = ?
+        AND (state = 'uncertain' OR (state = 'running' AND request <> ?)) LIMIT 1
+    `).get(scope.conversationId, scope.assistantMessageId, scope.requestId))
+      throw new RuntimeError('OUTCOME_UNCERTAIN', 'Reconcile the earlier outcome before dispatching another operation.');
     const result = this.db
       .prepare(
         `
@@ -399,11 +443,11 @@ export class RuntimeStore {
   }
 
   interruptPrograms(request: string) {
-    this.db.prepare(`
+    this.database?.prepare(`
       UPDATE program_children SET state = 'uncertain' WHERE state = 'reserved'
         AND program IN (SELECT id FROM programs WHERE request = ? AND state = 'running')
     `).run(request);
-    this.db.prepare("UPDATE programs SET state = 'uncertain' WHERE request = ? AND state = 'running'")
+    this.database?.prepare("UPDATE programs SET state = 'uncertain' WHERE request = ? AND state = 'running'")
       .run(request);
   }
 
@@ -421,6 +465,8 @@ export class RuntimeStore {
 
   deletePrograms(conversation: string) {
     this.db.prepare('DELETE FROM programs WHERE conversation = ?').run(conversation);
+    this.db.prepare('DELETE FROM provider_checkpoints WHERE conversation = ?').run(conversation);
+    this.db.prepare('DELETE FROM approval_receipts WHERE conversation = ?').run(conversation);
   }
 
   close() {

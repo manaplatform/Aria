@@ -46,7 +46,7 @@ function canonical(value: unknown): string {
 }
 
 const transientResultKeys = new Set([
-  'stepId', 'callId', 'sourceId', 'resultId', 'resultRef', 'observationId', 'retrievedAt',
+  'stepId', 'attemptId', 'callId', 'sourceId', 'resultId', 'resultRef', 'observationId', 'retrievedAt',
   'documentId', 'elementId', 'timestamp', 'durationMs', 'startedAt', 'finishedAt',
 ]);
 
@@ -95,6 +95,29 @@ export class ExecutionEngine {
 
   reserveProgram() {
     this.context.budget.step();
+  }
+
+  async reserveNative(requestNumber: number) {
+    const scope = {
+      requestId: this.request.requestId,
+      conversationId: this.request.conversationId,
+      assistantMessageId: this.request.assistantMessageId,
+      revision: this.tools.host.current.revision,
+      voiceSessionId: this.voiceSessionId,
+      fingerprint: createHash('sha256')
+        .update(canonical(['provider.native', this.context.registry.primary.ref, requestNumber]))
+        .digest('hex'),
+    };
+    await this.tools.host.request({
+      ...scope,
+      type: 'reserve',
+      operation: { id: 'provider.native', stepId: randomUUID(), callId: String(requestNumber) },
+    }, this.signal);
+    this.billableChildStarted = true;
+    return async (state: 'completed' | 'uncertain') => {
+      if (!this.signal.aborted)
+        await this.tools.host.request({ ...scope, type: 'receipt', state }, this.signal);
+    };
   }
 
   async execute(
@@ -161,6 +184,9 @@ export class ExecutionEngine {
             outcome?.status === 'completed'
               ? outcome.artifact
                 ? 'Artifact created'
+                : outcome.data?.status === 'dispatched_outcome_unverified' ||
+                    outcome.data?.status === 'action_dispatched'
+                  ? 'Action sent. Outcome awaits verification.'
                 : outcome.sources?.length
                   ? `${outcome.sources.length} verified source references`
                   : 'Result received'
@@ -177,6 +203,7 @@ export class ExecutionEngine {
     let launched = false;
     let lease: Awaited<ReturnType<ToolRegistry['scheduler']['acquire']>> | undefined;
     let operation: Promise<StepValue> | undefined;
+    let settleArtifact: ReturnType<ToolContext['budget']['artifact']> | undefined;
     let reservation: { fingerprint: string; revision: string } | undefined;
     const scope = {
       requestId: this.request.requestId,
@@ -337,6 +364,7 @@ export class ExecutionEngine {
           throw new ToolError('PERMISSION_DENIED', 'The operation was revoked before dispatch.');
       };
       authorize();
+      if (descriptor.artifacts) settleArtifact = this.context.budget.artifact();
       if (descriptor.effect === 'billable') {
         const revision = this.tools.host.current.revision;
         await this.tools.host.request(
@@ -409,6 +437,11 @@ export class ExecutionEngine {
           executionId: id,
           ...(hosted && { hostedExecution: { stepId: id, sessionId: hosted.id } }),
         });
+      if (settleArtifact) {
+        const settle = settleArtifact;
+        settleArtifact = undefined;
+        settle(artifact);
+      } else if (artifact) this.context.budget.artifact()(artifact);
       if (artifact) this.emit({ type: 'artifact', artifact });
       if (restricted || privateContent || descriptor.capability === 'browser_screenshot') {
         this.restricted.add(id);
@@ -478,6 +511,7 @@ export class ExecutionEngine {
         problem: { code, message: message.slice(0, 400) },
       };
     } finally {
+      settleArtifact?.();
       const held = lease;
       if (held) {
         if (operation) {
