@@ -4,6 +4,8 @@ import 'reflect-metadata';
 import { NestFactory } from '@nestjs/core';
 import { ValidationPipe } from '@nestjs/common';
 import type { NestExpressApplication } from '@nestjs/platform-express';
+import { BrowserPortClient, type BrowserPort } from './web/browser-port.client';
+import { WebService } from './web/web.service';
 import { AppModule } from './app.module';
 import { ModelRegistry } from './providers/model-registry.service';
 
@@ -32,7 +34,10 @@ if (require.main === module) {
       process as NodeJS.Process & {
         parentPort?: {
           postMessage(message: unknown): void;
-          on(name: string, callback: (event: { data: unknown }) => void): void;
+          on(
+            name: string,
+            callback: (event: { data: unknown; ports?: BrowserPort[] }) => void,
+          ): void;
         };
       }
     ).parentPort;
@@ -41,11 +46,18 @@ if (require.main === module) {
       parentPort.postMessage({ type: 'configure' });
       await new Promise<void>((resolve, reject) => {
         const timeout = setTimeout(() => reject(new Error('Configuration timed out.')), 10_000);
-        parentPort.on('message', ({ data }) => {
+        parentPort.on('message', ({ data, ports }) => {
           if (!data || typeof data !== 'object' || !('registry' in data)) return;
           clearTimeout(timeout);
           try {
             app.get(ModelRegistry).install(data.registry);
+            if ('web' in data) app.get(WebService).install(data.web);
+            if (
+              ports?.length === 1 &&
+              'browserGeneration' in data &&
+              typeof data.browserGeneration === 'string'
+            )
+              app.get(BrowserPortClient).install(ports[0], data.browserGeneration);
             resolve();
           } catch {
             reject(new Error('Invalid registry configuration.'));

@@ -1,3 +1,8 @@
+import type { BrowserCommand, BrowserLayout, BrowserState } from './browser.js';
+import type { WebSettings, WebSettingsInput } from './web.js';
+export * from './browser.js';
+export * from './web.js';
+export * from './public-address.js';
 import type {
   ConnectionInput,
   DiscoveredModel,
@@ -285,6 +290,7 @@ export interface ChatServiceStatus {
   model: string;
   error?: string;
   revision?: string;
+  registryRevision?: string;
   voiceReady?: boolean;
 }
 export type GenerationMode = 'chat' | 'image' | 'speech' | 'transcription' | 'live';
@@ -358,6 +364,12 @@ export interface DesktopBridge {
   health(baseUrl: string): Promise<HealthResult>;
   copy(text: string): Promise<void>;
   openExternal(url: string): Promise<void>;
+  browserState(): Promise<BrowserState>;
+  browserCommand(command: BrowserCommand): Promise<string | void>;
+  browserLayout(layout: BrowserLayout): Promise<void>;
+  onBrowserState(callback: (state: BrowserState) => void): () => void;
+  webSettings(): Promise<WebSettings>;
+  saveWebSettings(input: WebSettingsInput): Promise<WebSettings>;
   chatStatus(): Promise<ChatServiceStatus>;
   onChatStatus(callback: (status: ChatServiceStatus) => void): () => void;
   restartChatService(): Promise<void>;

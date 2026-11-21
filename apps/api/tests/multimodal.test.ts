@@ -601,12 +601,12 @@ it('executes a documented image model from an ID-only OpenAI catalog without cap
     ),
   ).toHaveLength(1);
 });
-it('searches with the explicitly chosen OpenAI model and feeds sourced results into image generation', async () => {
+it('does not send a query to a legacy hosted search model', async () => {
   const snapshot = config();
   snapshot.crossConnection = true;
   snapshot.connections.push({
     id: secondId,
-    name: 'OpenAI research',
+    name: 'Legacy OpenAI research',
     baseUrl: 'https://api.openai.com/v1',
     apiKey: 'search-key',
     verified: [],
@@ -615,74 +615,26 @@ it('searches with the explicitly chosen OpenAI model and feeds sourced results i
   });
   registry.install(snapshot);
   const nativeFetch = globalThis.fetch;
-  const source = 'https://example.com/study';
-  const search = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, options) => {
+  const fetch = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, options) => {
     if (String(input) === 'https://api.openai.com/v1/models')
       return Response.json({ data: [{ id: 'gpt-6-luna' }] });
-    if (String(input) === 'https://api.openai.com/v1/responses') {
-      expect(JSON.parse(String(options?.body))).toMatchObject({
-        model: 'gpt-6-luna',
-        max_tool_calls: 3,
-        tools: [expect.objectContaining({ type: 'web_search' })],
-      });
-      return Response.json({
-        id: 'response',
-        output: [
-          {
-            type: 'web_search_call',
-            id: 'search',
-            status: 'completed',
-            action: { type: 'search', query: 'electric cars' },
-          },
-          {
-            type: 'message',
-            role: 'assistant',
-            id: 'answer',
-            content: [
-              {
-                type: 'output_text',
-                text: 'Verified comparison data',
-                annotations: [
-                  {
-                    type: 'url_citation',
-                    start_index: 0,
-                    end_index: 24,
-                    title: 'Study',
-                    url: source,
-                  },
-                ],
-              },
-            ],
-          },
-        ],
-      });
-    }
+    if (String(input) === 'https://api.openai.com/v1/responses')
+      throw new Error('Legacy hosted search was called.');
     return nativeFetch(input, options);
   });
-  const result = await read('Compare electric cars and create an infographic', [
+  const result = await read('Find information about electric cars', [
     step('research', '', 'web-search', 'sources', {
       target: { kind: 'tool', tool: 'web_search', model: `${secondId}:gpt-6-luna` },
       instructions: 'Compare electric cars.',
     }),
-    step('graphic', 'gpt-image-2.6-flare', 'image', 'image', {
-      dependsOn: ['research'],
-      inputs: [{ kind: 'result', stepId: 'research' }],
-    }),
   ]);
   expect(
-    search.mock.calls.filter(([input]) => String(input) === 'https://api.openai.com/v1/responses'),
-  ).toHaveLength(1);
-  expect(result.events).toContainEqual(
-    expect.objectContaining({
-      type: 'activity',
-      activity: expect.objectContaining({
-        stepId: 'research',
-        sources: [{ url: source, title: 'Study' }],
-      }),
-    }),
-  );
-  expect(fixture.mediaReceived.at(-1)?.body).toContain('Verified comparison data');
-  expect(result.bytes).toEqual([fixture.png]);
+    fetch.mock.calls.some(([input]) => String(input) === 'https://api.openai.com/v1/responses'),
+  ).toBe(false);
+  expect(result.events.at(-1)).toMatchObject({
+    type: 'failed',
+    error: expect.stringContaining('Web & Browser'),
+  });
 });
 it('routes client-delegated GPT-Live requests once through the same primary and returns the spoken result', async () => {
   const ws = new WebSocket(url.replace('http:', 'ws:') + '/voice', { headers });

@@ -20,6 +20,7 @@
     "typescript": "^5.7.2"
   },
   "dependencies": {
+    "ipaddr.js": "2.3.0",
     "zod": "^4.6.7"
   }
 }

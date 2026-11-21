@@ -406,11 +406,13 @@ function RegistryEditor({ settings }: { settings: RegistrySettings }) {
             Restart service
           </Button>
         )}
-        {status.state === 'ready' && status.configured && draft.revision === status.revision && (
-          <span className="muted">
-            <Check size={14} /> Primary configured
-          </span>
-        )}
+        {status.state === 'ready' &&
+          status.configured &&
+          draft.revision === (status.registryRevision ?? status.revision) && (
+            <span className="muted">
+              <Check size={14} /> Primary configured
+            </span>
+          )}
       </div>
       {feedback && (
         <p
@@ -537,17 +539,6 @@ function ConnectionCard({
           </Button>
         )}
       </div>
-      {official && (
-        <label className="registry-checkbox">
-          <input
-            type="checkbox"
-            checked={connection.webSearch}
-            disabled={disabled}
-            onChange={(event) => update({ ...connection, webSearch: event.target.checked })}
-          />
-          Allow OpenAI Web Search on this connection
-        </label>
-      )}
       {catalog.error && (
         <p className="chat-response-error" role="alert">
           {catalog.error}

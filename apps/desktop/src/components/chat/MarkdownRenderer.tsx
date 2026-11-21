@@ -4,6 +4,7 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { CopyButton } from '../ui';
 import { openExternal, errorMessage } from '../../services/desktop';
+import { openResearchSource } from '../../stores/browserStore';
 import { notify } from '../../stores/uiStore';
 export function CodeBlock({ children }: { children: ReactNode }): ReactNode {
   return (
@@ -26,9 +27,11 @@ function extractText(node: ReactNode): string {
 export default function MarkdownRenderer({
   content,
   sources = [],
+  research = false,
 }: {
   content: string;
   sources?: ConductorSource[];
+  research?: boolean;
 }): ReactNode {
   return (
     <div className="markdown">
@@ -37,14 +40,16 @@ export default function MarkdownRenderer({
         components={{
           pre: ({ children }) => <CodeBlock>{children}</CodeBlock>,
           a: ({ href, children }) =>
-            !href || (sources.length && !sources.some((source) => source.url === href)) ? (
+            !href ||
+            ((research || sources.length) && !sources.some((source) => source.url === href)) ? (
               <>{children}</>
             ) : (
               <a
                 href={href}
                 onClick={(event) => {
                   event.preventDefault();
-                  if (href)
+                  if (research || sources.length) void openResearchSource(href);
+                  else if (href)
                     void openExternal(href).catch((error) => notify(errorMessage(error), true));
                 }}
               >

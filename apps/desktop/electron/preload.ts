@@ -1,5 +1,11 @@
 import { contextBridge, ipcRenderer } from 'electron';
-import type { ChatEvent, ChatServiceStatus, DesktopBridge, LiveEvent } from '@aria/shared';
+import type {
+  BrowserState,
+  ChatEvent,
+  ChatServiceStatus,
+  DesktopBridge,
+  LiveEvent,
+} from '@aria/shared';
 
 const bridge: DesktopBridge = {
   platform: process.platform,
@@ -25,6 +31,16 @@ const bridge: DesktopBridge = {
   health: (url) => ipcRenderer.invoke('aria:health', url),
   copy: (text) => ipcRenderer.invoke('aria:copy', text),
   openExternal: (url) => ipcRenderer.invoke('aria:open-external', url),
+  browserState: () => ipcRenderer.invoke('aria:browser-state'),
+  browserCommand: (command) => ipcRenderer.invoke('aria:browser-command', command),
+  browserLayout: (layout) => ipcRenderer.invoke('aria:browser-layout', layout),
+  onBrowserState: (callback) => {
+    const listener = (_event: Electron.IpcRendererEvent, state: BrowserState) => callback(state);
+    ipcRenderer.on('aria:browser-state-update', listener);
+    return () => ipcRenderer.removeListener('aria:browser-state-update', listener);
+  },
+  webSettings: () => ipcRenderer.invoke('aria:web-settings'),
+  saveWebSettings: (input) => ipcRenderer.invoke('aria:save-web-settings', input),
   chatStatus: () => ipcRenderer.invoke('aria:chat-status'),
   registrySettings: () => ipcRenderer.invoke('aria:registry-settings'),
   saveRegistry: (settings) => ipcRenderer.invoke('aria:save-registry', settings),

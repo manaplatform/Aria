@@ -17,8 +17,14 @@ import { mkdirSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { LocalStorage, localDataSchema } from './storage';
+import { BrowserController } from './browser/controller';
+import { openBrowserBridge } from './browser/bridge';
+import { WebSettingsStorage } from './web-settings-storage';
 import { ProviderStorage } from './provider-storage';
 import {
+  browserCommandSchema,
+  browserLayoutSchema,
+  webSettingsInputSchema,
   connectionInputSchema,
   endActivity,
   identifier,
@@ -39,6 +45,7 @@ import {
 } from './project';
 
 app.setName('Aria');
+app.commandLine.appendSwitch('disable-quic');
 protocol.registerSchemesAsPrivileged([
   {
     scheme: 'aria-media',
@@ -51,6 +58,8 @@ if (process.env.ARIA_TEST_DATA_DIR) {
 }
 let mainWindow: BrowserWindow | null = null;
 let storage: LocalStorage;
+let webSettings: WebSettingsStorage;
+let browser: BrowserController;
 let provider: ProviderStorage;
 let chat: ChatService;
 let assets: MediaStorage;
@@ -135,6 +144,7 @@ function registerIpc(): void {
   });
   handle('aria:close-ready', async () => {
     await media.close();
+    await browser.flush();
     mainWindow?.destroy();
     if (quitting) app.quit();
   });
@@ -171,6 +181,7 @@ function registerIpc(): void {
         const previous = initial.data;
         await storage.save(parsed);
         initial = { data: parsed };
+        browser.pruneConversations(parsed.chat.conversations);
         await assets.prune(previous, parsed).catch(() => undefined);
       });
     await saving;
@@ -226,6 +237,37 @@ function registerIpc(): void {
   handle('aria:health', (url) => checkHealth(string.parse(url)));
   handle('aria:copy', (text) => clipboard.writeText(z.string().max(10_000_000).parse(text)));
   handle('aria:open-external', (url) => shell.openExternal(safeExternalUrl(string.parse(url))));
+  handle('aria:browser-state', () => browser.state());
+  handle('aria:browser-command', (input) => browser.command(browserCommandSchema.parse(input)));
+  handle('aria:browser-layout', (input) => browser.setLayout(browserLayoutSchema.parse(input)));
+  handle('aria:web-settings', () => webSettings.get());
+  handle('aria:save-web-settings', async (input) => {
+    const parsed = webSettingsInputSchema.parse(input);
+    const previous = webSettings.get();
+    const immediate =
+      (previous.enabled && !parsed.enabled) || (previous.aiBrowser && !parsed.aiBrowser);
+    if (configuring) throw new Error('Wait for settings to finish saving.');
+    if (!immediate) {
+      chat.assertIdle();
+      media.assertIdle();
+    }
+    configuring = true;
+    try {
+      if (immediate) {
+        await chat.cancelAll();
+        await media.close();
+      }
+      await webSettings.save(parsed);
+      try {
+        await browser.applyPolicy(previous);
+      } finally {
+        await chat.restart();
+      }
+      return webSettings.get();
+    } finally {
+      configuring = false;
+    }
+  });
   handle('aria:chat-status', () => chat.getStatus());
   handle('aria:registry-settings', () => provider.get());
   handle('aria:save-registry', (input) =>
@@ -378,14 +420,17 @@ function createWindow(): void {
       sandbox: true,
     },
   });
+  browser.attach(mainWindow);
   mainWindow.webContents.on('render-process-gone', () => {
     closeFlushEnabled = false;
     closePending = false;
+    browser.resetRenderer();
     void chat.cancelAll();
     void media.close();
   });
   mainWindow.webContents.on('did-start-navigation', (event) => {
     if (event.isMainFrame && !event.isSameDocument) {
+      browser.resetRenderer();
       void chat.cancelAll();
       void media.close();
     }
@@ -415,6 +460,7 @@ function createWindow(): void {
       details.mediaType === 'audio',
   );
   mainWindow.on('closed', () => {
+    void browser.detach();
     void media.close();
     void chat.cancelAll();
     mainWindow = null;
@@ -481,13 +527,18 @@ app
         return new Response(null, { status: 404 });
       }
     });
-    provider = new ProviderStorage(directory, {
+    const cipher = {
       available: async () =>
         (await safeStorage.isAsyncEncryptionAvailable()) &&
         (process.platform !== 'linux' || safeStorage.getSelectedStorageBackend() !== 'basic_text'),
-      encrypt: (value) => safeStorage.encryptStringAsync(value),
-      decrypt: (value) => safeStorage.decryptStringAsync(value),
-    });
+      encrypt: (value: string) => safeStorage.encryptStringAsync(value),
+      decrypt: (value: Buffer) => safeStorage.decryptStringAsync(value),
+    };
+    provider = new ProviderStorage(directory, cipher);
+    webSettings = new WebSettingsStorage(directory);
+    await webSettings.load();
+    browser = new BrowserController(directory, () => webSettings.get());
+    await browser.load();
     chat = new ChatService(
       provider,
       (env) =>
@@ -505,6 +556,23 @@ app
           mainWindow.webContents.send('aria:chat-status-update', status);
       },
       assets,
+      {
+        runtime: () => webSettings.runtime(),
+        revision: () => webSettings.revision,
+        open: (authorize) =>
+          openBrowserBridge(browser, (request) => {
+            const signal = authorize(request);
+            if (!signal) return;
+            const turn = initial.data.chat.messages.find(
+              (message) =>
+                message.requestId === request.requestId &&
+                message.conversationId === request.conversationId &&
+                message.role === 'assistant' &&
+                ['pending', 'streaming'].includes(message.status),
+            );
+            return turn ? signal : undefined;
+          }),
+      },
     );
     media = new MediaService(chat, assets, (event) =>
       mainWindow?.webContents.send('aria:live-event', event),
@@ -532,6 +600,7 @@ app.on('before-quit', (event) => {
       .close()
       .then(() => chat.close())
       .finally(() => {
+        browser.close();
         shutdownComplete = true;
         app.quit();
       });

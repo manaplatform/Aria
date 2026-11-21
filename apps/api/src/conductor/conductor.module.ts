@@ -1,3 +1,4 @@
+import { WebModule } from '../web/web.module';
 import { Module } from '@nestjs/common';
 import { AiModule } from '../ai/ai.module';
 import { ProvidersModule } from '../providers/providers.module';
@@ -7,7 +8,7 @@ import { RunAssets } from './run-assets';
 import { ToolRegistry } from './tool-registry';
 
 @Module({
-  imports: [AiModule, ProvidersModule],
+  imports: [AiModule, ProvidersModule, WebModule],
   providers: [Conductor, RunAssets, MediaService, ToolRegistry],
   exports: [Conductor, RunAssets],
 })

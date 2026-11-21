@@ -1,4 +1,6 @@
 import { z } from 'zod';
+import { browserOps, browserToolArgs } from './browser.js';
+import { webToolArgs } from './web.js';
 import { identifier, modelCapabilitySchema, modelRefSchema } from './model-registry.js';
 
 export const conductorLimits = {
@@ -13,8 +15,19 @@ export const conductorLimits = {
   artifactBytes: 64_000_000,
   artifacts: 4,
 } as const;
-export const toolIds = ['read_attachment', 'create_text_artifact', 'web_search'] as const;
-export const outputKinds = ['text', 'image', 'audio', 'file', 'sources'] as const;
+export const toolIds = [
+  'read_attachment',
+  'create_text_artifact',
+  'web_search',
+  'web_fetch',
+  'web_read',
+  'web_find',
+  ...browserOps,
+] as const;
+export const localWebToolIds = ['web_fetch', 'web_read', 'web_find', ...browserOps] as const;
+export const researchToolArgs = { ...webToolArgs, ...browserToolArgs };
+export type ResearchToolId = keyof typeof researchToolArgs;
+export const outputKinds = ['text', 'image', 'audio', 'file', 'sources', 'data'] as const;
 export const stepId = z
   .string()
   .min(1)
@@ -41,16 +54,21 @@ export const executionStepSchema = z
         .object({
           kind: z.literal('tool'),
           tool: z.enum(toolIds),
-          model: modelRefSchema
-            .nullable()
-            .describe(
-              'Copy the listed backing model reference for web_search; use null for local tools.',
-            ),
+          model: modelRefSchema.nullable().describe('Use null for local tools.'),
         })
         .strict(),
     ]),
-    capability: z.union([modelCapabilitySchema, z.enum(['read-file', 'create-file'])]),
+    capability: z.union([
+      modelCapabilitySchema,
+      z.enum(['read-file', 'create-file', ...localWebToolIds]),
+    ]),
     instructions: z.string().trim().min(1).max(4000),
+    args: z
+      .record(z.string().max(50), z.unknown())
+      .optional()
+      .describe(
+        'Use the argument schema in the operation descriptor. Opaque IDs must come from a successful dependency.',
+      ),
     inputs: z.array(referenceInput).max(8),
     dependsOn: z.array(stepId).max(conductorLimits.steps),
     output: z.enum(outputKinds),
@@ -83,6 +101,13 @@ export const sourceSchema = z
         }
       }),
     title: z.string().max(300),
+    id: z.string().uuid().optional(),
+    publisher: z.string().max(300).optional(),
+    domain: z.string().max(253).optional(),
+    publishedAt: z.iso.datetime().optional(),
+    retrievedAt: z.iso.datetime().optional(),
+    contentType: z.string().max(100).optional(),
+    provenance: z.enum(['hosted', 'publisher', 'browser']).optional(),
   })
   .strict();
 export const artifactReferenceSchema = z

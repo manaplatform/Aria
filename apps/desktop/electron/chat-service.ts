@@ -1,9 +1,11 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { UtilityProcess } from 'electron';
 import {
   conductorLimits,
   emptyRegistryPolicy,
   type ArtifactReference,
+  type BrowserRequest,
+  type RuntimeWeb,
   type ChatEvent,
   type ChatRequest,
   type ChatServiceStatus,
@@ -16,6 +18,14 @@ import { chatRequestSchema, readChatEvents } from './chat-protocol';
 import { ProviderConfigurationError, type ProviderStorage } from './provider-storage';
 import type { MediaStorage } from './media-storage';
 
+import type { BrowserBridgeSession } from './browser/bridge';
+
+interface BrowserIntegration {
+  runtime(): Promise<RuntimeWeb>;
+  revision(): string;
+  open(authorize: (request: BrowserRequest) => AbortSignal | undefined): BrowserBridgeSession;
+}
+
 interface ActiveRequest {
   request: ChatRequest;
   controller: AbortController;
@@ -27,6 +37,7 @@ interface ActiveRequest {
 }
 export class ChatService {
   private child?: UtilityProcess;
+  private browserSession?: BrowserBridgeSession;
   private url = '';
   private token = '';
   private generation = 0;
@@ -39,6 +50,7 @@ export class ChatService {
     private readonly emitEvent: (event: ChatEvent) => void,
     private readonly emitStatus: (status: ChatServiceStatus) => void,
     private readonly assets?: MediaStorage,
+    private readonly browser?: BrowserIntegration,
   ) {}
   getStatus(): ChatServiceStatus {
     return { ...this.status };
@@ -75,6 +87,15 @@ export class ChatService {
         registry = { ...emptyRegistryPolicy, revision: '', connections: [] };
         configurationError = error.message;
       }
+      const registryRevision = registry.revision;
+      const web = await this.browser?.runtime();
+      if (this.browser)
+        registry = {
+          ...registry,
+          revision: createHash('sha256')
+            .update(JSON.stringify([registry.revision, this.browser.revision()]))
+            .digest('hex'),
+        };
       if (generation !== this.generation) return;
       this.token = randomUUID() + randomUUID();
       const env = { ...process.env };
@@ -82,6 +103,18 @@ export class ChatService {
         delete env[key];
       const child = this.launch({ ...env, ARIA_MANAGED: '1', ARIA_INTERNAL_TOKEN: this.token });
       this.child = child;
+      const native = this.browser?.open((request) => {
+        const turn = this.requests.get(request.requestId);
+        if (
+          generation === this.generation &&
+          !turn?.stopped &&
+          turn?.request.conversationId === request.conversationId
+        )
+          return turn.controller.signal;
+        return undefined;
+      });
+      this.browserSession = native;
+      let sentConfiguration = false;
       const port = await new Promise<number>((resolve, reject) => {
         const timer = setTimeout(() => {
           cleanup();
@@ -94,7 +127,12 @@ export class ChatService {
             'type' in message &&
             message.type === 'configure'
           ) {
-            child.postMessage({ registry });
+            if (sentConfiguration) return;
+            sentConfiguration = true;
+            child.postMessage(
+              { registry, ...(web && { web }), browserGeneration: native?.generation },
+              native ? [native.port] : undefined,
+            );
             return;
           }
           const parsed = z
@@ -123,6 +161,7 @@ export class ChatService {
       }
       this.url = `http://127.0.0.1:${port}`;
       child.once('exit', () => {
+        native?.close();
         if (generation !== this.generation) return;
         ++this.generation;
         this.child = undefined;
@@ -152,10 +191,12 @@ export class ChatService {
         this.setStatus({
           state: 'ready',
           ...capabilities,
+          registryRevision,
           ...(configurationError ? { configured: false, error: configurationError } : {}),
         });
     } catch (error) {
       if (generation === this.generation) {
+        this.browserSession?.close();
         this.child?.kill();
         this.url = '';
         this.setStatus({
@@ -399,6 +440,7 @@ export class ChatService {
     this.assertIdle();
     if (this.starting) await this.starting;
     ++this.generation;
+    this.browserSession?.close();
     this.child?.kill();
     this.child = undefined;
     this.url = '';
@@ -407,6 +449,7 @@ export class ChatService {
   async close(): Promise<void> {
     ++this.generation;
     await this.cancelAll();
+    this.browserSession?.close();
     const child = this.child;
     this.child = undefined;
     if (!child) return;
