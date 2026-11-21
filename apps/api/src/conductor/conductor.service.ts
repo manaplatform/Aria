@@ -5,6 +5,7 @@ import type { ModelMessage, ToolResultPart } from 'ai';
 import {
   conductorLimits,
   computerProviderCall,
+  replyFormattingPrompt,
   type ChatRequest,
   type ConductorEvent,
   type RuntimeRegistry,
@@ -19,6 +20,7 @@ import { ExecutionEngine, type Invocation } from './execution-engine';
 import type { OpenAIRuntime } from '../providers/openai-runtime';
 import { RunAssets, RunError } from './run-assets';
 import { ToolRegistry } from './tool-registry';
+import { TurnBudget } from './turn-budget';
 import { ProgramBroker } from './program-broker';
 import { HostedProgramTurn, hostedProgramTool } from './hosted-program-turn';
 import { hostedProgramName } from '../providers/openai-program';
@@ -83,10 +85,7 @@ export class Conductor {
     let native: OpenAIRuntime | undefined;
     let toolContext: import('./tool-registry').ToolContext | undefined;
     let hosted: HostedProgramTurn | undefined;
-    let providerRequests = 0;
-    let responseContinuations = 0;
-    let inputTokens: number | undefined;
-    let outputTokens: number | undefined;
+    let budget: TurnBudget | undefined;
     const runInfo = () =>
       primary
         ? {
@@ -94,13 +93,17 @@ export class Conductor {
             primaryName,
             revision,
             billableChildStarted: engine?.billableChildStarted ?? false,
+            ...(toolContext?.privateContent && { privateContent: true }),
             usage: {
-              providerRequests,
-              responseContinuations,
+              providerRequests: budget?.providerRequests ?? 0,
+              responseContinuations: budget?.responseContinuations ?? 0,
               directToolCalls: engine?.directToolCalls ?? 0,
               programChildCalls: engine?.programChildCalls ?? 0,
-              inputTokens,
-              outputTokens,
+              controlCalls: budget?.controlCalls,
+              nativeToolCalls: budget?.nativeToolCalls,
+              accountedCostUsdMicros: budget?.accountedCostUsdMicros,
+              inputTokens: budget?.inputTokens,
+              outputTokens: budget?.outputTokens,
             },
           }
         : undefined;
@@ -116,12 +119,13 @@ export class Conductor {
       revision = registry.config.revision;
       primary = registry.primary.ref;
       primaryName = `${registry.primary.connection.name} / ${registry.primary.id}`;
+      budget = new TurnBudget(snapshot.spendingLimitUsdMicros);
       const context: import('./tool-registry').ToolContext = {
         registry,
         attachments,
         research: this.web.scope(request, !config),
-        privateContent: false,
-        programPrivateHistory: request.programPrivateHistory,
+        privateContent: request.programPrivateHistory === true,
+        budget,
         ...(!voiceSessionId &&
           this.tools.host.current.desktopRuntime && {
             runtime: {
@@ -183,6 +187,7 @@ export class Conductor {
         namespaces.push('skills (reusable procedures)');
       const system = [
         registry.config.systemPrompt || DEFAULT_SYSTEM_PROMPT,
+        ...(process.env.ARIA_MANAGED === '1' && !voiceSessionId ? [replyFormattingPrompt] : []),
         'Answer directly when the request needs no external evidence or action. Discover tools only when their functionality is needed. Use relevant skills for specialized procedures and read supporting resources as needed. Choose authorized targets and actions based on this conversation and observed results. Ask the user when a needed detail is missing.',
         'Use find_capabilities for metadata, then load the relevant tool schemas by ID. For model operations, choose an exact discovered modelRef and delegate the minimum context. Refer to preceding results by execution ID. URLs for browser navigation and publisher reads require user or tool provenance. Cite publisher evidence using its returned links. Wait for any required approval and verify consequential outcomes where possible.',
         ...(context.runtime
@@ -217,23 +222,24 @@ export class Conductor {
           : []),
       ].join('\n\n');
       const messages: ModelMessage[] = [...request.messages];
+      let historicalMessages = messages.length - 1;
       const seen = new Set<string>();
+      const nativeReceipts = new Set<string>();
       let stagnant = 0;
       let problem: { code: ToolError['code']; message: string } | undefined;
       let unavailable = false;
       let contentBudget = 72_000;
-      let nativeComputerUsed = false;
       let ariaComputerImageUsed = false;
       let computerStatus = '';
       for (let round = 0; round < conductorLimits.primaryCalls; round++) {
         signal.throwIfAborted();
-        const synthesis = stagnant >= 2 || round === conductorLimits.primaryCalls - 1;
+        const synthesis = stagnant >= 3 || budget.remainingRequests === 1 ||
+          (budget.remainingSteps === 0 && !hosted?.pending);
         native = context.native;
         const active = native?.active;
         const nativeComputerActive = context.computer?.mode === 'openai-responses';
         const nativeTools = synthesis ? {} : (native?.tools() ?? {});
-        nativeComputerUsed ||= nativeComputerActive;
-        const computerTools = nativeComputerUsed ? nativeComputerTools : {};
+        const computerTools = nativeComputerActive && !synthesis ? nativeComputerTools : {};
         context.hostedProgramsBlocked = nativeComputerActive || Object.keys(nativeTools).length > 0;
         const controls = turn.controls(messages);
         const hostedBindings = turn.programTools('openai-responses');
@@ -249,21 +255,33 @@ export class Conductor {
         const runtimeNotes = [
           computerStatus && `Previous computer batch results from the trusted runtime: ${computerStatus}`,
           hosted?.outcome && `Program validation reported ${hosted.outcome.code}. ${hosted.outcome.message}`,
+          stagnant === 2 && 'NO_PROGRESS: The last two execution rounds returned no new evidence, results, or capabilities. Choose a different authorized approach, ask for missing information, or provide the verified partial result.',
         ].filter(Boolean);
-        if (hosted?.transport.hasContinuation) responseContinuations++;
-        providerRequests++;
+        const instructions = [system, ...runtimeNotes].join('\n\n');
+        const hasHostedNative = Object.hasOwn(nativeTools, 'aria_native_file_search') ||
+          (active?.shell?.kind === 'hosted' && Object.hasOwn(nativeTools, 'aria_native_shell'));
+        const nativeLimit = hasHostedNative ? Math.min(4, budget.remainingSteps) : 0;
+        const prepared = await budget.prepare(
+          messages, historicalMessages, instructions, exposed, registry.primary,
+          hosted?.transport.hasContinuation === true,
+          !hasHostedNative && !nativeComputerActive && !ariaComputerImageUsed && !hosted,
+        );
+        historicalMessages = prepared.historicalMessages;
+        signal.throwIfAborted();
+        const settleNative = budget.native(nativeLimit);
+        let nativeCompleted = 0;
         const response = this.ai.generate(
           messages,
           signal,
           registry.primary,
-          [system, ...runtimeNotes].join('\n\n'),
+          instructions,
           exposed,
           undefined,
           synthesis && !hosted?.pending,
           Object.keys(nativeTools).length || nativeComputerActive || ariaComputerImageUsed || hosted
             ? {
                 fileSearch: Boolean(active?.search),
-                toolLimit: 4,
+                toolLimit: nativeLimit || 4,
                 computerImages: ariaComputerImageUsed,
                 program: hosted?.transport,
               }
@@ -293,10 +311,15 @@ export class Conductor {
                 throw new ToolError('CALLER_MISMATCH', 'The provider returned an unauthorized program.');
             }
             if (part.type === 'tool-result') {
-              const hostedSearch = part.toolName === 'aria_native_file_search' && active?.search;
+              const hostedSearch = part.toolName === 'aria_native_file_search' && active?.search &&
+                Object.hasOwn(nativeTools, part.toolName);
               const hostedShell =
-                part.toolName === 'aria_native_shell' && active?.shell?.kind === 'hosted';
+                part.toolName === 'aria_native_shell' && active?.shell?.kind === 'hosted' &&
+                Object.hasOwn(nativeTools, part.toolName);
               if (hostedSearch || hostedShell) {
+                if (++nativeCompleted > nativeLimit || nativeReceipts.has(part.toolCallId))
+                  throw new ToolError('INVALID_TOOL_OUTPUT', 'The provider returned an unreserved native tool result.');
+                nativeReceipts.add(part.toolCallId);
                 const stepId = randomUUID();
                 const evidence = hostedSearch ? native?.evidence(part.output) : undefined;
                 const checked =
@@ -351,11 +374,8 @@ export class Conductor {
           throw error;
         }
         signal.throwIfAborted();
-        const usage = await response.usage;
-        if (usage.inputTokens !== undefined && Number.isSafeInteger(usage.inputTokens) && usage.inputTokens >= 0)
-          inputTokens = (inputTokens ?? 0) + usage.inputTokens;
-        if (usage.outputTokens !== undefined && Number.isSafeInteger(usage.outputTokens) && usage.outputTokens >= 0)
-          outputTokens = (outputTokens ?? 0) + usage.outputTokens;
+        prepared.settle(await response.usage);
+        settleNative(nativeCompleted);
         const previousProgramProblem = hosted?.outcome;
         await hosted?.receive(calls.map(({ toolCallId }) => toolCallId));
         if (hosted) {
@@ -384,7 +404,11 @@ export class Conductor {
               ...(problem && { problem }),
             });
           } else {
-            emit({ type: 'completed', partial: engine.failed || engine.partial || Boolean(problem), run: runInfo() });
+            emit({
+              type: 'completed',
+              partial: engine.failed || engine.partial || stagnant >= 2 || Boolean(problem),
+              run: runInfo(),
+            });
           }
           return text;
         }

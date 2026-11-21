@@ -186,14 +186,13 @@ function RegistryEditor({ settings }: { settings: RegistrySettings }) {
       .map((model) => {
         const descriptor = catalogs[connection.id]?.models?.find((item) => item.id === model.id);
         const capabilities =
-          descriptor?.source === 'unknown' ? model.declared : (descriptor?.capabilities ?? []);
+          descriptor?.source === 'provider' ? descriptor.capabilities : model.declared;
         return {
           value: modelReference(connection.id, model.id),
           label: `${connection.name} · ${model.id}`,
           primary:
-            capabilities.includes('chat') &&
-            capabilities.includes('tools') &&
-            (descriptor?.source !== 'unknown' || isVerified(connection, model.id)),
+            (descriptor?.source === 'provider' && capabilities.includes('chat') &&
+              capabilities.includes('tools')) || isVerified(connection, model.id),
           voice: capabilities.includes('live'),
         };
       }),
@@ -345,6 +344,23 @@ function RegistryEditor({ settings }: { settings: RegistrySettings }) {
             <option value="quality">Higher quality</option>
           </select>
         </Field>
+        <Field label="Spending cap per chat turn (USD)">
+          <input
+            type="number"
+            min="0.01"
+            max="1000"
+            step="0.01"
+            placeholder="Off"
+            disabled={busy}
+            value={draft.spendingLimitUsdMicros === undefined ? '' : draft.spendingLimitUsdMicros / 1_000_000}
+            onChange={(event) => setDraft({
+              ...draft,
+              spendingLimitUsdMicros: event.target.value
+                ? Math.round(Number(event.target.value) * 1_000_000)
+                : undefined,
+            })}
+          />
+        </Field>
       </div>
       <label className="registry-checkbox">
         <input
@@ -459,7 +475,6 @@ function ConnectionCard({
       ...connection,
       models: [...connection.models.filter((row) => row.id !== model.id), model],
     });
-  const official = connection.baseUrl.replace(/\/+$/, '') === officialOpenAI;
   return (
     <div className="registry-connection">
       <div className="registry-connection-heading">
@@ -565,7 +580,7 @@ function ConnectionCard({
             declared: [],
           };
           const discovered = descriptors.get(id);
-          const unknown = discovered?.source === 'unknown';
+          const unknown = discovered && discovered.source !== 'provider';
           const unsupported = discovered && !unknown && !discovered.capabilities.length;
           const missing = Boolean(catalog.models && !discovered);
           const capabilities = unknown ? model.declared : (discovered?.capabilities ?? []);
@@ -639,8 +654,7 @@ function ConnectionCard({
                 <div className="registry-declarations">
                   {modelCapabilities
                     .filter(
-                      (capability) =>
-                        capability !== 'web-search' && (!official || capability !== 'live'),
+                      (capability) => capability !== 'web-search',
                     )
                     .map((capability) => (
                       <label key={capability} className="registry-checkbox">

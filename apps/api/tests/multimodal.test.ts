@@ -1,6 +1,9 @@
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from 'vitest';
 import { randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { INestApplication } from '@nestjs/common';
 import { emptyRegistryPolicy, type RuntimeRegistry, type ExecutionStep } from '@aria/shared';
 import WebSocket from 'ws';
@@ -19,6 +22,7 @@ let fixture: Awaited<ReturnType<typeof createProviderFixture>>;
 let app: INestApplication;
 let registry: InstanceType<typeof ModelRegistry>;
 let url: string;
+let dispatchDirectory: string;
 const token = 'Bearer multimodal-session';
 const headers = { Authorization: token };
 const jsonHeaders = { ...headers, 'Content-Type': 'application/json' };
@@ -54,6 +58,8 @@ function config(): RuntimeRegistry {
 }
 
 beforeAll(async () => {
+  dispatchDirectory = await mkdtemp(join(tmpdir(), 'aria-dispatch-test-'));
+  vi.stubEnv('ARIA_DISPATCH_DIRECTORY', dispatchDirectory);
   fixture = await createProviderFixture();
   vi.stubEnv('ARIA_INTERNAL_TOKEN', 'multimodal-session');
   app = await createApi();
@@ -66,6 +72,7 @@ afterEach(() => vi.restoreAllMocks());
 afterAll(async () => {
   await app?.close();
   await fixture?.close();
+  if (dispatchDirectory) await rm(dispatchDirectory, { recursive: true, force: true });
   vi.unstubAllEnvs();
 });
 
@@ -168,7 +175,7 @@ async function submit(
     body: JSON.stringify({
       requestId,
       conversationId: 'chat',
-      assistantMessageId: 'assistant',
+      assistantMessageId: requestId,
       messages: [{ role: 'user', content }],
       attachmentIds: attachments.map((attachment) => attachment.id),
     }),
@@ -454,7 +461,7 @@ it('deduplicates equivalent operations and reports a missing capability without 
   snapshot.connections[0].models.find((model) => model.id === 'gpt-image-2.6-flare')!.enabled =
     false;
   registry.install(snapshot);
-  fixture.queueTool('Show a city', 'report_unavailable', { capability: 'image' });
+  fixture.queueTool('Show a city', 'find_capabilities', { query: 'image', ids: ['media.image'] });
   const unavailable = await read('Show a city');
   expect(unavailable.events.at(-1)).toMatchObject({ type: 'failed', settingsHelp: true });
   expect(unavailable.text).toContain('Enable a compatible image');

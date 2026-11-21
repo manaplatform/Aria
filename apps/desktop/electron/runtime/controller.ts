@@ -11,6 +11,7 @@ import {
   runtimeSettingsSchema,
   workspaceFilename,
   type CapabilityHostRequest,
+  type ChatMessage,
   type MediaAsset,
   type ExecutionHistoryEntry,
   type RuntimeArgs,
@@ -77,7 +78,7 @@ export class DesktopRuntime {
     private readonly resolveRegistry: () => Promise<RuntimeRegistry>,
     private readonly programCipher: SecretCipher,
   ) {
-    this.store = new RuntimeStore(directory);
+    this.store = skills.runtimeStore;
     this.knowledge = new Knowledge(this.store, extractDocument);
     this.library = new DocumentLibrary(directory, this.store);
     this.embeddings = new LocalEmbeddings(directory);
@@ -88,6 +89,8 @@ export class DesktopRuntime {
       .prepare(
         `SELECT id, operation, state, started, elapsed, exit_code FROM attempts
          UNION ALL SELECT id, 'program.' || backend, state, started, finished - started, NULL FROM programs
+         UNION ALL SELECT fingerprint, operation, state, started, finished - started, NULL
+         FROM dispatch_receipts WHERE operation IS NOT NULL
          ORDER BY started DESC LIMIT 50`,
       )
       .all()
@@ -592,6 +595,7 @@ ${
 
   release(requestId: string) {
     this.grants.delete(requestId);
+    this.store.interruptDispatches(requestId);
     void this.programs.release(requestId);
     if (this.skills.policy().programming?.backend && this.skills.policy().programming?.backend !== 'off')
       this.store.interruptPrograms(requestId);
@@ -1004,7 +1008,7 @@ ${files
     request: string,
     step: string,
     session: string,
-    provenance: 'managed' | 'openai-shell' | 'computer',
+    provenance: 'managed' | 'openai-shell' | 'computer' | 'conductor',
   ) {
     this.store.db
       .prepare('INSERT INTO artifacts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
@@ -1099,11 +1103,11 @@ ${files
     }
   }
 
-  async adoptHostedArtifact(
+  async adoptArtifact(
     asset: MediaAsset,
     conversation: string,
     request: string,
-    execution: { stepId: string; sessionId: string },
+    execution: { stepId: string; sessionId?: string },
     signal: AbortSignal,
   ) {
     try {
@@ -1127,8 +1131,8 @@ ${files
         conversation,
         request,
         execution.stepId,
-        execution.sessionId,
-        'openai-shell',
+        execution.sessionId ?? execution.stepId,
+        execution.sessionId ? 'openai-shell' : 'conductor',
       );
     } catch (error) {
       await this.assets.remove(asset.id);
@@ -1165,6 +1169,31 @@ ${files
     if (digest(bytes) !== row.version)
       throw new Error('The generated file failed its integrity check.');
     return asset;
+  }
+
+  async recoverArtifacts(messages: ChatMessage[]) {
+    if (!messages.some((message) => message.role === 'assistant')) return messages;
+    const get = this.store.db.prepare(`
+      SELECT id, version FROM artifacts WHERE conversation = ? AND request = ?
+        AND state = 'available' ORDER BY created LIMIT 4
+    `);
+    let changed = false;
+    const recovered = await Promise.all(messages.map(async (message) => {
+      if (message.role !== 'assistant' || (message.assets?.length ?? 0) >= 4) return message;
+      const current = message.assets ?? [];
+      const rows = get.all(message.conversationId, message.requestId)
+        .filter(({ id }) => !current.some((asset) => asset.id === id));
+      if (!rows.length) return message;
+      const additions: MediaAsset[] = [];
+      for (const row of rows.slice(0, 4 - current.length)) {
+        const saved = await this.assets.get(String(row.id)).catch(() => undefined);
+        if (saved && digest(saved.bytes) === row.version) additions.push({ ...saved.asset, managed: true });
+      }
+      if (!additions.length) return message;
+      changed = true;
+      return { ...message, assets: [...current, ...additions] };
+    }));
+    return changed ? recovered : messages;
   }
 
   evidence(id: string, conversation: string) {

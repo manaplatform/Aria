@@ -21,10 +21,18 @@ function notice(directory) {
       name: file.name,
       text: fs.readFileSync(path.join(directory, file.name), 'utf8'),
     }));
-  if (!files.length && name === '@ai-sdk/provider-utils' && version === '5.0.79') {
-    const name = 'ai-sdk-provider-utils-5.0.79.txt';
-    const text = fs.readFileSync(path.join(root, 'third-party/licenses', name), 'utf8');
-    files.push({ name, text });
+  const bundledNotice = {
+    '@ai-sdk/provider-utils@5.0.79': 'ai-sdk-provider-utils-5.0.79.txt',
+    'remark-math@6.0.0': 'remark-math-6.0.0.txt',
+  }[`${name}@${version}`];
+  if (!files.length && bundledNotice) {
+    const text = fs.readFileSync(path.join(root, 'third-party/licenses', bundledNotice), 'utf8');
+    files.push({ name: bundledNotice, text });
+  }
+  if (name === 'katex') {
+    const fontNotice = 'katex-fonts-OFL-1.1.txt';
+    const text = fs.readFileSync(path.join(root, 'third-party/licenses', fontNotice), 'utf8');
+    files.push({ name: fontNotice, text });
   }
   const known =
     !license &&

@@ -149,6 +149,18 @@ export const capabilityHostRequest = z.discriminatedUnion('type', [
     id: z.string().uuid(),
     type: z.literal('reserve'),
     fingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+    operation: z.strictObject({
+      id: capabilityId,
+      stepId: identifier,
+      callId: z.string().min(1).max(256),
+    }).optional(),
+  }),
+  z.strictObject({
+    ...scope,
+    id: z.string().uuid(),
+    type: z.literal('receipt'),
+    fingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+    state: z.enum(['completed', 'failed', 'uncertain']),
   }),
   z.strictObject({
     ...scope,

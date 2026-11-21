@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { Injectable } from '@nestjs/common';
+import { Injectable, type OnModuleDestroy } from '@nestjs/common';
 import {
   capabilityHostReply,
   executionLimits,
@@ -11,6 +11,7 @@ import {
 } from '@aria/shared';
 import type { BrowserPort } from '../web/browser-port.client';
 import { RunError } from './run-assets';
+import { StandaloneDispatch } from './standalone-dispatch';
 
 type HostCommand = CapabilityHostRequest extends infer Request
   ? Request extends { id: string }
@@ -29,10 +30,16 @@ export class ToolError extends RunError {
 }
 
 @Injectable()
-export class CapabilityHost {
+export class CapabilityHost implements OnModuleDestroy {
   private policy = defaultToolPolicy;
   private port?: BrowserPort;
   private readonly pending = new Map<string, (reply?: CapabilityHostReply) => void>();
+  private readonly standalone = new StandaloneDispatch();
+
+  onModuleDestroy() {
+    this.standalone.close();
+    for (const settle of this.pending.values()) settle();
+  }
 
   get current() {
     return this.policy;
@@ -69,7 +76,17 @@ export class CapabilityHost {
     signal.throwIfAborted();
     const port = this.port;
     if (!port) {
-      if (command.type === 'reserve' && process.env.ARIA_MANAGED !== '1') return;
+      if ((command.type === 'reserve' || command.type === 'receipt') && process.env.ARIA_MANAGED !== '1') {
+        try {
+          const accepted = command.type === 'reserve'
+            ? this.standalone.reserve(command)
+            : this.standalone.settle(command, command.state);
+          if (accepted) return;
+        } catch {
+          throw new ToolError('CAPABILITY_UNAVAILABLE', 'The standalone dispatch journal is unavailable. Check its directory permissions.');
+        }
+        throw new ToolError('DUPLICATE_DISPATCH', 'The operation already has a reservation or receipt.');
+      }
       throw new ToolError(
         'CAPABILITY_UNAVAILABLE',
         'The desktop capability service is unavailable.',

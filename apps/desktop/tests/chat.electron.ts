@@ -63,6 +63,11 @@ async function send(content: string) {
   await page.getByRole('textbox', { name: 'Message Aria' }).fill(content);
   await page.getByRole('button', { name: 'Send message', exact: true }).click();
 }
+
+function visualBlock(visual: object) {
+  return `\`\`\`aria-visual\n${JSON.stringify({ v: 1, ...visual })}\n\`\`\``;
+}
+
 test.beforeAll(async () => {
   fixture = await createProviderFixture();
 });
@@ -197,6 +202,11 @@ test('selects and revokes a full screen in Settings from an unsent chat', async 
   await select.click();
   await expect(page.getByText('Start a local desktop session in this chat within two minutes.')).toBeVisible();
   await page.getByRole('checkbox', { name: 'Allow access until revoked', exact: true }).check();
+  await app.evaluate(({ app, BrowserWindow }) => {
+    if (process.platform === 'darwin') app.focus({ steal: true });
+    BrowserWindow.getAllWindows()[0].focus();
+  });
+  await expect.poll(() => app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].isFocused())).toBe(true);
   await select.click();
   await expect(page.getByText('This chat can use the selected display until you click Revoke or quit Aria.')).toBeVisible();
   await page.getByRole('button', { name: 'Revoke', exact: true }).click();
@@ -264,6 +274,156 @@ test('streams through the managed NestJS API, renders Markdown, manages conversa
     page.getByRole('button', { name: 'A thoughtful conversation', exact: true }),
   ).toBeVisible();
 });
+
+test('renders inline visuals from the primary text stream and restores them in a narrow chat', async () => {
+  await launch();
+  await page.getByRole('button', { name: 'Open settings', exact: true }).click();
+  await page.getByRole('button', { name: 'Dark', exact: true }).click();
+  await page.getByRole('button', { name: 'Back to chat', exact: true }).click();
+  const prompt = '[slow] Visualize the survey';
+  const categories = ['Jan', 'Feb', 'Mar'];
+  fixture.finalReply(
+    prompt,
+    [
+      '## Survey results ✓\n\nPrices changed from $5 to $10. Mean $$x = \\frac{a}{b}$$.',
+      visualBlock({
+        type: 'bar',
+        title: 'Monthly change',
+        categories,
+        yLabel: 'Change (%)',
+        series: [
+          { name: 'Actual', values: [-5, 8, 0] },
+          { name: 'Target', values: [2, 6, 9] },
+        ],
+      }),
+      visualBlock({
+        type: 'flowchart',
+        title: 'Review process',
+        nodes: [
+          { id: 'draft', label: 'Draft' },
+          { id: 'review', label: 'Review' },
+          { id: 'publish', label: 'Publish' },
+        ],
+        edges: [
+          { from: 'draft', to: 'review' },
+          { from: 'review', to: 'publish', label: 'Approved' },
+        ],
+      }),
+      'The largest change was in February.',
+    ].join('\n\n'),
+  );
+  await send(prompt);
+  const answer = page.locator('.from-assistant');
+  await expect(answer.getByText('Preparing visual…')).toBeVisible();
+  const bar = answer.getByRole('figure', { name: 'Monthly change' });
+  const plot = bar.getByRole('application');
+  await expect(bar.locator('.recharts-bar-rectangle').first()).toBeVisible();
+  await expect(answer).toHaveAttribute('data-status', 'streaming');
+  await plot.focus();
+  await plot.press('ArrowRight');
+  await expect(bar.locator('.recharts-tooltip-wrapper')).toBeVisible();
+  await expect(bar.locator('.recharts-tooltip-wrapper')).toContainText('Actual');
+  await bar.getByText('Show data').click();
+  await expect(bar.getByRole('table', { name: 'Monthly change data' })).toContainText('-5');
+  await expect(answer.getByRole('img', { name: 'Review process flowchart' })).toBeVisible();
+  await expect(answer.locator('math')).toHaveCount(1);
+  await expect(bar.getByRole('table')).toBeVisible();
+  fixture.releaseSlow();
+  await expect(answer).toHaveAttribute('data-status', 'completed');
+  const turn = fixture.received.find(({ body }) =>
+    body.messages.some(({ content }) => content === prompt),
+  );
+  expect(
+    turn?.body.messages.some(
+      ({ role, content }) => role === 'system' && content.includes('```aria-visual'),
+    ),
+  ).toBe(true);
+  await bar.getByText('Show data').click();
+  await bar.scrollIntoViewIfNeeded();
+  await screenshot('chat-rich-response.png');
+
+  await page.getByRole('button', { name: 'Open settings', exact: true }).click();
+  await page.getByRole('button', { name: 'Light', exact: true }).click();
+  await page.getByRole('button', { name: 'Back to chat', exact: true }).click();
+  await app.close();
+  await launch();
+  await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].setSize(1140, 720));
+  await page.getByRole('button', { name: 'Split', exact: true }).click();
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'light');
+  const restoredBar = page.getByRole('figure', { name: 'Monthly change' });
+  await expect(restoredBar.locator('.recharts-bar-rectangle').first()).toBeVisible();
+  await expect(page.getByRole('img', { name: 'Review process flowchart' })).toBeVisible();
+  await expect
+    .poll(() => restoredBar.locator('.reply-chart-plot').evaluate((node) => node.clientWidth))
+    .toBeLessThan(500);
+  await expect
+    .poll(() =>
+      page.locator('.chat-scroll').evaluate((node) => node.scrollWidth <= node.clientWidth + 1),
+    )
+    .toBe(true);
+  await restoredBar.scrollIntoViewIfNeeded();
+  await screenshot('chat-rich-response-split.png');
+});
+
+test('plots lines, areas, scatter points, and pie slices from a single reply', async () => {
+  await launch();
+  const prompt = 'Show four chart styles';
+  const categories = ['First', 'Second', 'Third'];
+  fixture.finalReply(
+    prompt,
+    [
+      visualBlock({
+        type: 'line',
+        title: 'Line example',
+        categories,
+        series: [{ name: 'Trend', values: [1, null, 3] }],
+      }),
+      visualBlock({
+        type: 'area',
+        title: 'Area example',
+        categories,
+        series: [{ name: 'Change', values: [-1, 2, 4] }],
+      }),
+      visualBlock({
+        type: 'scatter',
+        title: 'Scatter example',
+        series: [
+          {
+            name: 'Points',
+            points: [
+              [1, 2],
+              [-3, 4],
+            ],
+          },
+        ],
+      }),
+      visualBlock({
+        type: 'pie',
+        title: 'Pie example',
+        categories,
+        series: [{ name: 'Share', values: [1, 3, 6] }],
+      }),
+    ].join('\n\n'),
+  );
+  await send(prompt);
+  await expect(page.locator('.from-assistant[data-status="completed"]')).toHaveCount(1);
+  await expect(
+    page.getByRole('figure', { name: 'Line example' }).locator('.recharts-line-dot').first(),
+  ).toBeVisible();
+  await expect(
+    page.getByRole('figure', { name: 'Area example' }).locator('.recharts-area-area').first(),
+  ).toBeVisible();
+  await expect(
+    page
+      .getByRole('figure', { name: 'Scatter example' })
+      .locator('.recharts-scatter-symbol')
+      .first(),
+  ).toBeVisible();
+  await expect(
+    page.getByRole('figure', { name: 'Pie example' }).locator('.recharts-pie-sector').first(),
+  ).toBeVisible();
+});
+
 test('shows real provider errors, supports explicit retry, and tests the connection without creating a chat', async () => {
   await launch();
   await send('[fail] check provider error');

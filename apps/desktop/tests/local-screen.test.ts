@@ -17,7 +17,7 @@ const { openPath, capture, frame, nativeCommand, display } = vi.hoisted(() => {
   };
   return {
     frame: bytes,
-    openPath: vi.fn(async (_path: string) => ''),
+    openPath: vi.fn<(_: string) => Promise<string>>(async () => ''),
     capture: vi.fn(async () => [{ display_id: '12', thumbnail }]),
     nativeCommand: vi.fn<(input: Record<string, unknown>) => Record<string, unknown>>(() => ({})),
     display: {
@@ -72,7 +72,7 @@ async function localScreen() {
   const store = new RuntimeStore(directory);
   let identity = 'fixture';
   const driver = new LocalComputer(() => identity);
-  const approve = vi.fn(async (_title: string, _detail: string) => false);
+  const approve = vi.fn<(_: string, detail: string) => Promise<boolean>>(async () => false);
   const runtime = new ComputerRuntime(
     store,
     [driver],

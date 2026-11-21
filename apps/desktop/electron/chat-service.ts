@@ -31,11 +31,11 @@ interface BrowserIntegration {
 interface CapabilityIntegration {
   policy(registry: RuntimeRegistry): ToolPolicy;
   artifact?(id: string, conversation: string, request: string): Promise<MediaAsset>;
-  adoptHostedArtifact?(
+  adoptArtifact?(
     asset: MediaAsset,
     conversation: string,
     request: string,
-    execution: NonNullable<ArtifactReference['hostedExecution']>,
+    execution: { stepId: string; sessionId?: string },
     signal: AbortSignal,
   ): Promise<void>;
   release?(request: string): void;
@@ -151,6 +151,7 @@ export class ChatService {
         if (
           generation === this.generation &&
           !turn?.stopped &&
+          turn?.request.programPrivateHistory !== true &&
           turn?.request.conversationId === request.conversationId
         )
           return turn.controller.signal;
@@ -432,12 +433,15 @@ export class ChatService {
           )
             throw new Error('The artifact does not match its verified storage record.');
           if (active.stopped) break;
-          if (event.artifact.hostedExecution)
-            await this.capabilities?.adoptHostedArtifact?.(
+          if (event.artifact.storage !== 'desktop' && event.artifact.executionId)
+            await this.capabilities?.adoptArtifact?.(
               asset,
               request.conversationId,
               request.requestId,
-              event.artifact.hostedExecution,
+              {
+                stepId: event.artifact.executionId,
+                sessionId: event.artifact.hostedExecution?.sessionId,
+              },
               controller.signal,
             );
           this.recentlyPublished(asset.id);
@@ -450,7 +454,7 @@ export class ChatService {
           active.emit({
             type: 'asset',
             asset:
-              event.artifact.storage === 'desktop' || event.artifact.hostedExecution
+              event.artifact.storage === 'desktop' || event.artifact.executionId
                 ? { ...asset, managed: true }
                 : asset,
             requestId: event.requestId,
@@ -551,7 +555,10 @@ export class ChatService {
     }
     signal?.throwIfAborted();
     if (bytes !== artifact.size) throw new Error('The artifact download was incomplete.');
-    const asset = await this.assets.put(Buffer.concat(chunks), artifact.name, mime);
+    const content = Buffer.concat(chunks);
+    if (artifact.sha256 && createHash('sha256').update(content).digest('hex') !== artifact.sha256)
+      throw new Error('The artifact failed its integrity check.');
+    const asset = await this.assets.put(content, artifact.name, mime);
     if (signal?.aborted) {
       await this.assets.remove(asset.id);
       signal.throwIfAborted();

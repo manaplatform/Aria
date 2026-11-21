@@ -84,6 +84,7 @@ export const registryPolicySchema = z
     preference: z.enum(['balanced', 'cost', 'latency', 'quality']),
     crossConnection: z.boolean(),
     crossConnectionAttachments: z.boolean(),
+    spendingLimitUsdMicros: z.number().int().positive().max(1_000_000_000).optional(),
   })
   .strict();
 export const connectionInputSchema = connectionSchema.safeExtend({
@@ -122,6 +123,11 @@ export type RegistrySettings = Omit<RegistryInput, 'connections'> & {
   environmentImportAvailable: boolean;
   encryptionAvailable: boolean;
 };
+export const textPricingSchema = z.strictObject({
+  unit: z.literal('usd-micros-per-million-tokens'),
+  input: z.number().int().nonnegative().max(1_000_000_000),
+  output: z.number().int().nonnegative().max(1_000_000_000),
+});
 export interface DiscoveredModel {
   id: string;
   capabilities: ModelCapability[];
@@ -131,6 +137,7 @@ export interface DiscoveredModel {
   contextTokens?: number;
   inputCost?: number;
   outputCost?: number;
+  textPricing?: z.infer<typeof textPricingSchema>;
 }
 export const emptyRegistryPolicy: z.infer<typeof registryPolicySchema> = {
   primary: null,
@@ -142,9 +149,9 @@ export const emptyRegistryPolicy: z.infer<typeof registryPolicySchema> = {
 };
 
 export function registryPolicyOf(value: z.infer<typeof registryPolicySchema>) {
-  const { primary, live, systemPrompt, preference, crossConnection, crossConnectionAttachments } =
+  const { primary, live, systemPrompt, preference, crossConnection, crossConnectionAttachments, spendingLimitUsdMicros } =
     value;
-  return { primary, live, systemPrompt, preference, crossConnection, crossConnectionAttachments };
+  return { primary, live, systemPrompt, preference, crossConnection, crossConnectionAttachments, spendingLimitUsdMicros };
 }
 
 export function registryDraft(settings: RegistrySettings): RegistryInput {

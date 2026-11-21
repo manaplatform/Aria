@@ -121,13 +121,21 @@ export class ChatController {
     response.setHeader('X-Accel-Buffering', 'no');
     response.flushHeaders();
     let sequence = 0;
+    const write = (frame: string) => {
+      if (response.destroyed || response.writableEnded || controller.signal.aborted) return;
+      if (response.writableLength + Buffer.byteLength(frame) > 1_000_000) {
+        controller.abort();
+        response.destroy();
+        return;
+      }
+      response.write(frame);
+    };
     const heartbeat = setInterval(() => {
-      if (!response.destroyed) response.write(': heartbeat\n\n');
+      write(': heartbeat\n\n');
     }, 15000);
     try {
       await this.conductor.run(input, controller.signal, (event) => {
-        if (!response.destroyed && !response.writableEnded)
-          response.write(
+          write(
             `data: ${JSON.stringify({
               requestId: input.requestId,
               conversationId: input.conversationId,

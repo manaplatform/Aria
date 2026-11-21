@@ -45,15 +45,27 @@ function canonical(value: unknown): string {
   return JSON.stringify(value) ?? 'null';
 }
 
+const transientResultKeys = new Set([
+  'stepId', 'callId', 'sourceId', 'resultId', 'resultRef', 'observationId', 'retrievedAt',
+  'documentId', 'elementId', 'timestamp', 'durationMs', 'startedAt', 'finishedAt',
+]);
+
+function stableResult(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stableResult);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.entries(value)
+    .filter(([key]) => !transientResultKeys.has(key))
+    .map(([key, item]) => [key, stableResult(item)]));
+}
+
 export class ExecutionEngine {
   private readonly results = new Map<string, Outcome>();
   private readonly corrected = new Set<string>();
   private readonly recoverable = new Map<string, string>();
   private readonly restricted = new Set<string>();
   private readonly dispatched = new Set<string>();
-  private readonly failedCapabilities = new Set<string>();
+  private readonly uncertainCapabilities = new Set<string>();
   private readonly counters = { searches: 0, fetches: 0, screenshots: 0 };
-  private count = 0;
   directToolCalls = 0;
   programChildCalls = 0;
   billableChildStarted = false;
@@ -82,8 +94,7 @@ export class ExecutionEngine {
   }
 
   reserveProgram() {
-    if (++this.count > conductorLimits.steps)
-      throw new ToolError('BUDGET_EXCEEDED', 'The turn reached its execution step limit.');
+    this.context.budget.step();
   }
 
   async execute(
@@ -138,6 +149,7 @@ export class ExecutionEngine {
           programStatus: outcome?.programStatus,
           programResultSaved: outcome?.programResultSaved,
           capability: descriptor.capability,
+          effect: descriptor.effect,
           target: model ? `${model.connection.name} / ${model.id}`.slice(0, 310) : descriptor.id,
           summary: descriptor.name,
           inputSummary: descriptor.permission,
@@ -163,8 +175,15 @@ export class ExecutionEngine {
     let result: Outcome;
     let reserved = false;
     let launched = false;
-    let release: (() => void) | undefined;
+    let lease: Awaited<ReturnType<ToolRegistry['scheduler']['acquire']>> | undefined;
     let operation: Promise<StepValue> | undefined;
+    let reservation: { fingerprint: string; revision: string } | undefined;
+    const scope = {
+      requestId: this.request.requestId,
+      conversationId: this.request.conversationId,
+      assistantMessageId: this.request.assistantMessageId,
+      voiceSessionId: this.voiceSessionId,
+    };
     try {
       parent.throwIfAborted();
       if (!program) this.reserveProgram();
@@ -181,10 +200,10 @@ export class ExecutionEngine {
           'The selected tool is unavailable for this turn.',
         );
       }
-      if (this.failedCapabilities.has(descriptor.capability))
+      if (this.uncertainCapabilities.has(descriptor.capability))
         throw new ToolError(
-          'CAPABILITY_UNAVAILABLE',
-          'That capability already failed in this turn. Explain the result to the user.',
+          'OUTCOME_UNCERTAIN',
+          'That capability already failed after dispatch. Reconcile the earlier operation before trying again.',
         );
       if (Buffer.byteLength(JSON.stringify(invocation.input ?? null)) > 48_000)
         throw new ToolError('INVALID_ARGUMENT', 'The tool input exceeds its size limit.');
@@ -295,7 +314,7 @@ export class ExecutionEngine {
           : descriptor.effect === 'local' || (program && !descriptor.program?.parallel)
             ? [`${this.request.conversationId}/state`]
             : [];
-        release = await this.tools.scheduler.acquire({
+        lease = await this.tools.scheduler.acquire({
           turn: this.request.requestId,
           provider: model?.connection.id,
           tool: descriptor.id,
@@ -307,26 +326,33 @@ export class ExecutionEngine {
           signal,
         });
       }
+      const authorize = () => {
+        signal.throwIfAborted();
+        if (!this.tools.allowed(descriptor, this.context) ||
+          (program && (program.revision !== this.tools.host.current.revision ||
+            !this.tools.allowedForProgram(descriptor, this.context, program.backend, input.data))) ||
+          (model && this.context.privateContent &&
+            model.connection.id !== this.context.registry.primary.connection.id &&
+            !this.context.registry.config.crossConnectionAttachments))
+          throw new ToolError('PERMISSION_DENIED', 'The operation was revoked before dispatch.');
+      };
+      authorize();
       if (descriptor.effect === 'billable') {
+        const revision = this.tools.host.current.revision;
         await this.tools.host.request(
           {
+            ...scope,
             type: 'reserve',
-            requestId: this.request.requestId,
-            conversationId: this.request.conversationId,
-            assistantMessageId: this.request.assistantMessageId,
-            revision: this.tools.host.current.revision,
-            voiceSessionId: this.voiceSessionId,
+            revision,
             fingerprint,
+            operation: { id: descriptor.id, stepId: id, callId },
           },
           signal,
         );
+        reservation = { fingerprint, revision };
         this.billableChildStarted = reserved = true;
       }
-      signal.throwIfAborted();
-      if (!this.tools.allowed(descriptor, this.context) ||
-        (program && (program.revision !== this.tools.host.current.revision ||
-          !this.tools.allowedForProgram(descriptor, this.context, program.backend, input.data))))
-        throw new ToolError('PERMISSION_DENIED', 'The tool was revoked before dispatch.');
+      authorize();
       activity('running');
       launched = true;
       if (program) this.programChildCalls++;
@@ -353,8 +379,6 @@ export class ExecutionEngine {
               ? 'The provider timed out after dispatch. The outcome is uncertain.'
               : 'The tool timed out.',
           );
-        if (model && !(error instanceof ToolError))
-          this.failedCapabilities.add(descriptor.capability);
         throw error;
       }
       activity('processing');
@@ -382,6 +406,7 @@ export class ExecutionEngine {
         managedArtifact ??
         (fileArtifact && {
           ...fileArtifact,
+          executionId: id,
           ...(hosted && { hostedExecution: { stepId: id, sessionId: hosted.id } }),
         });
       if (artifact) this.emit({ type: 'artifact', artifact });
@@ -409,11 +434,17 @@ export class ExecutionEngine {
                   descriptor.id,
                   result.evidence.map(({ chunkId, version }) => [chunkId, version]).sort(),
                 ]
-              : [fingerprint, result.text, result.data, result.sources, artifact?.id],
+              : [
+                  descriptor.id, result.text, stableResult(result.data),
+                  result.sources?.map(({ url, title }) => [url, title]),
+                  fileArtifact?.sha256,
+                  value.data.computerImage && createHash('sha256').update(value.data.computerImage.bytes).digest('hex'),
+                  managedArtifact?.id,
+                ],
           ),
         )
         .digest('hex');
-      if (!this.evidence.has(evidence)) {
+      if (result.status === 'completed' && !this.evidence.has(evidence)) {
         this.evidence.add(evidence);
         this.progress++;
       }
@@ -427,7 +458,8 @@ export class ExecutionEngine {
     } catch (error) {
       const stopped = parent.aborted;
       const code = stopped
-        ? program && launched && descriptor.program?.retry === 'never' ? 'OUTCOME_UNCERTAIN' : 'CANCELLED'
+        ? launched && (reserved || descriptor.effect === 'consequential' ||
+          descriptor.program?.retry === 'never') ? 'OUTCOME_UNCERTAIN' : 'CANCELLED'
         : error instanceof ToolError
           ? error.code
           : reserved && !(error instanceof RunError)
@@ -446,14 +478,30 @@ export class ExecutionEngine {
         problem: { code, message: message.slice(0, 400) },
       };
     } finally {
-      const free = release;
-      if (free) {
-        if (operation) void operation.then(free, free);
-        else free();
+      const held = lease;
+      if (held) {
+        if (operation) {
+          const timer = setTimeout(held.fence, 2000);
+          timer.unref();
+          const settle = () => {
+            clearTimeout(timer);
+            held.release();
+          };
+          void operation.then(settle, settle);
+        } else held.release();
       }
     }
+    if (reservation && !parent.aborted) {
+      await this.tools.host.request({
+        ...scope, ...reservation, type: 'receipt',
+        state: result.problem?.code === 'OUTCOME_UNCERTAIN' ? 'uncertain' :
+          result.status === 'completed' ? 'completed' : 'failed',
+      }, AbortSignal.any([parent, AbortSignal.timeout(2000)])).catch(() => undefined);
+    }
+    if (result.problem?.code === 'OUTCOME_UNCERTAIN')
+      this.uncertainCapabilities.add(descriptor.capability);
     this.results.set(id, result);
-    activity(result.status, result);
+    activity(result.problem?.code === 'OUTCOME_UNCERTAIN' ? 'uncertain' : result.status, result);
     return result;
   }
 }

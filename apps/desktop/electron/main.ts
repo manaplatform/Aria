@@ -40,6 +40,7 @@ import {
   identifier,
   modelCapabilitySchema,
   registryInputSchema,
+  selectChatContext,
   programSettingsSchema,
 } from '@aria/shared';
 import { ChatService } from './chat-service';
@@ -588,28 +589,11 @@ function registerIpc(): void {
       )
     )
       throw new Error('Attach the files to this turn before sending them.');
-    const blockedHistory = new Set(
-      messages
-        .filter(
-          (message) =>
-            message.id !== assistant.id &&
-            message.run?.revision !== chat.getStatus().revision &&
-            message.activity?.some((step) => step.privateContent),
-        )
-        .map((message) => message.content),
-    );
+    const context = selectChatContext(messages, chat.getStatus().revision ?? '');
     chat.submit({
       ...parsed,
-      programPrivateHistory: messages.some((message) =>
-        message.id !== assistant.id && message.activity?.some((step) => step.privateContent) &&
-        !blockedHistory.has(message.content) &&
-        parsed.messages.some((item) => item.role === 'assistant' && item.content === message.content)),
-      messages: parsed.messages.filter(
-        (item, index) =>
-          index === parsed.messages.length - 1 ||
-          item.role !== 'assistant' ||
-          !blockedHistory.has(item.content),
-      ),
+      programPrivateHistory: context.privateContent,
+      messages: context.messages,
     });
   });
   handle('aria:execution-history', () => executionRuntime.history());
@@ -920,7 +904,6 @@ app
     storage = new LocalStorage(directory);
     initial = await storage.load();
     assets = new MediaStorage(directory);
-    if (!initial.warning) await assets.pruneUnreferenced(initial.data).catch(() => undefined);
     protocol.handle('aria-media', async (request) => {
       try {
         const url = new URL(request.url);
@@ -997,6 +980,20 @@ app
       () => provider.resolve(),
       cipher,
     );
+    if (!initial.warning) {
+      try {
+        const previous = initial.data;
+        const messages = await executionRuntime.recoverArtifacts(previous.chat.messages);
+        if (messages !== previous.chat.messages) {
+          const recovered = { ...previous, chat: { ...previous.chat, messages } };
+          await storage.save(recovered);
+          initial = { data: recovered };
+        }
+        await assets.pruneUnreferenced(initial.data);
+      } catch {
+        // Keep files for reconciliation on the next successful load.
+      }
+    }
     webSettings = new WebSettingsStorage(directory);
     await webSettings.load();
     browser = new BrowserController(directory, () => webSettings.get(), approve);
@@ -1112,8 +1109,8 @@ app
         }),
         artifact: (id, conversation, request) =>
           executionRuntime.resolveArtifact(id, conversation, request),
-        adoptHostedArtifact: (asset, conversation, request, execution, signal) =>
-          executionRuntime.adoptHostedArtifact(asset, conversation, request, execution, signal),
+        adoptArtifact: (asset, conversation, request, execution, signal) =>
+          executionRuntime.adoptArtifact(asset, conversation, request, execution, signal),
         release: (request) => {
           executionRuntime.release(request);
           computerRuntime.release(request);

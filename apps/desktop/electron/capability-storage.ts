@@ -30,7 +30,7 @@ import {
   installedSkillSchema,
   readSkillFile,
 } from './skill-bundles';
-import { RuntimeError } from './runtime/store';
+import { RuntimeError, RuntimeStore } from './runtime/store';
 import { writeBrowserJson } from './web-settings-storage';
 
 const settingsSchema = z.strictObject({
@@ -67,7 +67,6 @@ export class CapabilityStorage {
     expires: number;
     preview: Awaited<ReturnType<typeof inspectBundle>>;
   };
-  private queue = Promise.resolve();
   private examples: Awaited<ReturnType<typeof inspectBundle>>[] = [];
 
   private exampleSummaries(): SkillSummary[] {
@@ -78,7 +77,7 @@ export class CapabilityStorage {
     }));
   }
 
-  constructor(directory: string) {
+  constructor(directory: string, readonly runtimeStore = new RuntimeStore(directory)) {
     this.file = path.join(directory, 'capabilities-v1.json');
     this.root = path.join(directory, 'approved-skills');
     this.journal = path.join(directory, 'tool-dispatch');
@@ -381,49 +380,28 @@ export class CapabilityStorage {
     };
   }
 
-  reserve(
+  async reserve(
     conversationId: string,
     turn: string,
     attempt: string,
     fingerprint: string,
     signal: AbortSignal,
+    metadata?: { id: string; stepId: string; callId: string; revision: string },
   ) {
-    const operation = this.queue.then(async () => {
-      signal.throwIfAborted();
-      const directory = path.join(this.journal, hash(conversationId), hash(turn));
-      await fs.mkdir(directory, { recursive: true, mode: 0o700 });
-      const owner = path.join(directory, 'attempt');
-      try {
-        await writeOnce(owner, hash(attempt));
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-        if ((await fs.readFile(owner, 'utf8')) !== hash(attempt)) return false;
-      }
-      signal.throwIfAborted();
-      try {
-        await writeOnce(path.join(directory, hash(fingerprint)), '');
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === 'EEXIST') return false;
-        throw error;
-      }
-      signal.throwIfAborted();
-      return true;
+    signal.throwIfAborted();
+    const directory = path.join(this.journal, hash(conversationId), hash(turn));
+    const owner = await fs.readFile(path.join(directory, 'attempt'), 'utf8').catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== 'ENOENT') throw error;
+      return undefined;
     });
-    this.queue = operation.then(
-      () => undefined,
-      () => undefined,
-    );
-    return operation;
-  }
-}
-
-async function writeOnce(filename: string, content: string) {
-  const file = await fs.open(filename, 'wx', 0o600);
-  try {
-    await file.writeFile(content);
-    await file.sync();
-  } finally {
-    await file.close();
+    if (owner !== undefined && !/^[a-f0-9]{64}$/.test(owner))
+      throw new RuntimeError('OUTCOME_UNCERTAIN', 'A legacy dispatch could not be reconciled.');
+    const legacy = owner === undefined ? undefined : {
+      attempt: owner,
+      fingerprints: (await fs.readdir(directory)).filter((key) => /^[a-f0-9]{64}$/.test(key)),
+    };
+    signal.throwIfAborted();
+    return this.runtimeStore.reserveDispatch(conversationId, turn, attempt, fingerprint, legacy, metadata);
   }
 }
 
@@ -507,12 +485,19 @@ export function openCapabilityBridge(
       const logicalTurn = request.voiceSessionId
         ? `${request.assistantMessageId}/${request.requestId}`
         : request.assistantMessageId;
+      if (request.type === 'receipt') {
+        signal.throwIfAborted();
+        return storage.runtimeStore.settleDispatch(
+          request.conversationId, logicalTurn, request.requestId, request.fingerprint, request.state,
+        ) ? { id, ok: true } : { id, ok: false, code: 'DUPLICATE_DISPATCH' };
+      }
       return (await storage.reserve(
         request.conversationId,
         logicalTurn,
         request.requestId,
         request.fingerprint,
         signal,
+        request.operation && { ...request.operation, revision: request.revision },
       ))
         ? { id, ok: true }
         : { id, ok: false, code: 'DUPLICATE_DISPATCH' };

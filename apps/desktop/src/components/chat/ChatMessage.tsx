@@ -99,17 +99,19 @@ export function ChatMessage({
   const evidence = useMemo(
     () => [
       ...new Map(
-        message.activity?.flatMap((step) => step.evidence ?? []).map((item) => [item.id, item]),
+        [...(message.activity?.flatMap((step) => step.evidence ?? []) ?? []),
+          ...(message.citations?.evidence ?? [])].map((item) => [item.id, item]),
       ).values(),
     ],
-    [message.activity],
+    [message.activity, message.citations],
   );
   const busy = generating(message);
   const revision = useChatStore((state) => state.status.revision);
   const retry = message.retryConfirmed && message.run?.revision === revision;
   const sources = [
     ...new Map(
-      message.activity?.flatMap((item) => item.sources ?? []).map((source) => [source.url, source]),
+      [...(message.activity?.flatMap((item) => item.sources ?? []) ?? []),
+        ...(message.citations?.sources ?? [])].map((source) => [source.url, source]),
     ).values(),
   ];
   const research =
@@ -145,6 +147,8 @@ export function ChatMessage({
             research={research}
             evidenceIds={evidence.map((item) => item.id)}
             onEvidence={setSelectedEvidence}
+            rich={!message.liveSessionId}
+            streaming={busy}
           />
         ) : busy ? (
           <div className="thinking-indicator" aria-label="Waiting for response">

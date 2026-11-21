@@ -10,6 +10,8 @@ Chat operations live in `chatStore`, not message components. Submission creates 
 
 Retry and regeneration reuse the latest user message. A retry requires a matching registry revision and confirmation that no billable child started. A fresh attempt uses current Settings. Provider context contains the latest user message and up to 20 completed prior turns, bounded to 100,000 characters. Attachment IDs belong to the submitted turn. Markdown supports safe links and copying. Binary previews use Aria's local asset protocol.
 
+Desktop text chat renders charts and flowcharts from versioned JSON in top-level `aria-visual` Markdown fences. The renderer mounts a visual after the closing fence arrives and the payload passes the shared schema. Invalid or interrupted blocks expose their source for copying. Chart data, diagram connections, and locally rendered equations travel through the existing text stream and history. The existing artifact workflow handles downloadable chart files.
+
 ## Managed NestJS service
 
 Electron main launches the staged API after app readiness with `utilityProcess.fork`, using Electron’s embedded Node runtime. A private parent-channel handshake installs the registry snapshot before reporting an ephemeral loopback port. Main generates a per-launch bearer token; only main receives the port/token. The renderer never receives provider credentials from persisted settings, the internal token, or arbitrary network/process access.

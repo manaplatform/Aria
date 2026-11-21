@@ -6,6 +6,10 @@ After building the desktop app and installing its Electron runtime, run `pnpm li
 
 The recorded notice for `@ai-sdk/provider-utils@5.0.79` comes from its [tagged upstream release](https://github.com/vercel/ai/blob/44ba949048fcfe4cd1b801c3bd9c49bffbad96fa/LICENSE).
 
+The inventory includes the notice from the `remark-math@6.0.0` release. [Upstream MIT notice](https://github.com/remarkjs/remark-math/blob/6.0.0/license)
+
+The bundled KaTeX fonts carry the copyright and reserved names from the distributed font files. [SIL Open Font License 1.1](https://openfontlicense.org/open-font-license-official-text/)
+
 Review entries flagged by the check for absent metadata, absent license files, or additional terms. Review generated CSS, embedded assets, trademarks, and any installer-specific additions separately. No standalone image, icon, or font asset was tracked at the start of this change. Aria's own name and marks require a separate ownership and trademark review before adding an open-source notice.
 
 See [Electron's license](https://github.com/electron/electron/blob/main/LICENSE) and the license notices included with each published Electron binary.

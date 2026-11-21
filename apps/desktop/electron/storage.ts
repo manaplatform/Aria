@@ -3,7 +3,9 @@ import {
   conductorLimits,
   conductorAttemptSchema,
   endActivity,
+  evidenceSchema,
   runInfoSchema,
+  sourceSchema,
 } from '@aria/shared';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
@@ -135,6 +137,10 @@ const chatSchema = z
           error: z.string().max(2000).optional(),
           operation: operationSchema.optional(),
           activity: z.array(activitySchema).max(conductorLimits.activity).optional(),
+          citations: z.strictObject({
+            sources: z.array(sourceSchema).max(conductorLimits.steps * 8),
+            evidence: z.array(evidenceSchema).max(conductorLimits.steps * 8),
+          }).optional(),
           attempts: z.array(conductorAttemptSchema).max(2).optional(),
           run: runInfoSchema.optional(),
           retryConfirmed: z.boolean().optional(),

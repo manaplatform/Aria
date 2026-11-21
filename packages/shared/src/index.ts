@@ -31,6 +31,7 @@ import type {
   ConductorAttempt,
   ConductorEvent,
   ConductorRunInfo,
+  ConductorSource,
 } from './conductor.js';
 export * from './model-registry.js';
 export * from './conductor.js';
@@ -258,6 +259,7 @@ export interface ChatMessage {
   error?: string;
   operation?: OperationInput;
   activity?: ConductorActivity[];
+  citations?: { sources: ConductorSource[]; evidence: DocumentEvidence[] };
   attempts?: ConductorAttempt[];
   run?: ConductorRunInfo;
   retryConfirmed?: boolean;
@@ -455,3 +457,4 @@ export interface DesktopBridge {
 }
 
 export * from './execution-runtime.js';
+export * from './reply-visual.js';

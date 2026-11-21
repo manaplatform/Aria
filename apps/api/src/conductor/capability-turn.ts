@@ -5,9 +5,7 @@ import { programWireOutput } from './program-broker';
 import {
   builtinSourceSkill,
   capabilityId,
-  conductorLimits,
   modelRefSchema,
-  modelCapabilitySchema,
   skillRefSchema,
   type ChatRequest,
   type ConductorEvent,
@@ -29,7 +27,6 @@ const resourcesInput = skillRefSchema.extend({
   resourceId: z.string().uuid(),
   offset: z.number().int().min(0).max(1_048_576).optional(),
 });
-const unavailableInput = z.strictObject({ capability: z.string().min(1).max(100) });
 const builtinInstructions = [
   'Identify the exact claims the user wants compared and the scope or time period that matters.',
   'When public research is appropriate, find independent sources and read the original publisher pages before citing them.',
@@ -51,9 +48,9 @@ export class CapabilityTurn {
   private readonly discoveredTools = new Map<string, ToolDescriptor>();
   private readonly selectedModels = new Map<string, Set<string>>();
   private readonly skills = new Set<string>();
-  private readonly searches = new Map<string, object>();
+  private readonly skillPages = new Map<string, NonNullable<Awaited<ReturnType<ToolRegistry['host']['request']>>>>();
+  private readonly searches = new Map<string, { items: unknown[]; nextOffset?: number }>();
   private delegateSnapshot?: ReturnType<ToolRegistry['delegates']>;
-  private controlCalls = 0;
   progress = 0;
 
   constructor(
@@ -126,10 +123,6 @@ export class CapabilityTurn {
         inputSchema: findInput,
       }),
       [this.protocol.name]: this.protocol.apiTool,
-      report_unavailable: tool({
-        description: 'Report that an operation required by the user has no available tool.',
-        inputSchema: unavailableInput,
-      }),
     };
     if (this.registry.host.current.skills.some((skill) => skill.enabled)) {
       tools.load_skill = tool({
@@ -153,7 +146,6 @@ export class CapabilityTurn {
   isControl(name: string) {
     return [
       'find_capabilities',
-      'report_unavailable',
       'load_skill',
       'read_skill_resource',
       this.protocol.name,
@@ -171,9 +163,7 @@ export class CapabilityTurn {
       ? name === 'load_skill'
         ? 'Loading a skill'
         : 'Reading a skill resource'
-      : name === 'report_unavailable'
-        ? 'Checking capability availability'
-        : name === 'find_capabilities'
+      : name === 'find_capabilities'
           ? 'Searching available capabilities'
           : 'Loading tool definitions';
     const start = Date.now();
@@ -193,16 +183,25 @@ export class CapabilityTurn {
           durationMs: status === 'running' ? undefined : Date.now() - start,
           error,
           resultSummary,
+          ...(skill && status === 'completed' && this.context.privateContent && { privateContent: true }),
         },
       });
     activity('running');
     try {
-      if (++this.controlCalls > conductorLimits.controlCalls)
-        throw new ToolError('BUDGET_EXCEEDED', 'The turn reached its discovery and skill limit.');
       this.signal.throwIfAborted();
+      this.context.budget.control();
       let value: object;
       if (name === 'find_capabilities') {
-        value = await this.find(findInput.parse(raw));
+        const query = findInput.parse(raw);
+        const found = await this.find(query);
+        if (query.ids?.length && !query.offset && !query.modelOffset &&
+          !found.items.length && found.nextOffset === undefined) {
+          const message = this.registry.discoveryProblem(query.ids, this.context);
+          const error = new ToolError('CAPABILITY_UNAVAILABLE', message);
+          activity('failed', message);
+          return { value: { ...found, error: { code: error.code, message } }, error, unavailable: true };
+        }
+        value = found;
         resultSummary = 'Capability metadata returned';
       } else if (name === this.protocol.name) {
         const loaded = await this.load(this.protocol.selection(raw, callId));
@@ -219,45 +218,6 @@ export class CapabilityTurn {
           resource?.offset,
         );
         resultSummary = resource ? 'Skill resource returned' : 'Skill instructions loaded';
-      } else {
-        const { capability } = unavailableInput.parse(raw);
-        const candidates = this.registry
-          .cards(this.context)
-          .filter(
-            (card) =>
-              this.registry.get(card.id)?.capability === capability || card.id === capability,
-          );
-        const eligible = candidates.filter(
-          (card) => this.registry.get(card.id)?.dependency !== 'delegate',
-        );
-        if (
-          eligible.length ||
-          (candidates.length &&
-            [...(await this.delegates()).models.values()].some(
-              (model) =>
-                model.delegate &&
-                model.capabilities.some(
-                  (item) =>
-                    item === capability ||
-                    candidates.some((card) => this.registry.get(card.id)?.capability === item),
-                ),
-            ))
-        )
-          throw new ToolError(
-            'INVALID_ARGUMENT',
-            'An eligible operation exists. Discover it before reporting it unavailable.',
-          );
-        const message =
-          capability === 'read-file'
-            ? 'Attach a supported UTF-8 file to this turn.'
-            : capability.startsWith('web') || capability.startsWith('browser')
-              ? 'Enable the requested operation in Tools and Web & Browser settings.'
-              : modelCapabilitySchema.safeParse(capability).success
-                ? `Enable a compatible ${capability} model or tool in Settings.`
-                : 'Enable the required capability in Tools settings.';
-        const error = new ToolError('CAPABILITY_UNAVAILABLE', message);
-        activity('failed', message);
-        return { value: { error: { code: error.code, message } }, error, unavailable: true };
       }
       activity('completed');
       return { value };
@@ -400,6 +360,10 @@ export class CapabilityTurn {
         'PERMISSION_DENIED',
         'That skill or resource is unavailable to this turn.',
       );
+    const page = JSON.stringify([this.registry.host.current.revision, key, resourceId, offset]);
+    const cached = this.skillPages.get(page);
+    if (cached)
+      return { skill, alreadyLoaded: true, resources: cached.resources, nextOffset: cached.nextOffset };
     const content =
       current.id === builtinSourceSkill.id
         ? { text: builtinInstructions, resources: [] }
@@ -419,6 +383,7 @@ export class CapabilityTurn {
           );
     if (!content)
       throw new ToolError('CAPABILITY_UNAVAILABLE', 'The selected skill could not be read.');
+    this.skillPages.set(page, content);
     if (current.provenance === 'local') this.context.privateContent = true;
     if (!this.skills.has(key)) this.progress++;
     this.skills.add(key);

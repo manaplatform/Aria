@@ -6,18 +6,19 @@ type Ticket = {
   locks: readonly string[];
   limit: number;
   signal: AbortSignal;
-  ready: (release: () => void) => void;
+  ready: (lease: { release(): void; fence(): void }) => void;
   cancelled: () => void;
 };
 
 export class ExecutionScheduler {
   private readonly queue: Ticket[] = [];
   private readonly active = new Set<Ticket>();
+  private readonly fenced = new Set<Ticket>();
 
-  async acquire(ticket: Omit<Ticket, 'ready' | 'cancelled'>): Promise<() => void> {
+  async acquire(ticket: Omit<Ticket, 'ready' | 'cancelled'>) {
     ticket.signal.throwIfAborted();
     if (this.queue.length >= 48) throw new Error('The tool execution queue is full.');
-    return new Promise((resolve, reject) => {
+    return new Promise<{ release(): void; fence(): void }>((resolve, reject) => {
       const cancelled = () => {
         const index = this.queue.indexOf(item);
         if (index >= 0) this.queue.splice(index, 1);
@@ -43,13 +44,15 @@ export class ExecutionScheduler {
     for (const ticket of [...this.queue]) {
       const active = [...this.active];
       if (
+        this.fenced.size >= 48 ||
         active.length >= 12 ||
         active.filter((current) => current.turn === ticket.turn).length >= ticket.limit ||
         (ticket.provider &&
           active.filter((current) => current.provider === ticket.provider).length >= 3) ||
         active.filter((current) => current.tool === ticket.tool).length >= ticket.toolLimit ||
         ticket.locks.some(
-          (key) => waitingLocks.has(key) || active.some((current) => current.locks.includes(key)),
+          (key) => waitingLocks.has(key) || active.some((current) => current.locks.includes(key)) ||
+            [...this.fenced].some((current) => current.locks.includes(key)),
         )
       ) {
         ticket.locks.forEach((key) => waitingLocks.add(key));
@@ -57,9 +60,17 @@ export class ExecutionScheduler {
       }
       this.queue.splice(this.queue.indexOf(ticket), 1);
       this.active.add(ticket);
-      ticket.ready(() => {
-        this.active.delete(ticket);
-        this.schedule();
+      ticket.ready({
+        release: () => {
+          this.active.delete(ticket);
+          this.fenced.delete(ticket);
+          this.schedule();
+        },
+        fence: () => {
+          if (!this.active.delete(ticket)) return;
+          this.fenced.add(ticket);
+          this.schedule();
+        },
       });
     }
   }

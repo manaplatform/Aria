@@ -39,7 +39,7 @@ export class RuntimeStore {
     try {
       db.exec('PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 2000; PRAGMA journal_mode = WAL;');
       const version = Number(db.prepare('PRAGMA user_version').get()?.user_version);
-      if (version > 4) throw new Error('This runtime profile requires a newer version of Aria.');
+      if (version > 5) throw new Error('This runtime profile requires a newer version of Aria.');
       if (version === 0) {
         db.exec(`
           BEGIN IMMEDIATE;
@@ -159,11 +159,32 @@ export class RuntimeStore {
           COMMIT;
         `);
       }
+      if (version < 5) {
+        db.exec(`
+          BEGIN IMMEDIATE;
+          CREATE TABLE dispatch_turns (
+            conversation TEXT NOT NULL, turn TEXT NOT NULL, attempt TEXT NOT NULL,
+            PRIMARY KEY(conversation, turn)
+          );
+          CREATE TABLE dispatch_receipts (
+            conversation TEXT NOT NULL, turn TEXT NOT NULL, fingerprint TEXT NOT NULL,
+            request TEXT, operation TEXT, step TEXT, call TEXT, revision TEXT,
+            state TEXT NOT NULL, started INTEGER NOT NULL, finished INTEGER,
+            PRIMARY KEY(conversation, turn, fingerprint),
+            FOREIGN KEY(conversation, turn) REFERENCES dispatch_turns(conversation, turn) ON DELETE CASCADE
+          );
+          CREATE INDEX dispatch_receipts_request ON dispatch_receipts(request, state);
+          PRAGMA user_version = 5;
+          COMMIT;
+        `);
+      }
       db.exec(`
         DELETE FROM program_results WHERE expires <= unixepoch() * 1000;
         UPDATE program_children SET state = 'uncertain' WHERE state = 'reserved';
         UPDATE programs SET state = 'uncertain' WHERE state = 'running';
         UPDATE attempts SET state = 'uncertain' WHERE state = 'running';
+        UPDATE dispatch_receipts SET state = 'uncertain', finished = unixepoch() * 1000
+          WHERE state = 'reserved';
         UPDATE sessions SET state = 'cleanup' WHERE state = 'active'
           AND id IN (SELECT session FROM attempts WHERE state = 'uncertain');
         UPDATE computer_sessions SET state = 'recovering', lease = lease + 1
@@ -200,6 +221,55 @@ export class RuntimeStore {
       db.exec('ROLLBACK');
       throw error;
     }
+  }
+
+  reserveDispatch(
+    conversation: string, turn: string, attempt: string, fingerprint: string,
+    legacy?: { attempt: string; fingerprints: string[] },
+    operation?: { id: string; stepId: string; callId: string; revision: string },
+  ) {
+    const owner = digest(conversation);
+    const logicalTurn = digest(turn);
+    const request = digest(attempt);
+    return this.transaction(() => {
+      const now = Date.now();
+      const inserted = this.db.prepare('INSERT OR IGNORE INTO dispatch_turns VALUES (?, ?, ?)')
+        .run(owner, logicalTurn, legacy?.attempt ?? request);
+      if (inserted.changes && legacy) {
+        const migrate = this.db.prepare(`
+          INSERT OR IGNORE INTO dispatch_receipts
+          (conversation, turn, fingerprint, state, started, finished)
+          VALUES (?, ?, ?, 'uncertain', ?, ?)
+        `);
+        for (const key of legacy.fingerprints) migrate.run(owner, logicalTurn, key, now, now);
+      }
+      const active = this.db.prepare('SELECT attempt FROM dispatch_turns WHERE conversation = ? AND turn = ?')
+        .get(owner, logicalTurn);
+      if (active?.attempt !== request) return false;
+      return Boolean(this.db.prepare(`
+        INSERT OR IGNORE INTO dispatch_receipts
+        (conversation, turn, fingerprint, request, operation, step, call, revision, state, started)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'reserved', ?)
+      `).run(owner, logicalTurn, digest(fingerprint), attempt, operation?.id ?? null,
+        operation?.stepId ?? null, operation?.callId ?? null, operation?.revision ?? null, now).changes);
+    });
+  }
+
+  settleDispatch(
+    conversation: string, turn: string, request: string, fingerprint: string,
+    state: 'completed' | 'failed' | 'uncertain',
+  ) {
+    return Boolean(this.db.prepare(`
+      UPDATE dispatch_receipts SET state = ?, finished = ?
+      WHERE conversation = ? AND turn = ? AND request = ? AND fingerprint = ? AND state = 'reserved'
+    `).run(state, Date.now(), digest(conversation), digest(turn), request, digest(fingerprint)).changes);
+  }
+
+  interruptDispatches(request: string) {
+    this.database?.prepare(`
+      UPDATE dispatch_receipts SET state = 'uncertain', finished = ?
+      WHERE request = ? AND state = 'reserved'
+    `).run(Date.now(), request);
   }
 
   begin(
@@ -245,7 +315,7 @@ export class RuntimeStore {
 
   finish(id: string, state: string, exitCode?: number) {
     this.db
-      .prepare('UPDATE attempts SET state = ?, elapsed = ? - started, exit_code = ? WHERE id = ?')
+      .prepare("UPDATE attempts SET state = ?, elapsed = ? - started, exit_code = ? WHERE id = ? AND state = 'running'")
       .run(state, Date.now(), exitCode ?? null, id);
   }
 

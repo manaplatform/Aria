@@ -53,16 +53,13 @@ export const providerConnection = (
 ): Connection => ({ provider: 'openai', baseUrl: config.baseUrl, apiKey: config.apiKey });
 
 export function capabilitiesFor(
-  connection: Pick<RuntimeConnection, 'baseUrl'>,
+  connection: Pick<RuntimeConnection, 'verified'>,
   discovered: DiscoveredModel,
   declared: ModelCapability[],
 ): ModelCapability[] {
-  const supported = declared.filter(
-    (capability) =>
-      capability !== 'web-search' &&
-      (capability !== 'live' || !officialConnection(connection.baseUrl)),
-  );
-  return discovered.source === 'unknown' ? [...new Set(supported)] : discovered.capabilities;
+  const supported = discovered.source === 'provider' ? discovered.capabilities : declared;
+  const verified: ModelCapability[] = connection.verified.includes(discovered.id) ? ['chat', 'tools'] : [];
+  return [...new Set([...supported.filter((capability) => capability !== 'web-search'), ...verified])];
 }
 
 @Injectable()
@@ -183,7 +180,7 @@ export class ModelRegistry {
           primaryEligible:
             capabilities.includes('chat') &&
             capabilities.includes('tools') &&
-            (descriptor.source !== 'unknown' || connection.verified.includes(policy.id)),
+            (descriptor.source === 'provider' || connection.verified.includes(policy.id)),
         });
       }
     }

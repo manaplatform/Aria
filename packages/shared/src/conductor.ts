@@ -1,9 +1,49 @@
 import { z } from 'zod';
 import { evidenceSchema } from './execution-runtime.js';
-import { capabilityId, type ToolProblem } from './capabilities.js';
+import { capabilityId, effectSchema, type ToolProblem } from './capabilities.js';
 import { browserOps, browserToolArgs } from './browser.js';
 import { webToolArgs } from './web.js';
 import { identifier, modelCapabilitySchema, modelRefSchema } from './model-registry.js';
+import type { ChatMessage, ChatRequest } from './index.js';
+
+/** Select complete saved turns and keep their privacy metadata until the wire projection. */
+export function selectChatContext(
+  messages: readonly ChatMessage[],
+  revision?: string,
+): { messages: ChatRequest['messages']; privateContent: boolean } {
+  let lastUser = messages.length - 1;
+  while (lastUser >= 0 && messages[lastUser].role !== 'user') lastUser--;
+  if (lastUser < 0) return { messages: [], privateContent: false };
+  const latest = messages[lastUser];
+  const pairs: { user: ChatMessage; assistant: ChatMessage; privateContent: boolean }[] = [];
+  for (let index = 0; index < lastUser; index++) {
+    const user = messages[index];
+    const assistant = messages[index + 1];
+    if (user.role !== 'user' || assistant?.role !== 'assistant' ||
+      assistant.status !== 'completed' || !assistant.content ||
+      (assistant.operation && assistant.operation.mode !== 'chat')) continue;
+    const privateContent = Boolean(
+      assistant.run?.privateContent || assistant.activity?.some((step) => step.privateContent),
+    );
+    if (privateContent && revision !== undefined && assistant.run?.revision !== revision) continue;
+    pairs.push({ user, assistant, privateContent });
+  }
+  const recent = pairs.slice(-20);
+  const sizeOf = ({ user, assistant }: (typeof recent)[number]) =>
+    user.content.length + assistant.content.length;
+  let size = latest.content.length + recent.reduce((total, pair) => total + sizeOf(pair), 0);
+  while (size > 100_000 && recent.length) size -= sizeOf(recent.shift()!);
+  return {
+    messages: [
+      ...recent.flatMap(({ user, assistant }) => [
+        { role: 'user' as const, content: user.content },
+        { role: 'assistant' as const, content: assistant.content },
+      ]),
+      { role: 'user', content: latest.content },
+    ],
+    privateContent: recent.some((pair) => pair.privateContent),
+  };
+}
 
 export const conductorLimits = {
   milliseconds: 300_000,
@@ -14,6 +54,9 @@ export const conductorLimits = {
   parallel: 3,
   turns: 4,
   searches: 2,
+  inputTokens: 600_000,
+  outputTokens: 65_536,
+  contextTokens: 160_000,
   resultCharacters: 12_000,
   attachmentBytes: 80_000_000,
   artifactBytes: 64_000_000,
@@ -112,6 +155,8 @@ export const artifactReferenceSchema = z
     mimeType: z.string().max(100),
     size: z.number().int().positive().max(conductorLimits.artifactBytes),
     storage: z.literal('desktop').optional(),
+    executionId: stepId.optional(),
+    sha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
     hostedExecution: z.strictObject({ stepId, sessionId: z.string().uuid() }).optional(),
   })
   .strict();
@@ -130,7 +175,9 @@ export const activitySchema = z
       'failed',
       'blocked',
       'cancelled',
+      'uncertain',
     ]),
+    effect: effectSchema.optional(),
     callId: z.string().max(256).optional(),
     parentStepId: stepId.optional(),
     programStatus: z.enum(['complete', 'partial', 'failed', 'cancelled', 'uncertain']).optional(),
@@ -153,11 +200,15 @@ export const runInfoSchema = z
     primary: modelRefSchema,
     primaryName: z.string().max(310).optional(),
     billableChildStarted: z.boolean(),
+    privateContent: z.boolean().optional(),
     usage: z.strictObject({
       providerRequests: z.number().int().nonnegative(),
       responseContinuations: z.number().int().nonnegative(),
       directToolCalls: z.number().int().nonnegative(),
       programChildCalls: z.number().int().nonnegative(),
+      controlCalls: z.number().int().nonnegative().optional(),
+      nativeToolCalls: z.number().int().nonnegative().optional(),
+      accountedCostUsdMicros: z.number().int().nonnegative().optional(),
       inputTokens: z.number().int().nonnegative().optional(),
       outputTokens: z.number().int().nonnegative().optional(),
     }).optional(),
@@ -175,7 +226,13 @@ export type ConductorAttempt = z.infer<typeof conductorAttemptSchema>;
 export function endActivity(activity?: ConductorActivity[]): ConductorActivity[] | undefined {
   return activity?.map((step) =>
     ['running', 'queued', 'approval', 'processing'].includes(step.status)
-      ? { ...step, status: 'cancelled' }
+      ? {
+          ...step,
+          status: (step.status === 'running' || step.status === 'processing') &&
+            (step.effect === 'billable' || step.effect === 'consequential')
+            ? 'uncertain'
+            : 'cancelled',
+        }
       : step,
   );
 }
