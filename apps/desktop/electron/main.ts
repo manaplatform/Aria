@@ -380,9 +380,10 @@ function registerIpc(): void {
     changeCapabilities(() => virtualComputer.verify(AbortSignal.timeout(30_000))),
   );
   handle('aria:local-computer-supported', () => localComputer.supported());
-  handle('aria:select-local-computer', async (value, rawTarget) => {
+  handle('aria:select-local-computer', async (value, rawTarget, rawStanding) => {
     const owner = identifier.parse(value);
     const target = z.enum(['window', 'screen']).default('window').parse(rawTarget);
+    const standing = target === 'screen' && z.boolean().default(false).parse(rawStanding);
     const checkForeground = () => {
       const active = browser.activeConversation();
       if (
@@ -396,12 +397,21 @@ function registerIpc(): void {
     };
     checkForeground();
     let display: Awaited<ReturnType<typeof chooseDisplay>>;
+    let standingProvider: string | undefined;
     if (target === 'screen') {
       if (!mainWindow?.isFocused()) throw new Error('Focus Aria before selecting a display.');
+      let detail = 'Aria can ask to share screenshots, open a supported app, or move and click the mouse on this display. Each action requires your approval.';
+      if (standing) {
+        const identity = chat.runtimeIdentity();
+        if (!identity || !chat.getStatus().configured)
+          throw new Error('Configure a primary model before allowing ongoing display access.');
+        standingProvider = identity.key;
+        detail = `Allow this chat to send screenshots to ${identity.model} at ${new URL(identity.endpoint).origin} and use the display’s supported controls until you click Revoke or quit Aria.`;
+      }
       display = await chooseDisplay(
         mainWindow,
         'Select a full screen',
-        'Aria can ask to share screenshots, open a supported app, or move and click the mouse on this display. Each action requires your approval.',
+        detail,
         true,
       );
       if (!display) return false;
@@ -409,7 +419,7 @@ function registerIpc(): void {
     return changeCapabilities(async () => {
       checkForeground();
       const signal = AbortSignal.timeout(85_000);
-      if (display) await localComputer.prepareScreen(owner, display, signal);
+      if (display) await localComputer.prepareScreen(owner, display, signal, standingProvider);
       else await localComputer.prepare(owner, signal);
       await computerRuntime.closeLocalSessions();
       try {
@@ -992,7 +1002,7 @@ app
     browser = new BrowserController(directory, () => webSettings.get(), approve);
     await browser.load();
     virtualComputer = new VirtualComputer(() => executionRuntime.settings(), directory);
-    localComputer = new LocalComputer();
+    localComputer = new LocalComputer(() => chat.executionIdentity());
     screen.on('display-removed', (_event, display) => localComputer.disconnectDisplay(display.id));
     computerRuntime = new ComputerRuntime(
       executionRuntime.store,

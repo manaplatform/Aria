@@ -35,9 +35,10 @@ export async function chooseDisplay(
     buttons: ['Cancel', ...labels],
     defaultId: 0,
     cancelId: 0,
-    ...(offerPointerPermission && process.platform === 'darwin' && {
-      checkboxLabel: 'Request macOS Accessibility permission for pointer control',
-    }),
+    ...(offerPointerPermission &&
+      process.platform === 'darwin' && {
+        checkboxLabel: 'Request macOS Accessibility permission for pointer control',
+      }),
   });
   const display = displays[response - 1];
   if (!display || window.isDestroyed()) return;

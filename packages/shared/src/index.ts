@@ -391,7 +391,7 @@ export interface DesktopBridge {
   computerPreview(conversationId: string, sessionId: string): Promise<string | undefined>;
   probeVirtualComputer(): Promise<void>;
   localComputerSupported(): Promise<boolean>;
-  selectLocalComputer(conversationId: string, target?: 'window' | 'screen'): Promise<boolean>;
+  selectLocalComputer(conversationId: string, target?: 'window' | 'screen', standing?: boolean): Promise<boolean>;
   revokeLocalComputer(): Promise<void>;
   superviseComputer(conversationId: string, command: ComputerSupervision): Promise<void>;
   sendComputerInput(

@@ -210,7 +210,7 @@ const runtimeDescriptions: Record<RuntimeOperation, readonly [string, string, To
   ],
   'computer.act': [
     'Interact with computer',
-    'Use the latest observation and the actions allowed by this session. For a selected full screen, open_file_manager requests approval to open Finder or File Explorer. Use a structured observation before requesting it. Check per-action results and observed state before claiming success.',
+    'Use the latest observation and the allowed actions for this session. On a selected display, open_application with application=messages opens macOS Messages (iMessage) when available. Use a structured observation for app launches. Local move and click require the latest approved image observation, with x and y measured in screenshot pixels. Check per-action results and observed state before claiming success.',
     'local',
   ],
   'computer.close': [

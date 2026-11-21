@@ -344,6 +344,10 @@ export class ChatService {
   executionIdentity() {
     return this.runtimeProviderKey;
   }
+  runtimeIdentity() {
+    if (this.runtimePrimary && this.runtimeProviderKey)
+      return { ...this.runtimePrimary, key: this.runtimeProviderKey };
+  }
   authorizeRuntime(request: Extract<CapabilityHostRequest, { type: 'runtime' }>) {
     const primary = this.runtimePrimary;
     if (

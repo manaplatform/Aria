@@ -47,6 +47,8 @@ const terminal = new Set<Status>(['completed', 'cancelled', 'failed', 'expired']
 
 function describeInput(action: InputAction) {
   switch (action.type) {
+    case 'open_application':
+      return 'Open the system Messages app.';
     case 'open_file_manager':
       return 'Open the system file manager to your home folder.';
     case 'type':
@@ -75,6 +77,11 @@ export interface ComputerDriver {
   readonly environment: ComputerEnvironment;
   ready(): boolean;
   actions?(owner: string, id?: string): ComputerAction['type'][];
+  standingAccess?(owner: string, id: string, provider: string): boolean;
+  pointerFingerprint?(
+    capture: Capture,
+    action: Extract<ComputerAction, { type: 'click' | 'move' }>,
+  ): string | undefined;
   targetAlive?(owner: string, target: string, id: string): boolean;
   wait?(owner: string, target: string, id: string, signal: AbortSignal): Promise<void>;
   open(owner: string, id: string, input: OpenInput, signal: AbortSignal): Promise<string>;
@@ -108,7 +115,7 @@ export interface ComputerDriver {
     observation: ComputerObservation,
     action: InputAction,
     signal: AbortSignal,
-  ): Promise<void>;
+  ): Promise<void | 'verified'>;
   owner(owner: string, target: string, id: string, user: boolean): void | Promise<void>;
   close(owner: string, target: string, id: string): void | Promise<void>;
   downloadTarget?(
@@ -242,6 +249,7 @@ export class ComputerRuntime {
       session.userBusy ||
       action.type === 'screenshot' ||
       action.type === 'open_file_manager' ||
+      action.type === 'open_application' ||
       action.type === 'wait'
     )
       throw new RuntimeError(
@@ -318,8 +326,8 @@ export class ComputerRuntime {
     return value;
   }
 
-  private captureDigest(value: Capture) {
-    const { revision, width, height, devicePixelRatio, state } = value.observation;
+  private captureDigest(value: Capture, pointerFingerprint?: string) {
+    const { revision, width, height, devicePixelRatio, state, screenshot } = value.observation;
     return digest(
       JSON.stringify([
         revision,
@@ -327,7 +335,8 @@ export class ComputerRuntime {
         height,
         devicePixelRatio,
         state,
-        value.bytes && digest(Buffer.from(value.bytes)),
+        screenshot,
+        value.bytes && (pointerFingerprint ?? digest(Buffer.from(value.bytes))),
       ]),
     );
   }
@@ -597,6 +606,9 @@ export class ComputerRuntime {
           !action ||
           action.type === 'screenshot' ||
           action.type === 'open_file_manager' ||
+          action.type === 'open_application' ||
+          (session.summary.environment === 'local-desktop' &&
+            (action.type === 'move' || action.type === 'click')) ||
           dispatched.has(index)
         )
           throw new RuntimeError(
@@ -1031,7 +1043,8 @@ export class ComputerRuntime {
     lease: number,
     signal: AbortSignal,
   ) {
-    if (!capture.bytes || !session.privateContents) return;
+    this.guard(session, lease, signal);
+    if (!capture.bytes || !session.privateContents || this.standingAccess(session)) return;
     this.state(session, 'waiting-for-approval', 'Approve sharing this observation');
     if (
       !(await this.approve(
@@ -1045,6 +1058,16 @@ export class ComputerRuntime {
     this.state(session, 'running', 'Observing interface');
   }
 
+  private standingAccess(session: Session) {
+    return (
+      session.driver.standingAccess?.(
+        session.summary.conversationId,
+        session.summary.id,
+        session.provider,
+      ) === true
+    );
+  }
+
   private async actions(
     session: Session,
     request: Request,
@@ -1056,7 +1079,7 @@ export class ComputerRuntime {
     const allowed = session.driver.actions?.(session.summary.conversationId, session.summary.id);
     if (
       input.actions.some(({ type }) =>
-        type === 'open_file_manager'
+        type === 'open_file_manager' || type === 'open_application'
           ? !allowed?.includes(type)
           : allowed && !allowed.includes(type),
       )
@@ -1141,23 +1164,49 @@ export class ComputerRuntime {
         continue;
       }
       if (!reference) break;
+      const localPointer =
+        session.summary.environment === 'local-desktop' &&
+        (action.type === 'move' || action.type === 'click');
+      if (localPointer) {
+        const frame = reference.observation.screenshot;
+        if (reference.observation.id !== input.observationId || !reference.bytes || !frame)
+          throw new RuntimeError(
+            'INVALID_ARGUMENT',
+            'Use a fresh, approved image observation before moving or clicking on the selected display.',
+          );
+        if (action.x >= frame.width || action.y >= frame.height || action.keys?.length)
+          throw new RuntimeError(
+            'INVALID_ARGUMENT',
+            'Use an unmodified pointer action inside the current screenshot.',
+          );
+      }
+      const fingerprint = (capture: Capture) =>
+        this.captureDigest(
+          capture,
+          localPointer ? session.driver.pointerFingerprint?.(capture, action) : undefined,
+        );
+      const expected = fingerprint(reference);
       const current = await this.capture(session, !!reference.bytes, active);
-      if (this.captureDigest(reference) !== this.captureDigest(current)) {
+      if (expected !== fingerprint(current)) {
         reference = current;
         outcomes.push({ index, action: action.type, status: 'stale-observation' });
         this.note(session, action.type, 'Stopped on changed interface');
         break;
       }
-      const signature = digest(
-        JSON.stringify([session.summary.targetId, this.captureDigest(reference), action]),
-      );
-      if (action.type !== 'move' && action.type !== 'scroll') {
-        this.state(session, 'waiting-for-approval', `Approve ${action.type.replace('_', ' ')}`);
+      const signature = digest(JSON.stringify([session.summary.targetId, expected, action]));
+      if (
+        !this.standingAccess(session) &&
+        (localPointer || (action.type !== 'move' && action.type !== 'scroll'))
+      ) {
+        this.state(session, 'waiting-for-approval', `Approve ${action.type.replaceAll('_', ' ')}`);
         const consent = describeInput(action);
+        const launch = action.type === 'open_file_manager' || action.type === 'open_application';
         const detail =
-          action.type === 'open_file_manager'
-            ? `${reference.observation.title}\n\n${consent}`
-            : `${reference.observation.url ?? session.summary.environment}\n\n${consent}\n\nThis sends input to the current target.`;
+          localPointer && action.type === 'move'
+            ? `${reference.observation.title}\n\nMove the pointer to (${action.x}, ${action.y}) in the approved screenshot.`
+            : localPointer || launch
+              ? `${reference.observation.title}\n\n${consent}`
+              : `${reference.observation.url ?? session.summary.environment}\n\n${consent}\n\nThis sends input to the current target.`;
         const approved = await this.approve(
           'Allow this computer action once?',
           detail,
@@ -1184,7 +1233,7 @@ export class ComputerRuntime {
           !!reference.bytes,
           AbortSignal.any([signal, AbortSignal.timeout(computerLimits.actionMs)]),
         );
-        if (this.captureDigest(reference) !== this.captureDigest(checked)) {
+        if (expected !== fingerprint(checked)) {
           reference = checked;
           outcomes.push({ index, action: action.type, status: 'stale-approval' });
           break;
@@ -1194,17 +1243,26 @@ export class ComputerRuntime {
       this.guard(session, lease, signal);
       const attempt = this.store.begin(request, session.summary.id, ['computer', signature]);
       try {
-        await session.driver.input(
+        const result = await session.driver.input(
           ...this.driverSession(session),
           reference.observation,
           action,
           AbortSignal.any([signal, AbortSignal.timeout(computerLimits.actionMs)]),
         );
-        this.store.finish(attempt, 'submitted');
-        outcomes.push({ index, action: action.type, status: 'submitted' });
-        this.note(session, action.type, 'Input dispatched');
+        const status = result === 'verified' ? 'verified' : 'submitted';
+        this.store.finish(attempt, status);
+        if (result === 'verified') {
+          session.previousDigest = undefined;
+          session.repeats = 0;
+        }
+        outcomes.push({ index, action: action.type, status });
+        this.note(
+          session,
+          action.type,
+          result === 'verified' ? 'Verified by the system' : 'Input dispatched',
+        );
       } catch (error) {
-        const checked = error instanceof RuntimeError;
+        const checked = error instanceof RuntimeError && error.code !== 'OUTCOME_UNCERTAIN';
         this.store.finish(attempt, checked ? 'failed' : 'uncertain');
         outcomes.push({ index, action: action.type, status: checked ? 'failed' : 'unknown' });
         problem = checked
@@ -1212,7 +1270,9 @@ export class ComputerRuntime {
           : {
               code: 'OUTCOME_UNCERTAIN',
               message:
-                'Input may have reached the interface. Inspect the target before trying again.',
+                error instanceof RuntimeError
+                  ? error.message
+                  : 'Input may have reached the interface. Inspect the target before trying again.',
             };
         break;
       }

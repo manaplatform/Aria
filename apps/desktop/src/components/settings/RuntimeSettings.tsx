@@ -26,6 +26,7 @@ export function RuntimeSettings() {
   const [registry, setRegistry] = useState<RegistrySettings>();
   const [native, setNative] = useState<OpenAIRuntimeFeature[]>([]);
   const [busy, setBusy] = useState(false);
+  const [standingDesktopAccess, setStandingDesktopAccess] = useState(false);
   const screenSupported = window.aria?.platform === 'darwin' || window.aria?.platform === 'win32';
 
   useEffect(() => {
@@ -106,8 +107,12 @@ export function RuntimeSettings() {
           throw new Error(
             'The chat draft could not be saved. Resolve the storage error and retry.',
           );
-        if (await desktop().selectLocalComputer(conversationId, 'screen'))
-          setStatus('Start a local desktop session in this chat within two minutes.');
+        if (await desktop().selectLocalComputer(conversationId, 'screen', standingDesktopAccess))
+          setStatus(
+            standingDesktopAccess
+              ? 'This chat can use the selected display until you click Revoke or quit Aria.'
+              : 'Start a local desktop session in this chat within two minutes.',
+          );
       }
     } catch (failure) {
       setError(errorMessage(failure));
@@ -281,15 +286,26 @@ export function RuntimeSettings() {
         </>
       )}
       {screenSupported && (
-        <div className="shortcut-row">
-          <span>Local desktop</span>
-          <Button variant="secondary" disabled={busy} onClick={() => void localDesktop('screen')}>
-            Select a full screen
-          </Button>
-          <Button variant="ghost" disabled={busy} onClick={() => void localDesktop('revoke')}>
-            Revoke
-          </Button>
-        </div>
+        <>
+          <div className="shortcut-row">
+            <span>Local desktop</span>
+            <Button variant="secondary" disabled={busy} onClick={() => void localDesktop('screen')}>
+              Select a full screen
+            </Button>
+            <Button variant="ghost" disabled={busy} onClick={() => void localDesktop('revoke')}>
+              Revoke
+            </Button>
+          </div>
+          <label className="settings-toggle">
+            Allow access until revoked
+            <input
+              type="checkbox"
+              checked={standingDesktopAccess}
+              disabled={busy}
+              onChange={(event) => setStandingDesktopAccess(event.target.checked)}
+            />
+          </label>
+        </>
       )}
       {nativeModes.map(({ id, label }) => (
         <div className="shortcut-row" key={id}>

@@ -196,6 +196,9 @@ test('selects and revokes a full screen in Settings from an unsent chat', async 
   await expect(select).toBeEnabled();
   await select.click();
   await expect(page.getByText('Start a local desktop session in this chat within two minutes.')).toBeVisible();
+  await page.getByRole('checkbox', { name: 'Allow access until revoked', exact: true }).check();
+  await select.click();
+  await expect(page.getByText('This chat can use the selected display until you click Revoke or quit Aria.')).toBeVisible();
   await page.getByRole('button', { name: 'Revoke', exact: true }).click();
   await expect(page.getByText('Local desktop access revoked.')).toBeVisible();
   await page.getByRole('button', { name: 'Back to chat', exact: true }).click();

@@ -39,8 +39,8 @@ const bridge: DesktopBridge = {
     ipcRenderer.invoke('aria:computer-preview', conversation, id),
   probeVirtualComputer: () => ipcRenderer.invoke('aria:probe-virtual-computer'),
   localComputerSupported: () => ipcRenderer.invoke('aria:local-computer-supported'),
-  selectLocalComputer: (conversation, target) =>
-    ipcRenderer.invoke('aria:select-local-computer', conversation, target),
+  selectLocalComputer: (conversation, target, standing) =>
+    ipcRenderer.invoke('aria:select-local-computer', conversation, target, standing),
   revokeLocalComputer: () => ipcRenderer.invoke('aria:revoke-local-computer'),
   superviseComputer: (conversation, command) =>
     ipcRenderer.invoke('aria:computer-supervise', conversation, command),
