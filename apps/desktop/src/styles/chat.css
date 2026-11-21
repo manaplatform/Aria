@@ -1208,3 +1208,28 @@
   cursor: pointer;
   text-decoration: underline;
 }
+.computer-panel {
+  border-block-end: 1px solid var(--border);
+  padding: 0.375rem 0.75rem;
+}
+
+.computer-panel-toolbar,
+.computer-panel-actions {
+  flex-wrap: wrap;
+}
+
+.computer-panel-toolbar {
+  justify-content: space-between;
+}
+
+.computer-panel-body {
+  max-height: 35vh;
+  overflow: auto;
+}
+
+.computer-panel-body img {
+  display: block;
+  max-width: 100%;
+  max-height: 28vh;
+  margin-inline: auto;
+}

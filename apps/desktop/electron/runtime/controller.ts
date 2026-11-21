@@ -447,6 +447,10 @@ Skills: ${[...references, ...inline].join(', ') || 'none'}`,
         });
       }
     }
+    throw new RuntimeError(
+      'CAPABILITY_UNAVAILABLE',
+      'The operation requires a different desktop runtime driver.',
+    );
   }
 
   private async getScoped(conversation: string, id: string) {
@@ -939,7 +943,7 @@ ${files
     request: string,
     step: string,
     session: string,
-    provenance: 'managed' | 'openai-shell',
+    provenance: 'managed' | 'openai-shell' | 'computer',
   ) {
     this.store.db
       .prepare('INSERT INTO artifacts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
@@ -957,6 +961,81 @@ ${files
         'available',
         provenance,
       );
+  }
+
+  async computerInput(conversation: string, assetId: string) {
+    return this.getScoped(conversation, assetId);
+  }
+
+  computerScript(
+    script: string,
+    operation: (request: unknown, signal: AbortSignal) => Promise<unknown>,
+    signal: AbortSignal,
+  ) {
+    const engine = this.sandbox();
+    return engine.computerScript(engine.profile(this.directory), script, operation, signal);
+  }
+
+  async adoptComputerArtifact(
+    request: RuntimeRequest,
+    sessionId: string,
+    name: string,
+    bytes: Buffer,
+    source: string,
+    signal: AbortSignal,
+  ) {
+    const extension = path.extname(name).toLowerCase();
+    const text = ['.txt', '.csv', '.md', '.json', '.tsv'].includes(extension);
+    if (!text && !['.png', '.jpeg', '.jpg', '.pdf', '.docx', '.xlsx', '.pptx'].includes(extension))
+      throw new RuntimeError(
+        'INVALID_ARGUMENT',
+        'Choose a supported text, image, PDF, or Office artifact format.',
+      );
+    const asset = await this.assets.put(bytes, name, text ? 'text/plain' : undefined);
+    try {
+      const expectedImage =
+        extension === '.png'
+          ? 'image/png'
+          : ['.jpeg', '.jpg'].includes(extension)
+            ? 'image/jpeg'
+            : undefined;
+      if (expectedImage && expectedImage !== asset.mimeType)
+        throw new RuntimeError(
+          'INVALID_ARGUMENT',
+          'The downloaded file does not match its expected format.',
+        );
+      if (
+        asset.mimeType === 'application/pdf' ||
+        asset.mimeType.startsWith('application/vnd.openxmlformats')
+      )
+        await extractDocument(asset, bytes, signal).catch((error: unknown) => {
+          if (!(
+            asset.mimeType === 'application/pdf' &&
+            error instanceof RuntimeError &&
+            error.message.includes('requires OCR')
+          ))
+            throw error;
+        });
+      signal.throwIfAborted();
+      this.store.transaction(() => {
+        this.recordArtifact(
+          asset,
+          bytes,
+          request.conversationId,
+          request.requestId,
+          request.stepId,
+          sessionId,
+          'computer',
+        );
+        this.store.db
+          .prepare('INSERT INTO computer_artifact_sources VALUES (?, ?)')
+          .run(asset.id, source);
+      });
+      return { ...asset, storage: 'desktop' as const };
+    } catch (error) {
+      await this.assets.remove(asset.id);
+      throw error;
+    }
   }
 
   async adoptHostedArtifact(

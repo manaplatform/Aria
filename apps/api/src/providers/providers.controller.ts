@@ -15,6 +15,7 @@ import { AiService, nativeToolSearch, providerError } from '../ai/ai.service';
 import { LocalApiGuard } from '../chat/local-api.guard';
 import { ModelRegistry, officialConnection } from './model-registry.service';
 import { OpenAIRuntime } from './openai-runtime';
+import { verifyComputerTransport } from './openai-computer';
 import { ProvidersService } from './providers.service';
 
 export class ConnectionDto {
@@ -50,10 +51,23 @@ export class ProvidersController {
     const feature = parsed.data;
     const signal = AbortSignal.timeout(35_000);
     const { primary } = await this.models.resolve(signal, undefined, false, true);
-    if (!officialConnection(primary.connection.baseUrl))
+    if (!officialConnection(primary.connection.baseUrl) && feature !== 'computer-image')
       throw new BadRequestException(
         'Native runtime tools require the official OpenAI Responses endpoint.',
       );
+    if (feature === 'computer' || feature === 'computer-image') {
+      const verified = await verifyComputerTransport(
+        this.ai,
+        primary,
+        feature === 'computer',
+        signal,
+      ).catch(() => false);
+      if (!verified)
+        throw new BadGatewayException(
+          'The selected primary could not read the synthetic Computer Use observation.',
+        );
+      return { feature, verified: true };
+    }
     const runtime = new OpenAIRuntime(primary);
     const marker = 'aria-runtime-probe-17';
     try {

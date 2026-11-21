@@ -5,6 +5,7 @@ import { useWorkspaceStore, flushPersistence } from '../../stores/workspaceStore
 import { selectChat, useChatStore } from '../../stores/chatStore';
 import { AppSidebar } from './AppSidebar';
 import { BrowserPane, useBrowserSlot } from '../browser/BrowserPane';
+import { ComputerPanel } from '../browser/ComputerPanel';
 import { connectBrowser, setBrowserMode, useBrowserStore } from '../../stores/browserStore';
 import { Button, ErrorState, IconButton, Modal, Toast } from '../ui';
 
@@ -140,6 +141,9 @@ export default function ChatLayout() {
             message={`Changes could not be saved: ${saveError}`}
             retry={() => void flushPersistence()}
           />
+        )}
+        {location.pathname === '/chat' && chat.selectedId && (
+          <ComputerPanel key={chat.selectedId} conversationId={chat.selectedId} />
         )}
         <div className={`chat-browser-workspace ${showBrowser ? browserMode : 'chat'}`}>
           <div className="chat-outlet" hidden={showBrowser && browserMode === 'browser'}>

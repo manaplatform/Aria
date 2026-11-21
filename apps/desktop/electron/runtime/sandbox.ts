@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { executionLimits, workspaceFilename } from '@aria/shared';
@@ -7,6 +8,7 @@ import { RuntimeError, digest } from './store';
 export const sandboxImage =
   'docker.io/library/python@sha256:c5ba3deef00c7758561a0f03c26f44f10589263d40e732b8748e0d1f38f6dd89';
 const workspaceLabel = 'com.aria.workspace';
+const desktopLabel = 'com.aria.virtual-desktop';
 const user = '10001:10001';
 const sandboxPath = '/workspace';
 const executable = '/usr/local/bin/python3';
@@ -53,6 +55,14 @@ function dockerExecutable() {
   return found;
 }
 
+function dockerEnvironment() {
+  return Object.fromEntries(
+    Object.entries(process.env).filter(([key]) =>
+      ['SYSTEMROOT', 'WINDIR', 'COMSPEC', 'TEMP', 'TMP'].includes(key.toUpperCase()),
+    ),
+  );
+}
+
 function execute(
   binary: string,
   args: string[],
@@ -63,11 +73,7 @@ function execute(
   signal.throwIfAborted();
   return new Promise<ProcessResult>((resolve, reject) => {
     // A fixed Docker invocation controls the sandbox. User shell code is only an argument to docker exec.
-    const env = Object.fromEntries(
-      Object.entries(process.env).filter(([key]) =>
-        ['SYSTEMROOT', 'WINDIR', 'COMSPEC', 'TEMP', 'TMP'].includes(key.toUpperCase()),
-      ),
-    );
+    const env = dockerEnvironment();
     const child = spawn(binary, args, { env, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
     let remaining = limit;
     let truncated = false;
@@ -166,8 +172,7 @@ export class DockerSandbox {
     );
   }
 
-  async probe(signal: AbortSignal) {
-    if (this.verified && Date.now() - this.verified.at < 30_000) return this.verified;
+  private async verifyEngine(signal: AbortSignal) {
     const result = await this.invoke(['info', '--format', '{{json .}}'], signal, 200_000);
     if (result.code !== 0 || result.truncated)
       throw new RuntimeError(
@@ -195,6 +200,17 @@ export class DockerSandbox {
         'Aria requires Docker Desktop Linux containers or rootless Linux Docker with cgroup and seccomp limits.',
       );
     }
+    return {
+      binary: dockerExecutable(),
+      at: Date.now(),
+      os: info.OSType as string,
+      architecture: info.Architecture as string,
+    };
+  }
+
+  async probe(signal: AbortSignal) {
+    if (this.verified && Date.now() - this.verified.at < 30_000) return this.verified;
+    const engine = await this.verifyEngine(signal);
     const image = await this.invoke(
       ['image', 'inspect', sandboxImage, '--format', '{{.Id}}'],
       signal,
@@ -204,12 +220,7 @@ export class DockerSandbox {
         'CAPABILITY_UNAVAILABLE',
         `Install the pinned workspace image using docker pull ${sandboxImage}.`,
       );
-    this.verified = {
-      binary: dockerExecutable(),
-      at: Date.now(),
-      os: info.OSType,
-      architecture: info.Architecture,
-    };
+    this.verified = engine;
     return this.verified;
   }
 
@@ -283,6 +294,277 @@ export class DockerSandbox {
       runtimes: ['/bin/sh', probe.stdout.toString('utf8').trim()],
       architecture: this.verified?.architecture,
     };
+  }
+
+  async createDesktop(id: string, profile: string, image: string, signal: AbortSignal) {
+    await this.verifyEngine(signal);
+    if (!/^sha256:[a-f0-9]{64}$/.test(image))
+      throw new RuntimeError(
+        'INVALID_ARGUMENT',
+        'Select the immutable image ID of the Aria graphical desktop.',
+      );
+    const metadata = await this.invoke(
+      ['image', 'inspect', image, '--format', '{{json .Config.Labels}}'],
+      signal,
+    );
+    if (
+      metadata.code !== 0 ||
+      JSON.parse(metadata.stdout.toString())?.['com.aria.desktop.protocol'] !== '1'
+    )
+      throw new RuntimeError(
+        'CAPABILITY_UNAVAILABLE',
+        'Build the reviewed Aria virtual desktop image and enter its immutable image ID.',
+      );
+    const result = await this.invoke(
+      [
+        'run',
+        '--detach',
+        '--rm',
+        '--pull=never',
+        '--name',
+        `aria-${id}`,
+        '--label',
+        `${desktopLabel}=${profile}`,
+        '--network=none',
+        '--ipc=none',
+        '--init',
+        '--read-only',
+        '--user',
+        user,
+        '--cap-drop=ALL',
+        '--security-opt=no-new-privileges',
+        '--memory=2g',
+        '--memory-swap=2g',
+        '--cpus=2',
+        '--pids-limit=128',
+        '--ulimit=nofile=512:512',
+        '--log-driver=none',
+        '--tmpfs',
+        '/tmp:rw,nosuid,nodev,noexec,size=128m,mode=1777',
+        '--tmpfs',
+        '/workspace/inputs:rw,nosuid,nodev,noexec,size=40m,mode=0755',
+        '--tmpfs',
+        '/workspace/working:rw,nosuid,nodev,noexec,size=128m,mode=0700,uid=10001,gid=10001',
+        '--tmpfs',
+        '/workspace/outputs:rw,nosuid,nodev,noexec,size=64m,mode=0700,uid=10001,gid=10001',
+        image,
+      ],
+      signal,
+    );
+    try {
+      if (result.code !== 0 || !(await this.ownsDesktop(id, profile, image, signal)))
+        throw new RuntimeError(
+          'CAPABILITY_UNAVAILABLE',
+          'The virtual desktop did not start with its required isolation profile.',
+        );
+      const probe = await this.desktopCommand(
+        id,
+        [
+          '/bin/sh',
+          '-c',
+          'for i in $(seq 1 50); do xdpyinfo >/dev/null 2>&1 && exit 0; sleep 0.1; done; exit 1',
+        ],
+        signal,
+      );
+      if (probe.code !== 0)
+        throw new RuntimeError(
+          'CAPABILITY_UNAVAILABLE',
+          'The virtual display did not become ready.',
+        );
+    } catch (error) {
+      await this.remove(id);
+      throw error;
+    }
+  }
+
+  async ownsDesktop(id: string, profile: string, image: string, signal: AbortSignal) {
+    const result = await this.invoke(
+      ['inspect', '--format', '{{json .}}', `aria-${id}`],
+      signal,
+      64_000,
+    );
+    if (result.code !== 0 || result.truncated) return false;
+    const record = JSON.parse(result.stdout.toString('utf8'));
+    const config = record.HostConfig;
+    return (
+      record.State?.Running === true &&
+      record.Config?.Labels?.[desktopLabel] === profile &&
+      record.Image === image &&
+      record.Config?.User === user &&
+      config?.NetworkMode === 'none' &&
+      config?.Privileged === false &&
+      config?.ReadonlyRootfs === true &&
+      !config?.Binds?.length &&
+      !config?.Devices?.length &&
+      config?.CapDrop?.includes('ALL') &&
+      !config?.CapAdd?.length &&
+      config?.SecurityOpt?.includes('no-new-privileges') &&
+      config?.Memory === 2 * 1024 ** 3 &&
+      config?.PidsLimit === 128
+    );
+  }
+
+  desktopCommand(
+    id: string,
+    command: readonly string[],
+    signal: AbortSignal,
+    limit = 6000,
+    detached = false,
+  ) {
+    return this.invoke(
+      ['exec', ...(detached ? ['--detach'] : []), '--user', user, `aria-${id}`, ...command],
+      signal,
+      limit,
+    );
+  }
+
+  async computerScript(
+    profile: string,
+    script: string,
+    operation: (request: unknown, signal: AbortSignal) => Promise<unknown>,
+    signal: AbortSignal,
+  ) {
+    const id = randomUUID();
+    const lifetime = new AbortController();
+    const active = AbortSignal.any([signal, lifetime.signal, AbortSignal.timeout(80_000)]);
+    let pending: Promise<unknown> | undefined;
+    await this.create(id, profile, active);
+    try {
+      return await new Promise<string>((resolve, reject) => {
+        const child = spawn(
+          this.verified?.binary ?? dockerExecutable(),
+          [
+            '--host',
+            this.endpoint,
+            'exec',
+            '-i',
+            '--user',
+            user,
+            '--workdir',
+            '/workspace/working',
+            `aria-${id}`,
+            executable,
+            '-I',
+            '-u',
+            '-c',
+            script,
+          ],
+          { env: dockerEnvironment(), windowsHide: true, stdio: ['pipe', 'pipe', 'ignore'] },
+        );
+        let buffered = '';
+        let requestCount = 0;
+        let reading = false;
+        let result: string | undefined;
+        let finished = false;
+        const stop = (error?: unknown) => {
+          if (finished) return;
+          finished = true;
+          active.removeEventListener('abort', aborted);
+          lifetime.abort();
+          child.kill('SIGKILL');
+          if (error) reject(error);
+          else if (result !== undefined) resolve(result);
+          else reject(new RuntimeError('EXECUTION_FAILED', 'The script ended without a result.'));
+        };
+        const aborted = () => stop(active.reason);
+        const receive = async () => {
+          if (reading || finished) return;
+          const end = buffered.indexOf('\n');
+          if (end < 0) return;
+          const line = buffered.slice(0, end);
+          buffered = buffered.slice(end + 1);
+          if (++requestCount > 16)
+            throw new RuntimeError(
+              'BUDGET_EXCEEDED',
+              'The script exceeded its computer request budget.',
+            );
+          reading = true;
+          const value = JSON.parse(line) as unknown;
+          if (
+            value &&
+            typeof value === 'object' &&
+            'result' in value &&
+            typeof value.result === 'string'
+          ) {
+            result = value.result.slice(0, 4000);
+            stop();
+            return;
+          }
+          active.throwIfAborted();
+          pending = operation(value, active);
+          const reply = await pending;
+          pending = undefined;
+          if (!finished) child.stdin.write(`${JSON.stringify(reply)}\n`);
+          reading = false;
+          await receive();
+        };
+        active.addEventListener('abort', aborted, { once: true });
+        if (active.aborted) aborted();
+        child.stdout.setEncoding('utf8');
+        child.stdout.on('data', (chunk: string) => {
+          if (finished) return;
+          buffered += chunk;
+          if (buffered.length > 16_000)
+            stop(new RuntimeError('BUDGET_EXCEEDED', 'The script exceeded its broker buffer.'));
+          else void receive().catch(stop);
+        });
+        child.stdin.on('error', stop);
+        child.once('error', stop);
+        child.once('close', () => stop());
+      });
+    } finally {
+      lifetime.abort();
+      await pending?.catch(() => undefined);
+      await this.remove(id);
+    }
+  }
+
+  async stageDesktop(id: string, filename: string, bytes: Buffer, signal: AbortSignal) {
+    const result = await this.invoke(
+      [
+        'exec',
+        '-i',
+        '--user',
+        '0:0',
+        `aria-${id}`,
+        '/usr/bin/python3',
+        '-I',
+        '-c',
+        stageBytes,
+        '/workspace/inputs',
+        workspaceFilename.parse(filename),
+      ],
+      signal,
+      2000,
+      bytes,
+    );
+    if (result.code !== 0)
+      throw new RuntimeError(
+        'EXECUTION_FAILED',
+        'Could not stage the input in the virtual desktop.',
+      );
+  }
+
+  async desktopOutput(id: string, filename: string, signal: AbortSignal) {
+    const result = await this.desktopCommand(
+      id,
+      [
+        '/usr/bin/python3',
+        '-I',
+        '-c',
+        readOutput,
+        workspaceFilename.parse(filename),
+        String(executionLimits.assetBytes),
+      ],
+      signal,
+      executionLimits.assetBytes,
+    );
+    if (result.code !== 0 || result.truncated || !result.stdout.length)
+      throw new RuntimeError(
+        'INVALID_ARGUMENT',
+        'Select a readable regular file in /workspace/outputs.',
+      );
+    return result.stdout;
   }
 
   async run(id: string, command: string[], signal: AbortSignal, timeoutMs: number) {

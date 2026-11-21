@@ -36,7 +36,7 @@ export class RuntimeStore {
     try {
       db.exec('PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 2000; PRAGMA journal_mode = WAL;');
       const version = Number(db.prepare('PRAGMA user_version').get()?.user_version);
-      if (version > 1) throw new Error('This runtime profile requires a newer version of Aria.');
+      if (version > 2) throw new Error('This runtime profile requires a newer version of Aria.');
       if (version === 0) {
         db.exec(`
           BEGIN IMMEDIATE;
@@ -98,10 +98,38 @@ export class RuntimeStore {
           COMMIT;
         `);
       }
+      if (version < 2) {
+        db.exec(`
+          BEGIN IMMEDIATE;
+          CREATE TABLE computer_sessions (
+            id TEXT PRIMARY KEY, conversation TEXT NOT NULL, environment TEXT NOT NULL, target TEXT NOT NULL,
+            provider TEXT NOT NULL, mode TEXT NOT NULL, state TEXT NOT NULL, lease INTEGER NOT NULL,
+            created INTEGER NOT NULL, touched INTEGER NOT NULL, restore_url TEXT
+          );
+          CREATE INDEX computer_sessions_owner ON computer_sessions(conversation, state);
+          CREATE TABLE computer_approvals (
+            id TEXT PRIMARY KEY, session TEXT NOT NULL REFERENCES computer_sessions(id) ON DELETE CASCADE,
+            step TEXT NOT NULL, fingerprint TEXT NOT NULL, decision TEXT NOT NULL, at INTEGER NOT NULL
+          );
+          CREATE TABLE computer_artifact_sources (
+            id TEXT PRIMARY KEY REFERENCES artifacts(id) ON DELETE CASCADE, source TEXT NOT NULL
+          );
+          CREATE TABLE computer_provider_calls (
+            session TEXT NOT NULL REFERENCES computer_sessions(id) ON DELETE CASCADE,
+            response TEXT NOT NULL, item TEXT NOT NULL, call TEXT NOT NULL, step TEXT NOT NULL,
+            observation TEXT, state TEXT NOT NULL, PRIMARY KEY(session, response, call)
+          );
+          PRAGMA user_version = 2;
+          COMMIT;
+        `);
+      }
       db.exec(`
         UPDATE attempts SET state = 'uncertain' WHERE state = 'running';
         UPDATE sessions SET state = 'cleanup' WHERE state = 'active'
           AND id IN (SELECT session FROM attempts WHERE state = 'uncertain');
+        UPDATE computer_sessions SET state = 'recovering', lease = lease + 1
+          WHERE state IN ('initializing', 'ready', 'running', 'waiting-for-approval', 'waiting-for-user', 'paused');
+        UPDATE computer_provider_calls SET state = 'interrupted' WHERE state = 'received';
       `);
       this.database = db;
       return db;

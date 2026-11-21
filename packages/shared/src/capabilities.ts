@@ -41,7 +41,10 @@ export const toolPolicySchema = z.strictObject({
   discovery: toolDiscoverySchema,
   nativeVerified: z.boolean().optional(),
   desktopRuntime: z.boolean().optional(),
-  nativeRuntime: z.array(openAIRuntimeFeatureSchema).max(3).optional(),
+  computerBrowser: z.boolean().optional(),
+  computerVirtual: z.boolean().optional(),
+  computerLocal: z.boolean().optional(),
+  nativeRuntime: z.array(openAIRuntimeFeatureSchema).max(5).optional(),
   skills: z.array(skillSummarySchema).max(128),
 });
 export const defaultToolPolicy: ToolPolicy = {

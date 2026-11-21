@@ -1,7 +1,14 @@
 import { z } from 'zod';
+import { computerImage, computerOperations } from './computer-use.js';
 
 const id = z.string().uuid();
-export const openAIRuntimeFeatureSchema = z.enum(['hosted-shell', 'local-shell', 'file-search']);
+export const openAIRuntimeFeatureSchema = z.enum([
+  'hosted-shell',
+  'local-shell',
+  'file-search',
+  'computer',
+  'computer-image',
+]);
 export type OpenAIRuntimeFeature = z.infer<typeof openAIRuntimeFeatureSchema>;
 export const executionLimits = {
   commandMs: 60_000,
@@ -21,6 +28,7 @@ export const workspaceFilename = z
   .regex(/^[\p{L}\p{N}_-][\p{L}\p{N}_. -]*$/u);
 
 export const runtimeOperations = {
+  ...computerOperations,
   'shell.inspect': z.strictObject({}),
   'shell.open': z.strictObject({
     inlineSkills: z
@@ -151,6 +159,7 @@ export const desktopArtifactSchema = z.strictObject({
 });
 
 export const runtimeResultSchema = z.strictObject({
+  computerImage: computerImage.optional(),
   text: z.string().max(12_000).optional(),
   data: z.record(z.string(), z.unknown()).optional(),
   evidence: z.array(evidenceSchema).max(executionLimits.searchResults).optional(),
@@ -167,6 +176,13 @@ export type RuntimeResult = z.infer<typeof runtimeResultSchema>;
 
 export const runtimeSettingsSchema = z.strictObject({
   engineSocket: z.string().max(1000),
+  desktopImage: z
+    .string()
+    .regex(/^sha256:[a-f0-9]{64}$/)
+    .optional(),
+  computerIdleMinutes: z.number().int().min(1).max(20).optional(),
+  computerLifetimeMinutes: z.number().int().min(2).max(45).optional(),
+  computerBatchLimit: z.number().int().min(1).max(8).optional(),
   artifactRetentionDays: z.number().int().min(1).max(365).optional(),
   embeddingTarget: z
     .strictObject({ connectionId: id, model: z.string().min(1).max(200) })

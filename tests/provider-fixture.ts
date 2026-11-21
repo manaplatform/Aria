@@ -1,4 +1,5 @@
 import http from 'node:http';
+import { inflateSync } from 'node:zlib';
 import { WebSocketServer, WebSocket } from 'ws';
 
 export const fixtureConnectionId = '10000000-0000-4000-8000-000000000001';
@@ -41,6 +42,7 @@ function descriptorId(step: FixtureStep) {
   if (step.target.kind === 'model')
     return `${['chat', 'vision'].includes(step.capability) ? 'models' : 'media'}.${step.capability.replace('-', '_')}`;
   const { tool } = step.target;
+  if (tool.includes('.')) return tool;
   return `${tool.startsWith('browser_') ? 'browser' : tool.startsWith('web_') ? 'web' : 'files'}.${tool}`;
 }
 
@@ -73,6 +75,7 @@ function invocation(step: FixtureStep, ids: Map<string, string>): ToolReply {
       },
     };
   }
+  if (step.target.tool.includes('.')) return { name, input: step.args ?? {} };
   return { name, input: { args: step.args ?? {}, dependsOn } };
 }
 
@@ -213,6 +216,7 @@ export async function createProviderFixture() {
       (body.tool_choice.function as { name: string }).name === 'verify_connection';
     const userPrompt =
       [...body.messages].reverse().find((item) => item.role === 'user')?.content ?? '';
+    const imageProbe = userPrompt === 'Request a screenshot and identify its color.';
     const latestResults: {
       id?: string;
       items?: { id: string }[];
@@ -223,8 +227,12 @@ export async function createProviderFixture() {
       let index = body.messages.length - 1;
       index >= 0 && body.messages[index].role === 'tool';
       index--
-    )
-      latestResults.unshift(JSON.parse(body.messages[index].content));
+    ) {
+      const content = body.messages[index].content;
+      const multipart = Array.isArray(content) ? content : null;
+      const text = multipart?.find((part) => part.type === 'text')?.text;
+      latestResults.unshift(multipart ? (text ? JSON.parse(text) : {}) : JSON.parse(content));
+    }
     const continuation = last?.role === 'tool' && continuedReplies.get(userPrompt);
     let script: ToolReply | undefined;
     let scripts: ToolReply[] | undefined;
@@ -253,6 +261,19 @@ export async function createProviderFixture() {
       if (continuation) continuedReplies.delete(userPrompt);
     }
     if (configuredTool) script = { name: 'verify_connection', input: { ok: true } };
+    if (imageProbe && last?.role === 'user') script = { name: 'aria_observation_probe', input: {} };
+    if (imageProbe && last?.role === 'tool' && Array.isArray(last.content)) {
+      const source = last.content.find((part) => part.type === 'image_url')?.image_url?.url;
+      if (typeof source === 'string' && source.startsWith('data:image/png;base64,')) {
+        const frame = Buffer.from(source.slice('data:image/png;base64,'.length), 'base64');
+        const pixel = inflateSync(frame.subarray(41, 41 + frame.readUInt32BE(33)));
+        const [, red, green, blue] = pixel;
+        finalReplies.set(
+          userPrompt,
+          blue > 200 ? 'blue' : red > 200 && green > 150 ? 'yellow' : red > 200 ? 'red' : 'green',
+        );
+      }
+    }
     if (script && isOperations(script)) {
       operation ??= { pending: [], dispatched: [], ids: new Map() };
       operation.pending = [...script.input.steps];

@@ -1,8 +1,112 @@
 import { afterEach, expect, it, vi } from 'vitest';
 import { createRequire } from 'node:module';
+import type { ModelMessage } from 'ai';
 const { AiService, providerError } = createRequire(import.meta.url)(
   '../dist/ai/ai.service.js',
 ) as typeof import('../src/ai/ai.service');
+const { nativeComputerName, nativeComputerTools, computerScreenshot, readComputerCall } =
+  createRequire(import.meta.url)(
+    '../dist/providers/openai-computer.js',
+  ) as typeof import('../src/providers/openai-computer');
+
+it('preserves computer call identifiers and safety attestations in a stateless Responses continuation', async () => {
+  const checks = [{ id: 'check_01', code: 'confirm', message: 'Review the synthetic action.' }];
+  const item = {
+    type: 'computer_call',
+    id: 'cu_01',
+    call_id: 'call_01',
+    status: 'completed',
+    pending_safety_checks: checks,
+    actions: [{ type: 'click', button: 'left', x: 8, y: 9 }, { type: 'screenshot' }],
+  };
+  const stream = (events: object[]) =>
+    new Response(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(''), {
+      headers: { 'Content-Type': 'text/event-stream' },
+    });
+  const created = {
+    type: 'response.created',
+    response: { id: 'resp_01', created_at: 1, model: 'fixture' },
+  };
+  const completed = { type: 'response.completed', response: {} };
+  const fetcher = vi
+    .spyOn(globalThis, 'fetch')
+    .mockResolvedValueOnce(
+      stream([
+        created,
+        {
+          type: 'response.output_item.added',
+          output_index: 0,
+          item: { ...item, status: 'in_progress' },
+        },
+        { type: 'response.output_item.done', output_index: 0, item },
+        completed,
+      ]),
+    )
+    .mockResolvedValueOnce(stream([created, completed]));
+  const ai = new AiService();
+  const signal = AbortSignal.timeout(2000);
+  const target = {
+    id: 'fixture',
+    connection: { baseUrl: 'https://api.openai.com/v1', apiKey: 'fixture-key' },
+  };
+  const messages: ModelMessage[] = [{ role: 'user', content: 'Use the synthetic computer.' }];
+  const initial = ai.generate(
+    messages,
+    signal,
+    target,
+    'Use the synthetic computer.',
+    nativeComputerTools,
+  );
+  const calls = [];
+  for await (const event of initial.stream) if (event.type === 'tool-call') calls.push(event);
+  expect(calls).toHaveLength(1);
+  const [call] = calls;
+  expect(call).toMatchObject({
+    toolName: nativeComputerName,
+    toolCallId: 'call_01',
+    providerMetadata: { openai: { itemId: 'cu_01' } },
+  });
+  expect(readComputerCall(call.input)?.actions.map(({ type }) => type)).toEqual([
+    'click',
+    'screenshot',
+  ]);
+  expect(readComputerCall({ ...(call.input as object), status: 'incomplete' })).toBeUndefined();
+  const result = await initial.response;
+  expect(result.id).toBe('resp_01');
+  messages.push(...result.messages.filter(({ role }) => role === 'assistant'), {
+    role: 'tool',
+    content: [
+      {
+        type: 'tool-result',
+        toolName: nativeComputerName,
+        toolCallId: 'call_01',
+        output: computerScreenshot(new Uint8Array([137, 80, 78, 71]), checks),
+      },
+    ],
+  });
+  const continued = ai.generate(
+    messages,
+    signal,
+    target,
+    'Summarize.',
+    nativeComputerTools,
+    undefined,
+    true,
+  );
+  for await (const event of continued.stream) if (event.type === 'error') throw event.error;
+  expect(JSON.parse(String(fetcher.mock.calls[1][1]?.body))).toMatchObject({
+    store: false,
+    input: expect.arrayContaining([
+      expect.objectContaining({ type: 'computer_call', id: 'cu_01', call_id: 'call_01' }),
+      expect.objectContaining({
+        type: 'computer_call_output',
+        call_id: 'call_01',
+        acknowledged_safety_checks: checks,
+        output: { type: 'computer_screenshot', image_url: 'data:image/png;base64,iVBORw==' },
+      }),
+    ]),
+  });
+});
 
 afterEach(() => {
   vi.restoreAllMocks();

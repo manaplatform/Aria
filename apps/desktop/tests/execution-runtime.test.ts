@@ -76,6 +76,32 @@ describe('durable runtime', () => {
 
 const docker = process.env.ARIA_TEST_DOCKER_ENDPOINT;
 describe.skipIf(!docker)('real Aria sandbox', () => {
+  it('exchanges bounded Computer Use messages with a separate offline Python process', async () => {
+    const sandbox = new DockerSandbox(docker!);
+    const signal = AbortSignal.timeout(20000);
+    const requests: unknown[] = [];
+    const script = [
+      'import json, os, sys',
+      'assert "lo" in os.listdir("/sys/class/net")',
+      'with open("/proc/net/route") as routes: assert len(routes.readlines()) == 1',
+      'assert not os.path.exists("/var/run/docker.sock")',
+      'print(json.dumps({"request": "observe"}), flush=True)',
+      'value = json.loads(sys.stdin.readline())',
+      'print(json.dumps({"result": value["title"]}), flush=True)',
+    ].join('\n');
+    const result = await sandbox.computerScript(
+      'aria-computer-test',
+      script,
+      async (item) => {
+        requests.push(item);
+        return { title: 'Verified broker round trip' };
+      },
+      signal,
+    );
+    expect(requests).toEqual([{ request: 'observe' }]);
+    expect(result).toBe('Verified broker round trip');
+  }, 25000);
+
   it('reuses a workspace, records actual output, and denies unsafe artifact paths', async () => {
     const sandbox = new DockerSandbox(docker!);
     const id = randomUUID();

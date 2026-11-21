@@ -34,6 +34,23 @@ const bridge: DesktopBridge = {
   browserState: () => ipcRenderer.invoke('aria:browser-state'),
   browserCommand: (command) => ipcRenderer.invoke('aria:browser-command', command),
   browserLayout: (layout) => ipcRenderer.invoke('aria:browser-layout', layout),
+  computerSessions: (conversation) => ipcRenderer.invoke('aria:computer-sessions', conversation),
+  computerPreview: (conversation, id) =>
+    ipcRenderer.invoke('aria:computer-preview', conversation, id),
+  probeVirtualComputer: () => ipcRenderer.invoke('aria:probe-virtual-computer'),
+  localComputerSupported: () => ipcRenderer.invoke('aria:local-computer-supported'),
+  selectLocalComputer: (conversation) =>
+    ipcRenderer.invoke('aria:select-local-computer', conversation),
+  revokeLocalComputer: () => ipcRenderer.invoke('aria:revoke-local-computer'),
+  superviseComputer: (conversation, command) =>
+    ipcRenderer.invoke('aria:computer-supervise', conversation, command),
+  sendComputerInput: (conversation, sessionId, action) =>
+    ipcRenderer.invoke('aria:computer-user-input', conversation, { sessionId, action }),
+  onComputerSession: (callback) => {
+    const listener: Parameters<typeof ipcRenderer.on>[1] = (_event, state) => callback(state);
+    ipcRenderer.on('aria:computer-session-update', listener);
+    return () => ipcRenderer.removeListener('aria:computer-session-update', listener);
+  },
   onBrowserState: (callback) => {
     const listener = (_event: Electron.IpcRendererEvent, state: BrowserState) => callback(state);
     ipcRenderer.on('aria:browser-state-update', listener);

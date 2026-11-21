@@ -27,13 +27,18 @@ export class AiService {
     });
   }
 
-  private model(config: Pick<Connection, 'apiKey' | 'baseUrl'>, id: string) {
+  private model(
+    config: Pick<Connection, 'apiKey' | 'baseUrl'>,
+    id: string,
+    multipartComputerResults: boolean,
+  ) {
     if (new URL(config.baseUrl).origin === 'https://api.openai.com')
       return this.client(config).responses(id);
     return createOpenAICompatible({
       name: 'aria-provider',
       baseURL: config.baseUrl,
       apiKey: config.apiKey,
+      supportsMultiPartToolContent: multipartComputerResults,
       fetch: (input, init) => fetch(input, { ...init, redirect: 'error' }),
     }).chatModel(id);
   }
@@ -46,11 +51,11 @@ export class AiService {
     tools?: ToolSet,
     forcedTool?: string,
     disableTools = false,
-    nativeOptions?: { fileSearch: boolean; toolLimit: number },
+    nativeOptions?: { fileSearch: boolean; toolLimit: number; computerImages?: boolean },
   ): ReturnType<typeof streamText<ToolSet>> {
     const official = new URL(target.connection.baseUrl).origin === 'https://api.openai.com';
     return streamText({
-      model: this.model(target.connection, target.id),
+      model: this.model(target.connection, target.id, nativeOptions?.computerImages === true),
       ...(official
         ? {
             providerOptions: {

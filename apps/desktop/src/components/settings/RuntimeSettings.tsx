@@ -7,11 +7,14 @@ import type {
 } from '@aria/shared';
 import { desktop, errorMessage } from '../../services/desktop';
 import { Button } from '../ui';
+import { useWorkspaceStore } from '../../stores/workspaceStore';
 
 const nativeModes: { id: OpenAIRuntimeFeature; label: string }[] = [
   { id: 'hosted-shell', label: 'OpenAI-hosted Shell' },
   { id: 'local-shell', label: 'OpenAI Shell with managed execution' },
   { id: 'file-search', label: 'OpenAI File Search' },
+  { id: 'computer', label: 'OpenAI native Computer Use' },
+  { id: 'computer-image', label: 'Aria Computer Use image observations' },
 ];
 
 export function RuntimeSettings() {
@@ -22,9 +25,17 @@ export function RuntimeSettings() {
   const [registry, setRegistry] = useState<RegistrySettings>();
   const [native, setNative] = useState<OpenAIRuntimeFeature[]>([]);
   const [busy, setBusy] = useState(false);
+  const [localSupported, setLocalSupported] = useState(false);
+  const conversationId = useWorkspaceStore((state) => state.data.chat.selectedId);
 
   useEffect(() => {
     let mounted = true;
+    void Promise.resolve()
+      .then(() => desktop().localComputerSupported())
+      .then((supported) => {
+        if (mounted) setLocalSupported(supported);
+      })
+      .catch(() => undefined);
     void Promise.resolve()
       .then(() => desktop().runtimeSettings())
       .then((settings) => {
@@ -50,14 +61,17 @@ export function RuntimeSettings() {
     };
   }, []);
 
-  async function save(probe: boolean) {
+  async function save(probe: boolean | 'desktop') {
     if (!value) return;
     setBusy(true);
     setError('');
     setStatus('');
     try {
       setValue(await desktop().saveRuntimeSettings(value));
-      if (probe) {
+      if (probe === 'desktop') {
+        await desktop().probeVirtualComputer();
+        setStatus('The isolated graphical desktop passed its capture and isolation checks.');
+      } else if (probe) {
         const result = await desktop().probeRuntime();
         setStatus(`Connected to the managed Linux environment (${String(result.architecture)}).`);
       } else {
@@ -76,6 +90,26 @@ export function RuntimeSettings() {
     setStatus('');
     try {
       setNative(await desktop().setNativeRuntime(feature, enabled));
+    } catch (failure) {
+      setError(errorMessage(failure));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function localWindow(select: boolean) {
+    if (select && !conversationId) return;
+    setBusy(true);
+    setError('');
+    setStatus('');
+    try {
+      if (select && conversationId) await desktop().selectLocalComputer(conversationId);
+      else await desktop().revokeLocalComputer();
+      setStatus(
+        select
+          ? 'The selected window is available to this chat for two minutes.'
+          : 'Local desktop access revoked.',
+      );
     } catch (failure) {
       setError(errorMessage(failure));
     } finally {
@@ -102,6 +136,62 @@ export function RuntimeSettings() {
               onChange={(event) => setValue({ ...value, engineSocket: event.target.value })}
             />
           </div>
+          <div className="shortcut-row">
+            <label htmlFor="virtual-desktop-image">Virtual desktop image ID</label>
+            <input
+              id="virtual-desktop-image"
+              value={value.desktopImage ?? ''}
+              disabled={busy}
+              placeholder="sha256:…"
+              onChange={(event) =>
+                setValue({ ...value, desktopImage: event.target.value.trim() || undefined })
+              }
+            />
+            <Button
+              variant="secondary"
+              disabled={busy || !value.desktopImage}
+              onClick={() => void save('desktop')}
+            >
+              Verify desktop
+            </Button>
+          </div>
+          {(
+            [
+              {
+                name: 'computerIdleMinutes',
+                label: 'Computer idle limit (minutes)',
+                maximum: 20,
+                fallback: 20,
+              },
+              {
+                name: 'computerLifetimeMinutes',
+                label: 'Computer session limit (minutes)',
+                maximum: 45,
+                fallback: 45,
+              },
+              {
+                name: 'computerBatchLimit',
+                label: 'Computer actions per batch',
+                maximum: 8,
+                fallback: 8,
+              },
+            ] as const
+          ).map(({ name, label, maximum, fallback }) => (
+            <div className="shortcut-row" key={name}>
+              <label htmlFor={name}>{label}</label>
+              <input
+                id={name}
+                type="number"
+                min={name === 'computerLifetimeMinutes' ? 2 : 1}
+                max={maximum}
+                value={value[name] ?? fallback}
+                disabled={busy}
+                onChange={(event) =>
+                  setValue({ ...value, [name]: event.target.valueAsNumber || undefined })
+                }
+              />
+            </div>
+          ))}
           <div className="shortcut-row">
             <label htmlFor="command-duration">Maximum command duration (seconds)</label>
             <input
@@ -190,6 +280,21 @@ export function RuntimeSettings() {
             </Button>
           </div>
         </>
+      )}
+      {localSupported && (
+        <div className="shortcut-row">
+          <span>Local desktop window</span>
+          <Button
+            variant="secondary"
+            disabled={!conversationId || busy}
+            onClick={() => void localWindow(true)}
+          >
+            Select a text editor window
+          </Button>
+          <Button variant="ghost" disabled={busy} onClick={() => void localWindow(false)}>
+            Revoke
+          </Button>
+        </div>
       )}
       {nativeModes.map(({ id, label }) => (
         <div className="shortcut-row" key={id}>

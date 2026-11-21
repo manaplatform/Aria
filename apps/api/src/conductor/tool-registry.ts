@@ -5,12 +5,16 @@ import { z } from 'zod';
 import {
   capabilityId,
   conductorLimits,
+  computerImage,
+  computerOperations,
   desktopArtifactSchema,
   evidenceSchema,
   executionLimits,
   runtimeOperations,
   runtimeResultSchema,
   type RuntimeOperation,
+  type ComputerImage,
+  type ComputerProviderCall,
   modelRefSchema,
   referenceInput,
   researchToolArgs,
@@ -33,6 +37,7 @@ import { RunError, type RunAttachment, type RunFile } from './run-assets';
 type Registry = Awaited<ReturnType<ModelRegistry['resolve']>>;
 export type StepInputs = { text: string[]; files: RunFile[] };
 export type StepValue = {
+  computerImage?: ComputerImage;
   text?: string;
   file?: RunFile;
   sources?: ConductorSource[];
@@ -45,6 +50,7 @@ export type StepValue = {
 };
 
 const resultSchema = z.strictObject({
+  computerImage: computerImage.optional(),
   text: z.string().optional(),
   file: z
     .custom<RunFile>((value) => {
@@ -87,6 +93,8 @@ export interface ToolContext {
   attachments: Map<string, RunAttachment>;
   privateContent: boolean;
   native?: OpenAIRuntime;
+  computer?: { sessionId: string; mode: 'aria' | 'openai-responses'; observationId?: string };
+  computerCall?: ComputerProviderCall;
   runtime?: { requestId: string; conversationId: string; assistantMessageId: string };
 }
 
@@ -163,6 +171,46 @@ const researchDescriptions: Record<ResearchToolId, string> = {
 };
 
 const runtimeDescriptions: Record<RuntimeOperation, readonly [string, string, ToolEffect]> = {
+  'computer.inspect': [
+    'Inspect computer environments',
+    'Report the verified Computer Use environments and their limits.',
+    'read',
+  ],
+  'computer.open': [
+    'Open computer session',
+    'Select an available environment and protocol. For the managed browser, use the tab ID returned by browser_open. The managed visual browser suspends network requests to protect external state.',
+    'local',
+  ],
+  'computer.observe': [
+    'Observe computer',
+    'Read visible controls or capture an authorized screenshot from this session. Image transport requires a verified primary.',
+    'read',
+  ],
+  'computer.act': [
+    'Interact with computer',
+    'Use the latest observation to dispatch an ordered action batch. Check the returned per-action results and actual state before claiming success.',
+    'local',
+  ],
+  'computer.close': [
+    'Close computer session',
+    'Release input and close this scoped environment.',
+    'local',
+  ],
+  'computer.navigate': [
+    'Navigate computer browser',
+    'Move the computer workspace to an already authorized URL, source, or public AI tab. Navigation starts from a fresh browser state and requires a new observation.',
+    'local',
+  ],
+  'computer.transfer': [
+    'Exchange computer files',
+    'Download an observed HTTPS link, request approval for an attachment upload, save an authorized screenshot, or exchange verified workspace files.',
+    'local',
+  ],
+  'computer.run_script': [
+    'Run bounded computer script',
+    'Run isolated Python with a computer-only broker. Print a JSON request with request=observe, or request=action and the declared action index. Read each response as one stdin JSON line. Finish with a JSON object containing a result string.',
+    'local',
+  ],
   'shell.inspect': [
     'Inspect execution environments',
     'Check the configured sandbox, available runtimes and limits before choosing commands.',
@@ -356,12 +404,20 @@ export class ToolRegistry {
         dependency: 'local',
         permission: 'Authorized desktop conversation runtime',
         timeoutMs: executionLimits.operationMs + 1000,
-        artifacts: operation === 'artifacts.publish',
+        repeatable: operation === 'computer.observe' || operation === 'computer.act',
+        programmaticEligible: operation === 'computer.inspect' || operation === 'computer.observe',
+        artifacts: operation === 'artifacts.publish' || operation === 'computer.transfer',
         citations: operation === 'knowledge.search',
         available: (context) =>
           Boolean(
             context.runtime &&
             this.host.current.desktopRuntime &&
+            (!operation.startsWith('computer.') ||
+              operation === 'computer.inspect' ||
+              ((this.host.current.computerBrowser ||
+                this.host.current.computerVirtual ||
+                this.host.current.computerLocal) &&
+                !context.privateContent)) &&
             (operation !== 'knowledge.prepare_search' ||
               this.host.current.nativeRuntime?.includes('file-search')),
           ),
@@ -373,6 +429,53 @@ export class ToolRegistry {
               'Open desktop text chat to use this runtime.',
             );
           const { primary } = context.registry;
+          if (operation === 'computer.open') {
+            const args = computerOperations[operation].parse(input);
+            if (
+              (args.environment === 'managed-browser' && !this.host.current.computerBrowser) ||
+              (args.environment === 'virtual-desktop' && !this.host.current.computerVirtual) ||
+              (args.environment === 'local-desktop' && !this.host.current.computerLocal)
+            )
+              throw new ToolError(
+                'CAPABILITY_UNAVAILABLE',
+                'The requested Computer Use environment is not verified or enabled.',
+              );
+            if (args.environment === 'local-desktop' && args.mode !== 'aria')
+              throw new ToolError(
+                'CAPABILITY_UNAVAILABLE',
+                'The scoped local driver requires Aria semantic actions.',
+              );
+            if (
+              args.mode === 'openai-responses' &&
+              !this.host.current.nativeRuntime?.includes('computer')
+            )
+              throw new ToolError(
+                'CAPABILITY_UNAVAILABLE',
+                'Verify OpenAI Computer Use for the selected primary in Settings.',
+              );
+          }
+          if (
+            (operation === 'computer.observe' && input.format === 'image') ||
+            (operation === 'computer.act' &&
+              (input.screenshot ||
+                (Array.isArray(input.actions) &&
+                  input.actions.some((action) => action?.type === 'screenshot'))))
+          ) {
+            const nativeDispatch =
+              operation === 'computer.act' &&
+              context.computerCall?.callId === callId &&
+              context.computer?.mode === 'openai-responses' &&
+              context.computer.sessionId === input.sessionId;
+            if (
+              !this.host.current.nativeRuntime?.includes(
+                nativeDispatch ? 'computer' : 'computer-image',
+              )
+            )
+              throw new ToolError(
+                'CAPABILITY_UNAVAILABLE',
+                'Verify image observations for this primary and Computer Use mode in Settings.',
+              );
+          }
           const nativeFeature =
             operation === 'knowledge.prepare_search'
               ? 'file-search'
@@ -440,7 +543,16 @@ export class ToolRegistry {
               operation,
               callId,
               stepId: step.id,
-              input,
+              input:
+                operation === 'computer.act' && context.computerCall?.callId === callId
+                  ? { ...input, provider: context.computerCall }
+                  : operation === 'computer.navigate' && input.target !== 'tab'
+                    ? {
+                        target: 'url',
+                        sessionId: input.sessionId,
+                        url: context.research.destination(input, step.dependsOn),
+                      }
+                    : input,
               primary: {
                 connectionId: primary.connection.id,
                 model: primary.id,
@@ -449,6 +561,24 @@ export class ToolRegistry {
             },
             signal,
           );
+          if (operation === 'computer.open') {
+            const mode = computerOperations[operation].parse(input).mode;
+            const sessionId = z.string().uuid().parse(data?.sessionId);
+            context.computer = { sessionId, mode };
+          }
+          if (operation === 'computer.close' && context.computer?.sessionId === input.sessionId)
+            context.computer = undefined;
+          if (
+            operation === 'computer.navigate' &&
+            context.computer &&
+            context.computer.sessionId === input.sessionId
+          )
+            context.computer.observationId = undefined;
+          if (
+            value.computerImage &&
+            context.computer?.sessionId === value.computerImage.observation.sessionId
+          )
+            context.computer.observationId = value.computerImage.observation.id;
           if (nativeFeature) {
             if (!context.native) {
               const scope = context.runtime;
@@ -706,18 +836,24 @@ export class ToolRegistry {
         ? 'Disabled in Tools settings.'
         : Object.hasOwn(runtimeOperations, descriptor.id) && !this.host.current.desktopRuntime
           ? 'Open the managed Aria desktop application to use this tool.'
-          : descriptor.dependency === 'browser' && !browserAvailable
-            ? 'Enable AI Browser in Web & Browser.'
-            : descriptor.dependency === 'delegate' &&
-                ![...(registry?.models.values() ?? [])].some(
-                  (model) =>
-                    model.delegate &&
-                    descriptor.requiredModelCapabilities.every((cap) =>
-                      model.capabilities.some((value) => cap === value),
-                    ),
-                )
-              ? 'Configure an eligible delegated model in AI Models.'
-              : undefined;
+          : descriptor.id.startsWith('computer.') &&
+              descriptor.id !== 'computer.inspect' &&
+              !this.host.current.computerBrowser &&
+              !this.host.current.computerVirtual &&
+              !this.host.current.computerLocal
+            ? 'Enable AI Browser, verify the virtual desktop, or select a scoped local window.'
+            : descriptor.dependency === 'browser' && !browserAvailable
+              ? 'Enable AI Browser in Web & Browser.'
+              : descriptor.dependency === 'delegate' &&
+                  ![...(registry?.models.values() ?? [])].some(
+                    (model) =>
+                      model.delegate &&
+                      descriptor.requiredModelCapabilities.every((cap) =>
+                        model.capabilities.some((value) => cap === value),
+                      ),
+                  )
+                ? 'Configure an eligible delegated model in AI Models.'
+                : undefined;
       return summarize(descriptor, !reason, reason);
     });
   }

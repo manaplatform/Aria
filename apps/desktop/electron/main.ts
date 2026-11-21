@@ -31,6 +31,8 @@ import {
   toolDiscoverySchema,
   type RuntimeRegistry,
   browserLayoutSchema,
+  computerSupervision,
+  computerUserInput,
   webSettingsInputSchema,
   connectionInputSchema,
   endActivity,
@@ -40,6 +42,9 @@ import {
 } from '@aria/shared';
 import { ChatService } from './chat-service';
 import { DesktopRuntime } from './runtime/controller';
+import { ComputerRuntime } from './runtime/computer';
+import { VirtualComputer } from './runtime/virtual-computer';
+import { LocalComputer } from './runtime/local-computer';
 import { openAIRuntimeFeatureSchema, runtimeSettingsSchema } from '@aria/shared';
 import { MediaStorage, referencedAssets } from './media-storage';
 import { MediaService, liveRequestSchema } from './media-service';
@@ -84,6 +89,9 @@ let provider: ProviderStorage;
 let chat: ChatService;
 let assets: MediaStorage;
 let executionRuntime: DesktopRuntime;
+let computerRuntime: ComputerRuntime;
+let virtualComputer: VirtualComputer;
+let localComputer: LocalComputer;
 let media: MediaService;
 let saving = Promise.resolve();
 let configuring = false;
@@ -154,7 +162,7 @@ async function changeRegistry<T>(save: () => Promise<T>) {
     configuring = false;
   }
 }
-function nativeProof(registry: RuntimeRegistry) {
+function nativeProof(registry: RuntimeRegistry, image = false) {
   for (const connection of registry.connections) {
     const model = connection.models.find(
       (item) => item.enabled && modelReference(connection.id, item.id) === registry.primary,
@@ -162,13 +170,27 @@ function nativeProof(registry: RuntimeRegistry) {
     if (
       model &&
       connection.apiKey &&
-      new URL(connection.baseUrl).origin === 'https://api.openai.com'
+      (image || new URL(connection.baseUrl).origin === 'https://api.openai.com')
     ) {
       return createHash('sha256')
-        .update(JSON.stringify([connection.baseUrl, model.id, connection.apiKey, 'responses']))
+        .update(
+          JSON.stringify([
+            connection.baseUrl,
+            model.id,
+            connection.apiKey,
+            image ? 'computer-image/1' : 'responses',
+          ]),
+        )
         .digest('hex');
     }
   }
+}
+
+function runtimePolicy(registry?: RuntimeRegistry) {
+  return capabilities.policy(
+    registry && nativeProof(registry),
+    registry && nativeProof(registry, true),
+  );
 }
 
 const toolList = z
@@ -190,7 +212,7 @@ const toolList = z
 
 async function toolSettings() {
   const registry = await provider.resolve().catch(() => undefined);
-  const policy = capabilities.policy(registry && nativeProof(registry));
+  const policy = runtimePolicy(registry);
   const response = await chat.http('chat/tools', { signal: AbortSignal.timeout(11_000) });
   return {
     discovery: policy.discovery,
@@ -320,7 +342,41 @@ function registerIpc(): void {
   handle('aria:open-external', (url) => shell.openExternal(safeExternalUrl(string.parse(url))));
   handle('aria:browser-state', () => browser.state());
   handle('aria:browser-command', (input) => browser.command(browserCommandSchema.parse(input)));
-  handle('aria:browser-layout', (input) => browser.setLayout(browserLayoutSchema.parse(input)));
+  handle('aria:browser-layout', (input) => {
+    const previous = browser.activeConversation();
+    browser.setLayout(browserLayoutSchema.parse(input));
+    if (previous && previous !== browser.activeConversation()) computerRuntime.leave(previous);
+  });
+  handle('aria:computer-sessions', (conversation) =>
+    computerRuntime.states(identifier.parse(conversation)),
+  );
+  handle('aria:computer-preview', (conversation, id) =>
+    computerRuntime.preview(identifier.parse(conversation), z.string().uuid().parse(id)),
+  );
+  handle('aria:computer-supervise', (conversation, command) =>
+    computerRuntime.supervise(identifier.parse(conversation), computerSupervision.parse(command)),
+  );
+  handle('aria:computer-user-input', (conversation, value) => {
+    const request = computerUserInput.parse(value);
+    return computerRuntime.userInput(
+      identifier.parse(conversation),
+      request.sessionId,
+      request.action,
+    );
+  });
+  handle('aria:probe-virtual-computer', () =>
+    changeCapabilities(() => virtualComputer.verify(AbortSignal.timeout(30_000))),
+  );
+  handle('aria:local-computer-supported', () => localComputer.supported());
+  handle('aria:select-local-computer', (value) => {
+    const owner = identifier.parse(value);
+    if (!browser.computerForeground(owner))
+      throw new Error('Open the conversation that will use the local window.');
+    return changeCapabilities(() => localComputer.prepare(owner, AbortSignal.timeout(85_000)));
+  });
+  handle('aria:revoke-local-computer', () =>
+    changeCapabilities(async () => localComputer.revoke()),
+  );
   handle('aria:web-settings', () => webSettings.get());
   handle('aria:save-web-settings', async (input) => {
     const parsed = webSettingsInputSchema.parse(input);
@@ -474,12 +530,18 @@ function registerIpc(): void {
   handle('aria:save-runtime-settings', async (value) => {
     chat.assertIdle();
     media.assertIdle();
-    await executionRuntime.configure(runtimeSettingsSchema.parse(value));
+    const current = executionRuntime.settings();
+    const next = runtimeSettingsSchema.parse(value);
+    await executionRuntime.configure(next);
+    if (current.engineSocket !== next.engineSocket || current.desktopImage !== next.desktopImage) {
+      await computerRuntime.shutdown();
+      await chat.restart();
+    }
     return executionRuntime.settings();
   });
   handle(
     'aria:native-runtime-modes',
-    async () => capabilities.policy(nativeProof(await provider.resolve())).nativeRuntime ?? [],
+    async () => runtimePolicy(await provider.resolve()).nativeRuntime ?? [],
   );
   handle('aria:set-native-runtime', (raw, enabled) => {
     const feature = openAIRuntimeFeatureSchema.parse(raw);
@@ -489,8 +551,8 @@ function registerIpc(): void {
         await capabilities.verifyNativeRuntime(feature);
         return;
       }
-      const proof = nativeProof(await provider.resolve());
-      if (!proof) throw new Error('Configure an official OpenAI primary model first.');
+      const proof = nativeProof(await provider.resolve(), feature === 'computer-image');
+      if (!proof) throw new Error('Configure a compatible primary model first.');
       const response = await chat.http('providers/verify-native-runtime', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -501,9 +563,7 @@ function registerIpc(): void {
         await response.json(),
       );
       await capabilities.verifyNativeRuntime(feature, proof);
-    }).then(
-      async () => capabilities.policy(nativeProof(await provider.resolve())).nativeRuntime ?? [],
-    );
+    }).then(async () => runtimePolicy(await provider.resolve()).nativeRuntime ?? []);
   });
   handle('aria:probe-runtime', () => executionRuntime.inspect(AbortSignal.timeout(10_000)));
   handle('aria:local-embeddings', () => executionRuntime.embeddings.available());
@@ -810,6 +870,21 @@ app
     provider = new ProviderStorage(directory, cipher);
     capabilities = new CapabilityStorage(directory);
     await capabilities.load();
+    const approve = async (message: string, detail: string, signal: AbortSignal) => {
+      signal.throwIfAborted();
+      if (!mainWindow || mainWindow.isDestroyed()) return false;
+      const { response } = await dialog.showMessageBox(mainWindow, {
+        type: 'warning',
+        message,
+        detail,
+        buttons: ['Decline', 'Allow once'],
+        cancelId: 0,
+        defaultId: 0,
+        noLink: true,
+        signal,
+      });
+      return response === 1 && !signal.aborted;
+    };
     executionRuntime = new DesktopRuntime(
       directory,
       assets,
@@ -820,28 +895,65 @@ app
             .filter((message) => message.conversationId === conversationId)
             .flatMap((message) => (message.assets ?? []).map((asset) => asset.id)),
         ),
-      async (message, detail, signal) => {
-        signal.throwIfAborted();
-        if (!mainWindow || mainWindow.isDestroyed()) return false;
-        const { response } = await dialog.showMessageBox(mainWindow, {
-          type: 'warning',
-          message,
-          detail,
-          buttons: ['Decline', 'Allow'],
-          cancelId: 0,
-          defaultId: 0,
-          noLink: true,
-          signal,
-        });
-        return response === 1 && !signal.aborted;
-      },
+      approve,
       () => chat.executionIdentity(),
       () => provider.resolve(),
     );
     webSettings = new WebSettingsStorage(directory);
     await webSettings.load();
-    browser = new BrowserController(directory, () => webSettings.get());
+    browser = new BrowserController(directory, () => webSettings.get(), approve);
     await browser.load();
+    virtualComputer = new VirtualComputer(() => executionRuntime.settings(), directory);
+    localComputer = new LocalComputer();
+    computerRuntime = new ComputerRuntime(
+      executionRuntime.store,
+      [
+        {
+          environment: 'managed-browser',
+          ready: () => browser.computerAvailable(),
+          targetAlive: (...args) => browser.computerTargetAlive(...args),
+          wait: (...args) => browser.waitForComputerTab(...args),
+          open: async (owner, id, { tabId: tab }, signal) => {
+            if (!tab) throw new Error('Missing browser tab.');
+            await browser.claimComputerTab(owner, tab, id, signal);
+            return tab;
+          },
+          observe: (...args) => browser.observeComputerTab(...args),
+          restore: (owner, id, _target, url, signal) => {
+            if (!url)
+              throw new Error('The previous browser destination cannot be restored safely.');
+            return browser.restoreComputerTab(owner, id, url, signal);
+          },
+          restoreUrl: (...args) => browser.computerRestoreUrl(...args),
+          navigate: async (owner, id, input, signal) => {
+            if (input.target === 'url')
+              return browser.restoreComputerTab(owner, id, input.url, signal);
+            if (input.target !== 'tab')
+              throw new Error('Missing validated navigation destination.');
+            return browser.selectComputerTab(owner, input.tabId, id, signal);
+          },
+          authenticate: (...args) => browser.authenticateComputerTab(...args),
+          authenticationSite: (...args) => browser.computerAuthenticationSite(...args),
+          input: (...args) => browser.actComputerTab(...args),
+          owner: (...args) => browser.setComputerOwner(...args),
+          close: (...args) => browser.closeComputerTab(...args),
+          downloadTarget: (...args) => browser.computerDownloadTarget(...args),
+          uploadTarget: (...args) => browser.computerUploadTarget(...args),
+        },
+        virtualComputer,
+        localComputer,
+      ],
+      () => chat.executionIdentity(),
+      (owner) => browser.computerForeground(owner),
+      approve,
+      (state) => mainWindow?.webContents.send('aria:computer-session-update', state),
+      {
+        read: (...args) => executionRuntime.computerInput(...args),
+        adopt: (...args) => executionRuntime.adoptComputerArtifact(...args),
+        script: (...args) => executionRuntime.computerScript(...args),
+      },
+      () => executionRuntime.settings(),
+    );
     chat = new ChatService(
       provider,
       (env) =>
@@ -893,14 +1005,20 @@ app
       },
       {
         policy: (registry) => ({
-          ...capabilities.policy(nativeProof(registry)),
+          ...runtimePolicy(registry),
           desktopRuntime: true,
+          computerBrowser: browser.computerAvailable(),
+          computerVirtual: virtualComputer.ready(),
+          computerLocal: localComputer.ready(),
         }),
         artifact: (id, conversation, request) =>
           executionRuntime.resolveArtifact(id, conversation, request),
         adoptHostedArtifact: (asset, conversation, request, execution, signal) =>
           executionRuntime.adoptHostedArtifact(asset, conversation, request, execution, signal),
-        release: (request) => executionRuntime.release(request),
+        release: (request) => {
+          executionRuntime.release(request);
+          computerRuntime.release(request);
+        },
         availableAssets: (conversation) =>
           [
             ...new Map(
@@ -920,7 +1038,10 @@ app
                 : request.voiceSessionId
                   ? media.authorizeCapability(request)
                   : authorize(request),
-            (request, signal) => executionRuntime.dispatch(request, signal),
+            (request, signal) =>
+              request.operation.startsWith('computer.')
+                ? computerRuntime.dispatch(request, signal)
+                : executionRuntime.dispatch(request, signal),
           ),
       },
     );
@@ -949,6 +1070,8 @@ app.on('before-quit', (event) => {
     shutdown ??= media
       .close()
       .then(() => chat.close())
+      .then(() => computerRuntime.shutdown())
+      .then(() => localComputer.revoke())
       .then(() => executionRuntime.close())
       .finally(() => {
         browser.close();

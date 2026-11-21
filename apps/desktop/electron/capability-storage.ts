@@ -101,17 +101,20 @@ export class CapabilityStorage {
     }
   }
 
-  policy(proof?: string): ToolPolicy {
+  policy(proof?: string, imageProof?: string): ToolPolicy {
     const active = this.data.skills.filter((item) => item.summary.enabled);
     return {
       revision: this.data.revision,
       discovery: this.data.discovery,
       disabled: this.data.disabled,
       nativeVerified: Boolean(proof && this.data.proof === proof),
-      ...(proof &&
+      ...((proof || imageProof) &&
         this.data.nativeRuntimeProofs && {
           nativeRuntime: Object.entries(this.data.nativeRuntimeProofs)
-            .filter(([, verified]) => proof === verified)
+            .filter(
+              ([feature, verified]) =>
+                (feature === 'computer-image' ? imageProof : proof) === verified,
+            )
             .map(([feature]) => openAIRuntimeFeatureSchema.parse(feature)),
         }),
       skills: [

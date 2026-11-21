@@ -8,8 +8,14 @@ import type {
 import type { SkillRef, SkillPreview, ToolDiscovery, ToolSettings } from './capabilities.js';
 export * from './capabilities.js';
 import type { BrowserCommand, BrowserLayout, BrowserState } from './browser.js';
+import type {
+  ComputerAction,
+  ComputerSessionSummary,
+  ComputerSupervision,
+} from './computer-use.js';
 import type { WebSettings, WebSettingsInput } from './web.js';
 export * from './browser.js';
+export * from './computer-use.js';
 export * from './web.js';
 export * from './public-address.js';
 import type {
@@ -378,6 +384,19 @@ export interface DesktopBridge {
   browserState(): Promise<BrowserState>;
   browserCommand(command: BrowserCommand): Promise<string | void>;
   browserLayout(layout: BrowserLayout): Promise<void>;
+  computerSessions(conversationId: string): Promise<ComputerSessionSummary[]>;
+  computerPreview(conversationId: string, sessionId: string): Promise<string | undefined>;
+  probeVirtualComputer(): Promise<void>;
+  localComputerSupported(): Promise<boolean>;
+  selectLocalComputer(conversationId: string): Promise<void>;
+  revokeLocalComputer(): Promise<void>;
+  superviseComputer(conversationId: string, command: ComputerSupervision): Promise<void>;
+  sendComputerInput(
+    conversationId: string,
+    sessionId: string,
+    action: ComputerAction,
+  ): Promise<void>;
+  onComputerSession(callback: (state: ComputerSessionSummary) => void): () => void;
   onBrowserState(callback: (state: BrowserState) => void): () => void;
   webSettings(): Promise<WebSettings>;
   saveWebSettings(input: WebSettingsInput): Promise<WebSettings>;

@@ -15,3 +15,5 @@ paraphrase-multilingual-MiniLM-L12-v2 model. Its model and tokenizer data are
 installed separately. The optional managed sandbox uses a digest-pinned
 Docker Official Python image. The bundled renderer dependency inventory
 covers the document and ONNX runtime libraries.
+
+The optional Aria graphical desktop recipe uses the pinned Debian base image and its distribution packages. If distributing the built image, retain the upstream package notices and review the applicable redistribution and source obligations. Windows local desktop builds stage a self-contained .NET Windows Desktop helper. Include the runtime license and third-party notices from the exact runtime packs used to publish that helper.

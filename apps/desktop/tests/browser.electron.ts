@@ -30,7 +30,8 @@ test('browses from ordinary chat through the managed private port and keeps priv
         .end(
           '<title>Aria research fixture</title><main><h1>Research evidence</h1>' +
             '<p>The sample contains 42 measurements.</p><p hidden>secret-hidden-value</p>' +
-            '<a href="/next">Next page</a></main>' +
+            '<a href="/next">Next page</a><button style="position:absolute;left:100px;top:180px;width:180px;height:40px">Ready for input</button></main>' +
+            '<script>document.querySelector("button").onclick=()=>{document.querySelector("button").textContent="Fixture received input";fetch("/unexpected-action").catch(()=>{})}</script>' +
             `<img src="http://127.0.0.1:${port}/private-canary" alt="">`,
         );
     }
@@ -294,6 +295,133 @@ test('browses from ordinary chat through the managed private port and keeps priv
     expect((await page.evaluate(() => window.aria!.browserState())).tabs).toHaveLength(
       state.tabs.length,
     );
+
+    await expect(page.getByRole('button', { name: 'Send message', exact: true })).toBeVisible();
+    const computerPrompt = `Use the computer to interact with ${url}`;
+    expect(
+      await page.evaluate(() => window.aria!.setNativeRuntime('computer-image', true)),
+    ).toContain('computer-image');
+    const computer = (id: string, operation: string, args: Record<string, unknown>) => ({
+      ...step(id, 'browser_open', args),
+      capability: operation,
+      target: { kind: 'tool' as const, tool: operation, model: null },
+    });
+    await app.evaluate(({ dialog }) => {
+      const show = dialog.showMessageBox.bind(dialog);
+      dialog.showMessageBox = ((...args: Parameters<typeof show>) => {
+        if (
+          args.some(
+            (part) => 'message' in part && part.message === 'Allow this computer action once?',
+          )
+        )
+          return Promise.resolve({ response: 1, checkboxChecked: false });
+        return show(...args);
+      }) as typeof show;
+    });
+    const computerResults: Record<string, unknown> = {};
+    const computerTools = [
+      'browser.browser_open',
+      'computer.open',
+      'computer.observe',
+      'computer.act',
+    ];
+    provider.queueTool(computerPrompt, 'find_capabilities', {
+      ids: computerTools,
+      kind: 'tools',
+      query: '',
+    });
+    provider.queueTool(computerPrompt, 'load_capabilities', { ids: computerTools });
+    provider.queueOperations(computerPrompt, { steps: [step('open', 'browser_open', { url })] });
+    provider.onToolResult(computerPrompt, (result) => {
+      if (!Array.isArray(result) || !result[0]) return;
+      const { id, data, status, error } = result[0];
+      computerResults.last = id;
+      if (status !== 'completed') {
+        computerResults.failure = error;
+        return;
+      }
+      if (id === 'open')
+        return {
+          name: 'fixture_operations',
+          input: {
+            steps: [
+              computer('start', 'computer.open', {
+                environment: 'managed-browser',
+                mode: 'aria',
+                tabId: data.tabId,
+              }),
+            ],
+          },
+        };
+      if (id === 'start')
+        return {
+          name: 'fixture_operations',
+          input: {
+            steps: [
+              computer('inspect', 'computer.observe', {
+                sessionId: data.sessionId,
+                format: 'image',
+              }),
+            ],
+          },
+        };
+      if (id === 'inspect')
+        return {
+          name: 'fixture_operations',
+          input: {
+            steps: [
+              computer('act', 'computer.act', {
+                sessionId: data.observation.sessionId,
+                observationId: data.observation.id,
+                actions: [
+                  {
+                    type: 'click',
+                    button: 'left',
+                    x: Math.round(
+                      (165 * data.observation.screenshot.width) / data.observation.width,
+                    ),
+                    y: Math.round(
+                      (198 * data.observation.screenshot.height) / data.observation.height,
+                    ),
+                  },
+                ],
+              }),
+            ],
+          },
+        };
+      if (id === 'act') {
+        computerResults.outcomes = data.outcomes;
+        computerResults.elements = data.observation.state.elements;
+      }
+    });
+    await page.getByRole('textbox', { name: 'Message Aria' }).fill(computerPrompt);
+    await page.getByRole('button', { name: 'Send message', exact: true }).click();
+    await expect
+      .poll(() => computerResults, { timeout: 20_000 })
+      .toMatchObject({
+        outcomes: [{ index: 0, action: 'click', status: 'submitted' }],
+        elements: expect.arrayContaining([
+          expect.objectContaining({ label: 'Fixture received input' }),
+        ]),
+      });
+    await expect(page.getByRole('region', { name: 'Computer Use' })).toBeVisible();
+    expect(
+      provider.received.some(({ body }) =>
+        body.messages.some(
+          ({ role, content }) =>
+            role === 'tool' &&
+            Array.isArray(content) &&
+            content.some((part) => part.type === 'image_url'),
+        ),
+      ),
+    ).toBe(true);
+    expect(traffic).not.toContain('/unexpected-action');
+    await page.getByRole('button', { name: 'Take control', exact: true }).click();
+    await expect(page.getByRole('region', { name: 'Computer Use' })).toContainText(
+      'You have control',
+    );
+    await page.getByRole('button', { name: 'Close', exact: true }).click();
+    await expect(page.getByRole('region', { name: 'Computer Use' })).toBeHidden();
   } finally {
     await app?.close();
     site.closeAllConnections();

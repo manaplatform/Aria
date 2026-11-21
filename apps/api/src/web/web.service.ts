@@ -74,7 +74,7 @@ export class ResearchRun {
     }
   }
 
-  private destination(args: Record<string, unknown>, dependsOn: string[]) {
+  destination(args: Record<string, unknown>, dependsOn: string[]) {
     if (typeof args.sourceId === 'string') {
       const source = this.sources.get(args.sourceId);
       if (source && dependsOn.includes(source.producer)) return source.url;
