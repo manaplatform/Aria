@@ -136,8 +136,7 @@ export async function readReleaseState(api) {
   };
 
   const candidates = new Set([
-    ...refs.filter((ref) => ref.object.type === 'tag' && tagPattern.test(ref.ref.slice(10)))
-      .map((ref) => ref.ref.slice(10)),
+    ...refs.map((ref) => ref.ref.slice(10)).filter((tag) => tagPattern.test(tag)),
     ...releases.filter((release) => !release.draft).map((release) => release.tag_name),
   ]);
   const identities = new Map();
@@ -158,7 +157,8 @@ export async function readReleaseState(api) {
     }
     published.push({ release, tag: release.tag_name, commit, version });
   }
-  return { tags, releases, reservations, published };
+  const tagCommits = new Map([...identities].map(([tag, { commit }]) => [tag, commit]));
+  return { tags, releases, reservations, published, tagCommits };
 }
 
 export function findRelease(state, version, commit) {
@@ -175,11 +175,13 @@ export function findRelease(state, version, commit) {
   const reserved = state.reservations.filter((item) => semver.eq(item.version, version));
   if (reserved.length > 1 || reserved.some((item) => item.commit !== commit || item.version !== version))
     throw new Error(`Application version ${version} is reserved by a different source. Retry the original workflow or choose a new version.`);
-  const tag = reserved[0]?.tag;
+  const reservedTag = reserved[0]?.tag;
   const drafts = state.releases.filter((item) => item.draft &&
-    (item.tag_name === tag || item.body?.startsWith(releaseNoteMarker(version, commit))));
-  if (drafts.length > 1 || drafts.some((item) => item.tag_name !== tag ||
-      !item.body?.startsWith(releaseNoteMarker(version, commit))))
+    (item.tag_name === reservedTag || item.body?.startsWith(releaseNoteMarker(version, commit))));
+  if (drafts.length > 1 || drafts.some((item) =>
+    !item.body?.startsWith(releaseNoteMarker(version, commit)) ||
+    (reservedTag ? item.tag_name !== reservedTag :
+      !tagPattern.test(item.tag_name) || state.tagCommits?.get(item.tag_name) !== commit)))
     throw new Error(`A conflicting draft exists for application version ${version}.`);
-  return { tag, draft: drafts[0] };
+  return { tag: reservedTag ?? drafts[0]?.tag_name, draft: drafts[0] };
 }

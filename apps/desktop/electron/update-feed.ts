@@ -6,7 +6,7 @@ import type { UpdateChannel } from '@aria/shared';
 const repo = 'manaplatform/Aria';
 const base = `https://github.com/${repo}/releases`;
 const api = `https://api.github.com/repos/${repo}/releases`;
-const calendarTag = /^v\d{4}\.\d{2}\.\d{2}(?:-(?:[2-9]|[1-9]\d+))?$/;
+const calendarTag = /^v\d{4}\.\d{2}\.\d{2}(?:\.[1-9]\d*|-(?:[2-9]|[1-9]\d+))?$/;
 const stableSemVer = (version: string) => parse(version)?.version === version;
 export const releasePage = base;
 

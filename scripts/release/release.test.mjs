@@ -60,12 +60,12 @@ test('Windows production signer pins reject missing, malformed, or incomplete se
   }
 });
 
-test('allocates UTC date tags and formats the title from the reserved date', () => {
+test('allocates UTC date tags and uses only SemVer in the title', () => {
   const local = new Date('2026-11-22T00:30:00+03:30');
   assert.equal(dateTag(local, new Set()), 'v2026.11.21');
   const utc = new Date('2026-11-22T23:00:00Z');
   assert.equal(dateTag(utc, new Set([tag, tag + '-2', tag + '.1'])), tag + '-3');
-  assert.equal(releaseTitle('0.0.2-beta.1', tag + '-2'), 'Aria v0.0.2-beta.1 — 2026.11.22');
+  assert.equal(releaseTitle('0.0.2-beta.1'), 'v0.0.2-beta.1');
 });
 
 test('production preparation skips an unchanged main version and rejects a tag named main', async (t) => {
@@ -102,16 +102,21 @@ test('release identity rejects duplicate precedence and recovers only its own dr
 });
 
 test('the recurring scan leaves drafts outside the current release request alone', async () => {
-  const candidate = { id: 23, draft: true, tag_name: `aria-auto-${version}`, target_commitish: 'main', assets: [] };
+  const candidate = { id: 23, draft: true, tag_name: tag + '.2', assets: [] };
+  const feature = 'b'.repeat(40);
   const drafts = [
-    { ...candidate, tag_name: 'aria-auto-0.0.2' },
-    { ...candidate, target_commitish: 'feature' },
+    { ...candidate, tag_name: tag + '.1' },
+    { ...candidate, tag_name: tag + '.3' },
     { ...candidate, body: 'Handwritten notes' },
     { ...candidate, assets: [{ name: 'manual.zip' }] },
-    { ...candidate, target_commitish: commit, body: '<!-- Aria release request run 25 -->' },
+    { ...candidate, body: `<!-- Aria release request run 25 tag ${candidate.tag_name} -->` },
   ];
-  const api = { pages: async (route) => route === '/releases' ? drafts : [] };
-  assert.equal(await claimDraftRequest(api, { version, source: commit, branch: 'main', runId: '42' }), undefined);
+  const api = { pages: async (route) => route === '/releases' ? drafts : [
+    { ref: `refs/tags/${candidate.tag_name}`, object: { type: 'commit', sha: commit } },
+    { ref: `refs/tags/${tag}.3`, object: { type: 'commit', sha: feature } },
+  ] };
+  assert.equal(await claimDraftRequest(api, { versionFor: (source) => source === commit ? version : undefined,
+    runId: '42' }), undefined);
 });
 
 test('first-release notes avoid unsupported claims and deduplicate PR commits', () => {
@@ -166,14 +171,14 @@ test('manifest hashes actual bytes and includes all six feeds', async (t) => {
   await assert.rejects(() => createManifest(directory, { version, tag, commit }), /ENOENT/);
 });
 
-async function buildFixture(t, production) {
+async function buildFixture(t, production, ref = 'HEAD') {
   const input = await mkdtemp(path.join(os.tmpdir(), 'aria-build-receipts-'));
   const output = path.join(input, 'verified');
   const builds = path.join(input, 'incoming');
   t.after(() => rm(input, { recursive: true, force: true }));
   const git = (...args) => execFileSync('git', args, { encoding: 'utf8' }).trim();
-  const version = applicationVersion(JSON.parse(git('show', 'HEAD:package.json')));
-  const commit = git('rev-parse', 'HEAD');
+  const commit = git('rev-parse', ref);
+  const version = applicationVersion(JSON.parse(git('show', `${commit}:package.json`)));
   for (const { platform, arch } of allTargets()) {
     const directory = path.join(builds, `aria-${platform}-${arch}`);
     await mkdir(directory, { recursive: true });
@@ -290,18 +295,19 @@ test('a lost publication response is reconciled by release ID', async () => {
 
 test('verified build through publication signs metadata, rejects corrupt uploads and retries the same tag',
   (t) => exercisePublication(t));
-test('a GitHub draft request is claimed and filled in place before publication',
+test('a GitHub draft keeps its existing tag and builds from the tagged ancestor',
   (t) => exercisePublication(t, 'schedule'));
 test('an automatic version release fills a matching GitHub draft already waiting for it',
   (t) => exercisePublication(t, 'push'));
 
 async function exercisePublication(t, trigger) {
-  const { builds, output, version, commit } = await buildFixture(t, true);
-  await verifyBuilds(builds, output, true);
+  const { builds, output, version, commit } = await buildFixture(t, true, trigger === 'schedule' ? 'HEAD^' : 'HEAD');
+  if (trigger === 'schedule') await assert.rejects(() => verifyBuilds(builds, output, true), /Invalid build receipt/);
+  await verifyBuilds(builds, output, true, commit);
   const { privateKey, publicKey } = generateKeyPairSync('ed25519');
   const timestamp = '2026-11-22T10:30:00Z';
   const now = new Date('2026-11-22T11:00:00Z');
-  const reserved = tag + '-2';
+  const reserved = tag + (trigger ? '.2' : '-2');
   const sample = buildInventory(version)[0].filename;
   const remote = new Map();
   const uploads = [];
@@ -309,14 +315,16 @@ async function exercisePublication(t, trigger) {
   const draftId = 23;
   let tagObject;
   let draft = trigger ? {
-    id: draftId, draft: true, tag_name: `aria-auto-${version}`, target_commitish: 'main', body: '',
+    id: draftId, draft: true, tag_name: reserved, target_commitish: 'main', body: '',
   } : undefined;
+  let taggedCommit = commit;
   let ref;
   let corrupt = true;
   const api = {
     async pages(route) {
       if (route === '/git/matching-refs/tags/v') return [
         { ref: `refs/tags/${tag}`, object: { type: 'commit', sha: commit } },
+        ...(trigger ? [{ ref: `refs/tags/${reserved}`, object: { type: 'commit', sha: taggedCommit } }] : []),
         ...(ref ? [ref] : []),
       ];
       if (route === '/releases') return draft ? [{ ...draft, assets: [...remote.values()] }] : [];
@@ -332,11 +340,59 @@ async function exercisePublication(t, trigger) {
     async json(route, options) {
       if (route === '/git/tags/reservation') return tagObject;
       if (route === '/releases/23' && !options) return { ...draft, assets: [...remote.values()] };
+      if (route === `/contents/package.json?ref=${commit}`)
+        return { content: Buffer.from(JSON.stringify({ version })).toString('base64') };
       const { method, body } = options;
       if (route === '/git/tags') {
+        assert.equal(trigger, undefined, 'the selected tag must not be recreated');
         assert.equal(tagObject, undefined, 'retry must reuse the annotated tag');
         assert.equal(body.tag, reserved);
         assert.equal(body.message, tagAnnotation(version, commit));
+        tagObject = { object: { type: body.type, sha: body.object }, message: body.message, sha: 'reservation' };
+        return tagObject;
+      }
+      if (route === '/git/refs') {
+        assert.deepEqual(body, { ref: `refs/tags/${reserved}`, sha: 'reservation' });
+        ref = { ref: body.ref, object: { type: 'tag', sha: body.sha } };
+        return ref;
+      }
+      if (route === '/releases') {
+        assert.equal(trigger, undefined, 'an existing request must keep its release ID');
+        assert.equal(draft, undefined, 'retry must reuse the existing draft');
+        assert.equal(body.tag_name, reserved);
+        assert.equal(body.target_commitish, commit);
+        assert.equal(body.name, `v${version}`);
+        assert.ok(body.draft);
+        assert.match(body.body, /New features[\s\S]*Add guided setup/);
+        assert.doesNotMatch(body.body, /releases\/download/);
+        draft = { ...body, id: 23 };
+        return draft;
+      }
+      if (route.startsWith('/releases/assets/') && method === 'DELETE') {
+        assert.equal(route, `/releases/assets/${remote.get(sample).id}`);
+        remote.delete(sample);
+        return null;
+      }
+      if (route === '/releases/23' && method === 'PATCH') {
+        assert.equal(body.tag_name, undefined);
+        assert.equal(body.target_commitish, undefined);
+        assert.equal(body.name, `v${version}`);
+        if (body.draft === false) {
+          assert.equal(body.make_latest, channelFor(version) === 'stable' ? 'true' : 'false');
+          assert.ok(!corrupt);
+        } else {
+          assert.equal(body.draft, undefined);
+          assert.ok(draft.draft);
+        }
+        draft = { ...draft, ...body };
+        return { ...draft, assets: [...remote.values()] };
+      }
+      throw new Error(`Unexpected mutation ${route}`);
+    },
+    async upload(id, name, _type, size, file) {
+      assert.equal(id, draft.id);
+      assert.ok(draft.draft);
+      if (!uploads.length) {
         const bytes = await readFile(path.join(output, manifestName));
         const signature = Buffer.from(await readFile(path.join(output, signatureName), 'utf8'), 'base64');
         assert.ok(verify(null, bytes, publicKey, signature));
@@ -351,48 +407,7 @@ async function exercisePublication(t, trigger) {
           const { sha256 } = await inspectFile(output, filename);
           assert.ok(checksums.includes(`${sha256}  ${filename}\n`));
         }
-        tagObject = { object: { type: body.type, sha: body.object }, message: body.message, sha: 'reservation' };
-        return tagObject;
       }
-      if (route === '/git/refs') {
-        assert.deepEqual(body, { ref: `refs/tags/${reserved}`, sha: 'reservation' });
-        ref = { ref: body.ref, object: { type: 'tag', sha: body.sha } };
-        return ref;
-      }
-      if (route === '/releases') {
-        assert.equal(trigger, undefined, 'an existing request must keep its release ID');
-        assert.equal(draft, undefined, 'retry must reuse the existing draft');
-        assert.equal(body.tag_name, reserved);
-        assert.equal(body.target_commitish, commit);
-        assert.equal(body.name, releaseTitle(version, reserved));
-        assert.ok(body.draft);
-        assert.match(body.body, /New features[\s\S]*Add guided setup/);
-        assert.doesNotMatch(body.body, /releases\/download/);
-        draft = { ...body, id: 23 };
-        return draft;
-      }
-      if (route.startsWith('/releases/assets/') && method === 'DELETE') {
-        assert.equal(route, `/releases/assets/${remote.get(sample).id}`);
-        remote.delete(sample);
-        return null;
-      }
-      if (route === '/releases/23' && method === 'PATCH') {
-        if (body.draft === false) {
-          assert.equal(body.make_latest, channelFor(version) === 'stable' ? 'true' : 'false');
-          assert.ok(!corrupt);
-        } else {
-          assert.equal(body.draft, undefined);
-          assert.equal(body.target_commitish, commit);
-          assert.ok(draft.draft);
-        }
-        draft = { ...draft, ...body };
-        return { ...draft, assets: [...remote.values()] };
-      }
-      throw new Error(`Unexpected mutation ${route}`);
-    },
-    async upload(id, name, _type, size, file) {
-      assert.equal(id, draft.id);
-      assert.ok(draft.draft);
       const digest = await inspectFile(path.dirname(file), path.basename(file));
       assert.equal(digest.size, size);
       uploads.push(name);
@@ -404,21 +419,23 @@ async function exercisePublication(t, trigger) {
     },
   };
 
-  const selection = { version, source: commit, branch: 'main', runId };
-  const request = trigger ? { branch: 'main', runId } : undefined;
+  const selection = { versionFor: (source) => source === commit ? version : undefined, runId };
+  const claim = { id: draftId, source: commit, tag: reserved };
+  let request = trigger ? { runId } : undefined;
   if (trigger === 'schedule') {
-    request.id = await claimDraftRequest(api, selection);
-    assert.equal(request.id, draftId);
+    assert.deepEqual(await claimDraftRequest(api, selection), claim);
+    request = { ...request, ...claim };
+    assert.equal(draft.name, `v${version}`);
     assert.match(draft.body, /Follow the build/);
     assert.equal(await claimDraftRequest(api, { ...selection, runId: '43' }), undefined);
-    assert.equal(await claimDraftRequest(api, selection), draftId);
+    assert.deepEqual(await claimDraftRequest(api, selection), claim);
   }
   const publishAt = (date) => publishRelease(api, output, timestamp, privateKey, date, request);
   if (trigger === 'schedule') {
-    draft.target_commitish = 'feature';
-    await assert.rejects(() => publishAt(now), /requested release draft changed/);
+    taggedCommit = 'b'.repeat(40);
+    await assert.rejects(() => publishAt(now), /conflicting draft/);
     assert.equal(tagObject, undefined);
-    draft.target_commitish = commit;
+    taggedCommit = commit;
   }
   await rm(path.join(output, sample));
   await assert.rejects(() => publishAt(now), /ENOENT/);
@@ -426,7 +443,7 @@ async function exercisePublication(t, trigger) {
   await writeFile(path.join(output, sample), sample);
   await assert.rejects(() => publishAt(now), /asset verification failed/);
   assert.ok(draft.draft);
-  if (trigger === 'schedule') assert.equal(await claimDraftRequest(api, selection), draftId);
+  if (trigger === 'schedule') assert.deepEqual(await claimDraftRequest(api, selection), claim);
   const firstUploads = uploads.length;
 
   corrupt = false;
@@ -435,7 +452,7 @@ async function exercisePublication(t, trigger) {
   assert.equal(result.id, draftId);
   assert.equal(result.draft, false);
   assert.equal(result.tag_name, reserved);
-  assert.equal(result.name, releaseTitle(version, reserved));
+  assert.equal(result.name, `v${version}`);
   assert.equal(result.prerelease, channelFor(version) === 'beta');
   assert.deepEqual(uploads.slice(firstUploads), [sample]);
   for (const filename of [...buildInventory(version).map((asset) => asset.filename),

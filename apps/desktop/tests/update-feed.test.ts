@@ -47,11 +47,11 @@ describe('verified Aria update feed', () => {
   test('orders by app SemVer independently of calendar tags', async () => {
     const request = fixture([
       { version: '2.1.0', tag: 'v2026.12.10-2' },
-      { version: '2.2.0', tag: 'v2026.11.02' },
+      { version: '2.2.0', tag: 'v2026.11.02.2' },
       { version: '2.3.0-beta.1', tag: 'v2026.11.01' },
     ]);
     await expect(findUpdate('2.0.0', 'stable', target, keys, request)).resolves.toMatchObject({
-      version: '2.2.0', tag: 'v2026.11.02', download: { url: expect.stringContaining('linux-arm64.AppImage') },
+      version: '2.2.0', tag: 'v2026.11.02.2', download: { url: expect.stringContaining('linux-arm64.AppImage') },
     });
     await expect(findUpdate('2.0.0', 'beta', target, keys, request)).resolves.toMatchObject({ version: '2.3.0-beta.1' });
     await expect(findUpdate('2.3.0-beta.1', 'stable', target, keys, request)).resolves.toBeUndefined();

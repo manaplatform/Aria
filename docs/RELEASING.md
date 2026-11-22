@@ -7,10 +7,10 @@ Aria Release Creator builds and verifies desktop packages on GitHub-hosted runne
 ### From GitHub Releases
 
 1. Open [Aria Releases](https://github.com/manaplatform/Aria/releases) and select **Draft a new release**.
-2. In **Choose a tag**, create `aria-auto-<version>` using the root version on `main`. For example, use `aria-auto-0.0.1` for Aria 0.0.1. Select `main` as the target.
-3. Leave the description and assets empty and select **Save draft**. Saving a draft with this tag requests automatic publication.
+2. In **Choose a tag**, select an existing calendar tag such as `v2026.11.23.2`. The tag must point to a commit in the history of `main`.
+3. Leave the description and assets empty and select **Save draft** to request automatic publication.
 
-Release Creator checks for new requests every 15 minutes, subject to GitHub Actions scheduling. It links the draft to the build, fills in the title and release notes, and attaches all verified desktop installers, checksums, and update metadata. After verification it publishes the same draft with an annotated calendar tag pointing to the build commit. Keep the draft saved while the workflow is running. [GitHub Actions events](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#release)
+Release Creator checks for new requests every 15 minutes, subject to GitHub Actions scheduling. It builds the tagged commit, sets the title to the application version from that commit's root `package.json`, and links the draft to the workflow. For example, tag `v2026.11.23.2` for Aria 0.0.1 gets the title `v0.0.1`. It publishes the same draft and tag with generated release notes, verified installers, checksums, and update metadata. Keep the draft saved while the workflow is running. [GitHub Actions events](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#release)
 
 ### From a version change
 
@@ -35,7 +35,7 @@ gh api --method POST repos/manaplatform/Aria/actions/workflows/release.yml/dispa
 JSON
 ```
 
-The application version and calendar tag are independent. The publish job prepares the signed manifest and `SHA256SUMS.txt`, then reserves an annotated UTC tag such as `v2026.11.22`. Additional versions on that UTC date get `-2`, `-3`, and subsequent suffixes. A reservation records the application version and source commit, so retrying after midnight retains the tag and title date. Release Creator creates the draft, verifies the uploaded assets, and publishes with the title `Aria v{VERSION} — {RELEASE_DATE}`.
+The application version and calendar tag are independent. If no matching draft exists, the publish job prepares the signed manifest and `SHA256SUMS.txt`, then reserves an annotated UTC tag such as `v2026.11.22`. Additional versions on that UTC date get `-2`, `-3`, and subsequent suffixes. A reservation records the application version and source commit, so retrying after midnight retains the tag. The release title is `v{VERSION}`.
 
 Release Creator renders the [Markdown template](../scripts/release/release-notes.md) from the tagged source and the verified uploads. Highlights use actual commit subjects, merged PR titles and labels, and Conventional Commits. Empty categories are omitted. Stable notes cover changes since the last stable release with assets on the source branch. Beta notes can also use a previous prerelease with assets. The first release with assets uses repository history. Apply `skip-release-notes` to omit a PR from the highlights. The full changelog remains available through GitHub.
 
@@ -76,7 +76,7 @@ An ad hoc signature seals the bundle and its nested code. Publisher authenticity
 
 ## Retry and verify
 
-Use **Re-run failed jobs** to retry a failed workflow at its original commit. Rerun all jobs if Actions artifacts have expired. Draft requests remain linked to their original workflow after a failed build. To request a build from a newer commit after fixing a failure that occurred before tag reservation, clear the request draft's description, set its target back to `main`, and save it again. After tag reservation, retries reuse the version’s tag and recover its draft. Uploaded assets with matching hashes are retained and missing or mismatched owned draft assets are repaired. Review any unexpected assets before retrying. Every published version occupies its SemVer precedence, including a public release with zero assets. Use a new root version for a correction after publication.
+Use **Re-run failed jobs** to retry with the same source commit. Rerun all jobs if Actions artifacts have expired. Draft requests remain linked to their original workflow after a failed build. To request a different source before any assets have been attached, select the tag for that commit, clear the draft description, and save it again. Uploaded assets with matching hashes are retained and missing or mismatched owned draft assets are repaired. Review any unexpected assets before retrying. Every published version occupies its SemVer precedence, including a public release with zero assets. Use a new root version for a correction after publication.
 
 Download the installer for your platform and architecture. Compare the file hashes with `SHA256SUMS.txt` and verify build provenance with `gh attestation verify <file> --repo manaplatform/Aria --source-ref refs/heads/main`. On Windows compare `Get-FileHash -Algorithm SHA256` and inspect the file's Authenticode publisher and certificate fingerprint. On macOS use `shasum -a 256`, `hdiutil verify <image>`, and `codesign --verify --strict <image>`. After mounting the image, use `codesign --verify --deep --strict <path-to-Aria.app>` to check the app seal. Linux users can use `sha256sum -c SHA256SUMS.txt --ignore-missing` from the download directory. The signed release manifest also records each asset’s size, URL, and digest.
 

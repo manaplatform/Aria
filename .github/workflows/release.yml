@@ -34,6 +34,8 @@ jobs:
       contents: write
     outputs:
       id: ${{ steps.claim.outputs.id }}
+      source: ${{ steps.claim.outputs.source }}
+      tag: ${{ steps.claim.outputs.tag }}
     steps:
       - name: Check for release requests
         id: drafts
@@ -42,9 +44,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           drafts=$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases" |
-            jq -r --arg marker "<!-- Aria release request run $GITHUB_RUN_ID -->" '
+            jq -r --arg marker "<!-- Aria release request run $GITHUB_RUN_ID tag " '
               .[][] | select(.draft) |
-              select(((.tag_name | startswith("aria-auto-")) and ((.body // "") | test("^\\s*$"))) or
+              select(((.tag_name | test("^v[0-9]{4}\\.[0-9]{2}\\.[0-9]{2}(\\.[1-9][0-9]*|-[2-9]|-[1-9][0-9]+)?$")) and
+                      (.assets | length) == 0 and ((.body // "") | test("^\\s*$"))) or
                 ((.body // "") | contains($marker))) |
               .id')
           if [[ -n "$drafts" ]]; then
@@ -53,6 +56,7 @@ jobs:
       - if: steps.drafts.outputs.found == 'true'
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          fetch-depth: 0
           persist-credentials: false
       - if: steps.drafts.outputs.found == 'true'
         uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
@@ -85,7 +89,9 @@ jobs:
     outputs:
       run: ${{ steps.prepare.outputs.run }}
       mode: ${{ steps.prepare.outputs.mode }}
+      source: ${{ steps.prepare.outputs.source }}
       draft-id: ${{ needs.claim-release-draft.outputs.id }}
+      draft-tag: ${{ needs.claim-release-draft.outputs.tag }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -103,6 +109,8 @@ jobs:
         id: prepare
         env:
           RELEASE_MODE: ${{ github.event_name != 'workflow_dispatch' && 'publish' || inputs.mode }}
+          RELEASE_SOURCE: ${{ needs.claim-release-draft.outputs.source }}
+          RELEASE_DRAFT_TAG: ${{ needs.claim-release-draft.outputs.tag }}
           GH_TOKEN: ${{ github.token }}
           ARIA_RELEASE_ENABLED: ${{ vars.ARIA_RELEASE_ENABLED }}
           ARIA_DISTRIBUTION_AUTHORIZED: ${{ vars.ARIA_DISTRIBUTION_AUTHORIZED }}
@@ -122,6 +130,7 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          ref: ${{ needs.prepare-release.outputs.source }}
           persist-credentials: false
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
@@ -132,7 +141,7 @@ jobs:
       - run: pnpm release:check
 
   lint-typecheck-test:
-    needs: validate-version
+    needs: [prepare-release, validate-version]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -140,6 +149,8 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          ref: ${{ needs.prepare-release.outputs.source }}
+          fetch-depth: 2
           persist-credentials: false
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
@@ -172,6 +183,7 @@ jobs:
       arch: ${{ matrix.arch }}
       runner: ${{ matrix.runner }}
       mode: ${{ needs.prepare-release.outputs.mode }}
+      source: ${{ needs.prepare-release.outputs.source }}
 
   build-macos:
     needs: [prepare-release, lint-typecheck-test]
@@ -189,6 +201,7 @@ jobs:
       arch: ${{ matrix.arch }}
       runner: ${{ matrix.runner }}
       mode: ${{ needs.prepare-release.outputs.mode }}
+      source: ${{ needs.prepare-release.outputs.source }}
 
   build-linux:
     needs: [prepare-release, lint-typecheck-test]
@@ -206,6 +219,7 @@ jobs:
       arch: ${{ matrix.arch }}
       runner: ${{ matrix.runner }}
       mode: ${{ needs.prepare-release.outputs.mode }}
+      source: ${{ needs.prepare-release.outputs.source }}
 
   verify-artifacts:
     needs: [prepare-release, build-windows, build-macos, build-linux]
@@ -220,6 +234,7 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          fetch-depth: 0
           persist-credentials: false
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
@@ -235,6 +250,7 @@ jobs:
         id: inventory
         env:
           RELEASE_MODE: ${{ needs.prepare-release.outputs.mode }}
+          RELEASE_SOURCE: ${{ needs.prepare-release.outputs.source }}
         run: node scripts/release/run.mjs verify-builds incoming verified "$RELEASE_MODE"
       - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
         with:
@@ -280,5 +296,7 @@ jobs:
           ARIA_UPDATE_PUBLIC_KEYS: ${{ vars.ARIA_UPDATE_PUBLIC_KEYS }}
           ARIA_UPDATE_PRIVATE_KEY: ${{ secrets.ARIA_UPDATE_PRIVATE_KEY }}
           BUILD_TIMESTAMP: ${{ needs.verify-artifacts.outputs.timestamp }}
+          RELEASE_SOURCE: ${{ needs.prepare-release.outputs.source }}
           RELEASE_DRAFT_ID: ${{ needs.prepare-release.outputs.draft-id }}
+          RELEASE_DRAFT_TAG: ${{ needs.prepare-release.outputs.draft-tag }}
         run: node scripts/release/run.mjs publish verified "$BUILD_TIMESTAMP"

@@ -18,8 +18,24 @@ const git = (...args) => execFileSync('git', args, { cwd: root, encoding: 'utf8'
 const sourcePackage = (source) => JSON.parse(git('show', `${source}:package.json`));
 const versionAt = (source) => applicationVersion(sourcePackage(source));
 const commit = () => git('rev-parse', 'HEAD').trim();
-const versionAtHead = () => validatePackageVersion(versionAt(commit()));
+const releaseVersion = (source) => validatePackageVersion(versionAt(source));
 const localVersion = async () => validatePackageVersion(applicationVersion(await readJson(path.join(root, 'package.json'))));
+
+function isAncestor(source, target) {
+  try {
+    git('merge-base', '--is-ancestor', source, target);
+    return true;
+  } catch (error) {
+    if (error.status === 1) return false;
+    throw error;
+  }
+}
+
+function releaseSource(source) {
+  if (!sourcePattern.test(source) || !isAncestor(source, commit()))
+    throw new Error('The selected release source must be in the default-branch workflow history.');
+  return source;
+}
 
 function previousRelease(state, target, channel) {
   const result = state.published.filter((item) => item.commit !== target && item.release.assets.length > 0 &&
@@ -27,10 +43,8 @@ function previousRelease(state, target, channel) {
     .sort((a, b) => Date.parse(b.release.published_at) - Date.parse(a.release.published_at));
   return result.find((item) => {
     try {
-      git('merge-base', '--is-ancestor', item.commit, target);
-      return true;
+      return isAncestor(item.commit, target);
     } catch (error) {
-      if (error.status === 1) return false;
       throw new Error(`Cannot read release ancestry for ${item.tag}. Fetch full history and tags.`);
     }
   });
@@ -92,63 +106,62 @@ function defaultBranch() {
   return event;
 }
 
-const draftRequestMarker = (runId) => `<!-- Aria release request run ${runId} -->`;
-const claimedReleaseMarker = (version, source, runId) =>
-  `${releaseNoteMarker(version, source)}\n\n${draftRequestMarker(runId)}\n\n`;
+const draftRequestMarker = (runId, tag) => `<!-- Aria release request run ${runId} tag ${tag} -->`;
+const claimedReleaseMarker = (version, source, runId, tag) =>
+  `${releaseNoteMarker(version, source)}\n\n${draftRequestMarker(runId, tag)}\n\n`;
 
-function pendingDraft(release, version, branch) {
-  return release.draft && release.tag_name === `aria-auto-${version}` &&
-    release.target_commitish === branch && !release.body?.trim() && release.assets.length === 0;
+function emptyDraft(release) {
+  return release.draft && !release.body?.trim() && release.assets.length === 0;
 }
 
-function requestedDraft(releases, version, branch) {
-  const matches = releases.filter((release) => pendingDraft(release, version, branch));
-  if (matches.length > 1) throw new Error(`Multiple draft requests match Aria ${version}.`);
-  return matches[0];
-}
-
-function claimedDraft(release, version, source, runId) {
-  return release.draft && release.tag_name === `aria-auto-${version}` &&
-    release.target_commitish === source && release.body?.split('\n', 1)[0] === draftRequestMarker(runId) &&
-    release.assets.length === 0;
-}
-
-export async function claimDraftRequest(api, { version, source, branch, runId }) {
+export async function claimDraftRequest(api, { versionFor, runId }, state) {
   if (!/^\d+$/.test(runId)) throw new Error('The release request requires a GitHub Actions run ID.');
-  const state = await readReleaseState(api);
-  const claimed = state.releases.find((release) => claimedDraft(release, version, source, runId));
-  const resumed = state.releases.find((release) =>
-    release.draft && release.body?.startsWith(claimedReleaseMarker(version, source, runId)));
-  const draft = requestedDraft(state.releases, version, branch);
-  if (!draft && !claimed && !resumed) return;
-  const existing = findRelease(state, version, source);
-  if (existing.alreadyPublished) return;
-  if (resumed && existing.draft?.id === resumed.id) return resumed.id;
-  if (existing.draft) throw new Error(`Aria ${version} already has a draft. Retry the original release workflow.`);
-  if (claimed) return claimed.id;
-  if (!draft) return;
-  const current = await api.json(`/releases/${draft.id}`);
-  if (current.id !== draft.id || !pendingDraft(current, version, branch))
-    throw new Error('The release draft changed before it could be claimed.');
-  const confirmation = await api.json(`/releases/${draft.id}`, { method: 'PATCH', body: {
-    target_commitish: source,
-    body: `${draftRequestMarker(runId)}\n\nAria Release Creator is preparing this draft. [Follow the build](https://github.com/${repository}/actions/runs/${runId}).`,
-  } });
-  if (confirmation.id !== draft.id || !claimedDraft(confirmation, version, source, runId))
-    throw new Error('GitHub did not confirm the release draft request.');
-  return draft.id;
+  state ??= await readReleaseState(api);
+  const drafts = state.releases.filter((release) => release.draft && state.tagCommits.has(release.tag_name));
+  const candidates = drafts.map((draft) => ({
+    draft, resumed: draft.body?.includes(draftRequestMarker(runId, draft.tag_name)) ?? false,
+  })).sort((a, b) => Number(b.resumed) - Number(a.resumed) || a.draft.id - b.draft.id);
+  for (const { draft, resumed } of candidates) {
+    if (!resumed && !emptyDraft(draft)) continue;
+    const { id, tag_name: tag } = draft;
+    const source = state.tagCommits.get(tag);
+    const version = versionFor(source);
+    if (!version) continue;
+    const existing = findRelease(resumed ? state : {
+      ...state, releases: state.releases.filter((item) => item.id !== id),
+    }, version, source);
+    if (existing.alreadyPublished || (existing.tag && existing.tag !== tag)) continue;
+    const marker = claimedReleaseMarker(version, source, runId, tag);
+    if (resumed) {
+      if (existing.draft?.id !== id || !draft.body.startsWith(marker))
+        throw new Error('The claimed release draft or its tag changed. Check the draft and retry.');
+    } else {
+      const current = await api.json(`/releases/${id}`);
+      if (current.id !== id || current.tag_name !== tag || !emptyDraft(current))
+        throw new Error('The release draft changed before it could be claimed.');
+      const body = `${marker}Aria Release Creator is preparing this draft. [Follow the build](https://github.com/${repository}/actions/runs/${runId}).`;
+      const confirmation = await api.json(`/releases/${id}`, { method: 'PATCH', body: {
+        body, name: releaseTitle(version),
+      } });
+      if (confirmation.id !== id || !confirmation.draft || confirmation.tag_name !== tag || confirmation.body !== body)
+        throw new Error('GitHub did not confirm the release draft request.');
+    }
+    return { id, source, tag };
+  }
 }
 
 async function claimDraft() {
-  const event = defaultBranch();
+  defaultBranch();
   if (env.GITHUB_EVENT_NAME !== 'schedule') throw new Error('Draft requests are claimed by the scheduled workflow.');
   required('GH_TOKEN');
   if (env.ARIA_RELEASE_ENABLED !== 'true' || env.ARIA_DISTRIBUTION_AUTHORIZED !== 'true')
     throw new Error('The repository has not enabled and authorized production releases.');
-  const id = await claimDraftRequest(github(), {
-    version: versionAtHead(), source: commit(), branch: event.repository.default_branch, runId: env.GITHUB_RUN_ID,
+  const workflowCommit = commit();
+  const selected = await claimDraftRequest(github(), {
+    versionFor: (source) => isAncestor(source, workflowCommit) ? releaseVersion(source) : undefined,
+    runId: env.GITHUB_RUN_ID,
   });
-  if (id) await outputs({ id });
+  if (selected) await outputs(selected);
 }
 
 function reportPublished(state, tag, version) {
@@ -172,10 +185,13 @@ async function prepare(mode) {
       }
     }
   }
-  const version = versionAtHead();
+  const source = releaseSource(env.RELEASE_SOURCE || commit());
+  const version = releaseVersion(source);
   if (mode === 'publish') {
     const state = await readReleaseState(github());
-    const existing = findRelease(state, version, commit());
+    if (env.GITHUB_EVENT_NAME === 'schedule' && state.tagCommits.get(env.RELEASE_DRAFT_TAG) !== source)
+      throw new Error('The selected release tag no longer points to the build commit.');
+    const existing = findRelease(state, version, source);
     if (existing.alreadyPublished) {
       reportPublished(state, existing.alreadyPublished, version);
       await outputs({ run: false });
@@ -185,8 +201,8 @@ async function prepare(mode) {
         env.ARIA_DISTRIBUTION_AUTHORIZED !== 'true')
       throw new Error('Enable production releasing and confirm distribution terms in the repository variables.');
   }
-  await outputs({ run: true, mode });
-  console.log(`Aria ${version} (${channelFor(version)}) at ${commit()} in ${mode} mode.`);
+  await outputs({ run: true, mode, source });
+  console.log(`Aria ${version} (${channelFor(version)}) at ${source} in ${mode} mode.`);
 }
 
 async function preview(notesOnly = false) {
@@ -199,7 +215,7 @@ async function preview(notesOnly = false) {
   const tag = tagPattern.test(existingTag) ? existingTag : dateTag(new Date(), state.tags);
   const channel = channelFor(version);
   if (!notesOnly) console.log([
-    releaseTitle(version, tag), `Version: ${version}`, `Tag: ${tag}`, `Source: ${source}`,
+    releaseTitle(version), `Version: ${version}`, `Tag: ${tag}`, `Source: ${source}`,
     `Channel: ${channel}`, ...(match.alreadyPublished ? [`Version already published as ${match.alreadyPublished}.`] : []),
     'Expected assets:',
     ...buildInventory(version).map(({ filename }) => `  ${filename}`),
@@ -211,9 +227,8 @@ async function preview(notesOnly = false) {
   console.log(formatNotes({ ...notes, commit: source, tag, version, channel, compareTarget: source }));
 }
 
-export async function verifyBuilds(input, output, production) {
-  const version = versionAtHead();
-  const source = commit();
+export async function verifyBuilds(input, output, production, source = commit()) {
+  const version = releaseVersion(source);
   const directories = await readdir(input);
   const targets = allTargets();
   if (directories.length !== targets.length) throw new Error('One or more required platform build receipts are missing.');
@@ -340,39 +355,43 @@ async function stageRelease(directory, identity, key) {
 
 export async function publishRelease(api, directory, buildTimestamp, key, now = new Date(), request) {
   if (!buildTimestamp || !Number.isFinite(Date.parse(buildTimestamp))) throw new Error('Build timestamp is missing.');
-  const version = versionAtHead();
-  const source = commit();
+  const source = releaseSource(request?.source ?? commit());
+  const version = releaseVersion(source);
   let state = await readReleaseState(api);
+  if (!request?.id && request?.runId) {
+    const claimed = await claimDraftRequest(api, {
+      runId: request.runId, versionFor: (tagCommit) => tagCommit === source ? version : undefined,
+    }, state);
+    if (claimed) {
+      request = { ...request, ...claimed };
+      state = await readReleaseState(api);
+    }
+  }
   const match = findRelease(state, version, source);
-  const requested = request?.id && !match.alreadyPublished
-    ? state.releases.find((release) => release.id === request.id)
-    : undefined;
-  const requestMarker = requested && draftRequestMarker(request.runId);
-  if (request?.id && !match.alreadyPublished &&
-      !(requested && (claimedDraft(requested, version, source, request.runId) ||
-        match.draft?.id === requested.id && requested.body.startsWith(claimedReleaseMarker(version, source, request.runId)))))
-    throw new Error('The requested release draft changed or was removed. Check the draft and retry.');
-  if (!request?.id && request?.branch && !match.draft && !match.alreadyPublished &&
-      state.releases.some((release) => release.draft && release.tag_name === `aria-auto-${version}` &&
-        release.body?.startsWith('<!-- Aria release request run ')))
-    throw new Error(`Aria ${version} has a claimed draft. Retry the original release workflow.`);
-  const pending = !request?.id && request?.branch && !match.draft && !match.alreadyPublished
-    ? requestedDraft(state.releases, version, request.branch)
-    : undefined;
+  const requestMarker = request?.id ? draftRequestMarker(request.runId, request.tag) : undefined;
+  if (request?.id && (match.alreadyPublished ? match.alreadyPublished !== request.tag :
+    match.tag !== request.tag || match.draft?.id !== request.id ||
+    !match.draft.body.startsWith(claimedReleaseMarker(version, source, request.runId, request.tag))))
+    throw new Error('The claimed release draft or its tag changed. Check the draft and retry.');
   const reservation = await reserveTag(api, state, version, source, (tag) =>
     stageRelease(directory, { version, tag, commit: source, buildTimestamp }, key), now);
   state = await readReleaseState(api);
   const existing = findRelease(state, version, source);
   if (existing.alreadyPublished) {
+    if (request?.id && existing.alreadyPublished !== request.tag)
+      throw new Error('The claimed version was published using a different tag.');
     reportPublished(state, existing.alreadyPublished, version);
     return;
   }
   const { tag, staged } = reservation;
-  if (!tag || existing.tag !== tag) throw new Error('The remote tag no longer matches the reserved source.');
+  if (!tag || existing.tag !== tag || (request?.id &&
+      (existing.draft?.id !== request.id ||
+       !existing.draft.body.startsWith(claimedReleaseMarker(version, source, request.runId, tag)))))
+    throw new Error('The remote tag or draft no longer matches the selected source.');
   const { release, expected } = staged;
   const { channel, assets } = release;
   const beta = channel === 'beta';
-  const name = releaseTitle(version, tag);
+  const name = releaseTitle(version);
   const notes = await collectNotes(api, state, source, channel);
   const render = (verified) => [
     releaseNoteMarker(version, source), requestMarker, formatNotes({
@@ -381,19 +400,6 @@ export async function publishRelease(api, directory, buildTimestamp, key, now = 
   ].filter(Boolean).join('\n\n');
 
   let draft = existing.draft;
-  const requestToFill = requested ?? pending;
-  if (!draft && requestToFill) {
-    const current = await api.json(`/releases/${requestToFill.id}`);
-    const unchanged = requested
-      ? claimedDraft(current, version, source, request.runId)
-      : pendingDraft(current, version, request.branch);
-    if (!unchanged || current.id !== requestToFill.id)
-      throw new Error('The release draft changed before its notes and assets could be prepared.');
-    draft = await api.json(`/releases/${current.id}`, { method: 'PATCH', body: {
-      tag_name: tag, target_commitish: source, name, body: render(), prerelease: beta,
-    } });
-    if (draft.id !== current.id) throw new Error('GitHub returned a different release draft.');
-  }
   if (!draft) {
     try {
       draft = await api.json('/releases', { method: 'POST', body: {
@@ -408,21 +414,22 @@ export async function publishRelease(api, directory, buildTimestamp, key, now = 
     throw new Error('GitHub did not confirm creation of the expected draft.');
   const verified = await uploadAssets(api, draft, directory, expected);
   const confirmed = findRelease(await readReleaseState(api), version, source);
-  if (confirmed.draft?.id !== draft.id || confirmed.tag !== tag)
+  if (confirmed.draft?.id !== draft.id || confirmed.tag !== tag || confirmed.draft.body !== draft.body)
     throw new Error('The release draft or tag changed during verification.');
   return publishDraft(api, draft.id, { tag, beta, name, body: render(verified) });
 }
 
 async function publish(directory, buildTimestamp) {
-  const event = defaultBranch();
+  defaultBranch();
   required('GH_TOKEN');
   if (env.ARIA_RELEASE_ENABLED !== 'true' || env.ARIA_DISTRIBUTION_AUTHORIZED !== 'true')
     throw new Error('The repository has not enabled and authorized production releases.');
   const id = Number(env.RELEASE_DRAFT_ID || 0);
-  if (env.GITHUB_EVENT_NAME === 'schedule' && (!Number.isSafeInteger(id) || id <= 0))
-    throw new Error('Scheduled publication requires a claimed GitHub release draft.');
+  const tag = env.RELEASE_DRAFT_TAG;
+  if (env.GITHUB_EVENT_NAME === 'schedule' && (!Number.isSafeInteger(id) || id <= 0 || !tagPattern.test(tag)))
+    throw new Error('Scheduled publication requires a claimed GitHub release draft and its tag.');
   const result = await publishRelease(github(), directory, buildTimestamp, trustKeys(), new Date(), {
-    id, branch: event.repository.default_branch, runId: env.GITHUB_RUN_ID,
+    id, source: env.RELEASE_SOURCE || commit(), tag, runId: env.GITHUB_RUN_ID,
   });
   if (result) console.log(`Published ${result.html_url}`);
 }
@@ -454,7 +461,9 @@ async function main(command, args) {
     case 'notes': await preview(true); break;
     case 'claim-draft': await claimDraft(); break;
     case 'prepare': await prepare(args[0]); break;
-    case 'verify-builds': await verifyBuilds(args[0], args[1], args[2] === 'publish'); break;
+    case 'verify-builds':
+      await verifyBuilds(args[0], args[1], args[2] === 'publish', releaseSource(env.RELEASE_SOURCE || commit()));
+      break;
     case 'publish': await publish(args[0], args[1]); break;
     case 'create':
       if (args.length === 1 && args[0] === '--dry-run') await preview();

@@ -6,7 +6,7 @@ import semver from 'semver';
 
 export const repository = 'manaplatform/Aria';
 export const sourcePattern = /^[a-f0-9]{40}$/;
-export const tagPattern = /^v\d{4}\.\d{2}\.\d{2}(?:-(?:[2-9]|[1-9]\d+))?$/;
+export const tagPattern = /^v\d{4}\.\d{2}\.\d{2}(?:\.[1-9]\d*|-(?:[2-9]|[1-9]\d+))?$/;
 export const marker = 'Aria Release Creator v1';
 export const manifestName = 'release-manifest.json';
 export const signatureName = 'release-manifest.sig';
@@ -48,8 +48,8 @@ export function releaseDate(tag) {
   return tag.slice(1, 11);
 }
 
-export function releaseTitle(version, tag) {
-  return `Aria v${version} — ${releaseDate(tag)}`;
+export function releaseTitle(version) {
+  return `v${version}`;
 }
 
 const platforms = {
