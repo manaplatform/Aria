@@ -92,6 +92,65 @@ function defaultBranch() {
   return event;
 }
 
+const draftRequestMarker = (runId) => `<!-- Aria release request run ${runId} -->`;
+const claimedReleaseMarker = (version, source, runId) =>
+  `${releaseNoteMarker(version, source)}\n\n${draftRequestMarker(runId)}\n\n`;
+
+function pendingDraft(release, version, branch) {
+  return release.draft && release.tag_name === `aria-auto-${version}` &&
+    release.target_commitish === branch && !release.body?.trim() && release.assets.length === 0;
+}
+
+function requestedDraft(releases, version, branch) {
+  const matches = releases.filter((release) => pendingDraft(release, version, branch));
+  if (matches.length > 1) throw new Error(`Multiple draft requests match Aria ${version}.`);
+  return matches[0];
+}
+
+function claimedDraft(release, version, source, runId) {
+  return release.draft && release.tag_name === `aria-auto-${version}` &&
+    release.target_commitish === source && release.body?.split('\n', 1)[0] === draftRequestMarker(runId) &&
+    release.assets.length === 0;
+}
+
+export async function claimDraftRequest(api, { version, source, branch, runId }) {
+  if (!/^\d+$/.test(runId)) throw new Error('The release request requires a GitHub Actions run ID.');
+  const state = await readReleaseState(api);
+  const claimed = state.releases.find((release) => claimedDraft(release, version, source, runId));
+  const resumed = state.releases.find((release) =>
+    release.draft && release.body?.startsWith(claimedReleaseMarker(version, source, runId)));
+  const draft = requestedDraft(state.releases, version, branch);
+  if (!draft && !claimed && !resumed) return;
+  const existing = findRelease(state, version, source);
+  if (existing.alreadyPublished) return;
+  if (resumed && existing.draft?.id === resumed.id) return resumed.id;
+  if (existing.draft) throw new Error(`Aria ${version} already has a draft. Retry the original release workflow.`);
+  if (claimed) return claimed.id;
+  if (!draft) return;
+  const current = await api.json(`/releases/${draft.id}`);
+  if (current.id !== draft.id || !pendingDraft(current, version, branch))
+    throw new Error('The release draft changed before it could be claimed.');
+  const confirmation = await api.json(`/releases/${draft.id}`, { method: 'PATCH', body: {
+    target_commitish: source,
+    body: `${draftRequestMarker(runId)}\n\nAria Release Creator is preparing this draft. [Follow the build](https://github.com/${repository}/actions/runs/${runId}).`,
+  } });
+  if (confirmation.id !== draft.id || !claimedDraft(confirmation, version, source, runId))
+    throw new Error('GitHub did not confirm the release draft request.');
+  return draft.id;
+}
+
+async function claimDraft() {
+  const event = defaultBranch();
+  if (env.GITHUB_EVENT_NAME !== 'schedule') throw new Error('Draft requests are claimed by the scheduled workflow.');
+  required('GH_TOKEN');
+  if (env.ARIA_RELEASE_ENABLED !== 'true' || env.ARIA_DISTRIBUTION_AUTHORIZED !== 'true')
+    throw new Error('The repository has not enabled and authorized production releases.');
+  const id = await claimDraftRequest(github(), {
+    version: versionAtHead(), source: commit(), branch: event.repository.default_branch, runId: env.GITHUB_RUN_ID,
+  });
+  if (id) await outputs({ id });
+}
+
 function reportPublished(state, tag, version) {
   const { release } = state.published.find((item) => item.tag === tag);
   if (!release.assets.length)
@@ -279,11 +338,27 @@ async function stageRelease(directory, identity, key) {
   return { release, expected };
 }
 
-export async function publishRelease(api, directory, buildTimestamp, key, now = new Date()) {
+export async function publishRelease(api, directory, buildTimestamp, key, now = new Date(), request) {
   if (!buildTimestamp || !Number.isFinite(Date.parse(buildTimestamp))) throw new Error('Build timestamp is missing.');
   const version = versionAtHead();
   const source = commit();
   let state = await readReleaseState(api);
+  const match = findRelease(state, version, source);
+  const requested = request?.id && !match.alreadyPublished
+    ? state.releases.find((release) => release.id === request.id)
+    : undefined;
+  const requestMarker = requested && draftRequestMarker(request.runId);
+  if (request?.id && !match.alreadyPublished &&
+      !(requested && (claimedDraft(requested, version, source, request.runId) ||
+        match.draft?.id === requested.id && requested.body.startsWith(claimedReleaseMarker(version, source, request.runId)))))
+    throw new Error('The requested release draft changed or was removed. Check the draft and retry.');
+  if (!request?.id && request?.branch && !match.draft && !match.alreadyPublished &&
+      state.releases.some((release) => release.draft && release.tag_name === `aria-auto-${version}` &&
+        release.body?.startsWith('<!-- Aria release request run ')))
+    throw new Error(`Aria ${version} has a claimed draft. Retry the original release workflow.`);
+  const pending = !request?.id && request?.branch && !match.draft && !match.alreadyPublished
+    ? requestedDraft(state.releases, version, request.branch)
+    : undefined;
   const reservation = await reserveTag(api, state, version, source, (tag) =>
     stageRelease(directory, { version, tag, commit: source, buildTimestamp }, key), now);
   state = await readReleaseState(api);
@@ -299,11 +374,26 @@ export async function publishRelease(api, directory, buildTimestamp, key, now = 
   const beta = channel === 'beta';
   const name = releaseTitle(version, tag);
   const notes = await collectNotes(api, state, source, channel);
-  const render = (verified) => `${releaseNoteMarker(version, source)}\n\n${formatNotes({
-    ...notes, version, tag, commit: source, channel, buildTimestamp, assets, verified,
-  })}`;
+  const render = (verified) => [
+    releaseNoteMarker(version, source), requestMarker, formatNotes({
+      ...notes, version, tag, commit: source, channel, buildTimestamp, assets, verified,
+    }),
+  ].filter(Boolean).join('\n\n');
 
   let draft = existing.draft;
+  const requestToFill = requested ?? pending;
+  if (!draft && requestToFill) {
+    const current = await api.json(`/releases/${requestToFill.id}`);
+    const unchanged = requested
+      ? claimedDraft(current, version, source, request.runId)
+      : pendingDraft(current, version, request.branch);
+    if (!unchanged || current.id !== requestToFill.id)
+      throw new Error('The release draft changed before its notes and assets could be prepared.');
+    draft = await api.json(`/releases/${current.id}`, { method: 'PATCH', body: {
+      tag_name: tag, target_commitish: source, name, body: render(), prerelease: beta,
+    } });
+    if (draft.id !== current.id) throw new Error('GitHub returned a different release draft.');
+  }
   if (!draft) {
     try {
       draft = await api.json('/releases', { method: 'POST', body: {
@@ -324,11 +414,16 @@ export async function publishRelease(api, directory, buildTimestamp, key, now = 
 }
 
 async function publish(directory, buildTimestamp) {
-  defaultBranch();
+  const event = defaultBranch();
   required('GH_TOKEN');
   if (env.ARIA_RELEASE_ENABLED !== 'true' || env.ARIA_DISTRIBUTION_AUTHORIZED !== 'true')
     throw new Error('The repository has not enabled and authorized production releases.');
-  const result = await publishRelease(github(), directory, buildTimestamp, trustKeys());
+  const id = Number(env.RELEASE_DRAFT_ID || 0);
+  if (env.GITHUB_EVENT_NAME === 'schedule' && (!Number.isSafeInteger(id) || id <= 0))
+    throw new Error('Scheduled publication requires a claimed GitHub release draft.');
+  const result = await publishRelease(github(), directory, buildTimestamp, trustKeys(), new Date(), {
+    id, branch: event.repository.default_branch, runId: env.GITHUB_RUN_ID,
+  });
   if (result) console.log(`Published ${result.html_url}`);
 }
 
@@ -357,6 +452,7 @@ async function main(command, args) {
     }
     case 'preview': await preview(); break;
     case 'notes': await preview(true); break;
+    case 'claim-draft': await claimDraft(); break;
     case 'prepare': await prepare(args[0]); break;
     case 'verify-builds': await verifyBuilds(args[0], args[1], args[2] === 'publish'); break;
     case 'publish': await publish(args[0], args[1]); break;
