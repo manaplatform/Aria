@@ -10,13 +10,17 @@ Aria Release Creator builds and verifies desktop packages on GitHub-hosted runne
 2. In **Choose a tag**, select an existing calendar tag such as `v2026.11.23.2`. The tag must point to a commit in the history of `main`.
 3. Leave the description and assets empty and select **Save draft** to request automatic publication.
 
-Release Creator checks for new requests every 15 minutes, subject to GitHub Actions scheduling. It builds the tagged commit, sets the title to the application version from that commit's root `package.json`, and links the draft to the workflow. For example, tag `v2026.11.23.2` for Aria 0.0.1 gets the title `v0.0.1`. It publishes the same draft and tag with generated release notes, verified installers, checksums, and update metadata. Keep the draft saved while the workflow is running. [GitHub Actions events](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#release)
+Release Creator checks for requests on pushes to `main` and every 15 minutes, subject to GitHub Actions scheduling. It builds the tagged commit, sets the title to the application version from that commit's root `package.json`, and links the draft to the workflow. For example, tag `v2026.11.23.2` for Aria 0.0.1 gets the title `v0.0.1`. It publishes the same draft and tag with generated release notes, verified installers, checksums, and update metadata. Keep the draft saved while the workflow is running. [GitHub Actions events](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#release)
+
+If a calendar-tagged release was published with an empty title, description, and assets, Release Creator can complete it while it is mutable. It builds and verifies all packages before moving the placeholder to draft for upload and final publication.
 
 ### From a version change
 
 1. Change the root application version and merge the reviewed change into `main`. Use a final SemVer such as `1.2.3` for stable or a prerelease such as `1.2.4-beta.1` for beta. Keep the major component at or below 9999 and the minor and patch components at or below 99 for the macOS bundle fields. Build metadata is excluded from release versions because it has equal update precedence.
 2. Open **Actions → Aria Release Creator** to follow the run. The workflow compares the root versions before and after a push to `main` and starts the build when the version changes. The protected publish job runs after all six platform builds pass. Stable becomes the GitHub latest release. Beta is published as a prerelease.
 3. For the first release or to release the current default-branch version manually, use **Run workflow → publish** or `pnpm release:create`. Use `preview` to generate metadata and notes, or `verify` to produce packages, verification receipts, and build provenance without a GitHub Release. Windows verification uses a disposable signing certificate. The workflow must already be present on the default branch to dispatch it.
+
+A push that changes release automation without changing the app version or selecting a release request runs native package verification. The publish job runs when a release request or app version change qualifies for production.
 
 ```sh
 pnpm release:check
