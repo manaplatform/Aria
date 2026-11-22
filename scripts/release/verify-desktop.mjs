@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
-import { applicationVersion, inspectFile, platformAssets, readJson } from './generate-metadata.mjs';
+import { applicationVersion, inspectFile, platformAssets, readJson, windowsCertificateName } from './generate-metadata.mjs';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const desktop = path.join(root, 'apps', 'desktop');
@@ -236,7 +236,7 @@ try {
   if (destination) {
     await mkdir(destination, { recursive: true });
     const filenames = target.map(({ filename }) => filename);
-    if (production && platform === 'windows') filenames.push('Aria-Windows-Signing.cer');
+    if (production && platform === 'windows') filenames.push(windowsCertificateName);
     const files = {};
     for (const filename of filenames) {
       files[filename] = await inspectFile(artifacts, filename);

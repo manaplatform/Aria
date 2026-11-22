@@ -1,109 +1,190 @@
-import { repository } from './generate-metadata.mjs';
+import { readFileSync } from 'node:fs';
+import {
+  downloadUrl, manifestName, releaseDate, repository, sbomName, signatureName, sumsName,
+  windowsCertificateName,
+} from './generate-metadata.mjs';
+
+const template = readFileSync(new URL('./release-notes.md', import.meta.url), 'utf8');
+const base = `https://github.com/${repository}`;
 
 const headings = {
-  breaking: '💥 Breaking Changes',
-  security: '🔒 Security',
-  feature: '✨ New Features',
-  improvement: '🚀 Improvements',
-  bug: '🐛 Bug Fixes',
-  conductor: '🧠 Aria & Conductor',
-  desktop: '🖥️ Desktop Experience',
-  performance: '⚡ Performance',
-  dependencies: '📦 Dependencies',
+  breaking: 'Breaking changes',
+  feature: 'New features',
+  improvement: 'Improvements',
+  bug: 'Bug fixes',
+  security: 'Security updates',
 };
 
 const labelKinds = {
   breaking: ['breaking', 'breaking-change'],
   security: ['security'],
-  performance: ['performance', 'perf'],
-  conductor: ['conductor', 'aria-conductor'],
-  desktop: ['desktop', 'desktop-experience'],
-  dependencies: ['dependencies', 'deps'],
   bug: ['bug', 'bugfix', 'fix'],
   feature: ['feature', 'enhancement-feature'],
-  improvement: ['improvement', 'enhancement'],
+  improvement: ['improvement', 'enhancement', 'performance', 'perf', 'dependencies', 'deps'],
 };
 
-function category(title, body, labels) {
-  const conventional = /^([a-z]+)(?:\(([^)]+)\))?(!)?:\s+(.+)$/i.exec(title);
-  const type = conventional?.[1]?.toLowerCase();
-  const scope = conventional?.[2]?.toLowerCase();
-  const names = new Set(labels.map((label) => label.toLowerCase().replaceAll(/\s+/g, '-')));
+const conventional = /^([a-z]+)(?:\(([^)]+)\))?(!)?:\s+(.+)$/i;
+const normalizeLabel = (label) => label.toLowerCase().replaceAll(/\s+/g, '-');
+const skipNotes = (pull) => pull.labels.some((label) => normalizeLabel(label) === 'skip-release-notes');
+
+function category(title, body, labels = []) {
+  const [, type, scope, breaking] = (conventional.exec(title.toLowerCase()) ?? []);
+  const names = new Set(labels.map(normalizeLabel));
   const has = (kind) => labelKinds[kind].some((name) => names.has(name));
-  if (has('breaking') || conventional?.[3] || /^BREAKING[ -]CHANGE:\s+\S/m.test(body)) return 'breaking';
-  if (has('security') || type === 'security' || scope === 'security' && type === 'fix') return 'security';
-  if (has('performance') || type === 'perf') return 'performance';
-  if (has('conductor') || scope === 'conductor') return 'conductor';
-  if (has('desktop') || scope === 'desktop') return 'desktop';
-  if (has('dependencies') || type === 'deps' || scope === 'deps' || scope === 'deps-dev') return 'dependencies';
+  if (has('breaking') || breaking || /^BREAKING[ -]CHANGE:\s+\S/m.test(body)) return 'breaking';
+  if (has('security') || type === 'security' || (scope === 'security' && type === 'fix')) return 'security';
   if (has('bug') || type === 'fix') return 'bug';
   if (has('feature') || type === 'feat') return 'feature';
-  if (has('improvement') || type === 'refactor') return 'improvement';
+  if (has('improvement') || ['refactor', 'perf', 'deps'].includes(type) || ['deps', 'deps-dev'].includes(scope))
+    return 'improvement';
   if (/^(fix|repair|correct|prevent)\s/i.test(title)) return 'bug';
   if (/^(add|introduce|enable|implement|support)\s/i.test(title)) return 'feature';
   if (/^(improve|simplify|clarify|refine)\s/i.test(title)) return 'improvement';
-  return undefined;
 }
 
-function plain(text) {
-  return text.replace(/[\r\n]/g, ' ').replace(/[\x00-\x1f\x7f]/g, '').trim()
+function plain(value) {
+  return value.replace(/[\x00-\x1f\x7f]/g, ' ').trim()
     .replace(/[&<>]/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[character])
     .replace(/[\\`*_[\]{}!@|]/g, '\\$&');
 }
 
-export function formatNotes({ commits, pulls, nativeNotes = '', previousTag, commit, tag }) {
-  const base = `https://github.com/${repository}`;
-  const changes = new Map();
-  const contributors = new Set();
+function highlights(commits, pulls) {
+  const items = new Map(commits.map((item) => [item.sha, item]));
   const covered = new Set();
-  for (const pr of pulls.sort((a, b) => a.number - b.number)) {
-    for (const sha of pr.commits) covered.add(sha);
-    if (pr.labels.includes('skip-release-notes')) continue;
-    if (pr.user) contributors.add(pr.user);
-    const body = [pr.body, ...commits.filter((item) => pr.commits.has(item.sha))
-      .map((item) => item.body)].join('\n');
-    const associated = commits.filter((item) => pr.commits.has(item.sha));
-    const kinds = [category(pr.title, body, pr.labels), ...associated
-      .map((item) => category(item.title, item.body, []))];
-    const kind = kinds.includes('breaking') ? 'breaking' : kinds.find(Boolean);
-    if (kind) {
-      const entries = changes.get(kind) ?? [];
-      const title = /^(feat|fix|refactor|chore)\//i.test(pr.title)
-        ? associated.find((item) => category(item.title, item.body, []) === kind)?.title ?? pr.title
-        : pr.title;
-      entries.push(`- ${plain(title)} ([#${pr.number}](${base}/pull/${pr.number}))`);
-      changes.set(kind, entries);
+  const changes = new Map();
+  for (const pull of pulls.toSorted((a, b) => a.number - b.number)) {
+    const titles = new Map();
+    for (const sha of pull.commits) {
+      covered.add(sha);
+      const item = items.get(sha);
+      const kind = category(item.title, item.body);
+      if (kind && !titles.has(kind)) titles.set(kind, item.title);
     }
+    if (skipNotes(pull)) continue;
+    const kind = category(pull.title, pull.body, pull.labels);
+    if (kind && (!/^(feat|fix|refactor|chore)\//i.test(pull.title) || !titles.has(kind)))
+      titles.set(kind, pull.title);
+    for (const [section, title] of titles) add(section, title, `[#${pull.number}](${base}/pull/${pull.number})`);
   }
   for (const item of commits) {
     if (covered.has(item.sha)) continue;
-    if (item.author) contributors.add(item.author);
-    const kind = category(item.title, item.body, []);
-    if (!kind) continue;
+    const kind = category(item.title, item.body);
+    if (kind) add(kind, item.title, `[${item.sha.slice(0, 7)}](${base}/commit/${item.sha})`);
+  }
+  const sections = Object.entries(headings).flatMap(([kind, heading]) =>
+    changes.has(kind) ? [`### ${heading}\n\n${changes.get(kind).join('\n')}`] : []);
+  return sections.length ? ['## Release highlights', ...sections].join('\n\n') : '';
+
+  function add(kind, title, link) {
     const entries = changes.get(kind) ?? [];
-    entries.push(`- ${plain(item.title)} ([${item.sha.slice(0, 7)}](${base}/commit/${item.sha}))`);
+    entries.push(`- ${plain(conventional.exec(title)?.[4] ?? title)} (${link})`);
     changes.set(kind, entries);
   }
-  // Native notes can identify first-time contributors. Render only GitHub logins already
-  // associated with a merged PR in this range, and keep the rest of the text deterministic.
-  for (const match of nativeNotes.matchAll(/@([a-z\d-]{1,39}) made their first contribution in /gi)) {
-    const login = pulls.find((pr) => pr.user?.toLowerCase() === match[1].toLowerCase())?.user;
-    if (login) contributors.add(login);
-  }
+}
 
-  const sections = Object.entries(headings).flatMap(([kind, title]) =>
-    changes.has(kind) ? [`## ${title}\n\n${changes.get(kind).join('\n')}`] : []);
-  sections.push([
-    '## 📥 Installation', '',
-    'Download the package for your platform and architecture. Verify it with `SHA256SUMS.txt`.',
-    '- **Windows** — Use the NSIS installer or portable EXE. Windows packages use Aria’s self-signed certificate and require trust configured by your administrator for verified in-app updates. Windows may still show SmartScreen warnings or block installation under device policy.',
-    `- **macOS** — Both the Apple Silicon and Intel packages are ad hoc signed and unnotarized. Open the verified DMG and move Aria to Applications. For updates, quit Aria before replacing it in Finder. See the [macOS installation guide](${base}/blob/${commit}/docs/RELEASING.md#macos-installation) if macOS asks you to approve the app.`,
-    '- **Linux** — Choose DEB for Debian or Ubuntu, RPM for Fedora-compatible systems, or AppImage or TAR.GZ for manual installation.',
-  ].join('\n'));
-  if (contributors.size) sections.push(`## 👥 Contributors\n\n${[...contributors].sort().map((login) =>
-    /^[a-z\d-]{1,39}$/i.test(login) ? `[@${login}](https://github.com/${login})` : plain(login)).join(', ')}`);
-  sections.push(`## 🔗 Full Changelog\n\n[${previousTag ? 'Compare changes' : 'Browse commit history'}](${previousTag
-    ? `${base}/compare/${encodeURIComponent(previousTag)}...${encodeURIComponent(tag ?? commit)}`
-    : `${base}/commits/${commit}`})`);
-  return `${sections.join('\n\n')}\n`;
+const platforms = {
+  macos: {
+    name: 'macOS',
+    arches: { arm64: 'Apple Silicon (arm64)', x64: 'Intel (x64)' },
+    formats: { dmg: 'Disk image', zip: 'ZIP archive' },
+    install: {
+      dmg: 'Open the DMG and move Aria to Applications. Quit Aria before replacing an existing copy.',
+      zip: 'Extract the ZIP and move Aria to Applications.',
+    },
+  },
+  windows: {
+    name: 'Windows',
+    arches: { x64: 'x64', arm64: 'ARM64' },
+    formats: { exe: 'Installer', 'portable.exe': 'Portable EXE' },
+    install: {
+      exe: 'Run the installer and follow the prompts.',
+      'portable.exe': 'Run the portable EXE directly.',
+    },
+  },
+  linux: {
+    name: 'Linux',
+    arches: { x64: 'x64', arm64: 'ARM64' },
+    formats: { deb: 'DEB', rpm: 'RPM', AppImage: 'AppImage', 'tar.gz': 'TAR.GZ' },
+    install: {
+      deb: 'Install the DEB on Debian or Ubuntu.',
+      rpm: 'Install the RPM on Fedora-compatible distributions.',
+      AppImage: 'Make the AppImage executable and open it.',
+      'tar.gz': 'Extract the TAR.GZ and run Aria from the extracted directory.',
+    },
+  },
+};
+
+function downloads(assets, link, commit) {
+  const sections = [];
+  for (const [platform, { name, arches, formats, install }] of Object.entries(platforms)) {
+    const packages = assets.filter((asset) => asset.platform === platform);
+    if (!packages.length) continue;
+    const rows = Object.entries(arches).flatMap(([arch, label]) => {
+      const links = packages.filter((asset) => asset.arch === arch)
+        .map(({ filename, format }) => link(filename, formats[format]));
+      return links.length ? [`- **${label}** · ${links.join(' · ')}`] : [];
+    });
+    const includedFormats = new Set(packages.map(({ format }) => format));
+    const instructions = [...includedFormats].map((format) => install[format]);
+    if (platform === 'macos' && includedFormats.has('dmg'))
+      instructions.push(`[macOS installation guide](${base}/blob/${commit}/docs/RELEASING.md#macos-installation)`);
+    sections.push([`### ${name}`, rows.join('\n'), instructions.join(' ')].join('\n\n'));
+  }
+  return sections.length ? ['## Downloads and installation', ...sections].join('\n\n') : '';
+}
+
+function verification(assets, link) {
+  const sums = link(sumsName);
+  if (!sums) return '';
+  const certificate = assets.find(({ filename }) => filename === windowsCertificateName);
+  const signature = link(signatureName, 'Manifest signature');
+  const links = [link(manifestName, 'Release manifest'), signature,
+    link(sbomName, 'Software bill of materials')].filter(Boolean);
+  const details = [];
+  if (assets.some(({ signing, notarized }) => signing === 'ad-hoc' && notarized === false))
+    details.push('- macOS packages are ad hoc signed and unnotarized. macOS may ask you to approve Aria in Privacy & Security.');
+  if (certificate && assets.some(({ platform }) => platform === 'windows')) {
+    details.push(`- Windows packages use Aria’s self-signed Authenticode certificate. Managed devices may require administrator-configured trust. ${link(certificate.filename, 'Public signing certificate')} · SHA-256 \`${certificate.sha256}\``);
+  }
+  const instructions = `Compare each download’s SHA-256 digest with ${sums}.`;
+  return ['## Checksums and verification', [instructions,
+    signature ? 'The release manifest carries an Ed25519 signature.' : ''].filter(Boolean).join(' '),
+    links.join(' · '), details.join('\n')].filter(Boolean).join('\n\n');
+}
+
+export function formatNotes({ commits, pulls, previousTag, commit, tag, compareTarget = tag, version, channel, buildTimestamp,
+  license = {}, assets = [], verified = [] }) {
+  const uploaded = new Set(verified.map(({ name }) => name));
+  // Use the reserved public tag for URLs while the verified uploads are still on the draft.
+  const link = (name, label = name) => uploaded.has(name) ? `[${label}](${downloadUrl(tag, name)})` : '';
+  const included = assets.filter(({ filename }) => uploaded.has(filename));
+  const contributors = [...new Set(pulls.filter((pull) => !skipNotes(pull)).map(({ user }) => user))]
+    .filter((login) => /^[a-z\d-]{1,39}$/i.test(login ?? '')).sort();
+  const blob = (file) => `${base}/blob/${commit}/${file.split('/').map(encodeURIComponent).join('/')}`;
+  const licenseLinks = (license.files ?? []).map((file) => `[${plain(file)}](${blob(file)})`);
+  const terms = license.declaration && !license.declaration.startsWith('SEE LICENSE IN ')
+    ? plain(license.declaration) : '';
+  const licenseLines = [
+    [terms, ...licenseLinks].filter(Boolean).join(' · '),
+    license.notices ? `[Third-party notices](${blob(license.notices)})` : '',
+  ].filter(Boolean);
+  const values = {
+    highlights: highlights(commits, pulls),
+    downloads: downloads(included, link, commit),
+    verification: verification(included, link),
+    version, tag, date: releaseDate(tag),
+    channel: channel === 'beta' ? 'Beta prerelease' : 'Stable',
+    source: `[\`${commit}\`](${base}/commit/${commit})`,
+    build: buildTimestamp ? `| Verified build (UTC) | \`${buildTimestamp}\` |\n` : '',
+    license: licenseLines.length ? `## Licensing and notices\n\n${licenseLines.join('\n\n')}` : '',
+    contributors: contributors.length ? `## Contributors\n\n${contributors.map((login) =>
+      `[@${login}](https://github.com/${login})`).join(', ')}` : '',
+    changelog: previousTag
+      ? `[Compare changes since ${plain(previousTag)}](${base}/compare/${encodeURIComponent(previousTag)}...${encodeURIComponent(compareTarget)})`
+      : `[Browse commit history](${base}/commits/${commit})`,
+  };
+  return template.replace(/{{(\w+)}}/g, (_token, key) => {
+    if (!Object.hasOwn(values, key)) throw new Error(`Unknown release notes placeholder: ${key}`);
+    return values[key];
+  }).replace(/\n{3,}/g, '\n\n').trim() + '\n';
 }

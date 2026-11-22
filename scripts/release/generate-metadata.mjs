@@ -11,6 +11,8 @@ export const marker = 'Aria Release Creator v1';
 export const manifestName = 'release-manifest.json';
 export const signatureName = 'release-manifest.sig';
 export const sumsName = 'SHA256SUMS.txt';
+export const sbomName = 'Aria.cdx.json';
+export const windowsCertificateName = 'Aria-Windows-Signing.cer';
 
 export function applicationVersion(manifest) {
   const version = manifest?.version;
@@ -41,12 +43,13 @@ export function dateTag(date, tags) {
   return `${prefix}-${suffix}`;
 }
 
-export function releaseTitle(version, tag) {
+export function releaseDate(tag) {
   if (!tagPattern.test(tag)) throw new Error('Invalid Aria release tag.');
-  const date = new Date(`${tag.slice(1, 11).replaceAll('.', '-')}T00:00:00Z`);
-  return `Aria v${version} — ${new Intl.DateTimeFormat('en-US', {
-    month: 'long', year: 'numeric', timeZone: 'UTC',
-  }).format(date)} Release`;
+  return tag.slice(1, 11);
+}
+
+export function releaseTitle(version, tag) {
+  return `Aria v${version} — ${releaseDate(tag)}`;
 }
 
 const platforms = {
@@ -109,7 +112,7 @@ export async function createManifest(directory, { version, tag, commit, buildTim
   })));
   const metadata = [
     ...allTargets().map(({ platform, arch }) => feedName(platform, arch)),
-    'Aria.cdx.json', 'Aria-Windows-Signing.cer',
+    sbomName, windowsCertificateName,
   ];
   for (const filename of metadata) {
     assets.push({ filename, url: downloadUrl(tag, filename), ...await inspectFile(directory, filename) });

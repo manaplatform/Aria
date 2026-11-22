@@ -52,7 +52,11 @@ if (process.platform === 'win32') {
     const match = new RegExp(`^Microsoft\\.(NETCore|WindowsDesktop)\\.App\\.Runtime\\.win-${architecture}$`, 'i');
     for (const framework of Object.values(assets.project.frameworks)) {
       for (const { name, version: range } of framework.downloadDependencies ?? []) {
-        if (match.test(name)) runtimes.set(name, range.replace(/^\[(.+)\]$/, '$1'));
+        if (!match.test(name)) continue;
+        // NuGet can serialize a pinned download as [version] or [version, version].
+        const version = /^\[\s*(\d[\w.+-]*)\s*(?:,\s*\1\s*)?\]$/.exec(range)?.[1];
+        if (!version) throw new Error(`Expected an exact runtime pack version for ${name}, received ${range}.`);
+        runtimes.set(name, version);
       }
     }
     if (runtimes.size !== 2) throw new Error('Expected the matching .NET and Windows Desktop runtime packs.');

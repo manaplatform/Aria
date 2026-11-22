@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  applicationVersion, inspectFile, platformAssets, readJson, repository, validatePackageVersion,
+  applicationVersion, inspectFile, platformAssets, readJson, repository, validatePackageVersion, windowsCertificateName,
 } from './generate-metadata.mjs';
 import { bundleApi } from './bundle-api.mjs';
 
@@ -22,7 +22,6 @@ const mode = process.argv[2];
 const output = path.resolve(process.argv[3] ?? path.join(desktop, 'out', 'release-packages'));
 const production = mode === 'publish';
 const target = platformAssets(version, platform, arch);
-const windowsCert = 'Aria-Windows-Signing.cer';
 
 function run(executable, args, options) {
   return execFileSync(executable, args, { cwd: root, stdio: 'inherit', ...options });
@@ -90,7 +89,7 @@ function verifyWindowsSigning(files, signer) {
 async function certificate(temporary, signer) {
   requireEnvironment('WIN_CSC_LINK', 'WIN_CSC_KEY_PASSWORD');
   const pfx = path.join(temporary, 'signer.pfx');
-  const cer = path.join(output, windowsCert);
+  const cer = path.join(output, windowsCertificateName);
   await writeFile(pfx, Buffer.from(env.WIN_CSC_LINK, 'base64'), { mode: 0o600 });
   powershell(`
     $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
@@ -246,7 +245,7 @@ async function packageDesktop() {
 
 if (mode === 'verify-windows-install') {
   const installed = path.resolve(process.argv[4]);
-  const cert = path.join(output, windowsCert);
+  const cert = path.join(output, windowsCertificateName);
   const expected = process.argv[5] === 'publish' ? windowsSignerPins()[0]
     : (new X509Certificate(await readFile(cert))).fingerprint256.replaceAll(':', '').toLowerCase();
   if (!expected) throw new Error('Windows signing fingerprint is missing.');

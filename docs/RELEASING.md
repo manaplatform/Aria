@@ -5,7 +5,7 @@ Aria Release Creator builds and verifies desktop packages on GitHub-hosted runne
 ## Create a release
 
 1. Change the root application version and merge the reviewed change into `main`. Use a final SemVer such as `1.2.3` for stable or a prerelease such as `1.2.4-beta.1` for beta. Keep the major component at or below 9999 and the minor and patch components at or below 99 for the macOS bundle fields. Build metadata is excluded from release versions because it has equal update precedence.
-2. Open **Actions → Aria Release Creator** to follow the run. A version change starts the build automatically. The protected publish job runs after all six platform builds pass. Stable becomes the GitHub latest release. Beta is published as a prerelease.
+2. Open **Actions → Aria Release Creator** to follow the run. The workflow compares the root versions before and after a push to `main` and starts the build when the version changes. The protected publish job runs after all six platform builds pass. Stable becomes the GitHub latest release. Beta is published as a prerelease.
 3. For the first release or to release the current default-branch version manually, use **Run workflow → publish** or `pnpm release:create`. Use `preview` to generate metadata and notes, or `verify` to produce packages, verification receipts, and build provenance without a GitHub Release. Windows verification uses a disposable signing certificate. The workflow must already be present on the default branch to dispatch it.
 
 ```sh
@@ -15,7 +15,7 @@ pnpm release:notes
 pnpm release:create --dry-run
 ```
 
-The preview reads GitHub’s tags, releases, and pull requests. It uses the local root version and checked-out commit. It lists expected filenames, and the preview tag is provisional until the production job reserves it. Authenticate `gh` for higher API limits when needed. The snapshot should come from a full clone.
+The preview reads GitHub’s tags, releases, and pull requests. It uses the local root version and checked-out commit. The preview lists expected filenames and renders the available release notes. Publication adds download links after verifying the uploaded bytes. The preview tag is provisional until the production job reserves it. Authenticate `gh` for higher API limits when needed. The snapshot should come from a full clone with the release history.
 
 ```sh
 gh workflow run release.yml --repo manaplatform/Aria --ref main -f mode=verify
@@ -25,7 +25,11 @@ gh api --method POST repos/manaplatform/Aria/actions/workflows/release.yml/dispa
 JSON
 ```
 
-The application version and calendar tag are independent. The publish job reserves an annotated UTC tag such as `v2026.11.22`. Additional versions on that UTC date get `-2`, `-3`, and subsequent suffixes. A reservation records the application version and source commit, so retrying after midnight retains the tag and title date. Release notes combine Git history since the last published ancestor with merged PR titles, labels, Conventional Commits, and GitHub’s generated notes. Use `skip-release-notes` on a PR when appropriate. First releases use repository history.
+The application version and calendar tag are independent. The publish job prepares the signed manifest and `SHA256SUMS.txt`, then reserves an annotated UTC tag such as `v2026.11.22`. Additional versions on that UTC date get `-2`, `-3`, and subsequent suffixes. A reservation records the application version and source commit, so retrying after midnight retains the tag and title date. Release Creator creates the draft, verifies the uploaded assets, and publishes with the title `Aria v{VERSION} — {RELEASE_DATE}`.
+
+Release Creator renders the [Markdown template](../scripts/release/release-notes.md) from the tagged source and the verified uploads. Highlights use actual commit subjects, merged PR titles and labels, and Conventional Commits. Empty categories are omitted. Stable notes cover changes since the last stable release with assets on the source branch. Beta notes can also use a previous prerelease with assets. The first release with assets uses repository history. Apply `skip-release-notes` to omit a PR from the highlights. The full changelog remains available through GitHub.
+
+Download and installation sections reflect the uploaded packages for each architecture. The notes link to checksums, the signed manifest and signature, the software bill of materials, and the public Windows signing certificate. First-party license details come from the root package metadata and tracked license files, with a separate link to third-party notices when available.
 
 ## Production setup
 
@@ -62,7 +66,7 @@ An ad hoc signature seals the bundle and its nested code. Publisher authenticity
 
 ## Retry and verify
 
-Use **Re-run failed jobs** to retry a failed workflow at its original commit. Rerun all jobs if Actions artifacts have expired. A failed build produces no draft. After tag reservation, retries reuse the version’s tag and recover its draft. Uploaded assets with matching hashes are retained and missing or mismatched owned draft assets are repaired. Review any unexpected assets before retrying. A published version cannot be reused by a different commit. Use a new version for a correction after publication.
+Use **Re-run failed jobs** to retry a failed workflow at its original commit. Rerun all jobs if Actions artifacts have expired. A failed build produces no draft. After tag reservation, retries reuse the version’s tag and recover its draft. Uploaded assets with matching hashes are retained and missing or mismatched owned draft assets are repaired. Review any unexpected assets before retrying. Every published version occupies its SemVer precedence, including a public release with zero assets. Use a new root version for a correction after publication.
 
 Download the installer for your platform and architecture. Compare the file hashes with `SHA256SUMS.txt` and verify build provenance with `gh attestation verify <file> --repo manaplatform/Aria --source-ref refs/heads/main`. On Windows compare `Get-FileHash -Algorithm SHA256` and inspect the file's Authenticode publisher and certificate fingerprint. On macOS use `shasum -a 256`, `hdiutil verify <image>`, and `codesign --verify --strict <image>`. After mounting the image, use `codesign --verify --deep --strict <path-to-Aria.app>` to check the app seal. Linux users can use `sha256sum -c SHA256SUMS.txt --ignore-missing` from the download directory. The signed release manifest also records each asset’s size, URL, and digest.
 

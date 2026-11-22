@@ -116,7 +116,10 @@ export async function readReleaseState(api) {
     api.pages('/git/matching-refs/tags/v'),
     api.pages('/releases'),
   ]);
-  const tags = new Set(refs.map((ref) => ref.ref.slice('refs/tags/'.length)));
+  const tags = new Set([
+    ...refs.map((ref) => ref.ref.slice('refs/tags/'.length)),
+    ...releases.map((release) => release.tag_name),
+  ]);
   const reservations = [];
   const published = [];
   const resolve = async (tag) => {

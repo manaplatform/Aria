@@ -29,6 +29,8 @@ jobs:
       - run: node --experimental-strip-types --test runner.test.mts
         working-directory: apps/desktop/program-runner
       - run: pnpm build
+        env:
+          ARIA_STAGE_RELEASE_NOTICES: '1'
       - run: pnpm --filter @aria/desktop exec node scripts/ensure-electron.cjs
       - run: pnpm licenses:check
       - run: pnpm --filter @aria/desktop test:electron
