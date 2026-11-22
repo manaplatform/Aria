@@ -443,7 +443,7 @@ test('browses from ordinary chat through the managed private port and keeps priv
       const { id, data, status, error } = result[0];
       computerResults.last = id;
       if (status !== 'completed') {
-        computerResults.failure = error;
+        computerResults.failure = error ?? status;
         return;
       }
       if (id === 'open')
@@ -502,13 +502,14 @@ test('browses from ordinary chat through the managed private port and keeps priv
     await page.getByRole('textbox', { name: 'Message Aria' }).fill(computerPrompt);
     await page.getByRole('button', { name: 'Send message', exact: true }).click();
     await expect
-      .poll(() => computerResults, { timeout: 20_000 })
-      .toMatchObject({
-        outcomes: [{ index: 0, action: 'click', status: 'submitted' }],
-        elements: expect.arrayContaining([
-          expect.objectContaining({ label: 'Fixture received input' }),
-        ]),
-      });
+      .poll(() => computerResults.failure ?? computerResults.outcomes, { timeout: 20_000 })
+      .toBeDefined();
+    expect(computerResults).toMatchObject({
+      outcomes: [{ index: 0, action: 'click', status: 'submitted' }],
+      elements: expect.arrayContaining([
+        expect.objectContaining({ label: 'Fixture received input' }),
+      ]),
+    });
     await expect(page.getByRole('region', { name: 'Computer Use' })).toBeVisible();
     const screenshot = provider.received
       .filter(({ body }) =>
@@ -534,10 +535,44 @@ test('browses from ordinary chat through the managed private port and keeps priv
     );
     expect(buttonPixel).toEqual([200, 130, 30, 255]);
     expect(traffic).not.toContain('/unexpected-action');
+    const controlHost = await app.evaluate(({ BaseWindow, BrowserWindow, WebContentsView }) => {
+      const main = BrowserWindow.getAllWindows()[0];
+      for (const window of BaseWindow.getAllWindows()) {
+        if (window.id === main.id) continue;
+        const tab = window.contentView.children.find((child) => child instanceof WebContentsView);
+        if (tab instanceof WebContentsView) {
+          return {
+            id: window.id,
+            contentsId: tab.webContents.id,
+            visible: window.isVisible(),
+            focusable: window.isFocusable(),
+            throttled: tab.webContents.backgroundThrottling,
+          };
+        }
+      }
+      throw new Error('The managed tab has no rendering host.');
+    });
+    expect(controlHost).toMatchObject({ visible: false, focusable: false, throttled: true });
     await page.getByRole('button', { name: 'Take control', exact: true }).click();
     await expect(page.getByRole('region', { name: 'Computer Use' })).toContainText(
       'You have control',
     );
+    await expect
+      .poll(() =>
+        app!.evaluate(
+          ({ BaseWindow, BrowserWindow, WebContentsView }, { id, contentsId }) => {
+            const main = BrowserWindow.getAllWindows()[0];
+            return {
+              hostClosed: BaseWindow.fromId(id) === null,
+              tabAttached: main.contentView.children.some(
+                (child) => child instanceof WebContentsView && child.webContents.id === contentsId,
+              ),
+            };
+          },
+          controlHost,
+        ),
+      )
+      .toEqual({ hostClosed: true, tabAttached: true });
     await page.getByRole('button', { name: 'Close', exact: true }).click();
     await expect(page.getByRole('region', { name: 'Computer Use' })).toBeHidden();
 

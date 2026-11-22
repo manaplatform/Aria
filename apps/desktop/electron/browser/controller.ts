@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 import {
+  BaseWindow,
   dialog,
   nativeImage,
   session,
@@ -58,6 +59,8 @@ type Tab = {
   privateOrigin?: string;
 };
 
+const computerBounds = { x: 0, y: 0, width: 1024, height: 768 };
+
 function whenActive<T>(promise: Promise<T>, signal: AbortSignal) {
   signal.throwIfAborted();
   return new Promise<T>((resolve, reject) => {
@@ -78,6 +81,7 @@ export class BrowserController {
   private conversationId: string | null = null;
   private window?: BrowserWindow;
   private visible?: Tab;
+  private computerHost?: { window: BaseWindow; tab: Tab };
   private playback?: { tab: Tab };
   private layout?: BrowserLayout;
   private layoutRevision = -1;
@@ -240,6 +244,7 @@ export class BrowserController {
     const window = this.window;
     if (!window || window.isDestroyed()) {
       this.visible = undefined;
+      this.placeComputerTab();
       return;
     }
     const tab = this.selected && this.tabs.get(this.selected);
@@ -256,6 +261,17 @@ export class BrowserController {
         : undefined;
     if (this.visible && this.visible !== view)
       window.contentView.removeChildView(this.visible.view);
+    this.placeComputerTab(
+      tab &&
+        tab.computer &&
+        !tab.computer.user &&
+        !tab.privateAuth &&
+        !tab.state.crashed &&
+        tab.owner === this.conversationId &&
+        !window.isMinimized()
+        ? tab
+        : undefined,
+    );
     if (view && rect) {
       const [width, height] = window.getContentSize();
       const zoom = window.webContents.zoomFactor;
@@ -271,6 +287,34 @@ export class BrowserController {
       view.view.setBounds(bounds);
     }
     this.visible = view;
+  }
+
+  private placeComputerTab(tab?: Tab) {
+    const previous = this.computerHost;
+    if (previous) {
+      const destroyed = previous.window.isDestroyed();
+      if (previous.tab === tab && !destroyed) return;
+      this.computerHost = undefined;
+      previous.tab.documentId = randomUUID();
+      if (!destroyed) {
+        previous.window.contentView.removeChildView(previous.tab.view);
+        previous.window.destroy();
+      }
+    }
+    if (!tab) return;
+
+    // Chromium needs a native compositor for reliable frame capture on Windows.
+    const window = new BaseWindow({
+      width: computerBounds.width,
+      height: computerBounds.height,
+      frame: false,
+      show: false,
+      focusable: false,
+      skipTaskbar: true,
+    });
+    window.contentView.addChildView(tab.view);
+    tab.view.setBounds(computerBounds);
+    this.computerHost = { window, tab };
   }
 
   private select(tab: Tab) {
@@ -961,13 +1005,13 @@ export class BrowserController {
       const source = publicWebUrl(tab.state.url);
       if (source.search || source.hash) tab.restorableComputerUrl = undefined;
       else tab.restorableComputerUrl = source.href;
-      this.select(tab);
-      tab.view.setBounds({ x: 0, y: 0, width: 1024, height: 768 });
       try {
         await whenActive(tab.profile.quarantine(), signal);
         signal.throwIfAborted();
+        tab.lifetime.signal.throwIfAborted();
+        this.select(tab);
       } catch (error) {
-        this.closeTab(tab);
+        if (this.tabs.get(target) === tab) this.closeTab(tab);
         throw error;
       }
     });
@@ -986,7 +1030,7 @@ export class BrowserController {
     if (user && tab.privateOrigin) tab.profile.authenticate(tab.privateOrigin);
     else if (!user && tab.privateAuth) await tab.profile.quarantine();
     this.select(tab);
-    if (!user) tab.view.setBounds({ x: 0, y: 0, width: 1024, height: 768 });
+    if (!user && tab.privateAuth) tab.view.setBounds(computerBounds);
   }
 
   computerAuthenticationSite(conversation: string, target: string, id: string) {
@@ -1035,6 +1079,7 @@ export class BrowserController {
     const tab = this.computerTab(conversation, target, sessionId);
     const contents = tab.view.webContents;
     const revision = tab.documentId;
+    const host = this.computerHost;
     const active = AbortSignal.any([signal, tab.lifetime.signal]);
     const ensure = () => {
       active.throwIfAborted();
@@ -1043,6 +1088,8 @@ export class BrowserController {
         tab.documentId !== revision ||
         this.selected !== target ||
         tab.computer?.user ||
+        (!tab.privateAuth &&
+          (host?.tab !== tab || this.computerHost !== host || host.window.isDestroyed())) ||
         contents.isLoadingMainFrame()
       )
         throw new RuntimeError(
@@ -1101,14 +1148,15 @@ export class BrowserController {
       ensure();
       return { observation };
     }
-    // Request a fresh compositor frame from the detached tab. Copying its current
-    // surface with capturePage can stall on Windows when the tab has no visible host.
+    // Request a fresh frame from the tab's compositor while the window stays hidden.
     const transport = contents.debugger;
     if (transport.isAttached())
       throw new RuntimeError('CAPABILITY_UNAVAILABLE', 'The browser capture channel is busy.');
     const frameSignal = AbortSignal.any([active, AbortSignal.timeout(5_000)]);
+    const backgroundThrottling = contents.backgroundThrottling;
     let capture: Electron.NativeImage;
     try {
+      contents.backgroundThrottling = false;
       transport.attach('1.3');
       const { data } = await whenActive(
         transport.sendCommand('Page.captureScreenshot', {
@@ -1128,6 +1176,7 @@ export class BrowserController {
       );
     } finally {
       if (transport.isAttached()) transport.detach();
+      if (!contents.isDestroyed()) contents.backgroundThrottling = backgroundThrottling;
     }
     const size = capture.getSize(1);
     const side = Math.max(size.width, size.height);
@@ -1194,6 +1243,8 @@ export class BrowserController {
       tab.documentId !== observation.revision ||
       this.selected !== target ||
       tab.computer?.user ||
+      this.computerHost?.tab !== tab ||
+      this.computerHost.window.isDestroyed() ||
       current.sensitive ||
       current.viewport?.width !== observation.width ||
       current.viewport?.height !== observation.height ||
