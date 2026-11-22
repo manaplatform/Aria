@@ -14,6 +14,8 @@ Release Creator checks for requests on pushes to `main` and every 15 minutes, su
 
 If a calendar-tagged release was published with an empty title, description, and assets, Release Creator can complete it while it is mutable. It builds and verifies all packages before moving the placeholder to draft for upload and final publication.
 
+Native jobs build the app and use its lockfile from the tagged commit. The release workflow supplies its packaging and verification scripts so fixes to the release tools can be applied to an existing tag.
+
 ### From a version change
 
 1. Change the root application version and merge the reviewed change into `main`. Use a final SemVer such as `1.2.3` for stable or a prerelease such as `1.2.4-beta.1` for beta. Keep the major component at or below 9999 and the minor and patch components at or below 99 for the macOS bundle fields. Build metadata is excluded from release versions because it has equal update precedence.

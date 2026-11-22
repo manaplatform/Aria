@@ -176,7 +176,7 @@ async function packageDesktop() {
         signExecutable: Boolean(windows),
         signtoolOptions: {
           signingHashAlgorithms: ['sha256'], ...windows && { publisherName: windows.publisher },
-          rfc3161TimeStampServer: 'https://timestamp.digicert.com',
+          rfc3161TimeStampServer: 'http://timestamp.digicert.com',
         },
       },
       nsis: { runAfterFinish: false, deleteAppDataOnUninstall: false },
