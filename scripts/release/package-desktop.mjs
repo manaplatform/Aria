@@ -10,6 +10,7 @@ import {
   applicationVersion, inspectFile, platformAssets, readJson, repository, validatePackageVersion, windowsCertificateName,
 } from './generate-metadata.mjs';
 import { bundleApi } from './bundle-api.mjs';
+import { windowsSignerPins } from './windows-signer-pins.mjs';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const desktop = path.join(root, 'apps', 'desktop');
@@ -41,15 +42,6 @@ function publicKeys() {
       throw new Error('ARIA_UPDATE_PUBLIC_KEYS must contain comma-separated base64 DER Ed25519 public keys.');
   }
   return keys;
-}
-
-function windowsSignerPins() {
-  if (production && platform === 'windows') requireEnvironment('ARIA_WINDOWS_SIGNER_SHA256');
-  const expected = env.ARIA_WINDOWS_SIGNER_SHA256?.toLowerCase();
-  const pins = expected ? [expected, ...(env.ARIA_WINDOWS_ADDITIONAL_SIGNERS_SHA256?.toLowerCase().split(',') ?? [])] : [];
-  if (pins.some((pin) => !/^[a-f0-9]{64}$/.test(pin)))
-    throw new Error('Windows signer fingerprints must be lowercase SHA-256 hex.');
-  return pins;
 }
 
 function powershell(script, variables = {}, stdio = 'inherit') {
@@ -132,7 +124,7 @@ async function packageDesktop() {
   if (!['verify', 'publish', 'dir'].includes(mode)) throw new Error('Select a packaging mode.');
   if (production && env.GITHUB_ACTIONS !== 'true') throw new Error('Production packaging requires GitHub Actions.');
   const updateKeys = publicKeys();
-  const windowsPins = windowsSignerPins();
+  const windowsPins = windowsSignerPins(env, { required: production && platform === 'windows' });
   const temporary = await mkdtemp(path.join(os.tmpdir(), 'aria-package-'));
   const configDirectory = path.join(desktop, 'out', 'package-config');
   await mkdir(output, { recursive: true });
@@ -246,9 +238,8 @@ async function packageDesktop() {
 if (mode === 'verify-windows-install') {
   const installed = path.resolve(process.argv[4]);
   const cert = path.join(output, windowsCertificateName);
-  const expected = process.argv[5] === 'publish' ? windowsSignerPins()[0]
+  const expected = process.argv[5] === 'publish' ? windowsSignerPins(env, { required: true })[0]
     : (new X509Certificate(await readFile(cert))).fingerprint256.replaceAll(':', '').toLowerCase();
-  if (!expected) throw new Error('Windows signing fingerprint is missing.');
   await withWindowsTrust(cert, async () => {
     const names = ['Aria.exe', 'Uninstall Aria.exe', 'resources/aria-computer/Aria.Computer.exe'];
     verifyWindowsSigning(names.map((name) => path.join(installed, name)), expected);

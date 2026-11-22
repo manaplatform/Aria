@@ -14,6 +14,7 @@ import {
 import { formatNotes } from './generate-notes.mjs';
 import { findRelease, GitHubError, releaseNoteMarker, tagAnnotation } from './github.mjs';
 import { publishDraft, publishRelease, reserveTag, uploadAssets, verifyBuilds } from './run.mjs';
+import { windowsSignerPins } from './windows-signer-pins.mjs';
 
 const commit = 'a'.repeat(40);
 const tag = 'v2026.11.22';
@@ -31,6 +32,32 @@ test('reads canonical SemVer and validates package limits', () => {
   assert.throws(() => validatePackageVersion('1.2.100'), /bundle field limits/);
   assert.equal(channelFor('1.2.3-beta.1'), 'beta');
   assert.equal(channelFor('1.2.3'), 'stable');
+});
+
+test('Windows production signer pins accept an empty rotation setting', () => {
+  const primary = 'a'.repeat(64);
+  const env = { ARIA_WINDOWS_SIGNER_SHA256: ` ${primary.toUpperCase()}\n` };
+  for (const additional of [undefined, '', ' \t ']) {
+    assert.deepEqual(windowsSignerPins({ ...env, ARIA_WINDOWS_ADDITIONAL_SIGNERS_SHA256: additional },
+      { required: true }), [primary]);
+  }
+  const first = 'b'.repeat(64);
+  const second = 'c'.repeat(64);
+  assert.deepEqual(windowsSignerPins({ ...env,
+    ARIA_WINDOWS_ADDITIONAL_SIGNERS_SHA256: `${first.toUpperCase()}, ${second}`,
+  }, { required: true }), [primary, first, second]);
+  assert.deepEqual(windowsSignerPins({}), []);
+});
+
+test('Windows production signer pins reject missing, malformed, or incomplete settings', () => {
+  const env = { ARIA_WINDOWS_SIGNER_SHA256: 'a'.repeat(64) };
+  assert.throws(() => windowsSignerPins({}, { required: true }), /Set ARIA_WINDOWS_SIGNER_SHA256/);
+  assert.throws(() => windowsSignerPins({ ARIA_WINDOWS_SIGNER_SHA256: 'a'.repeat(40) }, { required: true }),
+    /ARIA_WINDOWS_SIGNER_SHA256 must be a 64-character/);
+  for (const additional of ['g'.repeat(64), `${'b'.repeat(64)},`]) {
+    assert.throws(() => windowsSignerPins({ ...env, ARIA_WINDOWS_ADDITIONAL_SIGNERS_SHA256: additional },
+      { required: true }), /ARIA_WINDOWS_ADDITIONAL_SIGNERS_SHA256 must contain comma-separated/);
+  }
 });
 
 test('allocates UTC date tags and formats the title from the reserved date', () => {

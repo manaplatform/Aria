@@ -45,7 +45,10 @@ async function launch(
   });
   page = await app.firstWindow();
   page.on('pageerror', (error) => errors.push(error.message));
-  await expect(page.getByRole('navigation', { name: 'Chat navigation' })).toBeVisible();
+  // A cold Vite server needs time to transform the lazy chat route.
+  await expect(page.getByRole('textbox', { name: 'Message Aria', exact: true })).toBeVisible({
+    timeout: development ? 20_000 : 5_000,
+  });
   await expect
     .poll(() => page.evaluate(() => window.aria!.chatStatus()), { timeout: 20000 })
     .toMatchObject({ state: 'ready' });
