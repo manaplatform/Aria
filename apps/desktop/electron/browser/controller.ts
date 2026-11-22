@@ -1,5 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { setTimeout as sleep } from 'node:timers/promises';
 import {
+  BaseWindow,
   dialog,
   nativeImage,
   session,
@@ -11,6 +13,7 @@ import {
 import {
   browserBridgeArgs,
   browserSearchUrl,
+  computerLimits,
   publicWebUrl,
   webUrlSchema,
   type BrowserCommand,
@@ -18,12 +21,16 @@ import {
   type BrowserRequest,
   type BrowserState,
   type BrowserTab,
+  type ComputerAction,
+  type ComputerObservation,
   type WebPolicy,
 } from '@aria/shared';
 import { BrowserProxy } from './egress-proxy';
 import { inspectPage } from './page-inspector';
 import { BrowserSessionPolicy } from './session-policy';
 import { BrowserStateStorage, type BrowserDiskState } from './state-storage';
+import { browserInputPoint, dispatchBrowserInput } from './computer-input';
+import { RuntimeError } from '../runtime/store';
 
 class BrowserError extends Error {
   constructor(
@@ -46,7 +53,13 @@ type Tab = {
   submissions?: { requestId: string; fingerprints: Set<string> };
   queue: Promise<unknown>;
   lifetime: AbortController;
+  computer?: { id: string; user: boolean };
+  restorableComputerUrl?: string;
+  privateAuth?: boolean;
+  privateOrigin?: string;
 };
+
+const computerBounds = { x: 0, y: 0, width: 1024, height: 768 };
 
 function whenActive<T>(promise: Promise<T>, signal: AbortSignal) {
   signal.throwIfAborted();
@@ -68,6 +81,8 @@ export class BrowserController {
   private conversationId: string | null = null;
   private window?: BrowserWindow;
   private visible?: Tab;
+  private computerHost?: { window: BaseWindow; tab: Tab };
+  private playback?: { tab: Tab };
   private layout?: BrowserLayout;
   private layoutRevision = -1;
   private disk: BrowserDiskState = {
@@ -87,6 +102,11 @@ export class BrowserController {
   constructor(
     directory: string,
     private readonly policy: () => WebPolicy,
+    private readonly requestApproval: (
+      title: string,
+      detail: string,
+      signal: AbortSignal,
+    ) => Promise<boolean>,
   ) {
     this.storage = new BrowserStateStorage(directory);
   }
@@ -123,6 +143,7 @@ export class BrowserController {
   }
 
   resetRenderer() {
+    this.stopPlayback();
     this.layoutRevision = -1;
     this.layout = undefined;
     this.conversationId = null;
@@ -177,7 +198,16 @@ export class BrowserController {
       (tab) => !tab.background && (!tab.owner || tab.owner === this.conversationId),
     );
     return {
-      tabs: tabs.map((tab) => ({ ...tab.state })),
+      tabs: tabs.map((tab) =>
+        tab.privateAuth
+          ? {
+              ...tab.state,
+              url: tab.privateOrigin ?? '',
+              title: 'Private browser session',
+              icon: undefined,
+            }
+          : { ...tab.state },
+      ),
       selected: this.selected,
       history: this.policy().history ? this.disk.history : [],
       bookmarks: this.disk.bookmarks,
@@ -202,6 +232,7 @@ export class BrowserController {
     this.layout = layout;
     this.conversationId = layout.conversationId;
     if (previous !== this.conversationId) {
+      this.stopPlayback();
       this.selected =
         (this.conversationId && this.aiSelected.get(this.conversationId)) || this.personalSelected;
       this.changed();
@@ -213,6 +244,7 @@ export class BrowserController {
     const window = this.window;
     if (!window || window.isDestroyed()) {
       this.visible = undefined;
+      this.placeComputerTab();
       return;
     }
     const tab = this.selected && this.tabs.get(this.selected);
@@ -220,6 +252,7 @@ export class BrowserController {
     const view =
       tab &&
       !tab.state.crashed &&
+      (!tab.computer || tab.computer.user) &&
       (!tab.owner || tab.owner === this.conversationId) &&
       rect &&
       (tab.state.url || tab.state.loading) &&
@@ -228,6 +261,17 @@ export class BrowserController {
         : undefined;
     if (this.visible && this.visible !== view)
       window.contentView.removeChildView(this.visible.view);
+    this.placeComputerTab(
+      tab &&
+        tab.computer &&
+        !tab.computer.user &&
+        !tab.privateAuth &&
+        !tab.state.crashed &&
+        tab.owner === this.conversationId &&
+        !window.isMinimized()
+        ? tab
+        : undefined,
+    );
     if (view && rect) {
       const [width, height] = window.getContentSize();
       const zoom = window.webContents.zoomFactor;
@@ -243,6 +287,34 @@ export class BrowserController {
       view.view.setBounds(bounds);
     }
     this.visible = view;
+  }
+
+  private placeComputerTab(tab?: Tab) {
+    const previous = this.computerHost;
+    if (previous) {
+      const destroyed = previous.window.isDestroyed();
+      if (previous.tab === tab && !destroyed) return;
+      this.computerHost = undefined;
+      previous.tab.documentId = randomUUID();
+      if (!destroyed) {
+        previous.window.contentView.removeChildView(previous.tab.view);
+        previous.window.destroy();
+      }
+    }
+    if (!tab) return;
+
+    // Chromium needs a native compositor for reliable frame capture on Windows.
+    const window = new BaseWindow({
+      width: computerBounds.width,
+      height: computerBounds.height,
+      frame: false,
+      show: false,
+      focusable: false,
+      skipTaskbar: true,
+    });
+    window.contentView.addChildView(tab.view);
+    tab.view.setBounds(computerBounds);
+    this.computerHost = { window, tab };
   }
 
   private select(tab: Tab) {
@@ -350,6 +422,7 @@ export class BrowserController {
         nodeIntegrationInSubFrames: false,
         webviewTag: false,
         devTools: false,
+        safeDialogs: true,
         spellcheck: !owner,
       },
     });
@@ -374,6 +447,7 @@ export class BrowserController {
       },
     };
     const wc = view.webContents;
+    if (owner) wc.setAudioMuted(true);
     wc.setWebRTCIPHandlingPolicy('disable_non_proxied_udp');
     wc.setWindowOpenHandler(() => ({ action: 'deny' }));
     const check = (event: { url: string; isMainFrame?: boolean; preventDefault: () => void }) => {
@@ -387,9 +461,13 @@ export class BrowserController {
     wc.on('will-frame-navigate', check);
     wc.on('will-redirect', check);
     if (owner) {
-      wc.on('before-input-event', (event) => event.preventDefault());
+      wc.on('before-input-event', (event) => {
+        if (!tab.computer?.user) event.preventDefault();
+      });
       wc.on('before-mouse-event', (event, input) => {
-        if (input.type !== 'mouseWheel') event.preventDefault();
+        if (tab.computer && wc.debugger.isAttached() && this.visible !== tab) return;
+        if (!tab.computer?.user && (tab.computer || input.type !== 'mouseWheel'))
+          event.preventDefault();
       });
     } else {
       wc.on('context-menu', (_event, details) => {
@@ -412,12 +490,14 @@ export class BrowserController {
     }
     wc.on('did-start-navigation', ({ isMainFrame }) => {
       if (isMainFrame) {
+        this.stopPlayback(tab);
         tab.documentId = randomUUID();
         tab.runId = undefined;
         tab.state.error = undefined;
       }
     });
     const completed = (url: string) => {
+      this.stopPlayback(tab);
       tab.documentId = randomUUID();
       tab.runId = undefined;
       tab.state.url = webUrlSchema.safeParse(url).success ? url : '';
@@ -510,6 +590,7 @@ export class BrowserController {
       }
     });
     wc.on('render-process-gone', () => {
+      this.stopPlayback(tab);
       tab.lifetime.abort();
       tab.state.crashed = true;
       tab.state.loading = false;
@@ -520,6 +601,7 @@ export class BrowserController {
       this.changed();
     });
     wc.on('destroyed', () => {
+      this.stopPlayback(tab);
       if (this.tabs.has(id) && !tab.state.crashed) {
         tab.lifetime.abort();
         tab.state.crashed = true;
@@ -528,6 +610,15 @@ export class BrowserController {
         this.place();
         this.changed();
       }
+    });
+    wc.on('media-paused', () => {
+      if (this.playback?.tab !== tab || !tab.state.playingMedia) return;
+      const playback = this.playback;
+      void inspectPage(wc, { op: 'media-state', documentId: tab.documentId })
+        .then((value) => {
+          if (this.playback === playback && !value.playingMedia) this.stopPlayback(tab);
+        })
+        .catch(() => undefined);
     });
     this.tabs.set(id, tab);
     this.changed();
@@ -576,6 +667,7 @@ export class BrowserController {
   }
 
   private closeTab(tab: Tab) {
+    this.stopPlayback(tab);
     this.tabs.delete(tab.state.id);
     tab.lifetime.abort();
     if (this.personalSelected === tab.state.id)
@@ -593,6 +685,76 @@ export class BrowserController {
         .then(() => tab.profile.session.clearData())
         .catch(() => undefined);
     this.changed();
+  }
+
+  private stopPlayback(target?: Tab) {
+    const playback = this.playback;
+    if (!playback || (target && target !== playback.tab)) return;
+    this.playback = undefined;
+    const tab = playback.tab;
+    tab.state.playingMedia = false;
+    const contents = tab.view.webContents;
+    if (!contents.isDestroyed()) {
+      contents.setAudioMuted(true);
+      void inspectPage(contents, { op: 'stop-media', documentId: tab.documentId }).catch(
+        () => undefined,
+      );
+    }
+    this.changed();
+  }
+
+  private async playMedia(tab: Tab, signal: AbortSignal) {
+    const contents = tab.view.webContents;
+    const documentId = tab.documentId;
+    const deadline = AbortSignal.any([signal, AbortSignal.timeout(6500)]);
+    const ownsTab = () =>
+      tab.owner === this.conversationId &&
+      !tab.computer &&
+      !tab.privateAuth &&
+      !contents.isDestroyed() &&
+      tab.documentId === documentId &&
+      !contents.isLoadingMainFrame();
+    if (!ownsTab())
+      throw new BrowserError(
+        'TAB_UNAVAILABLE',
+        'Bring the playback conversation to the foreground.',
+      );
+    if (this.playback?.tab === tab && tab.state.playingMedia && contents.isCurrentlyAudible())
+      return;
+    this.stopPlayback();
+    const playback = { tab };
+    this.playback = playback;
+    try {
+      const result = await whenActive(
+        inspectPage(contents, { op: 'play-media', documentId }),
+        deadline,
+      );
+      if (!result.playingMedia || this.playback !== playback || !ownsTab())
+        throw new BrowserError(
+          'MEDIA_UNAVAILABLE',
+          'The page did not start a supported public media player.',
+        );
+      contents.setAudioMuted(false);
+      for (let check = 0; check < 12; check++) {
+        deadline.throwIfAborted();
+        if (this.playback !== playback || !ownsTab()) break;
+        if (contents.isCurrentlyAudible()) {
+          tab.state.playingMedia = true;
+          this.changed();
+          return;
+        }
+        await sleep(120, undefined, { signal: deadline });
+      }
+      throw new BrowserError('MEDIA_UNAVAILABLE', 'The browser did not detect audible playback.');
+    } catch (error) {
+      if (this.playback === playback) this.stopPlayback(tab);
+      if (!signal.aborted && deadline.aborted)
+        throw new BrowserError(
+          'MEDIA_UNAVAILABLE',
+          'The public media player did not start in time.',
+        );
+      throw error;
+    }
   }
 
   private url(input: string) {
@@ -676,6 +838,7 @@ export class BrowserController {
     if (!('tabId' in command)) return;
     const tab = this.tabs.get(command.tabId);
     if (!tab || tab.background || (tab.owner && tab.owner !== this.conversationId)) return;
+    if (command.kind === 'stop-media') return this.stopPlayback(tab);
     if (command.kind === 'close') {
       this.closeTab(tab);
       this.persist();
@@ -685,6 +848,7 @@ export class BrowserController {
       this.select(tab);
       return;
     }
+    if (tab.computer) return;
     if (command.kind === 'share-link') return tab.state.url;
     if (command.kind === 'recover') {
       const url = tab.state.url;
@@ -751,7 +915,450 @@ export class BrowserController {
     }
   }
 
-  async execute(request: BrowserRequest, signal: AbortSignal) {
+  computerAvailable() {
+    return this.policy().enabled && this.policy().aiBrowser;
+  }
+
+  computerForeground(conversation: string) {
+    return (
+      this.conversationId === conversation &&
+      !!this.window &&
+      !this.window.isDestroyed() &&
+      !this.window.isMinimized()
+    );
+  }
+
+  activeConversation() {
+    return this.conversationId;
+  }
+
+  async restoreComputerTab(conversation: string, id: string, url: string, signal: AbortSignal) {
+    if (!this.computerForeground(conversation))
+      throw new RuntimeError('PERMISSION_DENIED', 'Bring the owning chat to the foreground.');
+    const tab = await this.create(conversation);
+    try {
+      await this.navigate(tab, publicWebUrl(url).href, signal);
+      await this.claimComputerTab(conversation, tab.state.id, id, signal);
+      return tab.state.id;
+    } catch (error) {
+      this.closeTab(tab);
+      throw error;
+    }
+  }
+
+  computerTab(conversation: string, target: string, sessionId?: string) {
+    const tab = this.tabs.get(target);
+    if (
+      !this.computerAvailable() ||
+      this.conversationId !== conversation ||
+      !tab ||
+      tab.background ||
+      tab.owner !== conversation ||
+      tab.lifetime.signal.aborted ||
+      tab.view.webContents.isDestroyed() ||
+      (sessionId ? tab.computer?.id !== sessionId : !!tab.computer)
+    )
+      throw new RuntimeError(
+        'CAPABILITY_UNAVAILABLE',
+        'Select this conversation and an available AI browser tab.',
+      );
+    return tab;
+  }
+
+  computerTargetAlive(conversation: string, target: string, sessionId: string) {
+    const tab = this.tabs.get(target);
+    return (
+      !!tab &&
+      tab.owner === conversation &&
+      tab.computer?.id === sessionId &&
+      !tab.lifetime.signal.aborted
+    );
+  }
+
+  async selectComputerTab(conversation: string, target: string, id: string, signal: AbortSignal) {
+    if (this.computerTargetAlive(conversation, target, id)) {
+      const tab = this.computerTab(conversation, target, id);
+      if (tab.computer?.user)
+        throw new RuntimeError('PERMISSION_DENIED', 'The user is controlling this tab.');
+      signal.throwIfAborted();
+      tab.documentId = randomUUID();
+      this.select(tab);
+    } else await this.claimComputerTab(conversation, target, id, signal);
+    return target;
+  }
+
+  async claimComputerTab(
+    conversation: string,
+    target: string,
+    sessionId: string,
+    signal: AbortSignal,
+  ) {
+    const tab = this.computerTab(conversation, target);
+    const work = tab.queue.then(async () => {
+      signal.throwIfAborted();
+      this.computerTab(conversation, target);
+      if (!tab.state.url || tab.state.loading)
+        throw new RuntimeError('CAPABILITY_UNAVAILABLE', 'Wait until the page finishes loading.');
+      tab.computer = { id: sessionId, user: false };
+      this.stopPlayback(tab);
+      tab.runId = undefined;
+      const source = publicWebUrl(tab.state.url);
+      if (source.search || source.hash) tab.restorableComputerUrl = undefined;
+      else tab.restorableComputerUrl = source.href;
+      try {
+        await whenActive(tab.profile.quarantine(), signal);
+        signal.throwIfAborted();
+        tab.lifetime.signal.throwIfAborted();
+        this.select(tab);
+      } catch (error) {
+        if (this.tabs.get(target) === tab) this.closeTab(tab);
+        throw error;
+      }
+    });
+    tab.queue = work.catch(() => undefined);
+    await whenActive(work, signal);
+  }
+
+  computerRestoreUrl(conversation: string, target: string, id: string) {
+    return this.computerTab(conversation, target, id).restorableComputerUrl;
+  }
+
+  async setComputerOwner(conversation: string, target: string, sessionId: string, user: boolean) {
+    const tab = this.computerTab(conversation, target, sessionId);
+    tab.computer!.user = user;
+    tab.documentId = randomUUID();
+    if (user && tab.privateOrigin) tab.profile.authenticate(tab.privateOrigin);
+    else if (!user && tab.privateAuth) await tab.profile.quarantine();
+    this.select(tab);
+    if (!user && tab.privateAuth) tab.view.setBounds(computerBounds);
+  }
+
+  computerAuthenticationSite(conversation: string, target: string, id: string) {
+    return publicWebUrl(this.computerTab(conversation, target, id).state.url).origin;
+  }
+
+  async authenticateComputerTab(
+    conversation: string,
+    target: string,
+    id: string,
+    signal: AbortSignal,
+  ) {
+    const previous = this.computerTab(conversation, target, id);
+    const url = publicWebUrl(previous.state.url);
+    if (url.protocol !== 'https:')
+      throw new RuntimeError('PERMISSION_DENIED', 'Private sign-in requires an HTTPS site.');
+    const tab = await this.create(conversation);
+    try {
+      signal.throwIfAborted();
+      this.computerTab(conversation, target, id);
+      tab.computer = { id, user: true };
+      tab.privateAuth = true;
+      tab.privateOrigin = url.origin;
+      tab.profile.authenticate(url.origin);
+      this.select(tab);
+      await this.navigate(tab, url.href, signal);
+      return tab.state.id;
+    } catch (error) {
+      this.closeTab(tab);
+      throw error;
+    }
+  }
+
+  closeComputerTab(conversation: string, target: string, sessionId: string) {
+    const tab = this.tabs.get(target);
+    if (tab?.owner === conversation && tab.computer?.id === sessionId) this.closeTab(tab);
+  }
+
+  async observeComputerTab(
+    conversation: string,
+    target: string,
+    sessionId: string,
+    image: boolean,
+    signal: AbortSignal,
+  ) {
+    const tab = this.computerTab(conversation, target, sessionId);
+    const contents = tab.view.webContents;
+    const revision = tab.documentId;
+    const host = this.computerHost;
+    const active = AbortSignal.any([signal, tab.lifetime.signal]);
+    const ensure = () => {
+      active.throwIfAborted();
+      this.computerTab(conversation, target, sessionId);
+      if (
+        tab.documentId !== revision ||
+        this.selected !== target ||
+        tab.computer?.user ||
+        (!tab.privateAuth &&
+          (host?.tab !== tab || this.computerHost !== host || host.window.isDestroyed())) ||
+        contents.isLoadingMainFrame()
+      )
+        throw new RuntimeError(
+          'CAPABILITY_UNAVAILABLE',
+          'The computer target changed. Observe it again.',
+        );
+    };
+    ensure();
+    const state = await whenActive(
+      inspectPage(contents, { op: 'computer-state', documentId: revision }),
+      active,
+    );
+    ensure();
+    if (!state.viewport || (image && tab.privateAuth) || (state.sensitive && !tab.privateAuth))
+      throw new RuntimeError(
+        'PERMISSION_DENIED',
+        'The page contains controls or frames that are unavailable for Computer Use.',
+      );
+    const { width, height, dpr } = state.viewport;
+    const observation: ComputerObservation = {
+      id: randomUUID(),
+      sessionId,
+      targetId: target,
+      revision,
+      at: Date.now(),
+      environment: 'managed-browser',
+      width,
+      height,
+      devicePixelRatio: dpr,
+      url: tab.privateAuth
+        ? publicWebUrl(contents.getURL()).origin
+        : contents.getURL().split(/[?#]/, 1)[0],
+      title: tab.privateAuth ? 'Private browser session' : contents.getTitle().slice(0, 300),
+    };
+    if (!image) {
+      const page = await whenActive(
+        inspectPage(contents, {
+          op: 'inspect',
+          documentId: revision,
+          includeUploads: !tab.privateAuth,
+        }),
+        active,
+      );
+      observation.state = {
+        elements:
+          page.elements?.slice(0, 24).map(({ elementId, tag, role, type, editable, label }) => ({
+            elementId,
+            tag,
+            role,
+            type,
+            editable,
+            ...(!tab.privateAuth && { label }),
+          })) ?? [],
+        editable: state.editable,
+      };
+      ensure();
+      return { observation };
+    }
+    // Request a fresh frame from the tab's compositor while the window stays hidden.
+    const transport = contents.debugger;
+    if (transport.isAttached())
+      throw new RuntimeError('CAPABILITY_UNAVAILABLE', 'The browser capture channel is busy.');
+    const frameSignal = AbortSignal.any([active, AbortSignal.timeout(5_000)]);
+    const backgroundThrottling = contents.backgroundThrottling;
+    let capture: Electron.NativeImage;
+    try {
+      contents.backgroundThrottling = false;
+      transport.attach('1.3');
+      const { data } = await whenActive(
+        transport.sendCommand('Page.captureScreenshot', {
+          format: 'png',
+          fromSurface: true,
+          captureBeyondViewport: false,
+        }),
+        frameSignal,
+      );
+      capture = nativeImage.createFromBuffer(Buffer.from(data, 'base64'));
+      if (capture.isEmpty()) throw new Error('The browser returned an empty image.');
+    } catch {
+      active.throwIfAborted();
+      throw new RuntimeError(
+        'CAPABILITY_UNAVAILABLE',
+        'The browser could not capture the current viewport. Observe the tab again.',
+      );
+    } finally {
+      if (transport.isAttached()) transport.detach();
+      if (!contents.isDestroyed()) contents.backgroundThrottling = backgroundThrottling;
+    }
+    const size = capture.getSize(1);
+    const side = Math.max(size.width, size.height);
+    const scaled =
+      side > computerLimits.frameSide
+        ? capture.resize(
+            size.width >= size.height
+              ? { width: computerLimits.frameSide }
+              : { height: computerLimits.frameSide },
+          )
+        : capture;
+    const bytes = scaled.toPNG({ scaleFactor: 1 });
+    const after = await whenActive(
+      inspectPage(contents, { op: 'computer-state', documentId: revision }),
+      active,
+    );
+    ensure();
+    if (after.sensitive || JSON.stringify(after.viewport) !== JSON.stringify(state.viewport))
+      throw new RuntimeError(
+        'PERMISSION_DENIED',
+        'The page changed during capture. Observe it again.',
+      );
+    if (!bytes.length || bytes.length > computerLimits.imageBytes)
+      throw new RuntimeError(
+        'BUDGET_EXCEEDED',
+        'The screenshot did not fit within the image limit.',
+      );
+    observation.screenshot = scaled.getSize(1);
+    return { observation, bytes: new Uint8Array(bytes) };
+  }
+
+  async waitForComputerTab(conversation: string, target: string, id: string, signal: AbortSignal) {
+    const tab = this.computerTab(conversation, target, id);
+    if (tab.computer?.user)
+      throw new RuntimeError('PERMISSION_DENIED', 'The user is controlling this tab.');
+    await whenActive(
+      inspectPage(tab.view.webContents, { op: 'wait-change', documentId: tab.documentId }),
+      AbortSignal.any([signal, tab.lifetime.signal, AbortSignal.timeout(1800)]),
+    );
+  }
+
+  async actComputerTab(
+    conversation: string,
+    target: string,
+    sessionId: string,
+    observation: ComputerObservation,
+    action: Exclude<ComputerAction, { type: 'screenshot' | 'wait' }>,
+    signal: AbortSignal,
+  ) {
+    const tab = this.computerTab(conversation, target, sessionId);
+    if (tab.privateAuth)
+      throw new RuntimeError(
+        'PERMISSION_DENIED',
+        'Return to user control for input on this authenticated page.',
+      );
+    const contents = tab.view.webContents;
+    const active = AbortSignal.any([signal, tab.lifetime.signal]);
+    const current = await whenActive(
+      inspectPage(contents, { op: 'computer-state', documentId: observation.revision }),
+      active,
+    );
+    this.computerTab(conversation, target, sessionId);
+    if (
+      tab.documentId !== observation.revision ||
+      this.selected !== target ||
+      tab.computer?.user ||
+      this.computerHost?.tab !== tab ||
+      this.computerHost.window.isDestroyed() ||
+      current.sensitive ||
+      current.viewport?.width !== observation.width ||
+      current.viewport?.height !== observation.height ||
+      current.viewport?.dpr !== observation.devicePixelRatio
+    )
+      throw new RuntimeError(
+        'CAPABILITY_UNAVAILABLE',
+        'The target changed before input. Capture a fresh observation.',
+      );
+    if (action.type === 'type' && !current.editable)
+      throw new RuntimeError(
+        'PERMISSION_DENIED',
+        'The focused control cannot receive automated text.',
+      );
+    await dispatchBrowserInput(
+      contents,
+      action,
+      (x, y) => {
+        const frame = observation.screenshot;
+        if (!frame)
+          throw new RuntimeError(
+            'INVALID_ARGUMENT',
+            'Capture a screenshot before using pointer coordinates.',
+          );
+        return browserInputPoint(
+          x,
+          y,
+          frame.width,
+          frame.height,
+          observation.width,
+          observation.height,
+        );
+      },
+      active,
+    );
+  }
+
+  async computerDownloadTarget(
+    conversation: string,
+    target: string,
+    id: string,
+    observation: ComputerObservation,
+    elementId: string,
+    signal: AbortSignal,
+  ) {
+    const tab = this.computerTab(conversation, target, id);
+    if (tab.privateAuth)
+      throw new RuntimeError(
+        'PERMISSION_DENIED',
+        'Download private files yourself from the authenticated page.',
+      );
+    const revision = tab.documentId;
+    if (revision !== observation.revision || this.selected !== target || tab.computer?.user)
+      throw new RuntimeError(
+        'PERMISSION_DENIED',
+        'The download link belongs to an earlier observation.',
+      );
+    const described = await whenActive(
+      inspectPage(tab.view.webContents, { op: 'describe', documentId: revision, elementId }),
+      signal,
+    );
+    this.computerTab(conversation, target, id);
+    const href = described.element?.href;
+    if (
+      tab.documentId !== revision ||
+      this.selected !== target ||
+      !href ||
+      !webUrlSchema.safeParse(href).success
+    )
+      throw new RuntimeError(
+        'INVALID_ARGUMENT',
+        'The observed download link is no longer available.',
+      );
+    return href;
+  }
+
+  async computerUploadTarget(
+    conversation: string,
+    target: string,
+    id: string,
+    observation: ComputerObservation,
+    elementId: string,
+    signal: AbortSignal,
+  ) {
+    const tab = this.computerTab(conversation, target, id);
+    const revision = tab.documentId;
+    if (
+      tab.privateAuth ||
+      tab.computer?.user ||
+      this.selected !== target ||
+      revision !== observation.revision
+    )
+      throw new RuntimeError(
+        'PERMISSION_DENIED',
+        'Choose an upload form in the current public computer observation.',
+      );
+    const plan = await whenActive(
+      inspectPage(tab.view.webContents, { op: 'upload-target', documentId: revision, elementId }),
+      signal,
+    );
+    this.computerTab(conversation, target, id);
+    if (tab.documentId !== revision || this.selected !== target || !plan.action || !plan.field)
+      throw new RuntimeError(
+        'CAPABILITY_UNAVAILABLE',
+        'Only an observed same-origin, single-file HTTPS form is available for automated upload.',
+      );
+    return { url: publicWebUrl(plan.action).href, field: plan.field };
+  }
+
+  async execute(
+    request: BrowserRequest,
+    signal: AbortSignal,
+    lifecycle?: { approval(): void; reserve(fingerprint: string): Promise<boolean> },
+  ) {
     signal.throwIfAborted();
     if (!this.policy().enabled || !this.policy().aiBrowser)
       throw new BrowserError('UNAVAILABLE', 'AI browsing is disabled in Settings.');
@@ -762,6 +1369,7 @@ export class BrowserController {
       elementId?: string;
       delta?: number;
       query?: string;
+      action?: 'play' | 'stop';
       selection?: boolean;
       value?: string;
       fields?: { elementId: string; value: string }[];
@@ -779,6 +1387,15 @@ export class BrowserController {
       };
     };
     const owner = request.conversationId;
+    if (
+      request.op.startsWith('browser_') &&
+      request.op !== 'browser_get_tabs' &&
+      [...this.tabs.values()].some((tab) => tab.owner === owner && tab.computer?.user)
+    )
+      throw new BrowserError(
+        'TAB_UNAVAILABLE',
+        'The user currently controls the computer browser.',
+      );
     if (request.op === 'web_search' || request.op === 'web_fetch') {
       const searching = request.op === 'web_search';
       const url = searching ? browserSearchUrl(args.query!) : args.url!;
@@ -833,8 +1450,13 @@ export class BrowserController {
     if (request.op === 'browser_get_tabs')
       return output({
         tabs: [...this.tabs.values()]
-          .filter((tab) => tab.owner === owner && !tab.background)
-          .map((tab) => ({ tabId: tab.state.id, url: tab.state.url, title: tab.state.title })),
+          .filter((tab) => tab.owner === owner && !tab.background && !tab.privateAuth)
+          .map((tab) => ({
+            tabId: tab.state.id,
+            url: tab.state.url,
+            title: tab.state.title,
+            playingMedia: !!tab.state.playingMedia,
+          })),
       });
     if (request.op === 'browser_open') {
       if (!args.url) throw new BrowserError('INVALID_URL', 'Use a validated public URL.');
@@ -858,7 +1480,25 @@ export class BrowserController {
     const active = AbortSignal.any([signal, tab.lifetime.signal]);
     const work = tab.queue.then(async () => {
       active.throwIfAborted();
+      if (tab.computer)
+        throw new BrowserError(
+          'TAB_UNAVAILABLE',
+          'Use the tools for this active Computer Use session.',
+        );
       const contents = tab.view.webContents;
+      if (request.op === 'browser_media') {
+        if (args.action === 'stop') this.stopPlayback(tab);
+        else await this.playMedia(tab, active);
+        return output(
+          {
+            tabId: tab.state.id,
+            url: tab.state.url,
+            title: tab.state.title,
+            status: tab.state.playingMedia ? 'playing' : 'stopped',
+          },
+          tab,
+        );
+      }
       if (request.op === 'browser_switch_tab') {
         this.select(tab);
         return output({ tabId: tab.state.id });
@@ -972,7 +1612,14 @@ export class BrowserController {
           plan.action,
           [...fields].map(([key, value]) => `${key}: ${value}`).join('\n'),
           active,
+          lifecycle?.approval,
         );
+        snapshot();
+        if (!(await lifecycle?.reserve(digest)))
+          throw new BrowserError(
+            'DUPLICATE_DISPATCH',
+            'An earlier dispatch may already have taken effect. Check the website.',
+          );
         snapshot();
         const permit = {
           contentsId: contents.id,
@@ -1030,7 +1677,18 @@ export class BrowserController {
         tab.state.url,
         `${observed.element?.label || observed.element?.tag || 'Page control'}${args.value === undefined ? '' : `\nValue: ${args.value}`}`,
         active,
+        lifecycle?.approval,
       );
+      const digest = createHash('sha256')
+        .update(JSON.stringify([request.op, tab.state.url, observed.fingerprint, args.value]))
+        .digest('hex');
+      snapshot();
+      if (!(await lifecycle?.reserve(digest)))
+        throw new BrowserError(
+          'DUPLICATE_DISPATCH',
+          'An earlier dispatch may already have taken effect. Check the website.',
+        );
+      snapshot();
       await inspect(
         {
           ...action,
@@ -1052,6 +1710,7 @@ export class BrowserController {
     destination: string,
     detail: string,
     signal: AbortSignal,
+    pending?: () => void,
   ) {
     if (
       !this.window ||
@@ -1065,20 +1724,13 @@ export class BrowserController {
       );
     const documentId = tab.documentId;
     const deadline = AbortSignal.any([signal, AbortSignal.timeout(60_000)]);
+    pending?.();
     const decision = await whenActive(
-      dialog.showMessageBox(this.window, {
-        message: action,
-        detail: `${destination}\n\n${detail}`.slice(0, 8000),
-        type: 'question',
-        buttons: ['Deny', 'Approve once'],
-        cancelId: 0,
-        defaultId: 0,
-        signal: deadline,
-      }),
+      this.requestApproval(action, `${destination}\n\n${detail}`.slice(0, 8000), deadline),
       deadline,
     );
     deadline.throwIfAborted();
-    if (decision.response !== 1)
+    if (!decision)
       throw new BrowserError('APPROVAL_DENIED', 'The user did not approve this action.');
     if (
       this.conversationId !== tab.owner ||

@@ -1,6 +1,6 @@
 import { BadGatewayException, BadRequestException, Injectable } from '@nestjs/common';
 import { createHash } from 'node:crypto';
-import { modelCapabilitySchema, type DiscoveredModel } from '@aria/shared';
+import { modelCapabilitySchema, textPricingSchema, type DiscoveredModel } from '@aria/shared';
 import { documentedModel } from './openai-catalog';
 import { providerError } from '../ai/ai.service';
 
@@ -55,11 +55,12 @@ function describeModel(item: Record<string, unknown>, baseUrl: string): Discover
   });
   if (!capabilities) return documented ?? { id, capabilities: [], source: 'unknown' };
   const transport = item.transport;
+  const pricing = textPricingSchema.safeParse(item.textPricing);
   return {
-    ...documented,
     id,
     capabilities: [...new Set(capabilities)],
     source: 'provider',
+    ...(pricing.success && new URL(baseUrl).protocol === 'https:' && { textPricing: pricing.data }),
     ...(['realtime', 'speech-api', 'inline-png', 'base64-image'].includes(String(transport))
       ? { transport: transport as DiscoveredModel['transport'] }
       : {}),
@@ -75,7 +76,8 @@ function describeModel(item: Record<string, unknown>, baseUrl: string): Discover
       : {}),
     ...Object.fromEntries(
       ['contextTokens', 'inputCost', 'outputCost'].flatMap((key) =>
-        typeof item[key] === 'number' && Number.isFinite(item[key]) && item[key] >= 0
+        typeof item[key] === 'number' && Number.isFinite(item[key]) &&
+          (key === 'contextTokens' ? Number.isSafeInteger(item[key]) && item[key] > 0 : item[key] >= 0)
           ? [[key, item[key]]]
           : [],
       ),
@@ -85,24 +87,53 @@ function describeModel(item: Record<string, unknown>, baseUrl: string): Discover
 @Injectable()
 export class ProvidersService {
   private cache = new Map<string, { at: number; models: DiscoveredModel[] }>();
+  private readonly pending = new Map<string, {
+    controller: AbortController; result: Promise<DiscoveredModel[]>; waiters: number;
+  }>();
   async discover(
     config: Connection,
     refresh = false,
     signal?: AbortSignal,
   ): Promise<DiscoveredModel[]> {
+    signal?.throwIfAborted();
     if (config.provider !== 'openai') throw new BadRequestException('Select a supported provider.');
     if (!config.apiKey) throw new BadRequestException('Enter an API key before loading models.');
     const url = endpoint(config.baseUrl, 'models');
     const key = createHash('sha256').update(url).update('\0').update(config.apiKey).digest('hex');
     const cached = this.cache.get(key);
     if (!refresh && cached && Date.now() - cached.at < 300000) return cached.models;
+    let pending = this.pending.get(key);
+    if (!pending || pending.controller.signal.aborted) {
+      const controller = new AbortController();
+      const result = this.load(config, url, key, controller.signal).finally(() => {
+        if (this.pending.get(key)?.controller === controller) this.pending.delete(key);
+      });
+      pending = { controller, result, waiters: 0 };
+      this.pending.set(key, pending);
+    }
+    const active = pending;
+    active.waiters++;
+    let abort: (() => void) | undefined;
+    try {
+      if (!signal) return await active.result;
+      return await new Promise<DiscoveredModel[]>((resolve, reject) => {
+        abort = () => reject(signal.reason);
+        signal.addEventListener('abort', abort, { once: true });
+        active.result.then(resolve, reject);
+        if (signal.aborted) abort();
+      });
+    } finally {
+      if (abort) signal?.removeEventListener('abort', abort);
+      if (--active.waiters === 0 && this.pending.get(key) === active) active.controller.abort();
+    }
+  }
+
+  private async load(config: Connection, url: string, key: string, signal: AbortSignal) {
     try {
       const response = await fetch(url, {
         headers: { Authorization: `Bearer ${config.apiKey}` },
         redirect: 'error',
-        signal: signal
-          ? AbortSignal.any([signal, AbortSignal.timeout(15000)])
-          : AbortSignal.timeout(15000),
+        signal: AbortSignal.any([signal, AbortSignal.timeout(15000)]),
       });
       if (!response.ok) {
         await response.body?.cancel();
@@ -130,10 +161,11 @@ export class ProvidersService {
       }
       models.sort((a, b) => a.id.localeCompare(b.id));
       if (this.cache.size >= 20) this.cache.delete(this.cache.keys().next().value!);
+      signal.throwIfAborted();
       this.cache.set(key, { at: Date.now(), models });
       return models;
     } catch (error) {
-      this.cache.delete(key);
+      if (!signal.aborted) this.cache.delete(key);
       throw new BadGatewayException(providerError(error));
     }
   }

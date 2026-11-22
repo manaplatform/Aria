@@ -28,12 +28,30 @@ export class MediaService {
     ending?: Promise<void>;
     resolveEnd: () => void;
     finishing: boolean;
+    transfer: AbortController;
   };
   constructor(
     private readonly chat: ChatService,
     private readonly storage: MediaStorage,
     private readonly emitLive: (event: LiveEvent) => void,
   ) {}
+  authorizeCapability(request: {
+    voiceSessionId?: string;
+    conversationId: string;
+    assistantMessageId: string;
+  }) {
+    const active = this.live;
+    if (
+      active?.ready &&
+      !active.finishing &&
+      active.request.sessionId === request.voiceSessionId &&
+      active.request.conversationId === request.conversationId &&
+      active.request.assistantMessageId === request.assistantMessageId
+    )
+      return active.transfer.signal;
+    return undefined;
+  }
+
   assertIdle() {
     if (this.live) throw new Error('End Live Voice before continuing.');
   }
@@ -50,8 +68,10 @@ export class MediaService {
     const ending = new Promise<void>((resolve) => {
       resolveEnd = resolve;
     });
+    const transfer = new AbortController();
     const live = {
       request,
+      transfer,
       ws,
       ready: false,
       chunks: [] as Buffer[],
@@ -64,7 +84,6 @@ export class MediaService {
     const envelope = { sessionId: request.sessionId, conversationId: request.conversationId };
     let transcriptSize = 0;
     let transcriptFragments = 0;
-    const transfer = new AbortController();
     let conductorEvents = Promise.resolve();
     const artifacts = new Map<string, string>();
     await new Promise<void>((resolve, reject) => {

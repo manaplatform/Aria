@@ -24,6 +24,13 @@ export default defineConfig(({ command }) => {
     base: './',
     // AudioWorklet modules must remain same-origin files under the renderer CSP.
     build: {
+      target: 'esnext',
+      rollupOptions: {
+        input: {
+          main: fileURLToPath(new URL('./index.html', import.meta.url)),
+          extraction: fileURLToPath(new URL('./extraction.html', import.meta.url)),
+        },
+      },
       assetsInlineLimit: (file) => (file.endsWith('microphone-worklet.js') ? false : undefined),
     },
     resolve: { alias: { '@': fileURLToPath(new URL('./src', import.meta.url)) } },

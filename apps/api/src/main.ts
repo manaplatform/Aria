@@ -7,6 +7,7 @@ import type { NestExpressApplication } from '@nestjs/platform-express';
 import { BrowserPortClient, type BrowserPort } from './web/browser-port.client';
 import { WebService } from './web/web.service';
 import { AppModule } from './app.module';
+import { CapabilityHost } from './conductor/capability-host';
 import { ModelRegistry } from './providers/model-registry.service';
 
 if (process.env.ARIA_MANAGED !== '1')
@@ -53,11 +54,18 @@ if (require.main === module) {
             app.get(ModelRegistry).install(data.registry);
             if ('web' in data) app.get(WebService).install(data.web);
             if (
-              ports?.length === 1 &&
+              ports?.length &&
               'browserGeneration' in data &&
               typeof data.browserGeneration === 'string'
             )
               app.get(BrowserPortClient).install(ports[0], data.browserGeneration);
+            if ('tools' in data) {
+              const index =
+                'browserGeneration' in data && typeof data.browserGeneration === 'string' ? 1 : 0;
+              const port = ports?.[index];
+              if (!port) throw new Error('Missing desktop capability port.');
+              app.get(CapabilityHost).install(data.tools, port);
+            }
             resolve();
           } catch {
             reject(new Error('Invalid registry configuration.'));

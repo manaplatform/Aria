@@ -11,6 +11,8 @@ export interface FormPermit {
 export class BrowserSessionPolicy {
   readonly permissions = new Map<string, { origin: string; permission: string }>();
   permit?: FormPermit;
+  private offline = false;
+  private authenticationOrigin?: string;
 
   constructor(
     readonly session: Session,
@@ -28,6 +30,23 @@ export class BrowserSessionPolicy {
     });
     await this.session.closeAllConnections();
     this.session.webRequest.onBeforeRequest((details, callback) => {
+      if (this.authenticationOrigin) {
+        try {
+          const origin = publicWebUrl(details.url).origin;
+          callback({
+            cancel:
+              origin !== this.authenticationOrigin ||
+              !['GET', 'HEAD', 'POST'].includes(details.method),
+          });
+        } catch {
+          callback({ cancel: true });
+        }
+        return;
+      }
+      if (this.offline) {
+        callback({ cancel: true });
+        return;
+      }
       try {
         if (details.url === 'about:blank') {
           callback({ cancel: false });
@@ -66,14 +85,17 @@ export class BrowserSessionPolicy {
       this.session.webRequest.onBeforeSendHeaders((details, callback) => {
         const headers = { ...details.requestHeaders };
         for (const key of Object.keys(headers))
-          if (['authorization', 'proxy-authorization', 'cookie'].includes(key.toLowerCase()))
+          if (
+            ['authorization', 'proxy-authorization'].includes(key.toLowerCase()) ||
+            (key.toLowerCase() === 'cookie' && !this.authenticationOrigin)
+          )
             delete headers[key];
         callback({ requestHeaders: headers });
       });
       this.session.webRequest.onHeadersReceived((details, callback) => {
         const headers = { ...details.responseHeaders };
         for (const key of Object.keys(headers))
-          if (key.toLowerCase() === 'set-cookie') delete headers[key];
+          if (key.toLowerCase() === 'set-cookie' && !this.authenticationOrigin) delete headers[key];
         callback({ responseHeaders: headers });
       });
     }
@@ -151,6 +173,20 @@ export class BrowserSessionPolicy {
         title: 'Save website download',
       });
     });
+  }
+
+  async quarantine() {
+    this.authenticationOrigin = undefined;
+    this.offline = true;
+    this.permit = undefined;
+    await this.session.closeAllConnections();
+  }
+
+  authenticate(origin: string) {
+    const target = publicWebUrl(origin);
+    if (!this.ai || target.protocol !== 'https:')
+      throw new Error('Private authentication requires a public HTTPS origin.');
+    this.authenticationOrigin = target.origin;
   }
 
   private key(contents: WebContents, origin: string, permission: string) {

@@ -25,6 +25,7 @@ const labels: Record<ModelCapability, string> = {
   chat: 'Text streaming',
   tools: 'Function calling',
   vision: 'Vision',
+  embeddings: 'Embeddings',
   image: 'Image generation',
   'image-edit': 'Image editing',
   speech: 'Speech',
@@ -33,6 +34,15 @@ const labels: Record<ModelCapability, string> = {
   'web-search': 'Web Search',
 };
 const voices = registryPolicySchema.shape.live.unwrap().shape.voice.options;
+
+function includeDiscoveredEmbeddings(
+  model: ConnectionInput['models'][number],
+  descriptor?: DiscoveredModel,
+): ConnectionInput['models'][number] {
+  if (!descriptor?.capabilities.includes('embeddings') || model.declared.includes('embeddings'))
+    return model;
+  return { ...model, declared: [...model.declared, 'embeddings'] };
+}
 
 export function ModelSettings() {
   const { settings, loading, error } = useProviderStore();
@@ -118,11 +128,26 @@ function RegistryEditor({ settings }: { settings: RegistrySettings }) {
     }));
     try {
       const models = await desktop().discoverModels(connection);
-      if (catalogRevisions.current.get(connection.id) === revision)
+      if (catalogRevisions.current.get(connection.id) === revision) {
+        const descriptors = new Map(models.map((model) => [model.id, model]));
+        setDraft((current) => ({
+          ...current,
+          connections: current.connections.map((item) =>
+            item.id === connection.id
+              ? {
+                  ...item,
+                  models: item.models.map((model) =>
+                    includeDiscoveredEmbeddings(model, descriptors.get(model.id)),
+                  ),
+                }
+              : item,
+          ),
+        }));
         setCatalogs((current) => ({
           ...current,
           [connection.id]: { ...current[connection.id], models, busy: false },
         }));
+      }
     } catch (error) {
       if (catalogRevisions.current.get(connection.id) === revision)
         setCatalogs((current) => ({ ...current, [connection.id]: { error: errorMessage(error) } }));
@@ -186,14 +211,13 @@ function RegistryEditor({ settings }: { settings: RegistrySettings }) {
       .map((model) => {
         const descriptor = catalogs[connection.id]?.models?.find((item) => item.id === model.id);
         const capabilities =
-          descriptor?.source === 'unknown' ? model.declared : (descriptor?.capabilities ?? []);
+          descriptor?.source === 'provider' ? descriptor.capabilities : model.declared;
         return {
           value: modelReference(connection.id, model.id),
           label: `${connection.name} · ${model.id}`,
           primary:
-            capabilities.includes('chat') &&
-            capabilities.includes('tools') &&
-            (descriptor?.source !== 'unknown' || isVerified(connection, model.id)),
+            (descriptor?.source === 'provider' && capabilities.includes('chat') &&
+              capabilities.includes('tools')) || isVerified(connection, model.id),
           voice: capabilities.includes('live'),
         };
       }),
@@ -345,6 +369,23 @@ function RegistryEditor({ settings }: { settings: RegistrySettings }) {
             <option value="quality">Higher quality</option>
           </select>
         </Field>
+        <Field label="Spending cap per chat turn (USD)">
+          <input
+            type="number"
+            min="0.01"
+            max="1000"
+            step="0.01"
+            placeholder="Off"
+            disabled={busy}
+            value={draft.spendingLimitUsdMicros === undefined ? '' : draft.spendingLimitUsdMicros / 1_000_000}
+            onChange={(event) => setDraft({
+              ...draft,
+              spendingLimitUsdMicros: event.target.value
+                ? Math.round(Number(event.target.value) * 1_000_000)
+                : undefined,
+            })}
+          />
+        </Field>
       </div>
       <label className="registry-checkbox">
         <input
@@ -459,7 +500,6 @@ function ConnectionCard({
       ...connection,
       models: [...connection.models.filter((row) => row.id !== model.id), model],
     });
-  const official = connection.baseUrl.replace(/\/+$/, '') === officialOpenAI;
   return (
     <div className="registry-connection">
       <div className="registry-connection-heading">
@@ -565,10 +605,11 @@ function ConnectionCard({
             declared: [],
           };
           const discovered = descriptors.get(id);
-          const unknown = discovered?.source === 'unknown';
-          const unsupported = discovered && !unknown && !discovered.capabilities.length;
+          const unknown = discovered && discovered.source !== 'provider';
+          const unsupported = discovered && discovered.source !== 'unknown' && !discovered.capabilities.length;
           const missing = Boolean(catalog.models && !discovered);
-          const capabilities = unknown ? model.declared : (discovered?.capabilities ?? []);
+          const capabilities = model.declared.length && unknown
+            ? model.declared : (discovered?.capabilities ?? []);
           return (
             <li key={id}>
               <div className="registry-model-row">
@@ -604,11 +645,16 @@ function ConnectionCard({
                     checked={model.enabled}
                     disabled={disabled || (!model.enabled && !discovered)}
                     onChange={(event) =>
-                      setModel({
-                        ...model,
-                        enabled: event.target.checked,
-                        delegate: event.target.checked,
-                      })
+                      setModel(
+                        includeDiscoveredEmbeddings(
+                          {
+                            ...model,
+                            enabled: event.target.checked,
+                            delegate: event.target.checked,
+                          },
+                          discovered,
+                        ),
+                      )
                     }
                   />{' '}
                   Enabled
@@ -623,7 +669,7 @@ function ConnectionCard({
                   />{' '}
                   Delegation
                 </label>
-                {unknown && (
+                {unknown && !unsupported && (
                   <Button
                     type="button"
                     variant="ghost"
@@ -635,12 +681,11 @@ function ConnectionCard({
                   </Button>
                 )}
               </div>
-              {expanded === id && unknown && (
+              {expanded === id && unknown && !unsupported && (
                 <div className="registry-declarations">
                   {modelCapabilities
                     .filter(
-                      (capability) =>
-                        capability !== 'web-search' && (!official || capability !== 'live'),
+                      (capability) => capability !== 'web-search',
                     )
                     .map((capability) => (
                       <label key={capability} className="registry-checkbox">
@@ -660,7 +705,8 @@ function ConnectionCard({
                         {labels[capability]}
                       </label>
                     ))}
-                  {model.declared.includes('chat') && model.declared.includes('tools') && (
+                  {((model.declared.includes('chat') && model.declared.includes('tools')) ||
+                    (discovered?.source === 'documentation' && discovered.capabilities.includes('chat'))) && (
                     <Button
                       type="button"
                       size="sm"
@@ -670,6 +716,18 @@ function ConnectionCard({
                     >
                       {verified(id) ? 'Verify again' : 'Verify for primary'}
                     </Button>
+                  )}
+                  {model.declared.some((capability) => ['speech', 'image', 'image-edit'].includes(capability)) && (
+                    <Field label="Media API transport">
+                      <select value={model.transport ?? ''} disabled={disabled} onChange={(event) =>
+                        setModel({ ...model, transport: event.target.value
+                          ? event.target.value as typeof model.transport : undefined })}>
+                        <option value="">Standard API</option>
+                        {model.declared.includes('speech') && <option value="realtime">Realtime speech</option>}
+                        {model.declared.some((capability) => capability === 'image' || capability === 'image-edit') &&
+                          <option value="inline-png">Inline PNG images</option>}
+                      </select>
+                    </Field>
                   )}
                   {verified(id) && <span className="muted">Function calling verified</span>}
                 </div>

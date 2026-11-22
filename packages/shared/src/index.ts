@@ -1,6 +1,24 @@
+import type {
+  DocumentEvidence,
+  ExecutionHistoryEntry,
+  KnowledgeCollection,
+  OpenAIRuntimeFeature,
+  RuntimeSettings,
+} from './execution-runtime.js';
+import type { SkillRef, SkillPreview, ToolDiscovery, ToolSettings } from './capabilities.js';
+import type { ProgramSettings } from './programmatic.js';
+export * from './capabilities.js';
+export * from './programmatic.js';
 import type { BrowserCommand, BrowserLayout, BrowserState } from './browser.js';
+import type {
+  ComputerAction,
+  ComputerSessionSummary,
+  LocalDesktopAccess,
+  ComputerSupervision,
+} from './computer-use.js';
 import type { WebSettings, WebSettingsInput } from './web.js';
 export * from './browser.js';
+export * from './computer-use.js';
 export * from './web.js';
 export * from './public-address.js';
 import type {
@@ -14,6 +32,7 @@ import type {
   ConductorAttempt,
   ConductorEvent,
   ConductorRunInfo,
+  ConductorSource,
 } from './conductor.js';
 export * from './model-registry.js';
 export * from './conductor.js';
@@ -241,6 +260,7 @@ export interface ChatMessage {
   error?: string;
   operation?: OperationInput;
   activity?: ConductorActivity[];
+  citations?: { sources: ConductorSource[]; evidence: DocumentEvidence[] };
   attempts?: ConductorAttempt[];
   run?: ConductorRunInfo;
   retryConfirmed?: boolean;
@@ -265,7 +285,9 @@ export interface ChatRequest {
   assistantMessageId: string;
   messages: { role: 'user' | 'assistant'; content: string }[];
   attachmentIds?: string[];
+  availableAssets?: MediaAsset[];
   expectedRevision?: string;
+  programPrivateHistory?: boolean;
 }
 export type ChatEvent = {
   requestId: string;
@@ -299,6 +321,7 @@ export interface MediaAsset {
   name: string;
   mimeType: string;
   size: number;
+  managed?: boolean;
 }
 export interface OperationInput {
   mode: Exclude<GenerationMode, 'live'>;
@@ -351,8 +374,24 @@ export interface HealthResult {
   message: string;
   checkedAt: string;
 }
+export type UpdateChannel = 'stable' | 'beta';
+export type UpdateCommand =
+  | { action: 'channel'; channel: UpdateChannel }
+  | { action: 'check' | 'download' | 'install' | 'open-release' };
+export interface UpdateState {
+  version: string;
+  channel: UpdateChannel;
+  status: 'unsupported' | 'idle' | 'checking' | 'current' | 'available' | 'downloading' | 'ready' | 'installing' | 'error';
+  mode: 'install' | 'manual';
+  available?: string;
+  progress?: number;
+  error?: string;
+}
 export interface DesktopBridge {
   platform: string;
+  updateState(): Promise<UpdateState>;
+  updateCommand(command: UpdateCommand): Promise<void>;
+  onUpdateState(callback: (state: UpdateState) => void): () => void;
   onBeforeClose(callback: () => Promise<void>): () => void;
   load(): Promise<InitialState>;
   save(data: LocalData): Promise<void>;
@@ -367,9 +406,55 @@ export interface DesktopBridge {
   browserState(): Promise<BrowserState>;
   browserCommand(command: BrowserCommand): Promise<string | void>;
   browserLayout(layout: BrowserLayout): Promise<void>;
+  computerSessions(conversationId: string): Promise<ComputerSessionSummary[]>;
+  computerPreview(conversationId: string, sessionId: string): Promise<string | undefined>;
+  probeVirtualComputer(): Promise<void>;
+  localComputerSupported(): Promise<boolean>;
+  selectLocalComputer(conversationId: string | null, target?: 'window' | 'screen', standing?: boolean): Promise<boolean>;
+  localDesktopAccess(requestPermission?: boolean): Promise<LocalDesktopAccess>;
+  revokeLocalComputer(): Promise<void>;
+  superviseComputer(conversationId: string, command: ComputerSupervision): Promise<void>;
+  sendComputerInput(
+    conversationId: string,
+    sessionId: string,
+    action: ComputerAction,
+  ): Promise<void>;
+  onComputerSession(callback: (state: ComputerSessionSummary) => void): () => void;
   onBrowserState(callback: (state: BrowserState) => void): () => void;
   webSettings(): Promise<WebSettings>;
   saveWebSettings(input: WebSettingsInput): Promise<WebSettings>;
+  toolSettings(): Promise<ToolSettings>;
+  executionHistory(): Promise<ExecutionHistoryEntry[]>;
+  runtimeSettings(): Promise<RuntimeSettings>;
+  saveRuntimeSettings(settings: RuntimeSettings): Promise<RuntimeSettings>;
+  saveEmbeddingTarget(target: RuntimeSettings['embeddingTarget']): Promise<RuntimeSettings>;
+  nativeRuntimeModes(): Promise<OpenAIRuntimeFeature[]>;
+  setNativeRuntime(mode: OpenAIRuntimeFeature, enabled: boolean): Promise<OpenAIRuntimeFeature[]>;
+  probeRuntime(): Promise<Record<string, unknown>>;
+  localEmbeddings(): Promise<boolean>;
+  installLocalEmbeddings(): Promise<boolean>;
+  removeLocalEmbeddings(): Promise<void>;
+  knowledgeCollections(): Promise<KnowledgeCollection[]>;
+  manageKnowledge(
+    input:
+      | { operation: 'create'; name: string }
+      | { operation: 'enable'; id: string; enabled: boolean }
+      | { operation: 'add' | 'remove'; id: string }
+      | { operation: 'remove-file'; id: string; fileId: string },
+  ): Promise<KnowledgeCollection[]>;
+  previewDocument(conversationId: string, id: string): Promise<string>;
+  removeArtifact(conversationId: string, id: string): Promise<void>;
+  documentEvidence(conversationId: string, id: string): Promise<DocumentEvidence>;
+  setToolEnabled(id: string, enabled: boolean): Promise<ToolSettings>;
+  setToolDiscovery(mode: ToolDiscovery): Promise<ToolSettings>;
+  setProgramSettings(settings: ProgramSettings): Promise<ToolSettings>;
+  superviseProgram(requestId: string, conversationId: string, id: string, pause: boolean): Promise<void>;
+  inspectProgramResult(conversationId: string, id: string): Promise<string>;
+  recoverStoredResponse(conversationId: string, messageId: string, requestId: string):
+    Promise<{ content: string; privateContent: boolean }>;
+  previewSkill(kind: 'directory' | 'zip'): Promise<SkillPreview | null>;
+  approveSkill(token: string): Promise<ToolSettings>;
+  manageSkill(skill: SkillRef, action: 'enable' | 'disable' | 'remove'): Promise<ToolSettings>;
   chatStatus(): Promise<ChatServiceStatus>;
   onChatStatus(callback: (status: ChatServiceStatus) => void): () => void;
   restartChatService(): Promise<void>;
@@ -378,7 +463,9 @@ export interface DesktopBridge {
   discoverModels(connection: ConnectionInput): Promise<DiscoveredModel[]>;
   verifyModel(connection: ConnectionInput, model: string): Promise<void>;
   importRegistryEnvironment(): Promise<RegistrySettings>;
+  importDroppedFiles(files: File[]): Promise<MediaAsset[]>;
   chooseMedia(kind: 'image' | 'audio' | 'text' | 'any'): Promise<MediaAsset[]>;
+  captureScreen(): Promise<MediaAsset[]>;
   exportMedia(id: string): Promise<void>;
   startLive(request: LiveRequest): Promise<void>;
   sendLiveAudio(sessionId: string, audio: Uint8Array): void;
@@ -389,3 +476,6 @@ export interface DesktopBridge {
   cancelChat(requestId: string): Promise<void>;
   onChatEvent(callback: (event: ChatEvent) => void): () => void;
 }
+
+export * from './execution-runtime.js';
+export * from './reply-visual.js';

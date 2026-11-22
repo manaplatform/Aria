@@ -60,11 +60,15 @@ it('resolves speech transport and voices for documented audio variants and snaps
   for (const model of models.values()) expect(model.voices?.length).toBeGreaterThan(0);
 });
 
-it('identifies documented embedding and moderation models as having no supported Aria operations', async () => {
+it('recognizes documented embeddings and keeps moderation models unavailable', async () => {
   const ids = ['text-embedding-3-large', 'omni-moderation-latest'];
   const models = await discover(ids.map((id) => ({ id })));
-  for (const id of ids)
-    expect(models.get(id)).toMatchObject({ source: 'documentation', capabilities: [] });
+  expect(models.get('text-embedding-3-large')).toMatchObject({
+    source: 'documentation', capabilities: ['embeddings'],
+  });
+  expect(models.get('omni-moderation-latest')).toMatchObject({
+    source: 'documentation', capabilities: [],
+  });
 });
 
 it('keeps undocumented model IDs unknown instead of inferring capabilities from their spelling', async () => {
@@ -79,7 +83,7 @@ it('requires provider evidence for compatible endpoints even when they reuse an 
   expect(models.get(id)).toEqual({ id, source: 'unknown', capabilities: [] });
 });
 
-it('keeps provider capabilities authoritative while filling omitted protocol metadata from documentation', async () => {
+it('keeps provider capabilities authoritative without inferring omitted transports', async () => {
   const models = await discover([
     { id: 'gpt-image-2.6-sunburst', capabilities: ['image'] },
     { id: 'gpt-realtime-2.1', capabilities: ['speech'], voices: ['cedar'] },
@@ -88,12 +92,10 @@ it('keeps provider capabilities authoritative while filling omitted protocol met
   expect(models.get('gpt-image-2.6-sunburst')).toMatchObject({
     source: 'provider',
     capabilities: ['image'],
-    transport: 'inline-png',
   });
   expect(models.get('gpt-realtime-2.1')).toMatchObject({
     source: 'provider',
     capabilities: ['speech'],
-    transport: 'realtime',
     voices: ['cedar'],
   });
   expect(models.get('gpt-5.6-luna')).toMatchObject({
@@ -101,6 +103,8 @@ it('keeps provider capabilities authoritative while filling omitted protocol met
     capabilities: ['chat'],
     contextTokens: 4096,
   });
+  expect(models.get('gpt-image-2.6-sunburst')?.transport).toBeUndefined();
+  expect(models.get('gpt-realtime-2.1')?.transport).toBeUndefined();
 });
 
 it('honors an explicitly empty provider capability list', async () => {

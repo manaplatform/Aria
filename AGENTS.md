@@ -115,6 +115,7 @@ When implementing AI features:
 - Model selection belongs in Settings. A separate routing model, keyword-based intent classifier, static task-to-model mapping, provider preference order, or fallback provider/model violates this architecture.
 - Return actionable errors for configuration, capability, and invocation failures. An explicit retry uses the same authorized configuration.
 - Application code validates every model request and enforces permissions, input provenance, dependency rules, cancellation, deduplication, and resource limits. Provider and tool output is untrusted. Show concise decision summaries and keep hidden reasoning and credentials private.
+- Start ordinary chat with the selected primary. Investigation, planning, verification, discovery, and program execution are optional decisions driven by the task and observed results. Spend inference on semantic decisions. Use deterministic code for validation, scheduling, accounting, and result projection.
 
 ## Native web and browser
 
@@ -124,3 +125,45 @@ When implementing AI features:
 - Require trusted user authorization for consequential browser actions. Apply public-network policy to page retrieval and Chromium egress. Keep personal sessions and credentials outside AI tool access.
 - Preserve conversation and settings data, and verify actual built macOS and Windows behavior when changing browser or process boundaries.
 - Update architecture, permissions, and test documentation when these boundaries change. Preserve third-party notices and add the standard MIT license and package metadata only after confirming authority to license the first-party work.
+
+## Conductor tools and skills
+
+- Conductor is the central orchestration authority. The configured primary chat model decides whether to answer directly, discover a tool, load a skill, invoke an authorized capability, or ask the user for information.
+- Register every tool with the shared registry and execution lifecycle. Declare its schema, permissions, provenance, side effects, dependencies, supported modes, and capability requirements. Add integration tests for its normal entry point and permission enforcement.
+- Keep Tool Search optional and model-driven. Load tool definitions, skill bodies, and skill resources progressively. Ordinary chat must work without tool invocation or project selection.
+- Keep semantic selection in the model. Hardcoded intent routing, model-name rules in the execution loop, and silent provider, model, or tool substitutions are prohibited.
+- Establish provider support from authenticated and validated capability evidence, explicit configuration, or a supported probe. Handle provider-specific protocol details in adapters.
+- Enforce authorization again at dispatch. Model decisions, tool outputs, and skill instructions grant no permissions. Keep approvals, scoped credentials, and dispatch protection in the trusted runtime.
+- Build managed chat context from saved conversation records. Carry private provenance into direct and nested execution. Keep evidence receipts and published artifacts independent of activity presentation limits.
+
+## Conductor execution and knowledge
+
+- Route execution, retrieval, skill scripts, and file publication through the shared registry and Conductor lifecycle. The configured primary selects operations and continues from observed outcomes.
+- Execute Shell and skill scripts only in an authorized isolation profile. Report the selected backend and its verified limits. Keep private files and file-derived content behind destination-specific approval at transfer.
+- Scope documents, evidence, workspaces, and artifacts to their verified owners. Preserve source/version provenance, and publish artifacts after format, existence, and readability checks.
+- Use dispatch reservations, progress checks, and bounded continuations. Recover interrupted work without replaying uncertain effects. Keep ordinary chat usable when execution and retrieval backends are unavailable.
+- Keep optional coding engines behind the same registration contract. Native runtime features must work independently of any external coding engine.
+
+## Conductor Computer Use
+
+- Register optional Computer Use operations in the shared Tool Registry and execution lifecycle. Keep semantic decisions with the configured primary. Let Browser, Web Search, Shell, File Search, and Skills complement graphical interaction. Ordinary chat works without a project, a computer session, or a required observation loop.
+- Advertise only verified environment actions and provider transports. Require explicit environment and mode selection. Keep protocol details inside provider adapters and return actionable errors when either capability is unavailable.
+- Use Electron main and the existing scoped port, authorization checks, and dispatch journal. Treat interface content and artifacts as untrusted. Bind approvals and coordinates to the current target, action, and observation. Fence input on cancellation, scope changes, user takeover, and recovery.
+- Keep local desktop off until the user approves a window or display. Use native helpers scoped to that target and keep revocable grants bound to the approved primary. Keep authentication private and hold computer scripts in isolated runtimes behind the same action and transfer boundary.
+- Verify observable postconditions before reporting consequential success. Treat interrupted effects as uncertain and inspect the target before retrying.
+
+## Conductor Programmatic Tool Calling
+
+- The configured primary decides when ordinary replies, direct calls, parallel calls, or programs fit the task. Keep all dispatch in Conductor and the shared registry. Ordinary chat starts independently of program runtime availability.
+- Advertise only verified backends and registered caller modes. Revalidate the descriptor, arguments, provenance, ownership, active policy, and session immediately before dispatch. Keep sensitive or consequential effects direct-only unless the trusted runtime can suspend and authorize the exact operation.
+- Execute generated code and executable skill resources inside a verified isolation boundary. Programs receive only scoped bindings, consume the parent budgets, and cannot expand permissions or launch nested programs.
+- Verify program results, evidence, and artifact references against trusted receipts. Keep program fingerprints, hidden provider state, and credentials out of renderer events. Journal reservations and outcomes and fence interrupted work before considering any retry.
+- Preserve provider protocol semantics in the adapter. Select the exact verified model and backend. Keep semantic routing model-driven and reject unsupported capabilities explicitly.
+- Charge nested calls and continuations to the same turn. Reserve before sending paid or provider-executed work. Use versioned results and observed changes to detect progress. After interruption, use authoritative receipts to reconcile an effect before admitting another attempt.
+- Extend the existing registry, scheduler, scoped ports, and desktop journal before introducing another runtime contract. Test new boundaries through ordinary chat and the relevant built desktop, and record backend-specific verification.
+
+## Desktop releases
+
+- Change the root `package.json` to set the application SemVer. Keep calendar release tags separate from app versions. Release Creator reserves an annotated UTC tag at the exact commit it builds and reuses it on retry.
+- Keep platform builds, signatures, notices, verification, evidence, and release assets in the release pipeline. Production publication requires all required packages and a verified draft. Never rewrite an existing release tag.
+- Keep production publishing and signing on protected default-branch environments. Windows releases use Aria’s self-signed code-signing certificate and documented managed trust. Publish only the public certificate. Use preview, fixture tests, and Actions verification artifacts to test changes. See [release setup and recovery](docs/RELEASING.md).

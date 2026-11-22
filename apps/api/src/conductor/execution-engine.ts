@@ -1,154 +1,91 @@
-import { createHash } from 'node:crypto';
-import { z } from 'zod';
-import { HttpException } from '@nestjs/common';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   conductorLimits,
-  localWebToolIds,
-  researchToolArgs,
-  type ResearchToolId,
   type ArtifactReference,
+  type ChatRequest,
   type ConductorActivity,
   type ConductorEvent,
   type ExecutionStep,
+  type ToolProblem,
 } from '@aria/shared';
 import { providerError } from '../ai/ai.service';
-import { type ModelRegistry, type ResolvedModel } from '../providers/model-registry.service';
-import { RunError, type RunAssets, type RunAttachment } from './run-assets';
-import type { ResearchRun } from '../web/web.service';
-import { modelOutputs, toolOutputs, type StepValue, type ToolRegistry } from './tool-registry';
+import type { ResolvedModel } from '../providers/model-registry.service';
+import { ToolError } from './capability-host';
+import { RunError, type RunAssets } from './run-assets';
+import {
+  type StepValue,
+  type ToolContext,
+  type ToolDescriptor,
+  type ToolRegistry,
+} from './tool-registry';
 
-type Registry = Awaited<ReturnType<ModelRegistry['resolve']>>;
-type Outcome = StepValue & {
+export type Outcome = StepValue & {
+  id: string;
   status: 'completed' | 'failed' | 'blocked' | 'cancelled';
-  error?: string;
+  problem?: ToolProblem;
   artifact?: ArtifactReference;
 };
-type Planned = {
-  step: ExecutionStep;
-  model?: ResolvedModel;
-  attachmentDerived: boolean;
-  startedAt?: number;
-  researchOp?: ResearchToolId;
+
+export type Invocation = {
+  descriptor: ToolDescriptor;
+  callId: string;
+  input: unknown;
+  program?: { id: string; backend: 'managed' | 'openai-responses'; revision: string; signal: AbortSignal };
 };
-type Capability = ExecutionStep['capability'];
+
+function canonical(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
+  if (value && typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonical(record[key])}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
+
+const transientResultKeys = new Set([
+  'stepId', 'attemptId', 'callId', 'sourceId', 'resultId', 'resultRef', 'observationId', 'retrievedAt',
+  'documentId', 'elementId', 'timestamp', 'durationMs', 'startedAt', 'finishedAt',
+]);
+
+function stableResult(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stableResult);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.entries(value)
+    .filter(([key]) => !transientResultKeys.has(key))
+    .map(([key, item]) => [key, stableResult(item)]));
+}
 
 export class ExecutionEngine {
-  private readonly planned = new Map<string, Planned>();
   private readonly results = new Map<string, Outcome>();
+  private readonly corrected = new Set<string>();
+  private readonly recoverable = new Map<string, string>();
+  private readonly restricted = new Set<string>();
   private readonly dispatched = new Set<string>();
-  private readonly failedCapabilities = new Set<Capability>();
-  private searches = 0;
-  private fetches = 0;
-  private screenshots = 0;
-  private receivedAttachmentContent = false;
+  private readonly uncertainCapabilities = new Set<string>();
+  private readonly counters = { searches: 0, fetches: 0, screenshots: 0 };
+  directToolCalls = 0;
+  programChildCalls = 0;
   billableChildStarted = false;
-  unavailable = false;
-  rejection?: string;
+  partial = false;
+  progress = 0;
+  private readonly evidence = new Set<string>();
 
   constructor(
-    private readonly id: string,
-    private readonly registry: Registry,
-    private readonly attachments: Map<string, RunAttachment>,
+    private readonly request: ChatRequest,
+    readonly context: ToolContext,
     private readonly assets: RunAssets,
     private readonly tools: ToolRegistry,
     private readonly emit: (event: ConductorEvent) => void,
     private readonly signal: AbortSignal,
-    private readonly research: ResearchRun,
+    private readonly voiceSessionId?: string,
   ) {}
 
-  private eligible(model: ResolvedModel, capability: Capability) {
-    return model.delegate && model.capabilities.some((value) => value === capability);
-  }
-
-  canRun(capability: Capability) {
-    if (capability === 'create-file') return true;
-    if (capability === 'read-file')
-      return [...this.attachments.values()].some((file) => file.mimeType === 'text/plain');
-    if (capability === 'web-search' || localWebToolIds.some((id) => id === capability))
-      return this.research.native;
-    return [...this.registry.models.values()].some((model) => this.eligible(model, capability));
-  }
-
-  private researchDescriptors() {
-    if (!this.research.native) return [];
-    return (Object.keys(researchToolArgs) as ResearchToolId[]).map((op) => ({
-      capability: (op === 'web_search' ? 'web-search' : op) as Capability,
-      output: op === 'browser_screenshot' ? 'image' : op === 'web_read' ? 'text' : 'data',
-      target: { kind: 'tool', tool: op, model: null },
-      args: z.toJSONSchema(researchToolArgs[op], { unrepresentable: 'any' }),
-      description:
-        op === 'web_search'
-          ? 'Search the public web in Aria’s browser using a query. No URL is required.'
-          : op === 'web_fetch'
-            ? 'Read a page in Aria’s browser using a search result sourceId or a URL supplied by the user.'
-            : undefined,
-      authorization: ['browser_click', 'browser_type', 'browser_submit'].includes(op)
-        ? 'approval when required'
-        : 'user settings',
-    }));
-  }
-
-  descriptors() {
-    const models = [...this.registry.models.values()].filter((model) => model.delegate);
-    const delegates = models.flatMap((model) => {
-      const capabilities = model.capabilities.filter((capability) =>
-        Object.hasOwn(modelOutputs, capability),
-      );
-      return capabilities.length
-        ? [
-            {
-              name: model.id,
-              connection: model.connection.name,
-              operations: capabilities.map((capability) => ({
-                capability,
-                output: modelOutputs[capability as keyof typeof modelOutputs],
-                target: { kind: 'model', model: model.ref },
-              })),
-              contextTokens: model.contextTokens,
-              inputCost: model.inputCost,
-              outputCost: model.outputCost,
-              attachmentTransfer:
-                model.connection.id === this.registry.primary.connection.id ||
-                this.registry.config.crossConnectionAttachments,
-            },
-          ]
-        : [];
-    });
-    const research = this.researchDescriptors();
-    return research.length
-      ? [...delegates, { name: 'Web & Browser', operations: research }]
-      : delegates;
-  }
-
-  get webError() {
-    for (const [id, result] of this.results) {
-      if (this.planned.get(id)?.researchOp && result.status === 'failed') return result.error;
-    }
-  }
-
-  get requiresSettings() {
-    return this.failedCapabilities.size > 0;
-  }
-
-  private rejectTarget(capability: Capability) {
-    // Validation has not dispatched anything. Let the primary correct its choice
-    // when another authorized operation exists; invocation failures stay blocked.
-    if (this.canRun(capability))
-      throw new RunError(
-        `The requested target does not provide ${capability}. No operation started. Choose a listed ${capability} operation and copy its exact target and output.`,
-      );
-    this.failedCapabilities.add(capability);
-    throw new RunError(
-      'The selected model is unavailable for this capability. Check AI Models in Settings.',
-    );
-  }
-
   get failed() {
-    return (
-      this.unavailable ||
-      Boolean(this.rejection) ||
-      this.failedCapabilities.size > 0 ||
-      [...this.results.values()].some((result) => result.status !== 'completed')
+    return [...this.results.values()].some(
+      (result) => result.status !== 'completed' && !this.corrected.has(result.id),
     );
   }
 
@@ -156,247 +93,465 @@ export class ExecutionEngine {
     return [...this.results.values()].some((result) => result.status === 'completed');
   }
 
-  private activity(item: Planned, status: ConductorActivity['status'], outcome?: Outcome) {
-    const at = Date.now();
-    this.emit({
-      type: 'activity',
-      activity: {
-        stepId: item.step.id,
-        capability: item.step.capability,
-        summary: item.researchOp ? item.researchOp.replaceAll('_', ' ') : item.step.summary,
-        target: item.model
-          ? `${item.model.connection.name} / ${item.model.id}`
-          : item.step.target.kind === 'tool'
-            ? item.step.target.tool
-            : '',
-        status,
-        at,
-        durationMs: outcome && item.startedAt ? at - item.startedAt : undefined,
-        error: outcome?.error,
-        resultId: outcome?.artifact?.id,
-        sources: outcome?.sources,
-      },
-    });
+  reserveProgram() {
+    this.context.budget.step();
   }
 
-  private validate(steps: ExecutionStep[]) {
-    if (steps.length + this.planned.size > conductorLimits.steps)
-      throw new RunError('The turn reached its execution step limit.');
-    const batch = new Map(steps.map((step) => [step.id, step]));
-    if (batch.size !== steps.length || steps.some((step) => this.planned.has(step.id)))
-      throw new RunError('Each execution step must have a unique ID.');
-    const searchCount = steps.filter((step) => step.capability === 'web-search').length;
-    const fetchCount = steps.filter((step) => step.capability === 'web_fetch').length;
-    const screenshotCount = steps.filter((step) => step.capability === 'browser_screenshot').length;
-    if (this.fetches + fetchCount > this.research.policy.fetches)
-      throw new RunError('The turn reached its page fetch limit.');
-    if (this.screenshots + screenshotCount > this.research.policy.screenshots)
-      throw new RunError('The turn reached its screenshot limit.');
-    if (this.searches + searchCount > this.research.policy.searches)
-      throw new RunError('The turn reached its search limit.');
-    const checked = new Map<string, Planned>();
-    const visiting = new Set<string>();
-    const resolve = (id: string): Planned => {
-      const prior = checked.get(id) ?? this.planned.get(id);
-      if (prior) return prior;
-      const step = batch.get(id);
-      if (!step || visiting.has(id))
-        throw new RunError('A step has a missing or cyclic dependency.');
-      visiting.add(id);
-      if (new Set(step.dependsOn).size !== step.dependsOn.length)
-        throw new RunError('A step has duplicate dependencies.');
-      const dependencies = step.dependsOn.map(resolve);
-      if (this.failedCapabilities.has(step.capability))
-        throw new RunError(
-          'That capability already failed in this turn. Explain the result to the user.',
-        );
-      const model = step.target.model ? this.registry.models.get(step.target.model) : undefined;
-      const target = step.target;
-      const researchOp =
-        target.kind === 'tool' && Object.hasOwn(researchToolArgs, target.tool)
-          ? (target.tool as ResearchToolId)
-          : undefined;
-      if (step.target.kind === 'model') {
-        if (step.args)
-          throw new RunError('This model operation does not accept structured tool arguments.');
-        if (!model || !this.eligible(model, step.capability)) this.rejectTarget(step.capability);
-        if (modelOutputs[step.capability as keyof typeof modelOutputs] !== step.output)
-          throw new RunError('The selected output does not match the capability.');
-      } else if (researchOp) {
-        const descriptor = this.researchDescriptors().find(
-          ({ target }) => target.tool === researchOp,
-        );
-        if (
-          !descriptor ||
-          step.target.model !== null ||
-          step.capability !== descriptor.capability ||
-          step.output !== descriptor.output
+  async reserveNative(requestNumber: number) {
+    const scope = {
+      requestId: this.request.requestId,
+      conversationId: this.request.conversationId,
+      assistantMessageId: this.request.assistantMessageId,
+      revision: this.tools.host.current.revision,
+      voiceSessionId: this.voiceSessionId,
+      fingerprint: createHash('sha256')
+        .update(canonical(['provider.native', this.context.registry.primary.ref, requestNumber]))
+        .digest('hex'),
+    };
+    await this.tools.host.request({
+      ...scope,
+      type: 'reserve',
+      operation: { id: 'provider.native', stepId: randomUUID(), callId: String(requestNumber) },
+    }, this.signal);
+    this.billableChildStarted = true;
+    return async (state: 'completed' | 'uncertain') => {
+      if (!this.signal.aborted)
+        await this.tools.host.request({ ...scope, type: 'receipt', state }, this.signal);
+    };
+  }
+
+  async execute(
+    invocations: Invocation[],
+    delegates: () => ReturnType<ToolRegistry['delegates']>,
+    discovered: (id: string, ref: string) => boolean,
+  ) {
+    const outcomes: Outcome[] = [];
+    for (let index = 0; index < invocations.length;) {
+      const batch = [invocations[index++]];
+      // Reads may run together. A read that exposes private content takes effect
+      // before any later outbound invocation is authorized.
+      if (this.canRunConcurrently(batch[0])) {
+        while (
+          batch.length < conductorLimits.parallel &&
+          index < invocations.length &&
+          this.canRunConcurrently(invocations[index])
         )
-          throw new RunError(
-            'This web operation is not available for the selected target. Check Web & Browser settings.',
-          );
-        if (
-          step.inputs.length ||
-          Buffer.byteLength(JSON.stringify(step.args ?? {})) > 12_000 ||
-          !researchToolArgs[researchOp].safeParse(step.args).success
-        )
-          throw new RunError('The arguments do not match the listed web operation.');
-      } else {
-        const tool = toolOutputs[step.target.tool as keyof typeof toolOutputs];
-        if (
-          !tool ||
-          step.args ||
-          tool.capability !== step.capability ||
-          tool.output !== step.output
-        )
-          throw new RunError('The selected tool does not provide this capability or output.');
-        if (step.target.model !== null)
-          throw new RunError('This local tool does not use a backing model.');
+          batch.push(invocations[index++]);
       }
-      const attachmentDerived =
-        dependencies.some((item) => item.attachmentDerived) ||
-        step.inputs.some((input) => input.kind === 'attachment');
-      if (researchOp && (attachmentDerived || this.receivedAttachmentContent))
-        throw new RunError('Web tools cannot receive attachment contents.');
+      outcomes.push(
+        ...(await Promise.all(batch.map((item) => this.run(item, delegates, discovered)))),
+      );
+    }
+    return outcomes;
+  }
+
+  private canRunConcurrently({ descriptor }: Invocation) {
+    return (
+      descriptor.effect === 'billable' ||
+      (descriptor.effect === 'read' && descriptor.dependency === 'browser')
+    );
+  }
+
+  private async run(
+    invocation: Invocation,
+    delegates: () => ReturnType<ToolRegistry['delegates']>,
+    discovered: (id: string, ref: string) => boolean,
+  ): Promise<Outcome> {
+    const { descriptor, callId, program } = invocation;
+    const parent = program ? AbortSignal.any([this.signal, program.signal]) : this.signal;
+    const id = randomUUID();
+    const start = Date.now();
+    let model: ResolvedModel | undefined;
+    const activity = (status: ConductorActivity['status'], outcome?: Outcome) =>
+      this.emit({
+        type: 'activity',
+        activity: {
+          stepId: id,
+          callId,
+          parentStepId: program?.id,
+          programStatus: outcome?.programStatus,
+          programResultSaved: outcome?.programResultSaved,
+          capability: descriptor.capability,
+          effect: descriptor.effect,
+          target: model ? `${model.connection.name} / ${model.id}`.slice(0, 310) : descriptor.id,
+          summary: descriptor.name,
+          inputSummary: descriptor.permission,
+          status,
+          at: Date.now(),
+          durationMs: outcome ? Date.now() - start : undefined,
+          error: outcome?.problem?.message,
+          resultSummary:
+            outcome?.status === 'completed'
+              ? outcome.artifact
+                ? 'Artifact created'
+                : outcome.data?.status === 'dispatched_outcome_unverified' ||
+                    outcome.data?.status === 'action_dispatched'
+                  ? 'Action sent. Outcome awaits verification.'
+                : outcome.sources?.length
+                  ? `${outcome.sources.length} verified source references`
+                  : 'Result received'
+              : undefined,
+          resultId: outcome?.artifact?.id,
+          sources: outcome?.sources,
+          evidence: outcome?.evidence,
+          executionDetails: outcome?.executionDetails,
+          privateContent: outcome?.privateContent,
+        },
+      });
+    let result: Outcome;
+    let reserved = false;
+    let launched = false;
+    let lease: Awaited<ReturnType<ToolRegistry['scheduler']['acquire']>> | undefined;
+    let operation: Promise<StepValue> | undefined;
+    let settleArtifact: ReturnType<ToolContext['budget']['artifact']> | undefined;
+    let reservation: { fingerprint: string; revision: string } | undefined;
+    const scope = {
+      requestId: this.request.requestId,
+      conversationId: this.request.conversationId,
+      assistantMessageId: this.request.assistantMessageId,
+      voiceSessionId: this.voiceSessionId,
+    };
+    try {
+      parent.throwIfAborted();
+      if (!program) this.reserveProgram();
+      if (!program && !descriptor.modes.includes('direct'))
+        throw new ToolError('CALLER_MISMATCH', 'This tool is only available inside an authorized program.');
+      if (!this.tools.allowed(descriptor, this.context)) {
+        if (descriptor.dependency === 'browser' && this.context.privateContent)
+          throw new ToolError(
+            'PERMISSION_DENIED',
+            'Web tools cannot receive private skill or attachment contents.',
+          );
+        throw new ToolError(
+          'CAPABILITY_UNAVAILABLE',
+          'The selected tool is unavailable for this turn.',
+        );
+      }
+      if (this.uncertainCapabilities.has(descriptor.capability))
+        throw new ToolError(
+          'OUTCOME_UNCERTAIN',
+          'That capability already failed after dispatch. Reconcile the earlier operation before trying again.',
+        );
+      if (Buffer.byteLength(JSON.stringify(invocation.input ?? null)) > 48_000)
+        throw new ToolError('INVALID_ARGUMENT', 'The tool input exceeds its size limit.');
+      const input = descriptor.input.safeParse(invocation.input);
+      if (!input.success)
+        throw new ToolError(
+          'INVALID_ARGUMENT',
+          'The arguments do not match the loaded tool schema.',
+        );
+      if (program && (program.revision !== this.tools.host.current.revision ||
+        !this.tools.allowedForProgram(descriptor, this.context, program.backend, input.data)))
+        throw new ToolError('PERMISSION_DENIED', 'The program cannot invoke this tool with these arguments.');
+      const step: ExecutionStep = {
+        id,
+        target: { kind: 'tool', tool: descriptor.id, model: null },
+        capability: descriptor.capability,
+        output: descriptor.output,
+        instructions: descriptor.name,
+        summary: descriptor.name,
+        inputs: [],
+        dependsOn: [],
+        ...descriptor.normalize?.(input.data),
+      };
+      if (
+        new Set(step.dependsOn).size !== step.dependsOn.length ||
+        step.dependsOn.some((dependency) => this.results.get(dependency)?.status !== 'completed')
+      )
+        throw new ToolError(
+          'INVALID_ARGUMENT',
+          'Reference only successful execution IDs from this turn.',
+        );
+      if (step.target.kind === 'model') {
+        const available = await delegates();
+        model = available.models.get(step.target.model);
+        if (
+          !discovered(descriptor.id, step.target.model) ||
+          !model?.delegate ||
+          !descriptor.requiredModelCapabilities.every((capability) =>
+            model!.capabilities.some((value) => value === capability),
+          )
+        ) {
+          throw new ToolError(
+            'CAPABILITY_UNAVAILABLE',
+            'The selected model is unavailable for this capability. No operation started.',
+          );
+        }
+      }
+      let restricted = step.dependsOn.some((dependency) => this.restricted.has(dependency));
+      const text: string[] = [];
+      const files: NonNullable<StepValue['file']>[] = [];
+      for (const input of step.inputs) {
+        if (input.kind === 'text') text.push(input.text);
+        else if (input.kind === 'attachment') {
+          const file = this.context.attachments.get(input.id);
+          if (!file)
+            throw new ToolError(
+              'PERMISSION_DENIED',
+              'A step refers to an attachment outside this turn.',
+            );
+          files.push(file);
+          restricted = true;
+        } else {
+          if (!step.dependsOn.includes(input.stepId))
+            throw new ToolError(
+              'INVALID_ARGUMENT',
+              'Add referenced results to the step dependencies.',
+            );
+          const value = this.results.get(input.stepId)!;
+          if (value.text) text.push(value.text);
+          if (value.file) files.push(value.file);
+        }
+      }
       if (
         model &&
-        (attachmentDerived || this.receivedAttachmentContent) &&
-        model.connection.id !== this.registry.primary.connection.id &&
-        !this.registry.config.crossConnectionAttachments
+        (restricted || this.context.privateContent) &&
+        model.connection.id !== this.context.registry.primary.connection.id &&
+        !this.context.registry.config.crossConnectionAttachments
       )
-        throw new RunError('Settings restrict attachment transfer to this connection.');
-      for (const input of step.inputs) {
-        if (input.kind === 'attachment' && !this.attachments.has(input.id))
-          throw new RunError('A step refers to an attachment outside this turn.');
-        if (input.kind === 'result' && !step.dependsOn.includes(input.stepId))
-          throw new RunError('Add referenced results to the step dependencies.');
-      }
-      const item = {
-        step,
-        model,
-        attachmentDerived: attachmentDerived || researchOp === 'browser_screenshot',
-        researchOp,
-      };
-      checked.set(id, item);
-      visiting.delete(id);
-      return item;
-    };
-    return {
-      items: steps.map((step) => resolve(step.id)),
-      searchCount,
-      fetchCount,
-      screenshotCount,
-    };
-  }
-
-  async execute(steps: ExecutionStep[]) {
-    let validated: ReturnType<ExecutionEngine['validate']>;
-    try {
-      validated = this.validate(steps);
-      this.rejection = undefined;
-    } catch (error) {
-      this.rejection =
-        error instanceof RunError ? error.message : 'The execution request was rejected.';
-      throw error;
-    }
-    const { items, searchCount, fetchCount, screenshotCount } = validated;
-    this.fetches += fetchCount;
-    this.screenshots += screenshotCount;
-    this.searches += searchCount;
-    for (const item of items) {
-      this.planned.set(item.step.id, item);
-      this.activity(item, 'queued');
-    }
-    const pending = new Map(items.map((item) => [item.step.id, item]));
-    while (pending.size) {
-      const ready = [...pending.values()]
-        .filter((item) => item.step.dependsOn.every((dependency) => this.results.has(dependency)))
-        .slice(0, conductorLimits.parallel);
-      if (!ready.length) throw new RunError('Execution dependencies could not be resolved.');
-      await Promise.all(
-        ready.map(async (item) => {
-          pending.delete(item.step.id);
-          const result = await this.runStep(item);
-          this.results.set(item.step.id, result);
-          this.activity(item, result.status, result);
-        }),
-      );
-    }
-    if (items.some((item) => item.attachmentDerived && this.results.get(item.step.id)?.text))
-      this.receivedAttachmentContent = true;
-    return items.map(({ step }) => {
-      const result = this.results.get(step.id)!;
-      return {
-        id: step.id,
-        status: result.status,
-        error: result.error,
-        text: result.text,
-        data: result.data,
-        artifact: result.artifact,
-        sources: result.sources,
-      };
-    });
-  }
-
-  private async runStep(item: Planned): Promise<Outcome> {
-    const { step, model, researchOp } = item;
-    if (this.signal.aborted) return { status: 'cancelled' };
-    if (step.dependsOn.some((id) => this.results.get(id)?.status !== 'completed'))
-      return { status: 'blocked', error: 'A prerequisite did not complete.' };
-    const files = [];
-    const text = [];
-    for (const input of step.inputs) {
-      if (input.kind === 'text') text.push(input.text);
-      else if (input.kind === 'attachment') files.push(this.attachments.get(input.id)!);
-      else {
-        const result = this.results.get(input.stepId)!;
-        if (result.file) files.push(result.file);
-        if (result.text) text.push(result.text);
-      }
-    }
-    if (text.reduce((sum, item) => sum + item.length, 0) > 32_000)
-      return { status: 'failed', error: 'The supplied text exceeds the step input limit.' };
-    const args = researchOp ? researchToolArgs[researchOp].parse(step.args) : undefined;
-    const snapshot =
-      researchOp &&
-      ['browser_get_page', 'browser_get_tabs', 'browser_extract', 'browser_scroll'].includes(
-        researchOp,
-      );
-    const fingerprint = createHash('sha256')
-      .update(
-        JSON.stringify([step.target, step.capability, args ?? step.instructions, step.inputs]),
+        throw new ToolError(
+          'PERMISSION_DENIED',
+          'Settings restrict attachment transfer to this connection.',
+        );
+      if (descriptor.dependency === 'browser' && restricted)
+        throw new ToolError('PERMISSION_DENIED', 'Web tools cannot receive attachment contents.');
+      if (text.reduce((size, part) => size + part.length, 0) > 32_000)
+        throw new ToolError('INVALID_ARGUMENT', 'The supplied text exceeds the step input limit.');
+      const fingerprint = createHash('sha256')
+        .update(
+          canonical([descriptor.id, step.target, step.args ?? (descriptor.normalize ? step.instructions : input.data), step.inputs]),
+        )
+        .digest('hex');
+      if (!descriptor.repeatable && this.dispatched.has(fingerprint))
+        throw new ToolError('DUPLICATE_DISPATCH', 'This operation already ran.');
+      if (
+        descriptor.budget &&
+        ++this.counters[descriptor.budget] > this.context.research.policy[descriptor.budget]
       )
-      .digest('hex');
-    // A fresh observation may be needed after the page changes.
-    if (!snapshot && this.dispatched.has(fingerprint))
-      return { status: 'blocked', error: 'This operation already ran.' };
-    if (!snapshot) this.dispatched.add(fingerprint);
-    item.startedAt = Date.now();
-    this.activity(item, 'running');
-    if (model || researchOp?.startsWith('browser_')) this.billableChildStarted = true;
-    try {
-      const value = researchOp
-        ? await this.research.invoke(researchOp, args!, step, this.signal)
-        : await this.tools.invoke(step, { files, text }, this.signal, model);
-      this.signal.throwIfAborted();
-      if (step.output === 'sources' && (!value.text?.trim() || !value.sources?.length))
-        throw new RunError('Web search returned no usable sourced results.');
-      const artifact = value.file && this.assets.put(this.id, value.file);
+        throw new ToolError('BUDGET_EXCEEDED', `The turn reached its ${descriptor.budget} limit.`);
+      this.dispatched.add(fingerprint);
+      activity('queued');
+      const timeout = AbortSignal.timeout(descriptor.timeoutMs);
+      const signal = AbortSignal.any([parent, timeout]);
+      if (descriptor.id !== 'programs.run') {
+        const resource = step.args?.sessionId ?? step.args?.tabId ??
+          (step.args?.args as Record<string, unknown> | undefined)?.tabId;
+        const locks = typeof resource === 'string'
+          ? [`${this.request.conversationId}/${resource}`]
+          : descriptor.effect === 'local' || (program && !descriptor.program?.parallel)
+            ? [`${this.request.conversationId}/state`]
+            : [];
+        lease = await this.tools.scheduler.acquire({
+          turn: this.request.requestId,
+          provider: model?.connection.id,
+          tool: descriptor.id,
+          toolLimit: descriptor.program?.parallel ? 3 : 4,
+          limit: this.tools.host.current.programming?.backend !== 'off'
+            ? this.tools.host.current.programming?.parallel ?? conductorLimits.parallel
+            : conductorLimits.parallel,
+          locks,
+          signal,
+        });
+      }
+      const authorize = () => {
+        signal.throwIfAborted();
+        if (!this.tools.allowed(descriptor, this.context) ||
+          (program && (program.revision !== this.tools.host.current.revision ||
+            !this.tools.allowedForProgram(descriptor, this.context, program.backend, input.data))) ||
+          (model && this.context.privateContent &&
+            model.connection.id !== this.context.registry.primary.connection.id &&
+            !this.context.registry.config.crossConnectionAttachments))
+          throw new ToolError('PERMISSION_DENIED', 'The operation was revoked before dispatch.');
+      };
+      authorize();
+      if (descriptor.artifacts) settleArtifact = this.context.budget.artifact();
+      if (descriptor.effect === 'billable') {
+        const revision = this.tools.host.current.revision;
+        await this.tools.host.request(
+          {
+            ...scope,
+            type: 'reserve',
+            revision,
+            fingerprint,
+            operation: { id: descriptor.id, stepId: id, callId },
+          },
+          signal,
+        );
+        reservation = { fingerprint, revision };
+        this.billableChildStarted = reserved = true;
+      }
+      authorize();
+      activity('running');
+      launched = true;
+      if (program) this.programChildCalls++;
+      else if (descriptor.id !== 'programs.run') this.directToolCalls++;
+      if (descriptor.effect === 'consequential') this.billableChildStarted = true;
+      let raw;
+      try {
+        operation = Promise.resolve(descriptor.execute(input.data, {
+            step,
+            callId,
+            model,
+            inputs: { text, files },
+            context: this.context,
+            signal,
+            approval: () => activity('approval'),
+            programId: program?.id,
+          }));
+        raw = await waitForTool(operation, signal);
+      } catch (error) {
+        if (timeout.aborted)
+          throw new ToolError(
+            reserved || descriptor.effect === 'consequential' ? 'OUTCOME_UNCERTAIN' : 'TIMEOUT',
+            reserved
+              ? 'The provider timed out after dispatch. The outcome is uncertain.'
+              : 'The tool timed out.',
+          );
+        throw error;
+      }
+      activity('processing');
+      const value = descriptor.outputSchema.safeParse(raw);
+      if (!value.success)
+        throw new ToolError('INVALID_TOOL_OUTPUT', 'The tool returned an unexpected result.');
+      if (
+        (['image', 'file', 'audio'].includes(descriptor.output) &&
+          !value.data.file &&
+          !value.data.managedArtifact) ||
+        (descriptor.output === 'sources' && !value.data.sources?.length) ||
+        (descriptor.output === 'text' && typeof value.data.text !== 'string')
+      )
+        throw new ToolError('EXECUTION_FAILED', 'The tool returned no usable result.');
+      const { managedArtifact, privateContent, commandProblem, ...resultValue } = value.data;
+      if (value.data.programStatus === 'partial') this.partial = true;
+      const hosted =
+        descriptor.id === 'artifacts.publish' &&
+        this.context.native?.active.shell?.kind === 'hosted'
+          ? this.context.native.active.shell
+          : undefined;
+      const fileArtifact =
+        value.data.file && this.assets.put(this.request.requestId, value.data.file);
+      const artifact =
+        managedArtifact ??
+        (fileArtifact && {
+          ...fileArtifact,
+          executionId: id,
+          ...(hosted && { hostedExecution: { stepId: id, sessionId: hosted.id } }),
+        });
+      if (settleArtifact) {
+        const settle = settleArtifact;
+        settleArtifact = undefined;
+        settle(artifact);
+      } else if (artifact) this.context.budget.artifact()(artifact);
       if (artifact) this.emit({ type: 'artifact', artifact });
-      return {
-        ...value,
-        text: value.text?.slice(0, conductorLimits.resultCharacters),
-        status: 'completed',
+      if (restricted || privateContent || descriptor.capability === 'browser_screenshot') {
+        this.restricted.add(id);
+        if (value.data.text || privateContent) this.context.privateContent = true;
+      }
+      result = {
+        id,
+        ...resultValue,
+        privateContent: privateContent || restricted,
+        text: value.data.text?.slice(0, conductorLimits.resultCharacters),
+        status: commandProblem || ['failed', 'uncertain'].includes(value.data.programStatus ?? '')
+          ? 'failed' : value.data.programStatus === 'cancelled' ? 'cancelled' : 'completed',
+        problem: commandProblem ?? (value.data.programStatus === 'uncertain'
+          ? { code: 'OUTCOME_UNCERTAIN', message: 'Some program operations have uncertain outcomes.' }
+          : undefined),
         artifact,
       };
+      const evidence = createHash('sha256')
+        .update(
+          canonical(
+            result.evidence?.length
+              ? [
+                  descriptor.id,
+                  result.evidence.map(({ chunkId, version }) => [chunkId, version]).sort(),
+                ]
+              : [
+                  descriptor.id, result.text, stableResult(result.data),
+                  result.sources?.map(({ url, title }) => [url, title]),
+                  fileArtifact?.sha256,
+                  value.data.computerImage && createHash('sha256').update(value.data.computerImage.bytes).digest('hex'),
+                  managedArtifact?.id,
+                ],
+          ),
+        )
+        .digest('hex');
+      if (result.status === 'completed' && !this.evidence.has(evidence)) {
+        this.evidence.add(evidence);
+        this.progress++;
+      }
+      if (commandProblem?.code === 'EXECUTION_FAILED') this.recoverable.set(id, descriptor.id);
+      for (const [failedId, toolId] of this.recoverable) {
+        if (!commandProblem && toolId === descriptor.id) {
+          this.corrected.add(failedId);
+          this.recoverable.delete(failedId);
+        }
+      }
     } catch (error) {
-      if (this.signal.aborted) return { status: 'cancelled' };
-      const message =
-        error instanceof RunError || error instanceof HttpException
+      const stopped = parent.aborted;
+      const code = stopped
+        ? launched && (reserved || descriptor.effect === 'consequential' ||
+          descriptor.program?.retry === 'never') ? 'OUTCOME_UNCERTAIN' : 'CANCELLED'
+        : error instanceof ToolError
+          ? error.code
+          : reserved && !(error instanceof RunError)
+            ? 'OUTCOME_UNCERTAIN'
+            : 'EXECUTION_FAILED';
+      const message = stopped
+        ? code === 'OUTCOME_UNCERTAIN' ? 'The operation stopped after dispatch and needs reconciliation.' : 'The operation stopped.'
+        : error instanceof RunError
           ? error.message
           : providerError(error);
-      if (!researchOp) this.failedCapabilities.add(step.capability);
-      return { status: 'failed', error: message.slice(0, 400) };
+      if (!launched && (code === 'INVALID_ARGUMENT' || code === 'CAPABILITY_UNAVAILABLE'))
+        this.recoverable.set(id, descriptor.id);
+      result = {
+        id,
+        status: code === 'CANCELLED' ? 'cancelled' : code === 'DUPLICATE_DISPATCH' ? 'blocked' : 'failed',
+        problem: { code, message: message.slice(0, 400) },
+      };
+    } finally {
+      settleArtifact?.();
+      const held = lease;
+      if (held) {
+        if (operation) {
+          const timer = setTimeout(held.fence, 2000);
+          timer.unref();
+          const settle = () => {
+            clearTimeout(timer);
+            held.release();
+          };
+          void operation.then(settle, settle);
+        } else held.release();
+      }
     }
+    if (reservation && !parent.aborted) {
+      await this.tools.host.request({
+        ...scope, ...reservation, type: 'receipt',
+        state: result.problem?.code === 'OUTCOME_UNCERTAIN' ? 'uncertain' :
+          result.status === 'completed' ? 'completed' : 'failed',
+      }, AbortSignal.any([parent, AbortSignal.timeout(2000)])).catch(() => undefined);
+    }
+    if (result.problem?.code === 'OUTCOME_UNCERTAIN')
+      this.uncertainCapabilities.add(descriptor.capability);
+    this.results.set(id, result);
+    activity(result.problem?.code === 'OUTCOME_UNCERTAIN' ? 'uncertain' : result.status, result);
+    return result;
+  }
+}
+
+async function waitForTool<T>(operation: T | Promise<T>, signal: AbortSignal): Promise<T> {
+  signal.throwIfAborted();
+  let cancel: () => void = () => undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<never>((_, reject) => {
+        cancel = () => reject(signal.reason);
+        signal.addEventListener('abort', cancel, { once: true });
+      }),
+    ]);
+  } finally {
+    signal.removeEventListener('abort', cancel);
   }
 }

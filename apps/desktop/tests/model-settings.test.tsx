@@ -122,15 +122,25 @@ it('shows documented capabilities and distinguishes known unsupported operations
       capabilities: ['image', 'image-edit'],
       source: 'documentation',
     },
-    { id: 'text-embedding-3-large', capabilities: [], source: 'documentation' },
+    { id: 'text-embedding-3-large', capabilities: ['embeddings'], source: 'documentation' },
+    { id: 'omni-moderation-latest', capabilities: [], source: 'documentation' },
   ]);
   const user = userEvent.setup();
   render(<ModelSettings />);
   await user.click(await screen.findByRole('button', { name: 'Discover models' }));
 
   expect(await screen.findByText('Image generation · Image editing')).toBeVisible();
+  expect(screen.getByText('Embeddings', { exact: true })).toBeVisible();
   expect(screen.getByText('No supported Aria operations')).toBeVisible();
   expect(screen.queryByText('Unknown capabilities')).toBeNull();
   expect(screen.queryByText('Provider catalog lists only the ID')).toBeNull();
-  expect(screen.queryByRole('button', { name: 'Capabilities' })).toBeNull();
+  expect(screen.getAllByRole('button', { name: 'Capabilities' })).toHaveLength(2);
+  await user.click(screen.getByRole('checkbox', { name: 'Enable text-embedding-3-large' }));
+  expect(screen.queryByRole('option', { name: 'Fixture · text-embedding-3-large' })).toBeNull();
+  await user.click(screen.getByRole('button', { name: 'Save AI Models' }));
+  expect(window.aria!.saveRegistry).toHaveBeenCalledWith(expect.objectContaining({
+    connections: [expect.objectContaining({
+      models: [expect.objectContaining({ id: 'text-embedding-3-large', declared: ['embeddings'] })],
+    })],
+  }));
 });

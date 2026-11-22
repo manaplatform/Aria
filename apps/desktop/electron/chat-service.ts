@@ -11,10 +11,12 @@ import {
   type ChatServiceStatus,
   type MediaAsset,
   type RuntimeRegistry,
+  type CapabilityHostRequest,
+  type ToolPolicy,
 } from '@aria/shared';
 import { z } from 'zod';
 import WebSocket from 'ws';
-import { chatRequestSchema, readChatEvents } from './chat-protocol';
+import { managedChatRequestSchema, readChatEvents } from './chat-protocol';
 import { ProviderConfigurationError, type ProviderStorage } from './provider-storage';
 import type { MediaStorage } from './media-storage';
 
@@ -24,6 +26,24 @@ interface BrowserIntegration {
   runtime(): Promise<RuntimeWeb>;
   revision(): string;
   open(authorize: (request: BrowserRequest) => AbortSignal | undefined): BrowserBridgeSession;
+}
+
+interface CapabilityIntegration {
+  policy(registry: RuntimeRegistry): ToolPolicy;
+  artifact?(id: string, conversation: string, request: string): Promise<MediaAsset>;
+  adoptArtifact?(
+    asset: MediaAsset,
+    conversation: string,
+    request: string,
+    execution: { stepId: string; sessionId?: string },
+    signal: AbortSignal,
+  ): Promise<void>;
+  release?(request: string): void;
+  availableAssets?(conversation: string): MediaAsset[];
+  open(
+    revision: string,
+    authorize: (request: CapabilityHostRequest) => AbortSignal | undefined,
+  ): Pick<BrowserBridgeSession, 'port' | 'close'>;
 }
 
 interface ActiveRequest {
@@ -38,9 +58,13 @@ interface ActiveRequest {
 export class ChatService {
   private child?: UtilityProcess;
   private browserSession?: BrowserBridgeSession;
+  private capabilitySession?: Pick<BrowserBridgeSession, 'port' | 'close'>;
   private url = '';
   private token = '';
   private generation = 0;
+  private readonly newlyPublished = new Map<string, number>();
+  private runtimePrimary?: { connectionId: string; model: string; endpoint: string };
+  private runtimeProviderKey?: string;
   private starting?: Promise<void>;
   private requests = new Map<string, ActiveRequest>();
   private status: ChatServiceStatus = { state: 'starting', configured: false, model: '' };
@@ -51,6 +75,7 @@ export class ChatService {
     private readonly emitStatus: (status: ChatServiceStatus) => void,
     private readonly assets?: MediaStorage,
     private readonly browser?: BrowserIntegration,
+    private readonly capabilities?: CapabilityIntegration,
   ) {}
   getStatus(): ChatServiceStatus {
     return { ...this.status };
@@ -87,13 +112,31 @@ export class ChatService {
         registry = { ...emptyRegistryPolicy, revision: '', connections: [] };
         configurationError = error.message;
       }
+      const runtimeConnection = registry.connections.find((item) =>
+        registry.primary?.startsWith(`${item.id}:`),
+      );
+      this.runtimePrimary =
+        runtimeConnection && registry.primary
+          ? {
+              connectionId: runtimeConnection.id,
+              model: registry.primary.slice(runtimeConnection.id.length + 1),
+              endpoint: runtimeConnection.baseUrl,
+            }
+          : undefined;
+      this.runtimeProviderKey =
+        runtimeConnection && this.runtimePrimary
+          ? createHash('sha256')
+              .update(JSON.stringify([this.runtimePrimary, runtimeConnection.apiKey]))
+              .digest('hex')
+          : undefined;
       const registryRevision = registry.revision;
       const web = await this.browser?.runtime();
-      if (this.browser)
+      const tools = this.capabilities?.policy(registry);
+      if (this.browser || tools)
         registry = {
           ...registry,
           revision: createHash('sha256')
-            .update(JSON.stringify([registry.revision, this.browser.revision()]))
+            .update(JSON.stringify([registry.revision, this.browser?.revision(), tools?.revision]))
             .digest('hex'),
         };
       if (generation !== this.generation) return;
@@ -108,12 +151,21 @@ export class ChatService {
         if (
           generation === this.generation &&
           !turn?.stopped &&
+          turn?.request.programPrivateHistory !== true &&
           turn?.request.conversationId === request.conversationId
         )
           return turn.controller.signal;
         return undefined;
       });
       this.browserSession = native;
+      const capabilityPort =
+        tools &&
+        this.capabilities?.open(tools.revision, (request) => {
+          if (generation !== this.generation) return;
+          return this.activeTurn(request);
+        });
+      this.capabilitySession = capabilityPort;
+      const transfer = [native?.port, capabilityPort?.port].filter((port) => port !== undefined);
       let sentConfiguration = false;
       const port = await new Promise<number>((resolve, reject) => {
         const timer = setTimeout(() => {
@@ -130,8 +182,13 @@ export class ChatService {
             if (sentConfiguration) return;
             sentConfiguration = true;
             child.postMessage(
-              { registry, ...(web && { web }), browserGeneration: native?.generation },
-              native ? [native.port] : undefined,
+              {
+                registry,
+                ...(web && { web }),
+                ...(tools && { tools }),
+                browserGeneration: native?.generation,
+              },
+              transfer,
             );
             return;
           }
@@ -162,6 +219,7 @@ export class ChatService {
       this.url = `http://127.0.0.1:${port}`;
       child.once('exit', () => {
         native?.close();
+        capabilityPort?.close();
         if (generation !== this.generation) return;
         ++this.generation;
         this.child = undefined;
@@ -197,6 +255,7 @@ export class ChatService {
     } catch (error) {
       if (generation === this.generation) {
         this.browserSession?.close();
+        this.capabilitySession?.close();
         this.child?.kill();
         this.url = '';
         this.setStatus({
@@ -245,7 +304,7 @@ export class ChatService {
     });
   }
   private begin(input: ChatRequest, emit = this.emitEvent): ActiveRequest {
-    const request = chatRequestSchema.parse(input);
+    const request = managedChatRequestSchema.parse(input);
     if (this.status.state !== 'ready' || !this.status.configured || !this.url)
       throw new Error('Configure your provider in Settings before sending a message.');
     if (request.expectedRevision && this.status.revision !== request.expectedRevision)
@@ -272,9 +331,50 @@ export class ChatService {
     active.done = this.consume(active);
     return active;
   }
+  activeTurn(request: { requestId: string; conversationId: string; assistantMessageId?: string }) {
+    const turn = this.requests.get(request.requestId);
+    if (
+      !turn ||
+      turn.stopped ||
+      turn.request.conversationId !== request.conversationId ||
+      (request.assistantMessageId && turn.request.assistantMessageId !== request.assistantMessageId)
+    )
+      return;
+    return turn.controller.signal;
+  }
+  executionIdentity() {
+    return this.runtimeProviderKey;
+  }
+  runtimeIdentity() {
+    if (this.runtimePrimary && this.runtimeProviderKey)
+      return { ...this.runtimePrimary, key: this.runtimeProviderKey };
+  }
+  authorizeRuntime(request: Extract<CapabilityHostRequest, { type: 'runtime' }>) {
+    const primary = this.runtimePrimary;
+    if (
+      !primary ||
+      request.primary.connectionId !== primary.connectionId ||
+      request.primary.model !== primary.model ||
+      new URL(request.primary.endpoint).href.replace(/\/$/, '') !==
+        new URL(primary.endpoint).href.replace(/\/$/, '')
+    )
+      return;
+    return this.activeTurn(request);
+  }
+  assistantForTurn(requestId: string) {
+    return this.requests.get(requestId)?.request.assistantMessageId;
+  }
   submit(input: ChatRequest): void {
     this.begin(input);
   }
+  recentlyPublished(id: string) {
+    const now = Date.now();
+    for (const [asset, expires] of this.newlyPublished) {
+      if (expires <= now) this.newlyPublished.delete(asset);
+    }
+    return this.newlyPublished.has(id);
+  }
+
   private async consume(active: ActiveRequest): Promise<void> {
     const { request, controller } = active;
     let terminal = false;
@@ -285,7 +385,12 @@ export class ChatService {
       const response = await this.http('chat/stream', {
         method: 'POST',
         headers: this.headers(),
-        body: JSON.stringify(request),
+        body: JSON.stringify({
+          ...request,
+          availableAssets: this.capabilities
+            ?.availableAssets?.(request.conversationId)
+            ?.map(({ id, name, mimeType, size }) => ({ id, name, mimeType, size })),
+        }),
         signal: controller.signal,
       });
       if (
@@ -312,16 +417,47 @@ export class ChatService {
         if (event.type === 'reset') active.length = 0;
         if (active.stopped) break;
         if (event.type === 'artifact') {
-          const asset = await this.importArtifact(
-            request.requestId,
-            event.artifact,
-            controller.signal,
-          );
+          const asset =
+            event.artifact.storage === 'desktop'
+              ? await this.capabilities?.artifact?.(
+                  event.artifact.id,
+                  request.conversationId,
+                  request.requestId,
+                )
+              : await this.importArtifact(request.requestId, event.artifact, controller.signal);
+          if (
+            !asset ||
+            asset.name !== event.artifact.name ||
+            asset.mimeType !== event.artifact.mimeType ||
+            asset.size !== event.artifact.size
+          )
+            throw new Error('The artifact does not match its verified storage record.');
           if (active.stopped) break;
+          if (event.artifact.storage !== 'desktop' && event.artifact.executionId)
+            await this.capabilities?.adoptArtifact?.(
+              asset,
+              request.conversationId,
+              request.requestId,
+              {
+                stepId: event.artifact.executionId,
+                sessionId: event.artifact.hostedExecution?.sessionId,
+              },
+              controller.signal,
+            );
+          if (active.stopped) break;
+          this.recentlyPublished(asset.id);
+          if (this.newlyPublished.size >= 128) {
+            const oldest = this.newlyPublished.keys().next().value;
+            if (oldest) this.newlyPublished.delete(oldest);
+          }
+          this.newlyPublished.set(asset.id, Date.now() + 30_000);
           artifacts.set(event.artifact.id, asset.id);
           active.emit({
             type: 'asset',
-            asset,
+            asset:
+              event.artifact.storage === 'desktop' || event.artifact.executionId
+                ? { ...asset, managed: true }
+                : asset,
             requestId: event.requestId,
             conversationId: event.conversationId,
             assistantMessageId: event.assistantMessageId,
@@ -358,6 +494,7 @@ export class ChatService {
         });
       controller.abort();
       this.requests.delete(request.requestId);
+      this.capabilities?.release?.(request.requestId);
       void this.releaseAssets(request.requestId);
     }
   }
@@ -419,7 +556,10 @@ export class ChatService {
     }
     signal?.throwIfAborted();
     if (bytes !== artifact.size) throw new Error('The artifact download was incomplete.');
-    const asset = await this.assets.put(Buffer.concat(chunks), artifact.name, mime);
+    const content = Buffer.concat(chunks);
+    if (artifact.sha256 && createHash('sha256').update(content).digest('hex') !== artifact.sha256)
+      throw new Error('The artifact failed its integrity check.');
+    const asset = await this.assets.put(content, artifact.name, mime);
     if (signal?.aborted) {
       await this.assets.remove(asset.id);
       signal.throwIfAborted();
@@ -441,6 +581,7 @@ export class ChatService {
     if (this.starting) await this.starting;
     ++this.generation;
     this.browserSession?.close();
+    this.capabilitySession?.close();
     this.child?.kill();
     this.child = undefined;
     this.url = '';
@@ -450,6 +591,7 @@ export class ChatService {
     ++this.generation;
     await this.cancelAll();
     this.browserSession?.close();
+    this.capabilitySession?.close();
     const child = this.child;
     this.child = undefined;
     if (!child) return;

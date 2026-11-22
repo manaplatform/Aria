@@ -1,0 +1,228 @@
+name: Aria Release Creator
+
+on:
+  push:
+    branches: [main]
+    paths: [package.json]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Release operation
+        type: choice
+        options: [preview, verify, publish]
+        default: preview
+
+permissions: {}
+
+concurrency:
+  group: ${{ (github.event_name == 'push' || inputs.mode == 'publish') && 'aria-production-release' || format('aria-release-verification-{0}', github.run_id) }}
+  queue: max
+
+jobs:
+  prepare-release:
+    if: github.repository == 'manaplatform/Aria'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      run: ${{ steps.prepare.outputs.run }}
+      version: ${{ steps.prepare.outputs.version }}
+      mode: ${{ steps.prepare.outputs.mode }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '22'
+          cache: pnpm
+      - run: pnpm --filter aria install --frozen-lockfile --ignore-scripts
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+      - name: Select the release candidate
+        id: prepare
+        env:
+          RELEASE_MODE: ${{ github.event_name == 'push' && 'publish' || inputs.mode }}
+          GH_TOKEN: ${{ github.token }}
+          ARIA_RELEASE_ENABLED: ${{ vars.ARIA_RELEASE_ENABLED }}
+          ARIA_DISTRIBUTION_AUTHORIZED: ${{ vars.ARIA_DISTRIBUTION_AUTHORIZED }}
+        run: node scripts/release/run.mjs prepare "$RELEASE_MODE"
+      - if: steps.prepare.outputs.mode == 'preview'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: pnpm release:preview | tee -a "$GITHUB_STEP_SUMMARY"
+
+  validate-version:
+    if: needs.prepare-release.outputs.run == 'true' && needs.prepare-release.outputs.mode != 'preview'
+    needs: prepare-release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '22'
+          cache: pnpm
+      - run: pnpm --filter aria install --frozen-lockfile --ignore-scripts
+      - run: pnpm release:check
+
+  lint-typecheck-test:
+    needs: validate-version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '22'
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm lint
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm release:test
+      - run: npm ci --ignore-scripts
+        working-directory: apps/desktop/program-runner
+      - run: node --experimental-strip-types --test runner.test.mts
+        working-directory: apps/desktop/program-runner
+
+  build-windows:
+    needs: [prepare-release, lint-typecheck-test]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64, runner: windows-2025 }
+          - { arch: arm64, runner: windows-11-arm }
+    permissions:
+      contents: read
+    uses: ./.github/workflows/release-build.yml
+    with:
+      platform: windows
+      arch: ${{ matrix.arch }}
+      runner: ${{ matrix.runner }}
+      mode: ${{ needs.prepare-release.outputs.mode }}
+
+  build-macos:
+    needs: [prepare-release, lint-typecheck-test]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64, runner: macos-15-intel }
+          - { arch: arm64, runner: macos-15 }
+    permissions:
+      contents: read
+    uses: ./.github/workflows/release-build.yml
+    with:
+      platform: macos
+      arch: ${{ matrix.arch }}
+      runner: ${{ matrix.runner }}
+      mode: ${{ needs.prepare-release.outputs.mode }}
+
+  build-linux:
+    needs: [prepare-release, lint-typecheck-test]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64, runner: ubuntu-24.04 }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    permissions:
+      contents: read
+    uses: ./.github/workflows/release-build.yml
+    with:
+      platform: linux
+      arch: ${{ matrix.arch }}
+      runner: ${{ matrix.runner }}
+      mode: ${{ needs.prepare-release.outputs.mode }}
+
+  verify-artifacts:
+    needs: [prepare-release, build-windows, build-macos, build-linux]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      timestamp: ${{ steps.inventory.outputs.timestamp }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '22'
+          cache: pnpm
+      - run: pnpm --filter aria install --frozen-lockfile --ignore-scripts
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: aria-*
+          path: incoming
+      - name: Verify checksums and generate update metadata and SBOM
+        id: inventory
+        env:
+          RELEASE_MODE: ${{ needs.prepare-release.outputs.mode }}
+        run: node scripts/release/run.mjs verify-builds incoming verified "$RELEASE_MODE"
+      - if: needs.prepare-release.outputs.mode == 'publish'
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: verified/*
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: verified-release-assets
+          path: verified/
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 14
+          compression-level: 0
+
+  publish-release:
+    if: needs.prepare-release.outputs.mode == 'publish' && github.ref_name == github.event.repository.default_branch
+    needs: [prepare-release, verify-artifacts]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    environment: aria-release
+    permissions:
+      contents: write
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '22'
+          cache: pnpm
+      - run: pnpm --filter aria install --frozen-lockfile --ignore-scripts
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: verified-release-assets
+          path: verified
+      - name: Generate notes, reserve tag, verify draft and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARIA_RELEASE_ENABLED: ${{ vars.ARIA_RELEASE_ENABLED }}
+          ARIA_DISTRIBUTION_AUTHORIZED: ${{ vars.ARIA_DISTRIBUTION_AUTHORIZED }}
+          ARIA_UPDATE_PUBLIC_KEYS: ${{ vars.ARIA_UPDATE_PUBLIC_KEYS }}
+          ARIA_UPDATE_PRIVATE_KEY: ${{ secrets.ARIA_UPDATE_PRIVATE_KEY }}
+          BUILD_TIMESTAMP: ${{ needs.verify-artifacts.outputs.timestamp }}
+        run: node scripts/release/run.mjs publish verified "$BUILD_TIMESTAMP"

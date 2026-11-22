@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { basename } from 'node:path';
 import { Injectable, type OnModuleDestroy } from '@nestjs/common';
 import { conductorLimits, type ArtifactReference } from '@aria/shared';
@@ -24,6 +24,13 @@ const allowedInputs = new Map<string, number>([
     'video/webm',
   ].map((mime): [string, number] => [mime, 25_000_000]),
   ['text/plain', 1_000_000],
+  ...[
+    'application/pdf',
+    'application/zip',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  ].map((mime): [string, number] => [mime, 25_000_000]),
 ]);
 
 export function validateAttachment(file: RunAttachment) {
@@ -114,7 +121,10 @@ export class RunAssets implements OnModuleDestroy {
     const name = basename(file.name.replaceAll('\\', '/')).slice(0, 255);
     run.results.set(id, { ...file, name });
     run.bytes += file.bytes.length;
-    return { id, name, mimeType: file.mimeType, size: file.bytes.length };
+    return {
+      id, name, mimeType: file.mimeType, size: file.bytes.length,
+      sha256: createHash('sha256').update(file.bytes).digest('hex'),
+    };
   }
 
   get(runId: string, id: string) {

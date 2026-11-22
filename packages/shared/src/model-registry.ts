@@ -5,6 +5,7 @@ export const modelCapabilities = [
   'chat',
   'tools',
   'vision',
+  'embeddings',
   'image',
   'image-edit',
   'speech',
@@ -38,6 +39,7 @@ export const providerEndpointSchema = z
     }
   }, 'Enter a valid provider endpoint without credentials, query, or fragment.');
 export const capabilityList = z.array(modelCapabilitySchema).max(modelCapabilities.length);
+export const modelTransportSchema = z.enum(['realtime', 'speech-api', 'inline-png', 'base64-image']);
 
 export const modelPolicySchema = z
   .object({
@@ -45,6 +47,7 @@ export const modelPolicySchema = z
     enabled: z.boolean(),
     delegate: z.boolean(),
     declared: capabilityList,
+    transport: modelTransportSchema.optional(),
   })
   .strict();
 export const connectionSchema = z
@@ -84,6 +87,7 @@ export const registryPolicySchema = z
     preference: z.enum(['balanced', 'cost', 'latency', 'quality']),
     crossConnection: z.boolean(),
     crossConnectionAttachments: z.boolean(),
+    spendingLimitUsdMicros: z.number().int().positive().max(1_000_000_000).optional(),
   })
   .strict();
 export const connectionInputSchema = connectionSchema.safeExtend({
@@ -122,15 +126,21 @@ export type RegistrySettings = Omit<RegistryInput, 'connections'> & {
   environmentImportAvailable: boolean;
   encryptionAvailable: boolean;
 };
+export const textPricingSchema = z.strictObject({
+  unit: z.literal('usd-micros-per-million-tokens'),
+  input: z.number().int().nonnegative().max(1_000_000_000),
+  output: z.number().int().nonnegative().max(1_000_000_000),
+});
 export interface DiscoveredModel {
   id: string;
   capabilities: ModelCapability[];
   source: 'provider' | 'documentation' | 'unknown';
-  transport?: 'realtime' | 'speech-api' | 'inline-png' | 'base64-image';
+  transport?: z.infer<typeof modelTransportSchema>;
   voices?: string[];
   contextTokens?: number;
   inputCost?: number;
   outputCost?: number;
+  textPricing?: z.infer<typeof textPricingSchema>;
 }
 export const emptyRegistryPolicy: z.infer<typeof registryPolicySchema> = {
   primary: null,
@@ -142,9 +152,9 @@ export const emptyRegistryPolicy: z.infer<typeof registryPolicySchema> = {
 };
 
 export function registryPolicyOf(value: z.infer<typeof registryPolicySchema>) {
-  const { primary, live, systemPrompt, preference, crossConnection, crossConnectionAttachments } =
+  const { primary, live, systemPrompt, preference, crossConnection, crossConnectionAttachments, spendingLimitUsdMicros } =
     value;
-  return { primary, live, systemPrompt, preference, crossConnection, crossConnectionAttachments };
+  return { primary, live, systemPrompt, preference, crossConnection, crossConnectionAttachments, spendingLimitUsdMicros };
 }
 
 export function registryDraft(settings: RegistrySettings): RegistryInput {

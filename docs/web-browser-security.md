@@ -9,3 +9,21 @@ AI DOM inspection runs fixed code in an isolated world. Node references are scop
 Conductor exposes only tools enabled for the run. Browser search uses the Brave website and sends no search API credentials. Search discoveries are transient. Publisher reads provide provenance used for persistent citations. Saved web policy, browser history, and session state live outside model configuration and conversation history. Approval payloads and AI page bodies are transient. Explicit screenshots use the existing artifact store and conversation retention.
 
 Automated fixtures should cover network denial, managed browser requests, source history, cancellation, and process isolation on the built macOS and Windows desktop. Local fixtures are evidence for those test cases. Public-site smoke tests, live provider acceptance, and third-party redistribution review are separate release checks. Validate the latest available security patch for the Electron series before shipping a build.
+
+## Tool authorization and retry
+
+The tool registry evaluates policy at discovery, definition load, and dispatch. Electron main hosts skill imports, native browser approvals, and the durable dispatch journal. The managed service gets a scoped port for approved resource reads and dispatch reservations. Each request is matched to the current service generation, policy revision, and active text turn or Live Voice session.
+
+Before an approved consequential action or billable model operation runs, the runtime records its reservation under the saved logical turn. A retry with the same logical turn cannot dispatch external actions after a previous attempt may have dispatched one. A fresh user turn can authorize a new action. A timeout after dispatch may leave the remote result uncertain. The journal stores hashes and attempt ownership, without tool inputs or approval values.
+
+Desktop dispatch reservations use the execution database. Legacy file reservations remain readable and are imported transactionally on first access. Native prompts are serialized, with cancellation tied to their operation signal. Each driver rechecks the approved target, arguments, and session immediately before dispatch. Managed history is rebuilt from saved records before the model sees it, and private history restricts both browser and program dispatch.
+
+Verify with the built macOS and Windows Electron suites, the API's native wire fixtures, and a live configured Responses smoke test where credentials are available. Test malformed archives, private-resource transfer restrictions, revocation, cancellation, and recovery after a reservation.
+
+## Execution capability boundary
+
+The private capability port validates active turn bindings and the configured primary before runtime operations. Docker workspaces access staged files through the main-process broker, with kernel resource controls and an offline network namespace. Document parsers and the optional local embedding runtime use isolated Chromium sessions. Evidence and artifact access use versioned application IDs. File and network transfers require a reviewed, destination-specific grant. See [execution and knowledge](execution-knowledge-runtime.md).
+
+Computer Use shares the port and journal. Coordinate input uses an isolated browser tab with network activity suspended. Private sign-in runs in a separate single-origin partition while the user controls it. Authentication data stays in that partition and the model receives only bounded structural metadata after control returns. The public upload and download broker validates the observed destination again after approval and connects to a validated public address with redirects disabled. See [Computer Use](computer-use.md).
+
+For image observations, Electron main uses a fixed Chromium debugger command to request a fresh frame from the quarantined AI tab in a hidden, non-focusable window. It detaches the debugger after capture, timeout, or cancellation and checks the document, viewport, and sensitive controls again before releasing the image. The built-browser fixture checks that the provider receives pixels from the current viewport, the approved click updates the page with network requests blocked, and takeover closes the hidden window and moves the same tab into the chat window.

@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="logo.svg" alt="Logo" width="120" />
+</p>
+
 # Aria
 
 Aria is a desktop-first AI chatbot built with Electron, React, TypeScript, Tailwind, Radix UI, NestJS, and Vercel AI SDK.
@@ -11,13 +15,15 @@ pnpm install
 pnpm dev:desktop
 ```
 
+Vite refreshes the renderer as you edit. After a successful Electron compile, the development launcher closes Aria through its save flow and restarts it with the updated main and preload code.
+
 Aria opens directly into chat. In **Settings → AI Models**, add a connection, enter its endpoint and key, and choose **Discover models**. Enable models you want to use, select a primary that supports text streaming and function calling, and save. Electron manages the local NestJS service.
 
 ## AI Models and Conductor
 
 The primary model answers ordinary questions directly. It can also call tools, delegate to enabled models, and combine their results into a reply. Every model belongs to the same registry. AI Models controls provider connections, delegation, execution preferences, privacy, and the Live Voice profile.
 
-Aria uses the native Responses API for the official OpenAI endpoint and Chat Completions for compatible endpoints. Models must appear in the connected account’s catalog. Discovery combines provider metadata with exact documented OpenAI IDs, aliases, and snapshots, including their supported operations and protocol options. Known models whose APIs Aria does not implement display **No supported Aria operations**. Compatible endpoints that list only IDs can use explicit capability declarations in Settings. Run **Verify for primary** to confirm streaming function calling before selecting a model with declared capabilities. A provider can still reject an operation at execution time.
+Aria uses Responses for the official OpenAI endpoint and Chat Completions for compatible endpoints. Models must appear in the connected account’s catalog. Runtime capabilities come from provider metadata, explicit settings, and exact-model probes. Documented model details are shown as reference information. For catalogs that list only IDs, declare media capabilities and transport in Settings and run **Verify for primary** to confirm streaming function calling for a chat model. Aria keeps saved selections while you verify them.
 
 Settings encrypts API keys through Electron’s operating-system credential storage. Existing desktop provider settings migrate from `provider.json` to `provider-v2.json`, including the encrypted key, primary candidate, media candidates, and Live Voice choice. Open AI Models to repair a missing model or verify an unknown capability. If you configured desktop through the environment, choose **Import environment settings** once. Afterward, manage model selection in Settings.
 
@@ -66,9 +72,11 @@ Desktop build and predev stage the compiled API plus isolated production depende
 pnpm --filter @aria/desktop exec electron .
 ```
 
-Electron tests cover production and development startup, managed service streaming/cancellation/restart, encrypted settings, conversation management/persistence, responsive navigation, fetched model selection, image editing, transcription, media export/persistence/cancellation, synthetic-microphone GPT-Live, and legacy behavior. Commercial-provider generation and physical-microphone acceptance must be checked separately. They use temporary application-data directories and a local provider fixture. Screenshots are written to `apps/desktop/.artifacts/screenshots/`. CI runs checks on macOS and Windows; installer packaging, signing, and auto-update are separate work.
+Electron tests cover production and development startup, managed service streaming/cancellation/restart, encrypted settings, conversation management/persistence, responsive navigation, fetched model selection, image editing, transcription, media export/persistence/cancellation, synthetic-microphone GPT-Live, and legacy behavior. Commercial-provider generation and physical-microphone acceptance must be checked separately. They use temporary application-data directories and a local provider fixture. Screenshots are written to `apps/desktop/.artifacts/screenshots/`. CI runs desktop checks on macOS and Windows. See [Releasing Aria](docs/RELEASING.md) for installer builds, signatures, and desktop updates.
 
 The standalone API runs with `pnpm dev:api`, binds to loopback, and defaults to port 3000. Configure its primary with `OPENAI_MODEL`, `OPENAI_API_KEY`, and optional `OPENAI_BASE_URL`. For ID-only compatible catalogs, `ARIA_MODEL_CAPABILITIES=chat,tools` explicitly declares standalone primary support. `GET /health` is unchanged. Private endpoints require `ARIA_INTERNAL_TOKEN`. `POST /chat/stream` uses the configured primary and rejects a request-level `model` field.
+
+Guarded standalone operations require a writable dispatch journal. Set `ARIA_DISPATCH_DIRECTORY` to choose its location. The default is `~/.aria/runtime`. For a fixture performance check, build the API and run `node tests/conductor-benchmark.mts`. See [runtime verification](docs/conductor-runtime-audit.md).
 
 See [frontend architecture](docs/frontend-architecture.md) for process boundaries, persistence, and transport behavior.
 

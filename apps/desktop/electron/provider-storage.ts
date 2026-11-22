@@ -343,11 +343,10 @@ export class ProviderStorage {
           if (primaryChanged && !removeKey && primary) {
             const found = catalog.find((item) => item.id === primary.id);
             const capabilities =
-              found?.source === 'unknown' ? primary.declared : found?.capabilities;
+              found?.source === 'provider' ? found.capabilities : primary.declared;
             if (
-              !capabilities?.includes('chat') ||
-              !capabilities.includes('tools') ||
-              (found?.source === 'unknown' && !verified.includes(primary.id))
+              !(found?.source === 'provider' && capabilities?.includes('chat') &&
+                capabilities.includes('tools')) && !verified.includes(primary.id)
             )
               throw new ProviderConfigurationError(
                 'The primary needs streaming text and function calling. Verify unknown capabilities first.',
@@ -355,7 +354,7 @@ export class ProviderStorage {
           }
           if (liveChanged && !removeKey && live) {
             const found = catalog.find((item) => item.id === live.id);
-            const capabilities = found?.source === 'unknown' ? live.declared : found?.capabilities;
+            const capabilities = found?.source === 'provider' ? found.capabilities : live.declared;
             if (
               !capabilities?.includes('live') ||
               (found?.voices && !found.voices.includes(policy.live!.voice))

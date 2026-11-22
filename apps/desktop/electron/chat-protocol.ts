@@ -3,6 +3,7 @@ import {
   activitySchema,
   artifactReferenceSchema,
   runInfoSchema,
+  toolProblemSchema,
   type ChatEvent,
 } from '@aria/shared';
 
@@ -33,6 +34,10 @@ export const chatRequestSchema = z
     'Message context is invalid or too large.',
   );
 
+export const managedChatRequestSchema = chatRequestSchema.safeExtend({
+  programPrivateHistory: z.boolean().optional(),
+});
+
 const envelope = z.object({
   requestId: id,
   conversationId: id,
@@ -57,6 +62,7 @@ export const conductorEventSchema = z.discriminatedUnion('type', [
     interrupted: z.boolean(),
     run: runInfoSchema.optional(),
     settingsHelp: z.boolean().optional(),
+    problem: toolProblemSchema.optional(),
   }),
 ]);
 

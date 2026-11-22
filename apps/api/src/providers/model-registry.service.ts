@@ -53,16 +53,13 @@ export const providerConnection = (
 ): Connection => ({ provider: 'openai', baseUrl: config.baseUrl, apiKey: config.apiKey });
 
 export function capabilitiesFor(
-  connection: Pick<RuntimeConnection, 'baseUrl'>,
+  connection: Pick<RuntimeConnection, 'verified'>,
   discovered: DiscoveredModel,
   declared: ModelCapability[],
 ): ModelCapability[] {
-  const supported = declared.filter(
-    (capability) =>
-      capability !== 'web-search' &&
-      (capability !== 'live' || !officialConnection(connection.baseUrl)),
-  );
-  return discovered.source === 'unknown' ? [...new Set(supported)] : discovered.capabilities;
+  const supported = discovered.source === 'provider' ? discovered.capabilities : declared;
+  const verified: ModelCapability[] = connection.verified.includes(discovered.id) ? ['chat', 'tools'] : [];
+  return [...new Set([...supported.filter((capability) => capability !== 'web-search'), ...verified])];
 }
 
 @Injectable()
@@ -113,7 +110,24 @@ export class ModelRegistry {
     };
   }
 
-  async resolve(signal: AbortSignal, config = this.configuration(), includeLive = false) {
+  hasDelegateCandidates(config: RuntimeRegistry) {
+    const primary = config.connections.find((connection) =>
+      connection.models.some((model) => modelReference(connection.id, model.id) === config.primary),
+    );
+    return config.connections.some(
+      (connection) =>
+        connection.apiKey &&
+        (connection === primary || config.crossConnection) &&
+        connection.models.some((model) => model.enabled && model.delegate),
+    );
+  }
+
+  async resolve(
+    signal: AbortSignal,
+    config = this.configuration(),
+    includeLive = false,
+    primaryOnly = false,
+  ) {
     const primaryConnection = config.connections.find((connection) =>
       connection.models.some(
         (model) => model.enabled && modelReference(connection.id, model.id) === config.primary,
@@ -126,7 +140,7 @@ export class ModelRegistry {
     const connections = config.connections.filter(
       (connection) =>
         connection.apiKey &&
-        (connection.id === primaryConnection.id || config.crossConnection) &&
+        (connection.id === primaryConnection.id || (!primaryOnly && config.crossConnection)) &&
         (connection.id === primaryConnection.id ||
           connection.models.some(
             (model) =>
@@ -158,15 +172,16 @@ export class ModelRegistry {
         const capabilities = capabilitiesFor(connection, descriptor, policy.declared);
         const ref = modelReference(connection.id, policy.id);
         models.set(ref, {
-          ...descriptor,
+          ...(descriptor.source === 'provider' ? descriptor : { id: descriptor.id, source: descriptor.source }),
           ref,
           connection,
           capabilities,
+          transport: descriptor.source === 'provider' ? descriptor.transport : policy.transport,
           delegate: policy.delegate,
           primaryEligible:
             capabilities.includes('chat') &&
             capabilities.includes('tools') &&
-            (descriptor.source !== 'unknown' || connection.verified.includes(policy.id)),
+            (descriptor.source === 'provider' || connection.verified.includes(policy.id)),
         });
       }
     }

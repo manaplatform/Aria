@@ -6,6 +6,20 @@ After building the desktop app and installing its Electron runtime, run `pnpm li
 
 The recorded notice for `@ai-sdk/provider-utils@5.0.79` comes from its [tagged upstream release](https://github.com/vercel/ai/blob/44ba949048fcfe4cd1b801c3bd9c49bffbad96fa/LICENSE).
 
+The inventory includes the notice from the `remark-math@6.0.0` release. [Upstream MIT notice](https://github.com/remarkjs/remark-math/blob/6.0.0/license)
+
+The bundled KaTeX fonts carry the copyright and reserved names from the distributed font files. [SIL Open Font License 1.1](https://openfontlicense.org/open-font-license-official-text/)
+
 Review entries flagged by the check for absent metadata, absent license files, or additional terms. Review generated CSS, embedded assets, trademarks, and any installer-specific additions separately. No standalone image, icon, or font asset was tracked at the start of this change. Aria's own name and marks require a separate ownership and trademark review before adding an open-source notice.
 
 See [Electron's license](https://github.com/electron/electron/blob/main/LICENSE) and the license notices included with each published Electron binary.
+
+The opt-in local embedding pack is a pinned ONNX export of the Apache-2.0
+paraphrase-multilingual-MiniLM-L12-v2 model. Its model and tokenizer data are
+installed separately. The optional managed sandbox uses a digest-pinned
+Docker Official Python image. The bundled renderer dependency inventory
+covers the document and ONNX runtime libraries.
+
+The optional Aria graphical desktop recipe uses the pinned Debian base image and its distribution packages. If distributing the built image, retain the upstream package notices and review the applicable redistribution and source obligations. Windows local desktop builds stage a self-contained .NET Windows Desktop helper. Include the runtime license and third-party notices from the exact runtime packs used to publish that helper.
+
+The optional program runner recipe uses a digest-pinned Docker Official Node image and the QuickJS WebAssembly packages pinned in `apps/desktop/program-runner/package-lock.json`. Retain the base image notices and the license files included in those packages with any distribution of the runner image.

@@ -1,13 +1,135 @@
+import { useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Activity, ExternalLink, RotateCcw } from 'lucide-react';
-import type { ChatMessage as Message } from '@aria/shared';
-import { generating, regenerateChat, useChatStore } from '../../stores/chatStore';
+import type { ChatMessage as Message, ConductorActivity } from '@aria/shared';
+import { generating, regenerateChat, updateChat, useChatStore } from '../../stores/chatStore';
 import { AriaMark } from '../layout/AriaMark';
 import { Button, CopyButton } from '../ui';
-import { openExternal } from '../../services/desktop';
+import { desktop, errorMessage, openExternal } from '../../services/desktop';
 import { openResearchSource } from '../../stores/browserStore';
 import MarkdownRenderer from './MarkdownRenderer';
+import { ArtifactCard } from './ArtifactCard';
+import { DocumentEvidence } from './DocumentEvidence';
 import { MediaPreview } from './MediaPreview';
+
+function ActivityRow({ step, children }: {
+  step: ConductorActivity;
+  children?: React.ReactNode;
+}) {
+  return (
+    <li>
+      <span>
+        {step.summary} · {step.status === 'approval' ? 'Waiting for approval' : step.programStatus ?? step.status}
+      </span>
+      <small>
+        {step.target}
+        {step.durationMs !== undefined ? ` · ${(step.durationMs / 1000).toFixed(1)} s` : ''}
+      </small>
+      {step.inputSummary && <small>{step.inputSummary}</small>}
+      {step.resultSummary && <small>{step.resultSummary}</small>}
+      {step.executionDetails && (
+        <details>
+          <summary>{step.capability === 'programs.run' ? 'Program result' : 'Command output'}</summary>
+          <pre>{step.executionDetails}</pre>
+        </details>
+      )}
+      {step.error && <small>{step.error}</small>}
+      {children}
+    </li>
+  );
+}
+
+function ProgramControls({ message, id }: { message: Message; id: string }) {
+  const [paused, setPaused] = useState(false);
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState('');
+  return (
+    <div>
+      <Button size="sm" variant="ghost" disabled={pending} onClick={async () => {
+        if (!message.requestId) return;
+        setPending(true);
+        setError('');
+        try {
+          await desktop().superviseProgram(message.requestId, message.conversationId, id, !paused);
+          setPaused(!paused);
+        } catch (failure) {
+          setError(errorMessage(failure));
+        } finally {
+          setPending(false);
+        }
+      }}>
+        {paused ? 'Resume program' : 'Pause program'}
+      </Button>
+      {error && <small role="alert">{error}</small>}
+    </div>
+  );
+}
+
+function SavedProgramResult({ conversation, id }: { conversation: string; id: string }) {
+  const [value, setValue] = useState('');
+  const [error, setError] = useState('');
+  return (
+    <details onToggle={async (event) => {
+      if (!event.currentTarget.open || value) return;
+      setError('');
+      try {
+        setValue(await desktop().inspectProgramResult(conversation, id));
+      } catch (failure) {
+        setError(errorMessage(failure));
+      }
+    }}>
+      <summary>Saved program result</summary>
+      {error ? <small role="alert">{error}</small> : <pre>{value || 'Loading…'}</pre>}
+    </details>
+  );
+}
+
+
+function ActivityList({ steps, message, live }: {
+  steps: ConductorActivity[];
+  message: Message;
+  live?: boolean;
+}) {
+  const ids = new Set(steps.map(({ stepId }) => stepId));
+  const groups: ConductorActivity[][] = [];
+  for (const step of steps) {
+    if (step.parentStepId && ids.has(step.parentStepId)) continue;
+    const previous = groups.at(-1);
+    const head = previous?.[0];
+    if (head && step.status === 'completed' && head.status === step.status &&
+      (step.capability === 'conductor.discovery' || step.capability === 'conductor.skills') &&
+      head.capability === step.capability && head.summary === step.summary) previous.push(step);
+    else groups.push([step]);
+  }
+  const row = (step: ConductorActivity) => {
+    const children = steps.filter(({ parentStepId }) => parentStepId === step.stepId);
+    return (
+      <ActivityRow key={step.stepId} step={step}>
+        {live && step.capability === 'programs.run' && step.target === 'Aria isolated JavaScript' &&
+          step.status === 'running' && <ProgramControls message={message} id={step.stepId} />}
+        {step.programResultSaved && <SavedProgramResult conversation={message.conversationId} id={step.stepId} />}
+        {children.length > 0 && (
+          <details>
+            <summary>{children.length} tool {children.length === 1 ? 'call' : 'calls'}</summary>
+            <ul>{children.map((child) => <ActivityRow key={child.stepId} step={child} />)}</ul>
+          </details>
+        )}
+      </ActivityRow>
+    );
+  };
+  return (
+    <ul>
+      {groups.map(([first, ...rest]) => rest.length ? (
+        <li key={first.stepId}>
+          <details>
+            <summary>{first.summary} · {rest.length + 1} calls</summary>
+            <ul>{[first, ...rest].map(row)}</ul>
+          </details>
+        </li>
+      ) : row(first))}
+    </ul>
+  );
+}
 
 export function ChatMessage({
   message,
@@ -20,17 +142,31 @@ export function ChatMessage({
   canRegenerate: boolean;
   name: string;
 }) {
+  const [selectedEvidence, setSelectedEvidence] = useState<string | null>(null);
+  const [recovery, setRecovery] = useState<{ pending: boolean; error?: string }>({ pending: false });
+  const evidence = useMemo(
+    () => [
+      ...new Map(
+        [...(message.activity?.flatMap((step) => step.evidence ?? []) ?? []),
+          ...(message.citations?.evidence ?? [])].map((item) => [item.id, item]),
+      ).values(),
+    ],
+    [message.activity, message.citations],
+  );
   const busy = generating(message);
   const revision = useChatStore((state) => state.status.revision);
   const retry = message.retryConfirmed && message.run?.revision === revision;
   const sources = [
     ...new Map(
-      message.activity?.flatMap((item) => item.sources ?? []).map((source) => [source.url, source]),
+      [...(message.activity?.flatMap((item) => item.sources ?? []) ?? []),
+        ...(message.citations?.sources ?? [])].map((source) => [source.url, source]),
     ).values(),
   ];
   const research =
     message.activity?.some(({ capability }) => /^web[-_]|^browser_/.test(capability)) ?? false;
-  const activeStep = message.activity?.find((step) => step.status === 'running');
+  const activeStep = message.activity?.find((step) =>
+    ['running', 'approval', 'processing'].includes(step.status),
+  );
 
   return (
     <article
@@ -53,7 +189,15 @@ export function ChatMessage({
         {message.role === 'user' ? (
           <div className="user-message-text">{message.content}</div>
         ) : message.content ? (
-          <MarkdownRenderer content={message.content} sources={sources} research={research} />
+          <MarkdownRenderer
+            content={message.content}
+            sources={sources}
+            research={research}
+            evidenceIds={evidence.map((item) => item.id)}
+            onEvidence={setSelectedEvidence}
+            rich={!message.liveSessionId}
+            streaming={busy}
+          />
         ) : busy ? (
           <div className="thinking-indicator" aria-label="Waiting for response">
             <i />
@@ -65,27 +209,25 @@ export function ChatMessage({
       {message.activity?.length ? (
         <details className="conductor-activity">
           <summary>
-            <Activity size={13} aria-hidden="true" /> {activeStep?.summary || 'Conductor activity'}{' '}
+            <Activity size={13} aria-hidden="true" />{' '}
+            {activeStep?.status === 'approval'
+              ? 'Waiting for approval'
+              : activeStep?.status === 'processing'
+                ? 'Processing results'
+                : activeStep?.summary || 'Conductor activity'}{' '}
             · {message.activity.length}
           </summary>
-          <ul>
-            {message.activity.map((step) => (
-              <li key={step.stepId}>
-                <span>
-                  {step.summary} · {step.status}
-                </span>
-                <small>
-                  {step.target} · {step.capability}
-                  {step.durationMs !== undefined
-                    ? ` · ${(step.durationMs / 1000).toFixed(1)} s`
-                    : ''}
-                </small>
-                {step.error && <small>{step.error}</small>}
-              </li>
-            ))}
-          </ul>
+          <ActivityList steps={message.activity} message={message} live={busy} />
         </details>
       ) : null}
+      {evidence.length > 0 && (
+        <DocumentEvidence
+          conversation={message.conversationId}
+          evidence={evidence}
+          selected={selectedEvidence}
+          onSelect={setSelectedEvidence}
+        />
+      )}
       {sources.length ? (
         <nav className="conductor-sources" aria-label="Research sources">
           <span>Sources</span>
@@ -118,11 +260,7 @@ export function ChatMessage({
             {message.attempts.map((attempt) => (
               <li key={attempt.requestId}>
                 {attempt.outcome} · {attempt.run.primaryName ?? attempt.run.primary}
-                {attempt.activity.map((step) => (
-                  <small key={step.stepId}>
-                    {step.summary} · {step.status}
-                  </small>
-                ))}
+                <ActivityList steps={attempt.activity} message={message} />
               </li>
             ))}
           </ul>
@@ -148,13 +286,22 @@ export function ChatMessage({
           Live voice{message.role === 'assistant' ? ' · AI-generated audio' : ''}
         </p>
       )}
-      {message.assets?.map((asset) => (
-        <MediaPreview
-          key={asset.id}
-          asset={asset}
-          reusable={message.role === 'assistant' && canRegenerate && !busy}
-        />
-      ))}
+      {message.assets?.map((asset) =>
+        asset.mimeType === 'text/plain' || asset.mimeType.startsWith('application/') ? (
+          <ArtifactCard
+            key={asset.id}
+            asset={asset}
+            conversation={message.conversationId}
+            reusable={message.role === 'assistant' && canRegenerate && !busy}
+          />
+        ) : (
+          <MediaPreview
+            key={asset.id}
+            asset={asset}
+            reusable={message.role === 'assistant' && canRegenerate && !busy}
+          />
+        ),
+      )}
       {(message.status === 'failed' || message.status === 'interrupted') && (
         <p className="chat-response-error" role="alert">
           {message.error || 'The response did not finish. Please retry.'}
@@ -166,8 +313,33 @@ export function ChatMessage({
         </Link>
       )}
       {message.status === 'stopped' && <p className="chat-response-note">Response stopped</p>}
+      {recovery.error && <p className="chat-response-error" role="alert">{recovery.error}</p>}
       {!busy && (
         <div className="chat-message-actions">
+          {message.status === 'interrupted' && message.run?.storedResponses && (
+            <Button variant="ghost" size="sm" disabled={recovery.pending} onClick={async () => {
+              setRecovery({ pending: true });
+              try {
+                const result = await desktop().recoverStoredResponse(message.conversationId, message.id, message.requestId);
+                updateChat((current) => ({
+                  ...current,
+                  messages: current.messages.map((item) =>
+                    item.id === message.id && item.requestId === message.requestId && item.status === 'interrupted'
+                      ? {
+                          ...item, content: result.content, status: 'completed', error: undefined,
+                          retryConfirmed: false,
+                          run: item.run && { ...item.run, privateContent: result.privateContent },
+                        }
+                      : item),
+                }));
+                setRecovery({ pending: false });
+              } catch (error) {
+                setRecovery({ pending: false, error: errorMessage(error) });
+              }
+            }}>
+              {recovery.pending ? 'Checking stored response…' : 'Recover stored response'}
+            </Button>
+          )}
           {message.content && (
             <CopyButton
               text={message.content}

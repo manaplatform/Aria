@@ -1,6 +1,9 @@
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from 'vitest';
 import { randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { INestApplication } from '@nestjs/common';
 import { emptyRegistryPolicy, type RuntimeRegistry, type ExecutionStep } from '@aria/shared';
 import WebSocket from 'ws';
@@ -19,6 +22,7 @@ let fixture: Awaited<ReturnType<typeof createProviderFixture>>;
 let app: INestApplication;
 let registry: InstanceType<typeof ModelRegistry>;
 let url: string;
+let dispatchDirectory: string;
 const token = 'Bearer multimodal-session';
 const headers = { Authorization: token };
 const jsonHeaders = { ...headers, 'Content-Type': 'application/json' };
@@ -54,6 +58,8 @@ function config(): RuntimeRegistry {
 }
 
 beforeAll(async () => {
+  dispatchDirectory = await mkdtemp(join(tmpdir(), 'aria-dispatch-test-'));
+  vi.stubEnv('ARIA_DISPATCH_DIRECTORY', dispatchDirectory);
   fixture = await createProviderFixture();
   vi.stubEnv('ARIA_INTERNAL_TOKEN', 'multimodal-session');
   app = await createApi();
@@ -66,6 +72,7 @@ afterEach(() => vi.restoreAllMocks());
 afterAll(async () => {
   await app?.close();
   await fixture?.close();
+  if (dispatchDirectory) await rm(dispatchDirectory, { recursive: true, force: true });
   vi.unstubAllEnvs();
 });
 
@@ -160,7 +167,7 @@ async function submit(
         .status,
     ).toBe(201);
   }
-  if (steps) fixture.queueTool(content, 'execute_steps', { steps }, 'Preparing your request.');
+  if (steps) fixture.queueOperations(content, { steps }, 'Preparing your request.');
   const response = await fetch(`${url}/chat/stream`, {
     method: 'POST',
     headers: jsonHeaders,
@@ -168,7 +175,7 @@ async function submit(
     body: JSON.stringify({
       requestId,
       conversationId: 'chat',
-      assistantMessageId: 'assistant',
+      assistantMessageId: requestId,
       messages: [{ role: 'user', content }],
       attachmentIds: attachments.map((attachment) => attachment.id),
     }),
@@ -204,10 +211,12 @@ it('uses the same primary for semantic routing and synthesis and reuses image ge
   expect(generation.events.map((event) => event.type)).toContain('reset');
   expect(generation.events.at(-1)?.type).toBe('completed');
   expect(generation.bytes).toEqual([fixture.png]);
-  expect(fixture.received.slice(count).map((call) => call.body.model)).toEqual([
-    'fixture-model',
-    'fixture-model',
-  ]);
+  expect(fixture.received.slice(count).map((call) => call.body.model)).toEqual(
+    Array(4).fill('fixture-model'),
+  );
+  const requestTools = fixture.received.slice(count).map((call) => JSON.stringify(call.body.tools));
+  expect(requestTools[0]).not.toContain('media_image');
+  expect(requestTools[2]).toContain('media_image');
 
   const reference = file('reference.png', 'image/png', fixture.png);
   const edit = await read(
@@ -239,7 +248,7 @@ it.each([
     registry.install(snapshot);
     const prompt = `Make a panda image dancing (${target})`;
     const instructions = 'Create an image of a happy panda dancing.';
-    fixture.continueWithTool(prompt, 'execute_steps', {
+    fixture.continueWithOperations(prompt, {
       steps: [step('panda', 'gpt-image-2.6-flare', 'image', 'image', { instructions })],
     });
     const count = fixture.mediaReceived.length;
@@ -263,16 +272,17 @@ it.each([
       prompt: instructions,
     });
     const calls = fixture.received.slice(primaryCalls);
-    expect(calls.map((call) => call.body.model)).toEqual(Array(3).fill('fixture-model'));
-    expect(calls[1].body.messages.at(-1)?.content).toContain('No operation started');
-    expect(calls[0].body.messages[0].content).toContain(
-      JSON.stringify({
-        capability: 'image',
-        output: 'image',
-        target: { kind: 'model', model: fixtureRef('gpt-image-2.6-flare') },
-      }),
-    );
-    expect(result.events.filter((event) => event.type === 'activity')).toHaveLength(3);
+    expect(calls.map((call) => call.body.model)).toEqual(Array(5).fill('fixture-model'));
+    expect(calls[3].body.messages.at(-1)?.content).toContain('No operation started');
+    expect(calls[1].body.messages.at(-1)?.content).toContain(fixtureRef('gpt-image-2.6-flare'));
+    expect(
+      result.events.some(
+        (event) =>
+          event.type === 'activity' &&
+          event.activity.status === 'completed' &&
+          event.activity.target.includes('gpt-image-2.6-flare'),
+      ),
+    ).toBe(true);
   },
 );
 it('waits for a corrected primary decision after a target rejection without automatically choosing a model', async () => {
@@ -288,7 +298,7 @@ it('waits for a corrected primary decision after a target rejection without auto
   expect(result.text).toContain('No operation started');
   expect(fixture.mediaReceived).toHaveLength(count);
 });
-it('resolves selected Sunburst image operations from authenticated OpenAI IDs and documented capabilities', async () => {
+it('resolves selected Sunburst image operations from authenticated OpenAI capability metadata', async () => {
   const snapshot = config();
   snapshot.crossConnection = true;
   snapshot.connections[0].models.find((model) => model.id === 'gpt-image-2.6-flare')!.enabled =
@@ -306,7 +316,7 @@ it('resolves selected Sunburst image operations from authenticated OpenAI IDs an
   const nativeFetch = globalThis.fetch;
   const provider = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, options) => {
     if (String(input) === 'https://api.openai.com/v1/models')
-      return Response.json({ data: [{ id: 'gpt-image-2.6-sunburst' }] });
+      return Response.json({ data: [{ id: 'gpt-image-2.6-sunburst', capabilities: ['image'], transport: 'inline-png' }] });
     if (String(input) === 'https://api.openai.com/v1/images/generations') {
       expect(options?.headers).toMatchObject({ Authorization: 'Bearer image-key' });
       expect(JSON.parse(String(options?.body))).toMatchObject({
@@ -394,12 +404,12 @@ it('rejects a disabled target, a cycle, and a fabricated attachment before dispa
   const disabled = await read('Draw the first scene', [
     step('image', 'gpt-image-2.6-flare', 'image', 'image'),
   ]);
-  expect(disabled.text).toContain('unavailable for this capability');
+  expect(disabled.text).toContain('Enable a compatible image');
   const cyclic = await read('Handle these tasks', [
     step('a', 'test-model', 'chat', 'text', { dependsOn: ['b'] }),
     step('b', 'test-model', 'chat', 'text', { dependsOn: ['a'] }),
   ]);
-  expect(cyclic.text).toContain('cyclic dependency');
+  expect(cyclic.text).toContain('Reference only successful execution IDs');
   const fabricated = await read('Analyze that file', [
     step('vision', 'test-model', 'vision', 'text', {
       inputs: [{ kind: 'attachment', id: randomUUID() }],
@@ -451,7 +461,7 @@ it('deduplicates equivalent operations and reports a missing capability without 
   snapshot.connections[0].models.find((model) => model.id === 'gpt-image-2.6-flare')!.enabled =
     false;
   registry.install(snapshot);
-  fixture.queueTool('Show a city', 'report_unavailable', { capability: 'image' });
+  fixture.queueTool('Show a city', 'find_capabilities', { query: 'image', ids: ['media.image'] });
   const unavailable = await read('Show a city');
   expect(unavailable.events.at(-1)).toMatchObject({ type: 'failed', settingsHelp: true });
   expect(unavailable.text).toContain('Enable a compatible image');
@@ -468,7 +478,7 @@ it('blocks a model-requested replacement after a failed provider operation', asy
   });
   registry.install(snapshot);
   const prompt = 'Design a coastal illustration';
-  fixture.continueWithTool(prompt, 'execute_steps', {
+  fixture.continueWithOperations(prompt, {
     steps: [
       step('replacement', 'gpt-image-2.6-flare', 'image', 'image', {
         target: { kind: 'model', model: `${secondId}:gpt-image-2.6-flare` },
@@ -497,7 +507,7 @@ it('reads a native text attachment and prevents its contents from crossing conne
   registry.install(snapshot);
   const prompt = 'Read the note and consider the next action';
   const attachment = file('notes.txt', 'text/plain', Buffer.from('Private attachment contents'));
-  fixture.continueWithTool(prompt, 'execute_steps', {
+  fixture.continueWithOperations(prompt, {
     steps: [
       step('share', 'test-model', 'chat', 'text', {
         target: { kind: 'model', model: `${secondId}:test-model` },
@@ -522,7 +532,7 @@ it('reads a native text attachment and prevents its contents from crossing conne
       .slice(count)
       .every((request) => request.authorization === 'Bearer test-only-key'),
   ).toBe(true);
-  expect(fixture.received.slice(count)[1]?.body.messages.at(-1)?.content).toContain(
+  expect(fixture.received.slice(count)[3]?.body.messages.at(-1)?.content).toContain(
     'Private attachment contents',
   );
 });
@@ -559,7 +569,7 @@ it('isolates duplicate provider model IDs by connection and enforces cross-conne
   const call = [...fixture.received].reverse().find((call) => call.body.model === 'test-model');
   expect(call?.body.messages).toHaveLength(2);
 });
-it('executes a documented image model from an ID-only OpenAI catalog without capability declarations', async () => {
+it('requires an explicit image operation and transport for an ID-only provider catalog', async () => {
   const snapshot = config();
   snapshot.crossConnection = true;
   snapshot.connections.push({
@@ -587,11 +597,19 @@ it('executes a documented image model from an ID-only OpenAI catalog without cap
     return nativeFetch(input, options);
   });
 
-  const result = await read('Create a detailed panorama', [
+  const operations = [
     step('panorama', '', 'image', 'image', {
       target: { kind: 'model', model: `${secondId}:gpt-image-2.6-sunburst` },
     }),
-  ]);
+  ];
+  const unavailable = await read('Create a panorama from the ID listing', operations);
+  expect(unavailable.events.at(-1)).toMatchObject({
+    type: 'failed', problem: { code: 'CAPABILITY_UNAVAILABLE' },
+  });
+  snapshot.connections[1].models[0].declared = ['image'];
+  snapshot.connections[1].models[0].transport = 'inline-png';
+  registry.install(snapshot);
+  const result = await read('Create a detailed panorama', operations);
 
   expect(result.events.at(-1)).toMatchObject({ type: 'completed' });
   expect(result.bytes).toEqual([fixture.png]);

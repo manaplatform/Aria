@@ -1,4 +1,12 @@
-import { activitySchema, conductorAttemptSchema, endActivity, runInfoSchema } from '@aria/shared';
+import {
+  activitySchema,
+  conductorLimits,
+  conductorAttemptSchema,
+  endActivity,
+  evidenceSchema,
+  runInfoSchema,
+  sourceSchema,
+} from '@aria/shared';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
@@ -128,7 +136,11 @@ const chatSchema = z
           sequence: z.number().int().nonnegative(),
           error: z.string().max(2000).optional(),
           operation: operationSchema.optional(),
-          activity: z.array(activitySchema).max(12).optional(),
+          activity: z.array(activitySchema).max(conductorLimits.activity).optional(),
+          citations: z.strictObject({
+            sources: z.array(sourceSchema).max(conductorLimits.steps * 8),
+            evidence: z.array(evidenceSchema).max(conductorLimits.steps * 8),
+          }).optional(),
           attempts: z.array(conductorAttemptSchema).max(2).optional(),
           run: runInfoSchema.optional(),
           retryConfirmed: z.boolean().optional(),

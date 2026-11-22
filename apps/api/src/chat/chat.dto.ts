@@ -3,9 +3,13 @@ import {
   ArrayMaxSize,
   ArrayMinSize,
   IsArray,
+  IsBoolean,
   ArrayUnique,
   IsUUID,
   IsIn,
+  IsInt,
+  Min,
+  Max,
   IsNotEmpty,
   IsOptional,
   IsString,
@@ -23,7 +27,36 @@ export class ChatInputDto {
   content!: string;
 }
 
+class AvailableAssetDto {
+  @IsUUID()
+  id!: string;
+
+  @IsString()
+  @MaxLength(255)
+  name!: string;
+
+  @IsString()
+  @MaxLength(100)
+  mimeType!: string;
+
+  @IsInt()
+  @Min(1)
+  @Max(64_000_000)
+  size!: number;
+}
+
 export class ChatRequestDto {
+  @IsOptional()
+  @IsBoolean()
+  programPrivateHistory?: boolean;
+
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(12)
+  @ValidateNested({ each: true })
+  @Type(() => AvailableAssetDto)
+  availableAssets?: AvailableAssetDto[];
+
   @IsOptional()
   @IsArray()
   @ArrayMaxSize(4)

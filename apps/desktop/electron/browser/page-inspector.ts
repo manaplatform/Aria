@@ -14,6 +14,12 @@ type Command = {
     | 'submit'
     | 'selected'
     | 'screenshot'
+    | 'computer-state'
+    | 'wait-change'
+    | 'play-media'
+    | 'stop-media'
+    | 'media-state'
+    | 'upload-target'
     | 'search-results';
   documentId: string;
   ids?: string[];
@@ -24,6 +30,7 @@ type Command = {
   query?: string;
   selection?: boolean;
   fingerprint?: string;
+  includeUploads?: boolean;
 };
 const element = z.strictObject({
   elementId: z.string().uuid(),
@@ -46,6 +53,10 @@ const resultSchema = z.strictObject({
   action: z.string().max(2000).optional(),
   body: z.string().max(12_000).optional(),
   sensitive: z.boolean().optional(),
+  viewport: z.object({ width: z.number(), height: z.number(), dpr: z.number() }).optional(),
+  editable: z.boolean().optional(),
+  field: z.string().max(80).optional(),
+  playingMedia: z.boolean().optional(),
   results: z
     .array(z.strictObject({ url: z.string().max(2000), title: z.string().max(300) }))
     .max(8)
@@ -59,6 +70,7 @@ function execute(command: Command) {
       documentId: string;
       items: Map<string, { node: Element; signature: string }>;
     };
+    ariaPlayback?: HTMLMediaElement;
   };
   const signature = (node: Element) =>
     JSON.stringify([
@@ -122,6 +134,69 @@ function execute(command: Command) {
       ? item.node
       : undefined;
   };
+  if (command.op === 'stop-media') {
+    world.ariaPlayback?.pause();
+    world.ariaPlayback = undefined;
+    return { playingMedia: false };
+  }
+  if (command.op === 'media-state') {
+    const media = world.ariaPlayback;
+    return {
+      playingMedia: Boolean(media?.isConnected && !media.paused && !media.ended && !media.muted),
+    };
+  }
+  if (command.op === 'play-media') {
+    const candidates = Array.from(
+      document.querySelectorAll<HTMLMediaElement>('audio, video'),
+    ).filter(
+      (media) =>
+        visible(media) &&
+        !media.srcObject &&
+        Boolean(media.currentSrc || media.src || media.querySelector('source[src]')),
+    );
+    if (candidates.length !== 1) return { error: 'MEDIA_UNAVAILABLE' };
+    const [media] = candidates;
+    const previous = world.ariaPlayback;
+    if (previous && previous !== media) previous.pause();
+    world.ariaPlayback = media;
+    media.muted = false;
+    if (!media.volume) media.volume = 0.4;
+    const start = media.currentTime;
+    return new Promise<{ playingMedia?: boolean; error?: string }>((resolve) => {
+      let completed = false;
+      const finish = (success: boolean) => {
+        if (completed) return;
+        completed = true;
+        clearTimeout(timer);
+        media.removeEventListener('timeupdate', progress);
+        media.removeEventListener('error', failed);
+        if (success) resolve({ playingMedia: true });
+        else {
+          if (world.ariaPlayback === media) {
+            media.pause();
+            world.ariaPlayback = undefined;
+          }
+          resolve({ error: 'MEDIA_UNAVAILABLE' });
+        }
+      };
+      const failed = () => finish(false);
+      const progress = () => {
+        if (
+          world.ariaPlayback === media &&
+          media.isConnected &&
+          !media.paused &&
+          !media.ended &&
+          !media.muted &&
+          media.currentTime > start + 0.02
+        )
+          finish(true);
+      };
+      const timer = setTimeout(failed, 4000);
+      media.addEventListener('timeupdate', progress);
+      media.addEventListener('error', failed, { once: true });
+      void media.play().then(progress, failed);
+    });
+  }
   if (command.op === 'search-results') {
     const results: { url: string; title: string }[] = [];
     for (const anchor of document.querySelectorAll<HTMLAnchorElement>(
@@ -155,7 +230,48 @@ function execute(command: Command) {
     return {
       sensitive: [...document.querySelectorAll('input, textarea')].some((node) => visible(node)),
     };
+  if (command.op === 'computer-state') {
+    const inputs = [
+      ...document.querySelectorAll('input, textarea, iframe, frame, [contenteditable]'),
+    ];
+    return {
+      viewport: { width: innerWidth, height: innerHeight, dpr: devicePixelRatio },
+      sensitive: inputs.some(
+        (node) =>
+          visible(node) &&
+          !safeField(node) &&
+          !(node instanceof HTMLInputElement && node.type === 'file' && !node.files?.length),
+      ),
+      editable: !!document.activeElement && safeField(document.activeElement),
+    };
+  }
+  if (command.op === 'wait-change') {
+    return new Promise<Record<string, never>>((resolve) => {
+      const finish = () => {
+        observer.disconnect();
+        clearTimeout(timer);
+        resolve({});
+      };
+      const observer = new MutationObserver(finish);
+      const timer = setTimeout(finish, 750);
+      observer.observe(document.documentElement, {
+        attributes: true,
+        characterData: true,
+        childList: true,
+        subtree: true,
+      });
+    });
+  }
   if (command.op === 'inspect') {
+    const previous =
+      world.ariaInspection?.documentId === command.documentId
+        ? world.ariaInspection.items
+        : undefined;
+    const references = new Map(
+      previous
+        ? [...previous].map(([id, entry]) => [entry.node, { id, signature: entry.signature }])
+        : [],
+    );
     const items = new Map<string, { node: Element; signature: string }>();
     world.ariaInspection = { documentId: command.documentId, items };
     const elements = [];
@@ -164,12 +280,17 @@ function execute(command: Command) {
     )) {
       if (
         !visible(node) ||
-        (node instanceof HTMLInputElement && ['password', 'hidden', 'file'].includes(node.type))
+        (node instanceof HTMLInputElement &&
+          (['password', 'hidden'].includes(node.type) ||
+            (node.type === 'file' && !command.includeUploads)))
       )
         continue;
-      const id: string | undefined = command.ids?.[elements.length];
+      const prior = references.get(node);
+      const current = signature(node);
+      const id: string | undefined =
+        prior?.signature === current ? prior.id : command.ids?.[elements.length];
       if (!id) break;
-      items.set(id, { node, signature: signature(node) });
+      items.set(id, { node, signature: current });
       elements.push(descriptor(node, id));
     }
     return { elements };
@@ -218,6 +339,36 @@ function execute(command: Command) {
   const summary = descriptor(node, command.elementId);
   const fingerprint = signature(node);
   if (command.op === 'describe') return { element: summary, fingerprint };
+  if (command.op === 'upload-target') {
+    if (
+      !(node instanceof HTMLInputElement) ||
+      node.type !== 'file' ||
+      node.disabled ||
+      node.multiple ||
+      node.files?.length
+    )
+      return { error: 'MANUAL_ACTION_REQUIRED' };
+    const form = node.form;
+    if (
+      !form ||
+      form.method !== 'post' ||
+      form.enctype !== 'multipart/form-data' ||
+      !/^[A-Za-z0-9_.-]{1,80}$/.test(node.name) ||
+      [...form.elements].some(
+        (member) => member !== node && !(member instanceof HTMLButtonElement && !member.name),
+      )
+    )
+      return { error: 'MANUAL_ACTION_REQUIRED' };
+    const action = new URL(form.action);
+    if (
+      action.protocol !== 'https:' ||
+      action.origin !== location.origin ||
+      action.search ||
+      action.hash
+    )
+      return { error: 'MANUAL_ACTION_REQUIRED' };
+    return { action: action.href, field: node.name };
+  }
   if ((command.op === 'click' || command.op === 'type') && fingerprint !== command.fingerprint)
     return { error: 'STALE_ELEMENT' };
   if (command.op === 'click') {
@@ -307,7 +458,7 @@ export async function inspectPage(contents: WebContents, command: Command) {
         code: `(${execute.toString()})(${JSON.stringify(args)})`,
       },
     ],
-    false,
+    command.op === 'play-media',
   );
   return resultSchema.parse(raw);
 }

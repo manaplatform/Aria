@@ -201,6 +201,7 @@ export class VoiceService implements OnApplicationBootstrap, OnModuleDestroy {
                   send({ type: 'conductor', requestId, event });
                 },
                 configured.config,
+                parsed.sessionId,
               );
               if (terminal?.type === 'failed') reply(text.trim() || terminal.error);
               else if (terminal?.type === 'completed')

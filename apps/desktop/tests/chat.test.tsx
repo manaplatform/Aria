@@ -3,6 +3,7 @@ import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 import type { ChatEvent, ChatMessage, ChatRequest, DesktopBridge } from '@aria/shared';
+import { selectChatContext } from '@aria/shared';
 import ChatView from '../src/components/chat/ChatView';
 import { ConversationList } from '../src/components/conversations/ConversationList';
 import { TooltipProvider } from '../src/components/ui';
@@ -198,6 +199,25 @@ it('keeps provider context to 20 complete turns without discarding local history
   expect(context[0].content).toBe('user-5');
   expect(context.at(-1)?.content).toBe('Newest question');
   expect(messages).toHaveLength(51);
+});
+it('selects private history by saved turns and removes the complete private pair when the provider changes', () => {
+  const base = {
+    conversationId: 'chat', requestId: 'r', createdAt: '', status: 'completed' as const, sequence: 0,
+  };
+  const messages: ChatMessage[] = [
+    { ...base, id: 'a', role: 'user', content: 'Public question' },
+    { ...base, id: 'b', role: 'assistant', content: 'Same text' },
+    { ...base, id: 'c', role: 'user', content: 'Private question' },
+    {
+      ...base, id: 'd', role: 'assistant', content: 'Same text',
+      run: { revision: 'old', primary: 'provider:model', billableChildStarted: false, privateContent: true },
+    },
+    { ...base, id: 'e', role: 'user', content: 'Current request' },
+  ];
+  expect(selectChatContext(messages, 'old').privateContent).toBe(true);
+  const current = selectChatContext(messages, 'new');
+  expect(current.privateContent).toBe(false);
+  expect(current.messages.map((item) => item.content)).toEqual(['Public question', 'Same text', 'Current request']);
 });
 it('preserves earlier reading position during streaming and follows updates again near the bottom', async () => {
   setChatDraft('A longer answer please');

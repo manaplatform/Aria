@@ -15,6 +15,7 @@ export const browserToolArgs = {
   browser_get_tabs: z.strictObject({}),
   browser_switch_tab: z.strictObject(tab),
   browser_get_page: z.strictObject(tab),
+  browser_media: z.strictObject({ ...tab, action: z.enum(['play', 'stop']) }),
   browser_extract: z.strictObject({
     ...page,
     selection: z.boolean().optional(),
@@ -72,6 +73,9 @@ export const browserResponseSchema = z.strictObject({
     }),
   ]),
 });
+export const browserProgressSchema = browserResponseSchema.omit({ result: true }).extend({
+  progress: z.literal('approval'),
+});
 export const browserCancelSchema = z.strictObject({
   generation: webReference,
   operationId: webReference,
@@ -123,6 +127,7 @@ export const browserCommandSchema = z.discriminatedUnion('kind', [
     forward: z.boolean(),
   }),
   z.strictObject({ kind: z.enum(['clear-history', 'clear-site-data', 'revoke-permissions']) }),
+  z.strictObject({ kind: z.literal('stop-media'), ...tab }),
 ]);
 export type BrowserRequest = z.infer<typeof browserRequestSchema>;
 export type BrowserResponse = z.infer<typeof browserResponseSchema>;
@@ -137,6 +142,7 @@ export interface BrowserTab {
   loading: boolean;
   error?: string;
   crashed?: boolean;
+  playingMedia?: boolean;
   back: boolean;
   forward: boolean;
   zoom: number;

@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import { endActivity } from '@aria/shared';
+import { conductorLimits, endActivity, selectChatContext } from '@aria/shared';
 import type {
   ChatData,
   ChatEvent,
@@ -32,6 +32,34 @@ export function selectChat(id: string | null): void {
     ...chat,
     selectedId: id && chat.conversations.some((item) => item.id === id) ? id : null,
   }));
+}
+
+export function ensureChatDraft(): string {
+  const chat = useWorkspaceStore.getState().data.chat;
+  if (chat.selectedId) return chat.selectedId;
+  if (chat.conversations.length >= 500)
+    throw new Error('Delete a conversation before starting another.');
+  const id = crypto.randomUUID();
+  const now = new Date().toISOString();
+  updateChat((current) => ({
+    ...current,
+    selectedId: id,
+    newDraft: '',
+    newAttachments: [],
+    conversations: [
+      ...current.conversations,
+      {
+        id,
+        title: 'New chat',
+        draft: current.newDraft,
+        attachments: current.newAttachments,
+        pinned: false,
+        createdAt: now,
+        updatedAt: now,
+      },
+    ],
+  }));
+  return id;
 }
 export function setChatDraft(
   draft: string,
@@ -108,13 +136,25 @@ export function applyChatEvent(event: ChatEvent): void {
       if (event.type === 'activity') {
         const activity = next.activity ?? [];
         const previous = activity.find((item) => item.stepId === event.activity.stepId);
+        const { sources, evidence } = event.activity;
+        const citations = sources?.length || evidence?.length
+          ? {
+              sources: [...new Map([
+                ...(next.citations?.sources ?? []), ...(sources ?? []),
+              ].map((source) => [source.url, source])).values()].slice(0, conductorLimits.steps * 8),
+              evidence: [...new Map([
+                ...(next.citations?.evidence ?? []), ...(evidence ?? []),
+              ].map((item) => [item.id, item])).values()].slice(0, conductorLimits.steps * 8),
+            }
+          : next.citations;
         return {
           ...next,
+          citations,
           activity: previous
             ? activity.map((item) =>
                 item.stepId === event.activity.stepId ? event.activity : item,
               )
-            : [...activity, event.activity].slice(0, 12),
+            : [...activity, event.activity].slice(0, conductorLimits.activity),
         };
       }
       if (event.type === 'artifact') return next;
@@ -143,34 +183,8 @@ export function applyChatEvent(event: ChatEvent): void {
   }));
 }
 
-/** Send only complete recent turns, and always retain the newest user message. */
 export function buildChatContext(messages: ChatMessage[]): ChatRequest['messages'] {
-  let lastUser = messages.length - 1;
-  while (lastUser >= 0 && messages[lastUser].role !== 'user') lastUser--;
-  if (lastUser < 0) return [];
-  const latest = messages[lastUser];
-  const pairs: ChatRequest['messages'][] = [];
-  for (let index = 0; index < lastUser; index++) {
-    const user = messages[index];
-    const assistant = messages[index + 1];
-    if (
-      user.role === 'user' &&
-      assistant?.role === 'assistant' &&
-      assistant.status === 'completed' &&
-      assistant.content &&
-      (!assistant.operation || assistant.operation.mode === 'chat')
-    )
-      pairs.push([
-        { role: 'user', content: user.content },
-        { role: 'assistant', content: assistant.content },
-      ]);
-  }
-  const recent = pairs.slice(-20);
-  let size =
-    latest.content.length + recent.flat().reduce((sum, item) => sum + item.content.length, 0);
-  while (size > 100000 && recent.length)
-    size -= recent.shift()!.reduce((sum, item) => sum + item.content.length, 0);
-  return [...recent.flat(), { role: 'user', content: latest.content }];
+  return selectChatContext(messages).messages;
 }
 async function submitRequest(request: ChatRequest): Promise<void> {
   try {
@@ -256,6 +270,10 @@ export async function sendChat(): Promise<void> {
     ...chat.messages.filter((item) => item.conversationId === conversation.id),
     user,
   ];
+  const firstTitle =
+    history.length === 1 && conversation.title === 'New chat'
+      ? text.split('\n')[0].slice(0, 70)
+      : conversation.title;
   updateChat((current) => ({
     ...current,
     selectedId: conversation.id,
@@ -264,7 +282,7 @@ export async function sendChat(): Promise<void> {
     conversations: selected
       ? current.conversations.map((item) =>
           item.id === conversation.id
-            ? { ...item, draft: '', attachments: [], updatedAt: now }
+            ? { ...item, title: firstTitle, draft: '', attachments: [], updatedAt: now }
             : item,
         )
       : [...current.conversations, conversation],
@@ -326,6 +344,7 @@ export async function regenerateChat(id: string, expectedRevision?: string): Pro
             operation: undefined,
             run: undefined,
             activity: undefined,
+            citations: undefined,
             attempts: attempts.slice(-2),
             partial: undefined,
             retryConfirmed: undefined,

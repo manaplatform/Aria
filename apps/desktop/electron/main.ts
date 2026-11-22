@@ -4,36 +4,59 @@ import {
   clipboard,
   dialog,
   ipcMain,
+  nativeImage,
+  powerMonitor,
+  screen,
   shell,
   safeStorage,
   utilityProcess,
   protocol,
   type IpcMainInvokeEvent,
+  type NativeImage,
 } from 'electron';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { promises as fs } from 'node:fs';
 import { mkdirSync } from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { LocalStorage, localDataSchema } from './storage';
 import { BrowserController } from './browser/controller';
 import { openBrowserBridge } from './browser/bridge';
+import { CapabilityStorage, openCapabilityBridge } from './capability-storage';
 import { WebSettingsStorage } from './web-settings-storage';
 import { ProviderStorage } from './provider-storage';
 import {
   browserCommandSchema,
+  capabilityId,
+  effectSchema,
+  modelReference,
+  skillRefSchema,
+  toolDiscoverySchema,
+  type RuntimeRegistry,
   browserLayoutSchema,
+  computerSupervision,
+  computerUserInput,
   webSettingsInputSchema,
   connectionInputSchema,
   endActivity,
   identifier,
   modelCapabilitySchema,
   registryInputSchema,
+  selectChatContext,
+  programSettingsSchema,
 } from '@aria/shared';
 import { ChatService } from './chat-service';
-import { MediaStorage } from './media-storage';
+import { DesktopRuntime } from './runtime/controller';
+import { ComputerRuntime } from './runtime/computer';
+import { VirtualComputer } from './runtime/virtual-computer';
+import { LocalComputer } from './runtime/local-computer';
+import { openAIRuntimeFeatureSchema, runtimeSettingsSchema } from '@aria/shared';
+import { MediaStorage, referencedAssets } from './media-storage';
+import { captureDisplay, chooseDisplay } from './screen-capture';
+import { OperationApproval } from './operation-approval';
 import { MediaService, liveRequestSchema } from './media-service';
+import { DesktopUpdates } from './updates';
 import { chatRequestSchema } from './chat-protocol';
 import {
   checkHealth,
@@ -45,8 +68,20 @@ import {
 } from './project';
 
 app.setName('Aria');
+if (process.platform === 'win32' && app.isPackaged)
+  app.setAppUserModelId('io.github.manaplatform.aria');
 app.commandLine.appendSwitch('disable-quic');
 protocol.registerSchemesAsPrivileged([
+  {
+    scheme: 'aria-embedding-pack',
+    privileges: {
+      standard: true,
+      secure: true,
+      supportFetchAPI: true,
+      corsEnabled: true,
+      stream: true,
+    },
+  },
   {
     scheme: 'aria-media',
     privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true },
@@ -59,21 +94,35 @@ if (process.env.ARIA_TEST_DATA_DIR) {
 let mainWindow: BrowserWindow | null = null;
 let storage: LocalStorage;
 let webSettings: WebSettingsStorage;
+let capabilities: CapabilityStorage;
 let browser: BrowserController;
 let provider: ProviderStorage;
 let chat: ChatService;
 let assets: MediaStorage;
+let executionRuntime: DesktopRuntime;
+let computerRuntime: ComputerRuntime;
+let virtualComputer: VirtualComputer;
+let localComputer: LocalComputer;
+let localSelection: AbortController | undefined;
 let media: MediaService;
 let saving = Promise.resolve();
 let configuring = false;
 let shutdownComplete = false;
 let shutdown: Promise<void> | undefined;
+let updates: DesktopUpdates;
+let installUpdate: (() => void) | undefined;
 let initial: Awaited<ReturnType<LocalStorage['load']>>;
 const string = z.string().max(8000);
 const devServerUrl = process.env.VITE_DEV_SERVER_URL;
+const devLauncher = devServerUrl && process.env.ARIA_DEV_LAUNCHER === '1';
 let closeFlushEnabled = false;
 let closePending = false;
 let quitting = false;
+if (devLauncher) {
+  process.once('disconnect', () => {
+    if (media) app.quit();
+  });
+}
 function trustedUrl(value: string): boolean {
   try {
     return devServerUrl
@@ -133,12 +182,116 @@ async function changeRegistry<T>(save: () => Promise<T>) {
     configuring = false;
   }
 }
+
+async function changeRuntimeSettings<T>(save: () => Promise<T>) {
+  if (configuring) throw new Error('Wait for settings to finish saving.');
+  chat.assertIdle();
+  media.assertIdle();
+  configuring = true;
+  try {
+    return await save();
+  } finally {
+    configuring = false;
+  }
+}
+
+function nativeProof(registry: RuntimeRegistry, image = false) {
+  for (const connection of registry.connections) {
+    const model = connection.models.find(
+      (item) => item.enabled && modelReference(connection.id, item.id) === registry.primary,
+    );
+    if (
+      model &&
+      connection.apiKey &&
+      (image || new URL(connection.baseUrl).origin === 'https://api.openai.com')
+    ) {
+      return createHash('sha256')
+        .update(
+          JSON.stringify([
+            connection.baseUrl,
+            model.id,
+            connection.apiKey,
+            image ? 'computer-image/1' : 'responses',
+          ]),
+        )
+        .digest('hex');
+    }
+  }
+}
+
+function runtimePolicy(registry?: RuntimeRegistry) {
+  return capabilities.policy(
+    registry && nativeProof(registry),
+    registry && nativeProof(registry, true),
+  );
+}
+
+const toolList = z
+  .array(
+    z.strictObject({
+      id: capabilityId,
+      namespace: z.string().max(100),
+      name: z.string().max(200),
+      description: z.string().max(1024),
+      version: z.string().max(100),
+      provenance: z.string().max(100),
+      effect: effectSchema,
+      permission: z.string().max(200),
+      available: z.boolean(),
+      reason: z.string().max(200).optional(),
+      programmatic: z.array(z.enum(['managed', 'openai-responses'])).max(2).optional(),
+    }),
+  )
+  .max(1024);
+
+async function toolSettings() {
+  const registry = await provider.resolve().catch(() => undefined);
+  const policy = runtimePolicy(registry);
+  const response = await chat.http('chat/tools', { signal: AbortSignal.timeout(11_000) });
+  return {
+    discovery: policy.discovery,
+    nativeVerified: policy.nativeVerified ?? false,
+    programming: policy.programming,
+    nativeProgramVerified: policy.nativeProgramVerified,
+    tools: toolList.parse(await response.json()),
+    skills: capabilities.skills(),
+  };
+}
+
+async function changeCapabilities(
+  change: () => Promise<unknown>,
+  read: () => Promise<unknown> = toolSettings,
+) {
+  if (configuring) throw new Error('Wait for settings to finish saving.');
+  configuring = true;
+  try {
+    await chat.cancelAll();
+    await media.close();
+    await change();
+    await chat.restart();
+    return await read();
+  } finally {
+    configuring = false;
+  }
+}
+
 function registerIpc(): void {
   const handle = (channel: string, fn: (...args: unknown[]) => unknown) =>
     ipcMain.handle(channel, (event, ...args: unknown[]) => {
       validateSender(event);
       return fn(...args);
     });
+  handle('aria:update-state', () => updates.snapshot);
+  handle('aria:update-command', (input) => {
+    const command = z.union([
+      z.object({ action: z.literal('channel'), channel: z.enum(['stable', 'beta']) }),
+      z.object({ action: z.enum(['check', 'download', 'install', 'open-release']) }),
+    ]).parse(input);
+    return updates.command(command, (perform) => {
+      installUpdate = perform;
+      app.quit();
+    });
+  });
   handle('aria:enable-close-flush', () => {
     closeFlushEnabled = true;
   });
@@ -151,6 +304,8 @@ function registerIpc(): void {
   handle('aria:close-failed', (error) => {
     closePending = false;
     quitting = false;
+    installUpdate = undefined;
+    updates.installCancelled();
     dialog.showErrorBox('Local changes could not be saved', string.parse(error));
   });
   handle('aria:load', () => ({
@@ -182,6 +337,9 @@ function registerIpc(): void {
         await storage.save(parsed);
         initial = { data: parsed };
         browser.pruneConversations(parsed.chat.conversations);
+        const retained = new Set(parsed.chat.conversations.map(({ id }) => id));
+        for (const { id } of previous.chat.conversations)
+          if (!retained.has(id)) executionRuntime.store.deletePrograms(id);
         await assets.prune(previous, parsed).catch(() => undefined);
       });
     await saving;
@@ -239,7 +397,92 @@ function registerIpc(): void {
   handle('aria:open-external', (url) => shell.openExternal(safeExternalUrl(string.parse(url))));
   handle('aria:browser-state', () => browser.state());
   handle('aria:browser-command', (input) => browser.command(browserCommandSchema.parse(input)));
-  handle('aria:browser-layout', (input) => browser.setLayout(browserLayoutSchema.parse(input)));
+  handle('aria:browser-layout', (input) => {
+    const previous = browser.activeConversation();
+    browser.setLayout(browserLayoutSchema.parse(input));
+    if (previous && previous !== browser.activeConversation()) computerRuntime.leave(previous);
+  });
+  handle('aria:computer-sessions', (conversation) =>
+    computerRuntime.states(identifier.parse(conversation)),
+  );
+  handle('aria:computer-preview', (conversation, id) =>
+    computerRuntime.preview(identifier.parse(conversation), z.string().uuid().parse(id)),
+  );
+  handle('aria:computer-supervise', (conversation, command) =>
+    computerRuntime.supervise(identifier.parse(conversation), computerSupervision.parse(command)),
+  );
+  handle('aria:computer-user-input', (conversation, value) => {
+    const request = computerUserInput.parse(value);
+    return computerRuntime.userInput(
+      identifier.parse(conversation),
+      request.sessionId,
+      request.action,
+    );
+  });
+  handle('aria:probe-virtual-computer', () =>
+    changeCapabilities(() => virtualComputer.verify(AbortSignal.timeout(30_000))),
+  );
+  handle('aria:local-computer-supported', () => localComputer.supported());
+  handle('aria:local-desktop-access', (value) => {
+    const requestPermission = z.boolean().default(false).parse(value);
+    if (requestPermission && !mainWindow?.isFocused())
+      throw new Error('Focus Aria before requesting desktop permissions.');
+    return localComputer.access(AbortSignal.timeout(10_000), requestPermission);
+  });
+  handle('aria:select-local-computer', async (value, rawTarget, rawStanding) => {
+    const target = z.enum(['window', 'screen']).default('window').parse(rawTarget);
+    const standing = target === 'screen' && z.boolean().default(false).parse(rawStanding);
+    const owner = standing ? identifier.nullable().parse(value) ?? '' : identifier.parse(value);
+    const window = mainWindow;
+    if (!window?.isFocused()) throw new Error('Focus Aria before selecting desktop access.');
+    if (localSelection || configuring) throw new Error('Wait for the current settings change.');
+    const selection = new AbortController();
+    localSelection = selection;
+    const checkSelection = () => {
+      selection.signal.throwIfAborted();
+      const active = browser.activeConversation();
+      if (
+        mainWindow !== window || window.isDestroyed() || window.isMinimized() ||
+        (!standing && (initial.data.chat.selectedId !== owner || (active !== null && active !== owner)))
+      )
+        throw new Error('Keep Aria open and select the conversation that will use the local desktop.');
+    };
+    try {
+      checkSelection();
+      let display: Awaited<ReturnType<typeof chooseDisplay>>;
+      let standingProvider: string | undefined;
+      if (target === 'screen') {
+        let detail = 'Aria can ask to share screenshots, open a supported app, or use the mouse on this display. Each action requires your approval.';
+        if (standing) {
+          const identity = chat.runtimeIdentity();
+          if (!identity || !chat.getStatus().configured)
+            throw new Error('Configure a primary model before allowing ongoing display access.');
+          standingProvider = identity.key;
+          detail = `Allow Aria to send screenshots of the selected display to ${identity.model} at ${new URL(identity.endpoint).origin} and use its mouse controls and built-in desktop shortcuts from any active chat. Aria asks before opening other installed apps. Access continues after restart until you click Revoke.`;
+        }
+        display = await chooseDisplay(window, 'Select a full screen', detail, true);
+        if (!display || selection.signal.aborted) return false;
+      }
+      return await changeCapabilities(async () => {
+        checkSelection();
+        const signal = AbortSignal.any([selection.signal, AbortSignal.timeout(85_000)]);
+        if (display) await localComputer.prepareScreen(owner, display, signal, standingProvider, checkSelection);
+        else await localComputer.prepare(owner, signal, checkSelection);
+        await computerRuntime.closeLocalSessions();
+      }, async () => true);
+    } finally {
+      if (localSelection === selection) localSelection = undefined;
+    }
+  });
+  handle('aria:revoke-local-computer', async () => {
+    localSelection?.abort();
+    localComputer.revoke();
+    if (configuring) {
+      await computerRuntime.closeLocalSessions();
+      return;
+    }
+    await changeCapabilities(() => computerRuntime.closeLocalSessions(), async () => undefined);
+  });
   handle('aria:web-settings', () => webSettings.get());
   handle('aria:save-web-settings', async (input) => {
     const parsed = webSettingsInputSchema.parse(input);
@@ -267,6 +510,77 @@ function registerIpc(): void {
     } finally {
       configuring = false;
     }
+  });
+  handle('aria:tool-settings', toolSettings);
+  handle('aria:set-tool-enabled', (id, enabled) => {
+    const tool = capabilityId.parse(id);
+    const value = z.boolean().parse(enabled);
+    return changeCapabilities(async () => {
+      if (!(await toolSettings()).tools.some((item) => item.id === tool))
+        throw new Error('This tool is no longer registered.');
+      await capabilities.setEnabled(tool, value);
+    });
+  });
+  handle('aria:set-tool-discovery', (input) => {
+    const mode = toolDiscoverySchema.parse(input);
+    return changeCapabilities(async () => {
+      let proof: string | undefined;
+      if (mode === 'openai-responses') {
+        proof = nativeProof(await provider.resolve());
+        if (!proof) throw new Error('Select an official OpenAI primary model in AI Models first.');
+        const response = await chat.http('providers/verify-tool-search', {
+          method: 'POST',
+          signal: AbortSignal.timeout(22_000),
+        });
+        z.strictObject({ verified: z.literal(true) }).parse(await response.json());
+      }
+      await capabilities.setDiscovery(mode, proof);
+    });
+  });
+  handle('aria:set-program-settings', (input) => {
+    const settings = programSettingsSchema.parse(input);
+    return changeCapabilities(async () => {
+      let proof: string | undefined;
+      if (settings.backend === 'managed') {
+        if (!settings.image) throw new Error('Enter the immutable Aria program runner image ID.');
+        await executionRuntime.verifyProgramImage(settings.image, AbortSignal.timeout(16_000));
+      } else if (settings.backend === 'openai-responses') {
+        proof = nativeProof(await provider.resolve());
+        if (!proof) throw new Error('Select an official OpenAI primary in AI Models first.');
+        const policy = capabilities.policy(proof);
+        if (policy.discovery === 'openai-responses' && !policy.nativeVerified)
+          throw new Error('Verify OpenAI Tool Search before enabling this combination.');
+        const response = await chat.http('providers/verify-programmatic', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ continuation: settings.continuation, discovery: policy.discovery }),
+          signal: AbortSignal.timeout(45_000),
+        });
+        z.object({ verified: z.literal(true) }).parse(await response.json());
+      }
+      await capabilities.setProgramming(settings, proof);
+    });
+  });
+  handle('aria:preview-skill', async (input) => {
+    const kind = z.enum(['directory', 'zip']).parse(input);
+    if (configuring || !mainWindow) throw new Error('Wait for settings to finish saving.');
+    const selected = await dialog.showOpenDialog(mainWindow, {
+      title: 'Choose an Agent Skill bundle',
+      properties: [kind === 'zip' ? 'openFile' : 'openDirectory'],
+      ...(kind === 'zip' && { filters: [{ name: 'Skill archive', extensions: ['zip'] }] }),
+    });
+    const [file] = selected.filePaths;
+    if (selected.canceled || !file) return null;
+    return capabilities.preview(file, kind);
+  });
+  handle('aria:approve-skill', (token) => {
+    const parsed = z.string().uuid().parse(token);
+    return changeCapabilities(() => capabilities.approve(parsed));
+  });
+  handle('aria:manage-skill', (ref, action) => {
+    const parsed = skillRefSchema.parse(ref);
+    const command = z.enum(['enable', 'disable', 'remove']).parse(action);
+    return changeCapabilities(() => capabilities.manage(parsed, command));
   });
   handle('aria:chat-status', () => chat.getStatus());
   handle('aria:registry-settings', () => provider.get());
@@ -299,27 +613,191 @@ function registerIpc(): void {
     if (configuring) throw new Error('Wait for connection settings to finish saving.');
     const parsed = chatRequestSchema.parse(input);
     media.assertIdle();
-    if (parsed.attachmentIds?.length) {
-      const messages = initial.data.chat.messages.filter(
-        (message) => message.conversationId === parsed.conversationId,
-      );
-      const assistant = messages.at(-1);
-      const latest = messages.at(-2);
-      if (
-        assistant?.id !== parsed.assistantMessageId ||
-        assistant.requestId !== parsed.requestId ||
-        latest?.role !== 'user' ||
-        parsed.attachmentIds.some(
-          (id) =>
-            !latest.assets?.some((asset) => asset.id === id) &&
-            !latest.operation?.assetIds.includes(id),
-        )
+    const messages = initial.data.chat.messages.filter(
+      (message) => message.conversationId === parsed.conversationId,
+    );
+    const assistant = messages.at(-1);
+    const latest = messages.at(-2);
+    if (
+      assistant?.role !== 'assistant' ||
+      !['pending', 'streaming'].includes(assistant.status) ||
+      assistant.id !== parsed.assistantMessageId ||
+      assistant.requestId !== parsed.requestId ||
+      latest?.role !== 'user' ||
+      latest.content !== parsed.messages.at(-1)?.content
+    )
+      throw new Error('Save this conversation before sending its latest turn.');
+    if (
+      parsed.attachmentIds?.some(
+        (id) =>
+          !latest.assets?.some((asset) => asset.id === id) &&
+          !latest.operation?.assetIds.includes(id),
       )
-        throw new Error('Attach the files to this turn before sending them.');
-    }
-    chat.submit(parsed);
+    )
+      throw new Error('Attach the files to this turn before sending them.');
+    const context = selectChatContext(messages, chat.getStatus().revision ?? '');
+    chat.submit({
+      ...parsed,
+      programPrivateHistory: context.privateContent,
+      messages: context.messages,
+    });
   });
+  handle('aria:execution-history', () => executionRuntime.history());
+  handle('aria:runtime-settings', () => executionRuntime.settings());
+  handle('aria:save-runtime-settings', (value) =>
+    changeRuntimeSettings(async () => {
+      const current = executionRuntime.settings();
+      const next = runtimeSettingsSchema.parse(value);
+      await executionRuntime.configure(next);
+      if (current.engineSocket !== next.engineSocket || current.desktopImage !== next.desktopImage) {
+        await computerRuntime.shutdown();
+        await chat.restart();
+      }
+      return executionRuntime.settings();
+    }),
+  );
+  handle('aria:save-embedding-target', (value) =>
+    changeRuntimeSettings(() =>
+      executionRuntime.saveEmbeddingTarget(runtimeSettingsSchema.shape.embeddingTarget.parse(value)),
+    ),
+  );
+  const nativeRuntimeModes = async () => runtimePolicy(await provider.resolve()).nativeRuntime ?? [];
+  handle('aria:native-runtime-modes', nativeRuntimeModes);
+  handle('aria:set-native-runtime', (raw, enabled) => {
+    const feature = openAIRuntimeFeatureSchema.parse(raw);
+    const verify = z.boolean().parse(enabled);
+    return changeCapabilities(async () => {
+      if (!verify) return capabilities.verifyNativeRuntime(feature);
+      const proof = nativeProof(await provider.resolve(), feature === 'computer-image');
+      if (!proof) throw new Error('Configure a compatible primary model first.');
+      const response = await chat.http('providers/verify-native-runtime', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ feature }),
+        signal: AbortSignal.timeout(45_000),
+      });
+      z.object({ feature: z.literal(feature), verified: z.literal(true) }).parse(
+        await response.json(),
+      );
+      return capabilities.verifyNativeRuntime(feature, proof);
+    }, nativeRuntimeModes);
+  });
+  handle('aria:probe-runtime', () => executionRuntime.inspect(AbortSignal.timeout(10_000)));
+  handle('aria:local-embeddings', () => executionRuntime.embeddings.available());
+  handle('aria:install-local-embeddings', async () => {
+    chat.assertIdle();
+    const selection = await dialog.showOpenDialog(mainWindow!, {
+      title: 'Select the verified embedding pack',
+      properties: ['openDirectory'],
+    });
+    if (selection.canceled) return executionRuntime.embeddings.available();
+    chat.assertIdle();
+    await executionRuntime.embeddings.install(selection.filePaths[0]);
+    return true;
+  });
+  handle('aria:remove-local-embeddings', async () => {
+    chat.assertIdle();
+    await executionRuntime.embeddings.remove();
+  });
+  handle('aria:knowledge-collections', () => executionRuntime.library.list());
+  handle('aria:manage-knowledge', async (value) => {
+    const id = z.string().uuid();
+    const input = z
+      .discriminatedUnion('operation', [
+        z.strictObject({ operation: z.literal('create'), name: z.string().trim().min(1).max(100) }),
+        z.strictObject({ operation: z.literal('enable'), id, enabled: z.boolean() }),
+        z.strictObject({ operation: z.literal('add'), id }),
+        z.strictObject({ operation: z.literal('remove'), id }),
+        z.strictObject({ operation: z.literal('remove-file'), id, fileId: id }),
+      ])
+      .parse(value);
+    chat.assertIdle();
+    const library = executionRuntime.library;
+    switch (input.operation) {
+      case 'create':
+        library.create(input.name);
+        break;
+      case 'enable':
+        library.enable(input.id, input.enabled);
+        break;
+      case 'add': {
+        const selected = await dialog.showOpenDialog(mainWindow!, {
+          title: 'Add documents to this library',
+          properties: ['openFile', 'multiSelections'],
+        });
+        chat.assertIdle();
+        if (!selected.canceled) await library.add(input.id, selected.filePaths);
+        break;
+      }
+      case 'remove':
+        await library.remove(input.id);
+        break;
+      case 'remove-file':
+        await library.remove(input.id, input.fileId);
+        break;
+    }
+    return library.list();
+  });
+  handle('aria:preview-document', (conversation, id) =>
+    executionRuntime.preview(identifier.parse(conversation), z.string().uuid().parse(id)),
+  );
+  handle('aria:remove-artifact', async (conversation, id) => {
+    chat.assertConversationIdle(identifier.parse(conversation));
+    await executionRuntime.removeArtifact(
+      identifier.parse(conversation),
+      z.string().uuid().parse(id),
+    );
+  });
+  handle('aria:document-evidence', (conversationId, evidenceId) =>
+    executionRuntime.evidence(
+      z.string().uuid().parse(evidenceId),
+      identifier.parse(conversationId),
+    ),
+  );
   handle('aria:cancel-chat', (id) => chat.cancel(identifier.parse(id)));
+  handle('aria:supervise-program', (request, conversation, id, paused) => {
+    const requestId = identifier.parse(request);
+    const conversationId = identifier.parse(conversation);
+    if (!chat.activeTurn({ requestId, conversationId }))
+      throw new Error('The program is no longer active in this conversation.');
+    executionRuntime.programs.supervise(requestId, conversationId, z.string().uuid().parse(id), z.boolean().parse(paused));
+  });
+  handle('aria:inspect-program-result', (conversation, id) =>
+    executionRuntime.inspectProgramResult(identifier.parse(conversation), z.string().uuid().parse(id)),
+  );
+  handle('aria:recover-stored-response', async (conversation, message, request) => {
+    const conversationId = identifier.parse(conversation);
+    const messageId = identifier.parse(message);
+    const requestId = identifier.parse(request);
+    const eligible = () => initial.data.chat.messages.some((item) =>
+      item.conversationId === conversationId && item.id === messageId &&
+      item.requestId === requestId && item.status === 'interrupted' && item.run?.storedResponses);
+    if (!eligible()) throw new Error('The stored response does not belong to an interrupted turn.');
+    chat.assertConversationIdle(conversationId);
+    const result = await executionRuntime.recoverStoredResponse(conversationId, messageId, requestId);
+    if (!eligible()) throw new Error('The interrupted turn changed during recovery.');
+    return result;
+  });
+  async function importFiles(filenames: string[], kind: 'image' | 'audio' | 'text' | 'any') {
+    if (filenames.length > 4 || filenames.some((file) => !path.isAbsolute(file)))
+      throw new Error('Choose up to four files from your device.');
+    const imported = [];
+    try {
+      for (const filename of filenames) imported.push(await assets.import(filename, kind));
+      return imported;
+    } catch (error) {
+      await Promise.allSettled(imported.map((asset) => assets.remove(asset.id)));
+      throw error;
+    }
+  }
+  handle('aria:import-dropped-files', (files) =>
+    importFiles(z.array(z.string().min(1).max(16000)).max(4).parse(files), 'any'),
+  );
+  handle('aria:capture-screen', async () => {
+    if (!mainWindow?.isFocused()) throw new Error('Focus Aria before capturing your screen.');
+    const bytes = await captureDisplay(mainWindow);
+    return bytes ? [await assets.put(bytes, 'Screen capture.jpg', 'image/jpeg')] : [];
+  });
   handle('aria:choose-media', async (kind) => {
     const parsed = z.enum(['image', 'audio', 'text', 'any']).parse(kind);
     const result = await dialog.showOpenDialog(mainWindow!, {
@@ -327,7 +805,7 @@ function registerIpc(): void {
       properties: ['openFile', 'multiSelections'],
       filters: [
         {
-          name: 'Images, audio, and text',
+          name: 'Documents, data, images, and audio',
           extensions: [
             'png',
             'jpg',
@@ -342,6 +820,11 @@ function registerIpc(): void {
             'ogg',
             'wav',
             'webm',
+            'pdf',
+            'docx',
+            'xlsx',
+            'pptx',
+            'zip',
             'txt',
             'md',
             'csv',
@@ -368,18 +851,13 @@ function registerIpc(): void {
       ],
     });
     if (result.canceled) return [];
-    if (result.filePaths.length > 4) throw new Error('Choose up to four attachments.');
-    const imported = [];
-    try {
-      for (const filename of result.filePaths) imported.push(await assets.import(filename, parsed));
-      return imported;
-    } catch (error) {
-      await Promise.allSettled(imported.map((asset) => assets.remove(asset.id)));
-      throw error;
-    }
+    return importFiles(result.filePaths, parsed);
   });
   handle('aria:export-media', async (id) => {
-    const { asset, bytes } = await assets.get(z.string().uuid().parse(id));
+    const knownId = z.string().uuid().parse(id);
+    if (!referencedAssets(initial.data).has(knownId) && !chat.recentlyPublished(knownId))
+      throw new Error('This file is unavailable.');
+    const { asset, bytes } = await assets.get(knownId);
     const result = await dialog.showSaveDialog(mainWindow!, { defaultPath: asset.name });
     if (!result.canceled && result.filePath) await fs.writeFile(result.filePath, bytes);
   });
@@ -404,7 +882,7 @@ function registerIpc(): void {
   );
   handle('aria:end-live', () => media.endLive());
 }
-function createWindow(): void {
+function createWindow(icon: NativeImage | undefined): void {
   closeFlushEnabled = false;
   closePending = false;
   mainWindow = new BrowserWindow({
@@ -413,6 +891,7 @@ function createWindow(): void {
     minWidth: 720,
     minHeight: 520,
     backgroundColor: '#101116',
+    icon,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -479,6 +958,10 @@ function createWindow(): void {
 app
   .whenReady()
   .then(async () => {
+    const iconDirectory = devServerUrl ? '../public' : '../dist';
+    const image = nativeImage.createFromPath(path.join(__dirname, iconDirectory, 'aria-icon.png'));
+    const icon = image.isEmpty() ? undefined : image;
+    if (icon) app.dock?.setIcon(icon);
     if (!app.isPackaged) {
       try {
         process.loadEnvFile(path.resolve(__dirname, '../../..', '.env'));
@@ -487,10 +970,14 @@ app
       }
     }
     const directory = process.env.ARIA_TEST_DATA_DIR || app.getPath('userData');
+    updates = new DesktopUpdates(directory, (state) => {
+      if (mainWindow && !mainWindow.webContents.isDestroyed())
+        mainWindow.webContents.send('aria:update-state-changed', state);
+    });
+    await updates.load();
     storage = new LocalStorage(directory);
     initial = await storage.load();
     assets = new MediaStorage(directory);
-    if (!initial.warning) await assets.pruneUnreferenced(initial.data).catch(() => undefined);
     protocol.handle('aria-media', async (request) => {
       try {
         const url = new URL(request.url);
@@ -535,14 +1022,147 @@ app
       decrypt: (value: Buffer) => safeStorage.decryptStringAsync(value),
     };
     provider = new ProviderStorage(directory, cipher);
+    capabilities = new CapabilityStorage(directory);
+    await capabilities.load();
+    const approvals = new OperationApproval(async (message, detail, signal) => {
+      signal.throwIfAborted();
+      if (!mainWindow || mainWindow.isDestroyed()) return false;
+      const { response } = await dialog.showMessageBox(mainWindow, {
+        type: 'warning',
+        message,
+        detail,
+        buttons: ['Decline', 'Allow once'],
+        cancelId: 0,
+        defaultId: 0,
+        noLink: true,
+        signal,
+      });
+      return response === 1 && !signal.aborted;
+    }, {
+      begin: (scope, fingerprint) => capabilities.runtimeStore.beginApproval(scope, fingerprint),
+      finish: (id, decision) => capabilities.runtimeStore.finishApproval(id, decision),
+    });
+    const approve = approvals.approve.bind(approvals);
+    executionRuntime = new DesktopRuntime(
+      directory,
+      assets,
+      capabilities,
+      (conversationId) =>
+        new Set(
+          initial.data.chat.messages
+            .filter((message) => message.conversationId === conversationId)
+            .flatMap((message) => (message.assets ?? []).map((asset) => asset.id)),
+        ),
+      approve,
+      () => chat.executionIdentity(),
+      () => provider.resolve(),
+      cipher,
+    );
+    if (!initial.warning) {
+      try {
+        const previous = initial.data;
+        const messages = await executionRuntime.recoverArtifacts(previous.chat.messages);
+        if (messages !== previous.chat.messages) {
+          const recovered = { ...previous, chat: { ...previous.chat, messages } };
+          await storage.save(recovered);
+          initial = { data: recovered };
+        }
+        await assets.pruneUnreferenced(initial.data);
+      } catch {
+        // Keep files for reconciliation on the next successful load.
+      }
+    }
     webSettings = new WebSettingsStorage(directory);
     await webSettings.load();
-    browser = new BrowserController(directory, () => webSettings.get());
+    browser = new BrowserController(directory, () => webSettings.get(), approve);
     await browser.load();
+    virtualComputer = new VirtualComputer(() => executionRuntime.settings(), directory);
+    localComputer = new LocalComputer(executionRuntime.store, () => chat.executionIdentity());
+    screen.on('display-removed', (_event, display) => {
+      if (localComputer.disconnectDisplay(display.id)) void computerRuntime.closeLocalSessions();
+    });
+    computerRuntime = new ComputerRuntime(
+      executionRuntime.store,
+      [
+        {
+          environment: 'managed-browser',
+          ready: () => browser.computerAvailable(),
+          targetAlive: (...args) => browser.computerTargetAlive(...args),
+          wait: (...args) => browser.waitForComputerTab(...args),
+          open: async (owner, id, { tabId: tab }, signal) => {
+            if (!tab) throw new Error('Missing browser tab.');
+            await browser.claimComputerTab(owner, tab, id, signal);
+            return tab;
+          },
+          observe: (...args) => browser.observeComputerTab(...args),
+          restore: (owner, id, _target, url, signal) => {
+            if (!url)
+              throw new Error('The previous browser destination cannot be restored safely.');
+            return browser.restoreComputerTab(owner, id, url, signal);
+          },
+          restoreUrl: (...args) => browser.computerRestoreUrl(...args),
+          navigate: async (owner, id, input, signal) => {
+            if (input.target === 'url')
+              return browser.restoreComputerTab(owner, id, input.url, signal);
+            if (input.target !== 'tab')
+              throw new Error('Missing validated navigation destination.');
+            return browser.selectComputerTab(owner, input.tabId, id, signal);
+          },
+          authenticate: (...args) => browser.authenticateComputerTab(...args),
+          authenticationSite: (...args) => browser.computerAuthenticationSite(...args),
+          input: (owner, target, id, observation, action, signal) =>
+            browser.actComputerTab(owner, target, id, observation, action, signal),
+          owner: (...args) => browser.setComputerOwner(...args),
+          close: (...args) => browser.closeComputerTab(...args),
+          downloadTarget: (...args) => browser.computerDownloadTarget(...args),
+          uploadTarget: (...args) => browser.computerUploadTarget(...args),
+        },
+        virtualComputer,
+        localComputer,
+      ],
+      () => chat.executionIdentity(),
+      (owner) => browser.computerForeground(owner),
+      approve,
+      (state) => mainWindow?.webContents.send('aria:computer-session-update', state),
+      {
+        read: (...args) => executionRuntime.computerInput(...args),
+        adopt: (...args) => executionRuntime.adoptComputerArtifact(...args),
+        script: (...args) => executionRuntime.computerScript(...args),
+      },
+      () => executionRuntime.settings(),
+    );
+    let locked = false;
+    let sleeping = false;
+    const updateDesktopAvailability = () => {
+      const suspended = locked || sleeping;
+      localComputer.setSuspended(suspended);
+      if (suspended) {
+        localSelection?.abort();
+        void computerRuntime.closeLocalSessions();
+      }
+    };
+    powerMonitor.on('lock-screen', () => {
+      locked = true;
+      updateDesktopAvailability();
+    });
+    powerMonitor.on('unlock-screen', () => {
+      locked = false;
+      updateDesktopAvailability();
+    });
+    powerMonitor.on('suspend', () => {
+      sleeping = true;
+      updateDesktopAvailability();
+    });
+    powerMonitor.on('resume', () => {
+      sleeping = false;
+      updateDesktopAvailability();
+    });
     chat = new ChatService(
       provider,
       (env) =>
-        utilityProcess.fork(path.join(__dirname, 'api/dist/main.js'), [], {
+        utilityProcess.fork(app.isPackaged
+          ? path.join(process.resourcesPath, 'aria-api', 'dist', 'main.js')
+          : path.join(__dirname, 'api', 'dist', 'main.js'), [], {
           env: env as Record<string, string>,
           stdio: 'ignore',
           serviceName: 'Aria Chat API',
@@ -560,28 +1180,101 @@ app
         runtime: () => webSettings.runtime(),
         revision: () => webSettings.revision,
         open: (authorize) =>
-          openBrowserBridge(browser, (request) => {
-            const signal = authorize(request);
-            if (!signal) return;
-            const turn = initial.data.chat.messages.find(
-              (message) =>
-                message.requestId === request.requestId &&
-                message.conversationId === request.conversationId &&
-                message.role === 'assistant' &&
-                ['pending', 'streaming'].includes(message.status),
-            );
-            return turn ? signal : undefined;
-          }),
+          openBrowserBridge(
+            browser,
+            (request) => {
+              const signal = authorize(request);
+              if (!signal) return;
+              const turn = initial.data.chat.messages.find(
+                (message) =>
+                  message.requestId === request.requestId &&
+                  message.conversationId === request.conversationId &&
+                  message.role === 'assistant' &&
+                  ['pending', 'streaming'].includes(message.status),
+              );
+              return turn ? signal : undefined;
+            },
+            (request, fingerprint, signal) => {
+              const assistantId = chat.assistantForTurn(request.requestId);
+              return assistantId
+                ? capabilities.reserve(
+                    request.conversationId,
+                    assistantId,
+                    request.requestId,
+                    fingerprint,
+                    signal,
+                    { id: `browser.${request.op}`, stepId: request.stepId,
+                      callId: request.operationId, revision: webSettings.revision },
+                  )
+                : Promise.resolve(false);
+            },
+            (request, work) => approvals.within({
+              conversation: request.conversationId, request: request.requestId, step: request.stepId,
+              operation: request.op, binding: [webSettings.revision, request.args],
+            }, work),
+          ),
+      },
+      {
+        policy: (registry) => ({
+          ...runtimePolicy(registry),
+          desktopRuntime: true,
+          computerBrowser: browser.computerAvailable(),
+          computerVirtual: virtualComputer.ready(),
+          computerLocal: localComputer.configured(),
+        }),
+        artifact: (id, conversation, request) =>
+          executionRuntime.resolveArtifact(id, conversation, request),
+        adoptArtifact: (asset, conversation, request, execution, signal) =>
+          executionRuntime.adoptArtifact(asset, conversation, request, execution, signal),
+        release: (request) => {
+          executionRuntime.release(request);
+          computerRuntime.release(request);
+        },
+        availableAssets: (conversation) =>
+          [
+            ...new Map(
+              initial.data.chat.messages
+                .filter((message) => message.conversationId === conversation)
+                .flatMap((message) => message.assets ?? [])
+                .map((asset) => [asset.id, asset]),
+            ).values(),
+          ].slice(-12),
+        open: (revision, authorize) =>
+          openCapabilityBridge(
+            capabilities,
+            revision,
+            (request) =>
+              request.type === 'runtime'
+                ? authorize(request) && chat.authorizeRuntime(request)
+                : request.voiceSessionId
+                  ? media.authorizeCapability(request)
+                  : authorize(request),
+            (request, signal) => {
+              if (request.programId)
+                executionRuntime.store.assertProgramChild(request, chat.executionIdentity());
+              return approvals.within({
+                conversation: request.conversationId, request: request.requestId, step: request.stepId,
+                operation: request.operation,
+                binding: [request.revision, request.primary, request.input, request.programId],
+              }, () => request.operation.startsWith('computer.')
+                ? computerRuntime.dispatch(request, signal)
+                : executionRuntime.dispatch(request, signal));
+            },
+          ),
       },
     );
     media = new MediaService(chat, assets, (event) =>
       mainWindow?.webContents.send('aria:live-event', event),
     );
     registerIpc();
-    createWindow();
-    void chat.start();
+    if (devLauncher && !process.connected) {
+      app.quit();
+      return;
+    }
+    createWindow(icon);
+    void chat.start().then(() => executionRuntime.cleanHostedResources());
     app.on('activate', () => {
-      if (BrowserWindow.getAllWindows().length === 0) createWindow();
+      if (BrowserWindow.getAllWindows().length === 0) createWindow(icon);
     });
   })
   .catch((error) => {
@@ -599,9 +1292,21 @@ app.on('before-quit', (event) => {
     shutdown ??= media
       .close()
       .then(() => chat.close())
-      .finally(() => {
+      .then(() => computerRuntime.shutdown())
+      .then(() => localComputer.reset())
+      .then(() => executionRuntime.close())
+      .then(() => {
         browser.close();
         shutdownComplete = true;
+        const perform = installUpdate;
+        installUpdate = undefined;
+        if (perform) perform();
+        else app.quit();
+      }, () => {
+        browser.close();
+        shutdownComplete = true;
+        if (installUpdate) dialog.showErrorBox('Update paused', 'Aria could not complete shutdown. Open Aria and try the update again.');
+        installUpdate = undefined;
         app.quit();
       });
   }

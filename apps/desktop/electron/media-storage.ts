@@ -3,12 +3,14 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import type { LocalData, MediaAsset } from '@aria/shared';
+import { documentMime, documentMimeTypes, documentFormats } from './runtime/file-formats';
 export const assetSchema = z
   .object({
     id: z.string().uuid(),
     name: z.string().min(1).max(255),
     mimeType: z.enum([
       'text/plain',
+      ...documentMimeTypes,
       'image/png',
       'image/jpeg',
       'image/webp',
@@ -22,6 +24,7 @@ export const assetSchema = z
       'video/webm',
     ]),
     size: z.number().int().positive().max(64_000_000),
+    managed: z.boolean().optional(),
   })
   .strict();
 export function identifyMedia(bytes: Buffer): string {
@@ -60,7 +63,10 @@ export class MediaStorage {
     return 'text/plain';
   }
   async put(bytes: Buffer, name: string, expected?: string): Promise<MediaAsset> {
-    const mimeType = expected === 'text/plain' ? this.textType(bytes) : identifyMedia(bytes);
+    const mimeType =
+      expected === 'text/plain'
+        ? this.textType(bytes)
+        : (documentMime(name, bytes) ?? identifyMedia(bytes));
     if (expected && expected !== mimeType)
       throw new Error('The provider returned an unexpected media format.');
     const asset = assetSchema.parse({
@@ -99,8 +105,9 @@ export class MediaStorage {
       }
       if (
         bytes.length !== asset.size ||
-        (asset.mimeType === 'text/plain' ? this.textType(bytes) : identifyMedia(bytes)) !==
-          asset.mimeType
+        (asset.mimeType === 'text/plain'
+          ? this.textType(bytes)
+          : (documentMime(asset.name, bytes) ?? identifyMedia(bytes))) !== asset.mimeType
       )
         throw new Error('Invalid asset.');
       return { asset, bytes };
@@ -120,7 +127,11 @@ export class MediaStorage {
     if (!stat.isFile() || stat.size > max)
       throw new Error(`Choose a supported file up to ${max / 1_000_000} MB.`);
     const bytes = await fs.readFile(filename);
-    const mime = isText ? this.textType(bytes) : identifyMedia(bytes);
+    const mime = isText
+      ? this.textType(bytes)
+      : kind === 'any' && Object.hasOwn(documentFormats, path.extname(filename).toLowerCase())
+        ? documentMime(filename, bytes)!
+        : identifyMedia(bytes);
     if (mime.startsWith('image/') && bytes.length > 20_000_000)
       throw new Error('Choose an image up to 20 MB.');
     if (

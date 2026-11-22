@@ -1,5 +1,5 @@
 name: Desktop checks
-on: [push, pull_request]
+on: [push, pull_request, workflow_dispatch]
 jobs:
   desktop:
     strategy:
@@ -16,10 +16,18 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
+      - if: runner.os == 'Windows'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm lint
       - run: pnpm test
+      - run: npm ci --ignore-scripts
+        working-directory: apps/desktop/program-runner
+      - run: node --experimental-strip-types --test runner.test.mts
+        working-directory: apps/desktop/program-runner
       - run: pnpm build
       - run: pnpm --filter @aria/desktop exec node scripts/ensure-electron.cjs
       - run: pnpm licenses:check
@@ -33,3 +41,49 @@ jobs:
             apps/desktop/.artifacts/
             apps/desktop/test-results/
             apps/desktop/dist/third-party/
+
+  isolated-runtime:
+    if: github.event_name == 'workflow_dispatch' && vars.ARIA_SANDBOX_RUNNERS == 'enabled'
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [macOS, Windows, Linux]
+    runs-on: [self-hosted, aria-sandbox, '${{ matrix.platform }}']
+    env:
+      ARIA_TEST_DOCKER_ENDPOINT: ${{ vars[format('ARIA_DOCKER_{0}', matrix.platform)] }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.12.3
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - if: runner.os == 'Windows'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - name: Prepare pinned workspace image
+        shell: bash
+        run: |
+          test -n "$ARIA_TEST_DOCKER_ENDPOINT"
+          docker --host "$ARIA_TEST_DOCKER_ENDPOINT" pull docker.io/library/python@sha256:c5ba3deef00c7758561a0f03c26f44f10589263d40e732b8748e0d1f38f6dd89
+      - run: pnpm --filter @aria/desktop exec vitest run tests/execution-runtime.test.ts
+      - run: pnpm --filter @aria/desktop test:electron --grep 'runs real commands|runs a reviewed built-in skill'
+      - name: Verify the offline program runner
+        shell: bash
+        run: |
+          docker --host "$ARIA_TEST_DOCKER_ENDPOINT" build --tag aria-program-runner:ci apps/desktop/program-runner
+          ARIA_TEST_PROGRAM_IMAGE=$(docker --host "$ARIA_TEST_DOCKER_ENDPOINT" image inspect aria-program-runner:ci --format '{{.Id}}')
+          export ARIA_TEST_PROGRAM_IMAGE
+          pnpm --filter @aria/desktop test:electron --grep 'runs an isolated program'
+      - name: Prepare and test the offline graphical desktop
+        shell: bash
+        run: |
+          docker --host "$ARIA_TEST_DOCKER_ENDPOINT" build --tag aria-virtual-desktop:ci apps/desktop/virtual-desktop
+          ARIA_TEST_COMPUTER_IMAGE=$(docker --host "$ARIA_TEST_DOCKER_ENDPOINT" image inspect aria-virtual-desktop:ci --format '{{.Id}}')
+          export ARIA_TEST_COMPUTER_IMAGE
+          pnpm --filter @aria/desktop test:electron --grep 'runs real graphical input'

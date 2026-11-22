@@ -5,11 +5,12 @@ import { ProvidersModule } from '../providers/providers.module';
 import { MediaService } from '../media/media.service';
 import { Conductor } from './conductor.service';
 import { RunAssets } from './run-assets';
+import { CapabilityHost } from './capability-host';
 import { ToolRegistry } from './tool-registry';
 
 @Module({
   imports: [AiModule, ProvidersModule, WebModule],
-  providers: [Conductor, RunAssets, MediaService, ToolRegistry],
-  exports: [Conductor, RunAssets],
+  providers: [Conductor, RunAssets, MediaService, ToolRegistry, CapabilityHost],
+  exports: [Conductor, RunAssets, ToolRegistry, CapabilityHost],
 })
 export class ConductorModule {}
