@@ -1,15 +1,16 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import {
   allTargets, applicationVersion, buildInventory, channelFor, createManifest, dateTag, feedName,
-  inspectFile, releaseTitle, validatePackageVersion,
+  inspectFile, platformAssets, readJson, releaseTitle, validatePackageVersion,
 } from './generate-metadata.mjs';
 import { formatNotes } from './generate-notes.mjs';
 import { findRelease, releaseNoteMarker, tagAnnotation } from './github.mjs';
-import { publishDraft, reserveTag, uploadAssets } from './run.mjs';
+import { publishDraft, reserveTag, uploadAssets, verifyBuilds } from './run.mjs';
 
 const commit = 'a'.repeat(40);
 const tag = 'v2026.11.22';
@@ -60,6 +61,7 @@ test('first-release notes avoid unsupported claims and deduplicate PR commits', 
   assert.match(notes, /Breaking Changes/);
   assert.match(notes, /Browse commit history/);
   assert.match(notes, /Contributors[\s\S]*@aria-dev/);
+  assert.match(notes, /ad hoc signed and unnotarized/);
   assert.doesNotMatch(notes, /Speed|speed|Performance|Security|fix: repair/);
 });
 
@@ -72,11 +74,50 @@ test('manifest hashes actual bytes and includes all six feeds', async (t) => {
   const manifest = await createManifest(directory, { version, tag, commit, buildTimestamp: '2026-11-22T00:00:00Z' });
   assert.equal(manifest.platforms.length, 6);
   assert.equal(manifest.assets.length, filenames.length);
+  for (const arch of ['x64', 'arm64']) {
+    const macAssets = manifest.assets.filter((asset) => asset.platform === 'macos' && asset.arch === arch);
+    assert.equal(macAssets.find((asset) => asset.inAppUpdate)?.format, 'dmg');
+    assert.ok(macAssets.every((asset) => asset.signing === 'ad-hoc' && asset.notarized === false));
+  }
   const sample = manifest.assets[0];
   assert.match(sample.url, /releases\/download\/v2026\.11\.22\/Aria-/);
   assert.equal(sample.sha256, (await inspectFile(directory, sample.filename)).sha256);
   await rm(path.join(directory, sample.filename));
   await assert.rejects(() => createManifest(directory, { version, tag, commit }), /ENOENT/);
+});
+
+test('build verification requires ad hoc macOS receipts and generates DMG update feeds', async (t) => {
+  const input = await mkdtemp(path.join(os.tmpdir(), 'aria-build-receipts-'));
+  const output = path.join(input, 'verified');
+  const builds = path.join(input, 'incoming');
+  t.after(() => rm(input, { recursive: true, force: true }));
+  const git = (...args) => execFileSync('git', args, { encoding: 'utf8' }).trim();
+  const version = applicationVersion(JSON.parse(git('show', 'HEAD:package.json')));
+  const commit = git('rev-parse', 'HEAD');
+  for (const { platform, arch } of allTargets()) {
+    const directory = path.join(builds, `aria-${platform}-${arch}`);
+    await mkdir(directory, { recursive: true });
+    const files = {};
+    for (const { filename } of platformAssets(version, platform, arch)) {
+      await writeFile(path.join(directory, filename), filename);
+      files[filename] = await inspectFile(directory, filename);
+    }
+    await writeFile(path.join(directory, 'receipt.json'), JSON.stringify({
+      commit, version, platform, arch, files, components: [], timestamp: new Date().toISOString(),
+      ...(platform === 'macos' ? { signing: 'ad-hoc', notarized: false } : {}),
+    }));
+  }
+  await verifyBuilds(builds, output, false);
+  for (const arch of ['x64', 'arm64']) {
+    const feed = await readJson(path.join(output, feedName('macos', arch)));
+    const filename = `Aria-${version}-macos-${arch}.dmg`;
+    const { size, sha512 } = await inspectFile(output, filename);
+    assert.deepEqual(feed, { version, files: [{ url: filename, size, sha512 }] });
+  }
+  const pathToReceipt = path.join(builds, 'aria-macos-arm64', 'receipt.json');
+  const receipt = await readJson(pathToReceipt);
+  await writeFile(pathToReceipt, JSON.stringify({ ...receipt, signing: undefined }));
+  await assert.rejects(() => verifyBuilds(builds, output, false), /Missing ad hoc signing verification/);
 });
 
 test('lost tag creation response reuses the authoritative annotated tag', async () => {

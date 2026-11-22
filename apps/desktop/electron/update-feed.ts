@@ -43,26 +43,25 @@ export type VerifiedUpdate = {
   tag: string;
   version: string;
   url: string;
-  download?: { url: string; sha512: string; size: number };
+  download: { url: string; sha256: string; sha512: string; size: number };
 };
 
 function assetUrl(tag: string, filename: string) {
   return `${base}/download/${tag}/${filename}`;
 }
 
-async function readBytes(url: string, limit: number, request: typeof fetch) {
-  const signal = AbortSignal.timeout(25_000);
+export async function fetchUpdateResponse(url: string, signal: AbortSignal, request: typeof fetch = fetch) {
   let next = new URL(url);
   let response: Response;
   for (let redirects = 0; ; redirects++) {
+    if (next.protocol !== 'https:' || next.port || next.username || next.password ||
+        !['github.com', 'api.github.com', 'release-assets.githubusercontent.com', 'objects.githubusercontent.com'].includes(next.hostname))
+      throw new Error('The update request points to an untrusted location.');
     response = await request(next, { signal, redirect: 'manual' });
     if (![301, 302, 303, 307, 308].includes(response.status)) break;
     await response.body?.cancel();
     if (redirects === 3 || !response.headers.has('location')) throw new Error('The update feed redirect could not be validated.');
     next = new URL(response.headers.get('location')!, next);
-    if (next.protocol !== 'https:' || next.port || next.username || next.password ||
-        !['github.com', 'api.github.com', 'release-assets.githubusercontent.com', 'objects.githubusercontent.com'].includes(next.hostname))
-      throw new Error('The update feed redirected to an untrusted location.');
   }
   if (!response.ok || !response.body) {
     await response.body?.cancel();
@@ -70,7 +69,12 @@ async function readBytes(url: string, limit: number, request: typeof fetch) {
       ? 'GitHub’s update service is rate limited. Try again later.'
       : `The GitHub update service returned HTTP ${response.status}.`);
   }
-  const reader = response.body.getReader();
+  return response.body;
+}
+
+async function readBytes(url: string, limit: number, request: typeof fetch) {
+  const stream = await fetchUpdateResponse(url, AbortSignal.timeout(25_000), request);
+  const reader = stream.getReader();
   let total = 0;
   const chunks = [];
   try {
@@ -145,15 +149,20 @@ export async function findUpdate(
       throw new Error('Aria could not verify the update metadata checksum.');
     const feed = feedSchema.parse(JSON.parse(bytes.toString('utf8')));
     const [file] = feed.files;
-    const extension = { windows: 'exe', macos: 'zip', linux: 'AppImage' }[target.platform];
-    const expectedFile = `Aria-${manifest.version}-${target.platform}-${target.arch}.${extension}`;
+    const extension = { windows: 'exe', macos: 'dmg', linux: 'AppImage' }[target.platform];
+    const prefix = `Aria-${manifest.version}-${target.platform}-${target.arch}`;
+    const expectedFile = `${prefix}.${extension}`;
+    // Historical manifests pointed the macOS feed at a ZIP. Verify that feed's
+    // binding and use the DMG from the same signed manifest for manual updates.
+    const listed = manifest.assets.find((item) => item.filename === file.url);
     const binary = manifest.assets.find((item) => item.filename === expectedFile);
-    if (feed.version !== manifest.version || file.url !== expectedFile || !binary ||
-        binary.sha512 !== file.sha512 || binary.size !== file.size)
+    if (feed.version !== manifest.version || !binary || !listed ||
+        (file.url !== expectedFile && !(target.platform === 'macos' && file.url === `${prefix}.zip`)) ||
+        listed.sha512 !== file.sha512 || listed.size !== file.size)
       throw new Error('The signed update does not match the installer for this device.');
     return {
       version: manifest.version, tag: manifest.tag, url: `${base}/tag/${manifest.tag}`,
-      download: { url: binary.url, sha512: binary.sha512, size: binary.size },
+      download: { url: binary.url, sha256: binary.sha256, sha512: binary.sha512, size: binary.size },
     };
   }
 }

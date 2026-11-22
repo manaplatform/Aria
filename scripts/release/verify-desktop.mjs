@@ -1,7 +1,7 @@
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { existsSync, realpathSync } from 'node:fs';
-import { copyFile, mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, mkdtemp, open, readdir, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -32,13 +32,14 @@ function run(exe, args, cwd = root, capture = false) {
 async function smoke(executable, userData, fixture, verifyPersistence = false, env = {}) {
   const session = await _electron.launch({
     executablePath: executable,
-      args: platform === 'linux' ? ['--password-store=gnome-libsecret'] : [],
+    args: platform === 'linux' ? ['--password-store=gnome-libsecret'] : [],
     timeout: 35_000,
     cwd: path.dirname(executable),
     env: {
       ...process.env, ELECTRON_RUN_AS_NODE: undefined, VITE_DEV_SERVER_URL: undefined,
-      ARIA_TEST_DATA_DIR: userData, OPENAI_API_KEY: 'release-smoke-test',
-      OPENAI_MODEL: 'fixture-model', OPENAI_BASE_URL: fixture.baseUrl,
+      ARIA_TEST_DATA_DIR: userData, OPENAI_API_KEY: verifyPersistence ? undefined : 'release-smoke-test',
+      OPENAI_MODEL: verifyPersistence ? undefined : 'fixture-model',
+      OPENAI_BASE_URL: verifyPersistence ? undefined : fixture.baseUrl,
       PATH: process.platform === 'win32' ? `${process.env.SystemRoot}\\System32;${process.env.SystemRoot}` : '/usr/bin:/bin',
       ...env,
     },
@@ -49,7 +50,7 @@ async function smoke(executable, userData, fixture, verifyPersistence = false, e
     }));
     assert.deepEqual(info, { packaged: true, version, arch });
     const page = await session.firstWindow();
-    await expect(page.getByRole('navigation', { name: 'Chat navigation' })).toBeVisible();
+    await expect(page.getByRole('navigation', { name: 'Chat navigation' })).toBeVisible({ timeout: 30_000 });
     await expect.poll(() => page.evaluate(() => window.aria.chatStatus()), { timeout: 30_000 })
       .toMatchObject({ state: 'ready' });
     assert.equal(await page.evaluate(() => window.aria.localComputerSupported()), platform !== 'linux');
@@ -58,6 +59,7 @@ async function smoke(executable, userData, fixture, verifyPersistence = false, e
     // checked below even on profiles that have never enabled them.
     assert.ok(Array.isArray(packages));
     if (verifyPersistence) {
+      assert.equal((await page.evaluate(() => window.aria.chatStatus())).configured, true);
       const profile = await page.evaluate(async () => (await window.aria.load()).data.preferences.profileName);
       assert.equal(profile, 'Package smoke profile');
       const messages = await page.evaluate(async () => (await window.aria.load()).data.chat.messages);
@@ -85,25 +87,69 @@ async function smoke(executable, userData, fixture, verifyPersistence = false, e
   }
 }
 
+const codesign = '/usr/bin/codesign';
+const macArchitecture = arch === 'x64' ? 'x86_64' : 'arm64';
+const macExecutable = (app) => path.join(app, 'Contents', 'MacOS', 'Aria');
+const machoMagic = new Set(['cffaedfe', 'feedfacf', 'cefaedfe', 'feedface', 'cafebabe', 'cafebabf', 'bebafeca', 'bfbafeca']);
+
+function verifyAdHoc(file, architectures = [], deep = false) {
+  run(codesign, ['--verify', '--strict', '--all-architectures', ...(deep ? ['--deep'] : []), file]);
+  for (const architecture of architectures.length ? architectures : [undefined]) {
+    const architectureArgs = architecture ? ['--architecture', architecture] : [];
+    const info = spawnSync(codesign, ['--display', '--verbose=4', ...architectureArgs, file], {
+      encoding: 'utf8', timeout: 120_000,
+    });
+    assert.equal(info.status, 0, `Unable to inspect the signature on ${file}: ${info.stderr}`);
+    assert.match(info.stderr, /^CodeDirectory .*flags=0x[0-9a-f]+\([^)]*\badhoc\b/m,
+      `Expected an ad hoc signature on ${file}${architecture ? ` (${architecture})` : ''}.`);
+  }
+}
+
+function macArchitectures(file) {
+  return run('/usr/bin/lipo', ['-archs', file], root, true).trim().split(/\s+/);
+}
+
+async function verifyMacBundle(app) {
+  const main = macExecutable(app);
+  const helper = path.join(app, 'Contents', 'Resources', 'aria-computer', 'aria-macos-computer');
+  for (const file of [main, helper]) assert.deepEqual(macArchitectures(file), [macArchitecture], file);
+  verifyAdHoc(app, [macArchitecture], true);
+  // Strict recursive validation follows bundle code locations. Check loose native
+  // code in Resources too, including native modules and the Swift helper.
+  const header = Buffer.alloc(4);
+  for (const entry of await readdir(app, { recursive: true, withFileTypes: true })) {
+    if (!entry.isFile()) continue;
+    const file = path.join(entry.parentPath, entry.name);
+    const handle = await open(file, 'r');
+    const { bytesRead } = await handle.read(header, 0, header.length, 0).finally(() => handle.close());
+    if (bytesRead !== header.length || !machoMagic.has(header.toString('hex'))) continue;
+    const architectures = macArchitectures(file);
+    assert.ok(architectures.includes(macArchitecture), `${file} lacks ${macArchitecture}.`);
+    verifyAdHoc(file, architectures);
+  }
+}
+
 async function verifyMac(temp, fixture) {
   const mount = path.join(temp, 'mount');
-  const unzip = path.join(temp, 'unzip');
+  const installed = path.join(temp, 'Applications', 'Aria.app');
   const userData = path.join(temp, 'profile');
   await mkdir(mount);
-  await mkdir(unzip);
+  await mkdir(path.dirname(installed), { recursive: true });
+  run('hdiutil', ['verify', asset('dmg')]);
+  verifyAdHoc(asset('dmg'));
   run('hdiutil', ['attach', '-nobrowse', '-readonly', '-mountpoint', mount, asset('dmg')]);
   try {
-    await smoke(path.join(mount, 'Aria.app', 'Contents', 'MacOS', 'Aria'), userData, fixture);
+    const bundled = path.join(mount, 'Aria.app');
+    await verifyMacBundle(bundled);
+    run('ditto', [bundled, installed]);
   } finally {
     run('hdiutil', ['detach', mount]);
   }
-  run('ditto', ['-x', '-k', asset('zip'), unzip]);
-  const bundled = path.join(unzip, 'Aria.app');
-  if (production) {
-    run('codesign', ['--verify', '--deep', '--strict', bundled]);
-    run('xcrun', ['stapler', 'validate', bundled]);
-  }
-  await smoke(path.join(bundled, 'Contents', 'MacOS', 'Aria'), userData, fixture, true);
+  await smoke(macExecutable(installed), userData, fixture);
+  await rm(installed, { recursive: true });
+  run('ditto', ['-x', '-k', asset('zip'), path.dirname(installed)]);
+  await verifyMacBundle(installed);
+  await smoke(macExecutable(installed), userData, fixture, true);
 }
 
 async function verifyWindows(temp, fixture) {
@@ -199,6 +245,7 @@ try {
     }
     await writeFile(path.join(destination, 'receipt.json'), JSON.stringify({
       version, platform, arch, production, files,
+      ...(platform === 'macos' ? { signing: 'ad-hoc', notarized: false } : {}),
       timestamp: new Date().toISOString(), commit: run('git', ['rev-parse', 'HEAD'], root, true).trim(),
       components: await inventory(),
     }, null, 2) + '\n');

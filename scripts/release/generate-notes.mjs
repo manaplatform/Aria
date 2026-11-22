@@ -97,7 +97,7 @@ export function formatNotes({ commits, pulls, nativeNotes = '', previousTag, com
     '## 📥 Installation', '',
     'Download the package for your platform and architecture. Verify it with `SHA256SUMS.txt`.',
     '- **Windows** — Use the NSIS installer or portable EXE. Windows packages use Aria’s self-signed certificate and require trust configured by your administrator for verified in-app updates. Windows may still show SmartScreen warnings or block installation under device policy.',
-    '- **macOS** — Open the DMG and move Aria to Applications. The ZIP is used for in-app updates.',
+    `- **macOS** — Both the Apple Silicon and Intel packages are ad hoc signed and unnotarized. Open the verified DMG and move Aria to Applications. For updates, quit Aria before replacing it in Finder. See the [macOS installation guide](${base}/blob/${commit}/docs/RELEASING.md#macos-installation) if macOS asks you to approve the app.`,
     '- **Linux** — Choose DEB for Debian or Ubuntu, RPM for Fedora-compatible systems, or AppImage or TAR.GZ for manual installation.',
   ].join('\n'));
   if (contributors.size) sections.push(`## 👥 Contributors\n\n${[...contributors].sort().map((login) =>

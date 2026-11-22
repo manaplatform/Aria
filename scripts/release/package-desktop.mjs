@@ -146,11 +146,6 @@ async function packageDesktop() {
     const windows = (production && platform === 'windows') || testSigning
       ? await certificate(temporary, windowsPins[0]) : null;
     if (windows && !windows.publisher) throw new Error('Use a Windows signing certificate with a publisher CN.');
-    if (production && platform === 'macos') {
-      requireEnvironment('CSC_LINK', 'CSC_KEY_PASSWORD', 'APPLE_API_KEY_BASE64', 'APPLE_API_KEY_ID', 'APPLE_API_ISSUER');
-      env.APPLE_API_KEY = path.join(temporary, 'notary.p8');
-      await writeFile(env.APPLE_API_KEY, Buffer.from(env.APPLE_API_KEY_BASE64, 'base64'), { mode: 0o600 });
-    }
     const core = version.split('-')[0];
     const targetNames = {
       windows: ['nsis', 'portable'], macos: ['dmg', 'zip'], linux: ['deb', 'rpm', 'AppImage', 'tar.gz'],
@@ -184,7 +179,7 @@ async function packageDesktop() {
       publish: { provider: 'generic', url: `https://github.com/${repository}/releases` },
       icon: path.join(desktop, 'public', 'aria-icon.png'),
       artifactName: 'Aria-${version}-' + platform + '-${arch}.${ext}',
-      forceCodeSigning: Boolean(windows) || production && platform === 'macos',
+      forceCodeSigning: Boolean(windows) || platform === 'macos',
       win: {
         signExecutable: Boolean(windows),
         signtoolOptions: {
@@ -195,17 +190,17 @@ async function packageDesktop() {
       nsis: { runAfterFinish: false, deleteAppDataOnUninstall: false },
       portable: { artifactName: 'Aria-${version}-windows-${arch}-portable.${ext}' },
       mac: {
-        identity: production ? undefined : null,
-        hardenedRuntime: production,
-        notarize: production,
+        identity: '-',
+        hardenedRuntime: true,
+        notarize: false,
+        strictVerify: true,
         bundleShortVersion: core,
         bundleVersion: core,
         extendInfo: { NSMicrophoneUsageDescription: 'Aria uses the microphone for Live Voice.' },
-        ...(production && platform === 'macos' ? {
-          binaries: ['Contents/Resources/aria-computer/aria-macos-computer'],
-        } : {}),
+        binaries: ['Contents/Resources/aria-computer/aria-macos-computer'],
       },
-      dmg: { sign: production && platform === 'macos' },
+      // Electron Builder's DMG signer searches for a certificate. Sign the finished image below.
+      dmg: { sign: false, writeUpdateInfo: false },
       linux: {
         executableName: 'aria',
         category: 'Utility',
@@ -238,13 +233,9 @@ async function packageDesktop() {
       });
     } else await pack();
 
-    if (production && platform === 'macos') {
+    if (platform === 'macos' && mode !== 'dir') {
       const dmg = path.join(output, target.find(({ format }) => format === 'dmg').filename);
-      run('xcrun', ['notarytool', 'submit', dmg, '--key', env.APPLE_API_KEY,
-        '--key-id', env.APPLE_API_KEY_ID, '--issuer', env.APPLE_API_ISSUER, '--wait', '--timeout', '45m']);
-      run('xcrun', ['stapler', 'staple', dmg]);
-      run('xcrun', ['stapler', 'validate', dmg]);
-      run('codesign', ['--verify', '--strict', dmg]);
+      run('/usr/bin/codesign', ['--sign', '-', '--timestamp=none', dmg]);
     }
     if (mode !== 'dir')
       for (const { filename } of target) await inspectFile(output, filename);

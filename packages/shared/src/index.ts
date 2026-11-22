@@ -377,12 +377,12 @@ export interface HealthResult {
 export type UpdateChannel = 'stable' | 'beta';
 export type UpdateCommand =
   | { action: 'channel'; channel: UpdateChannel }
-  | { action: 'check' | 'download' | 'install' | 'open-release' };
+  | { action: 'check' | 'download' | 'install' | 'open-installer' | 'open-release' };
 export interface UpdateState {
   version: string;
   channel: UpdateChannel;
   status: 'unsupported' | 'idle' | 'checking' | 'current' | 'available' | 'downloading' | 'ready' | 'installing' | 'error';
-  mode: 'install' | 'manual';
+  mode: 'install' | 'disk-image' | 'manual';
   available?: string;
   progress?: number;
   error?: string;

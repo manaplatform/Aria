@@ -139,6 +139,8 @@ export async function verifyBuilds(input, output, production) {
     if (receipt.version !== version || receipt.commit !== source || receipt.platform !== platform ||
         receipt.arch !== arch || !Number.isFinite(Date.parse(receipt.timestamp)) ||
         production && !receipt.production) throw new Error(`Invalid build receipt for ${platform}-${arch}.`);
+    if (platform === 'macos' && (receipt.signing !== 'ad-hoc' || receipt.notarized !== false))
+      throw new Error(`Missing ad hoc signing verification for macOS ${arch}.`);
     timestamps.push(receipt.timestamp);
     const files = platformAssets(version, platform, arch).map(({ filename }) => filename);
     if (production && platform === 'windows') files.push('Aria-Windows-Signing.cer');

@@ -285,7 +285,7 @@ function registerIpc(): void {
   handle('aria:update-command', (input) => {
     const command = z.union([
       z.object({ action: z.literal('channel'), channel: z.enum(['stable', 'beta']) }),
-      z.object({ action: z.enum(['check', 'download', 'install', 'open-release']) }),
+      z.object({ action: z.enum(['check', 'download', 'install', 'open-installer', 'open-release']) }),
     ]).parse(input);
     return updates.command(command, (perform) => {
       installUpdate = perform;
@@ -1272,6 +1272,7 @@ app
       return;
     }
     createWindow(icon);
+    updates.startAutomaticChecks();
     void chat.start().then(() => executionRuntime.cleanHostedResources());
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow(icon);
