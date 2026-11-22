@@ -23,9 +23,10 @@ const production = mode === 'publish';
 const target = platformAssets(version, platform, arch);
 const asset = (format) => path.join(artifacts, target.find((item) => item.format === format).filename);
 
-function run(exe, args, cwd = root, capture = false) {
+function run(exe, args, cwd = root, capture = false, options = {}) {
   return execFileSync(exe, args, {
     cwd, timeout: 120_000, encoding: 'utf8', stdio: capture ? ['ignore', 'pipe', 'inherit'] : 'inherit',
+    ...options,
   });
 }
 
@@ -155,16 +156,29 @@ async function verifyMac(temp, fixture) {
 async function verifyWindows(temp, fixture) {
   const installed = path.join(temp, 'Aria');
   const userData = path.join(temp, 'profile');
-  run(asset('exe'), ['/S', `/D=${installed}`]);
+  const installerTemp = path.join(temp, 'tmp');
+  await mkdir(installerTemp);
+  const runInstaller = (exe, location) => run(exe, ['/S', location], temp, false, {
+    timeout: 600_000,
+    // NSIS reads the last argument as an unquoted path, including any spaces.
+    windowsVerbatimArguments: true,
+    argv0: `"${exe}"`,
+    env: { ...process.env, TEMP: installerTemp, TMP: installerTemp },
+  });
   const uninstaller = path.join(installed, 'Uninstall Aria.exe');
+  console.log('Installing the Windows package for verification.');
+  runInstaller(asset('exe'), `/D=${installed}`);
   try {
+    console.log('Verifying installed Windows signatures.');
     if (production || process.env.GITHUB_ACTIONS === 'true')
       run(process.execPath, [path.join(root, 'scripts/release/package-desktop.mjs'),
         'verify-windows-install', artifacts, installed, mode]);
+    console.log('Testing the installed Windows app.');
     await smoke(path.join(installed, 'Aria.exe'), userData, fixture);
     await smoke(path.join(installed, 'Aria.exe'), userData, fixture, true);
     // The NSIS wrapper spawns Electron separately. Start the unpacked portable
     // payload with the same portable environment to verify its native runtime.
+    console.log('Testing the portable Windows app.');
     const wrapper = path.join(temp, 'portable-wrapper');
     const app = path.join(temp, 'portable-app');
     const programFiles = process.env.ProgramFiles ?? 'C:\\Program Files';
@@ -179,7 +193,10 @@ async function verifyWindows(temp, fixture) {
       PORTABLE_EXECUTABLE_FILE: asset('portable.exe'),
     });
   } finally {
-    if (existsSync(uninstaller)) run(uninstaller, ['/S']);
+    if (existsSync(uninstaller)) {
+      console.log('Uninstalling the Windows smoke-test package.');
+      runInstaller(uninstaller, `_?=${installed}`);
+    }
   }
 }
 
@@ -230,7 +247,9 @@ async function inventory() {
 
 const fixture = await createProviderFixture();
 fixture.finalReply('Verify this packaged Aria.', 'Aria package fixture reply');
-const temporary = await mkdtemp(path.join(os.tmpdir(), 'aria-package-smoke-'));
+const temporaryRoot = platform === 'windows' && process.env.RUNNER_TEMP ? process.env.RUNNER_TEMP : os.tmpdir();
+const temporary = await mkdtemp(path.join(temporaryRoot, 'aria-'));
+let verificationFailed = false;
 try {
   await { windows: verifyWindows, macos: verifyMac, linux: verifyLinux }[platform](temporary, fixture);
   if (destination) {
@@ -250,7 +269,15 @@ try {
       components: await inventory(),
     }, null, 2) + '\n');
   }
+} catch (error) {
+  verificationFailed = true;
+  throw error;
 } finally {
   await fixture.close();
-  await rm(temporary, { recursive: true, force: true });
+  try {
+    await rm(temporary, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  } catch (error) {
+    if (!verificationFailed) throw error;
+    console.warn(`Could not clean up the package smoke-test directory. ${error.message}`);
+  }
 }
