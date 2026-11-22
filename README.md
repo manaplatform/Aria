@@ -86,4 +86,8 @@ Enable **Allow Aria to search and browse** in **Settings → Web & Browser**. Ar
 
 AI browser access is off by default. When enabled, the configured primary model can use AI tabs owned by that conversation. Personal tabs can share a previewed link or selection with a chat draft. For supported actions that change a page or submit a form, confirm the action in Aria's native dialog. Use a Personal tab for sign-ins, payments, uploads, or forms Aria cannot verify. Chromium tabs and public page tools block local and private network destinations. History, persistent cookies, and tab restore are independent settings.
 
-See [web and browser security](docs/web-browser-security.md) and [third-party notices](THIRD_PARTY_NOTICES.md). The first-party MIT license is pending confirmation of the legal copyright holder and authority to license the existing contributions.
+See [web and browser security](docs/web-browser-security.md).
+
+## License
+
+Aria’s first-party code is licensed under the [MIT License](LICENSE). See the [third-party notices](THIRD_PARTY_NOTICES.md) for bundled dependencies and assets.
