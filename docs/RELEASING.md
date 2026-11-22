@@ -4,6 +4,16 @@ Aria Release Creator builds and verifies desktop packages on GitHub-hosted runne
 
 ## Create a release
 
+### From GitHub Releases
+
+1. Open [Aria Releases](https://github.com/manaplatform/Aria/releases) and select **Draft a new release**.
+2. In **Choose a tag**, create `aria-auto-<version>` using the root version on `main`. For example, use `aria-auto-0.0.1` for Aria 0.0.1. Select `main` as the target.
+3. Leave the description and assets empty and select **Save draft**. Saving a draft with this tag requests automatic publication.
+
+Release Creator checks for new requests every 15 minutes, subject to GitHub Actions scheduling. It links the draft to the build, fills in the title and release notes, and attaches all verified desktop installers, checksums, and update metadata. After verification it publishes the same draft with an annotated calendar tag pointing to the build commit. Keep the draft saved while the workflow is running. [GitHub Actions events](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#release)
+
+### From a version change
+
 1. Change the root application version and merge the reviewed change into `main`. Use a final SemVer such as `1.2.3` for stable or a prerelease such as `1.2.4-beta.1` for beta. Keep the major component at or below 9999 and the minor and patch components at or below 99 for the macOS bundle fields. Build metadata is excluded from release versions because it has equal update precedence.
 2. Open **Actions → Aria Release Creator** to follow the run. The workflow compares the root versions before and after a push to `main` and starts the build when the version changes. The protected publish job runs after all six platform builds pass. Stable becomes the GitHub latest release. Beta is published as a prerelease.
 3. For the first release or to release the current default-branch version manually, use **Run workflow → publish** or `pnpm release:create`. Use `preview` to generate metadata and notes, or `verify` to produce packages, verification receipts, and build provenance without a GitHub Release. Windows verification uses a disposable signing certificate. The workflow must already be present on the default branch to dispatch it.
@@ -66,7 +76,7 @@ An ad hoc signature seals the bundle and its nested code. Publisher authenticity
 
 ## Retry and verify
 
-Use **Re-run failed jobs** to retry a failed workflow at its original commit. Rerun all jobs if Actions artifacts have expired. A failed build produces no draft. After tag reservation, retries reuse the version’s tag and recover its draft. Uploaded assets with matching hashes are retained and missing or mismatched owned draft assets are repaired. Review any unexpected assets before retrying. Every published version occupies its SemVer precedence, including a public release with zero assets. Use a new root version for a correction after publication.
+Use **Re-run failed jobs** to retry a failed workflow at its original commit. Rerun all jobs if Actions artifacts have expired. Draft requests remain linked to their original workflow after a failed build. To request a build from a newer commit after fixing a failure that occurred before tag reservation, clear the request draft's description, set its target back to `main`, and save it again. After tag reservation, retries reuse the version’s tag and recover its draft. Uploaded assets with matching hashes are retained and missing or mismatched owned draft assets are repaired. Review any unexpected assets before retrying. Every published version occupies its SemVer precedence, including a public release with zero assets. Use a new root version for a correction after publication.
 
 Download the installer for your platform and architecture. Compare the file hashes with `SHA256SUMS.txt` and verify build provenance with `gh attestation verify <file> --repo manaplatform/Aria --source-ref refs/heads/main`. On Windows compare `Get-FileHash -Algorithm SHA256` and inspect the file's Authenticode publisher and certificate fingerprint. On macOS use `shasum -a 256`, `hdiutil verify <image>`, and `codesign --verify --strict <image>`. After mounting the image, use `codesign --verify --deep --strict <path-to-Aria.app>` to check the app seal. Linux users can use `sha256sum -c SHA256SUMS.txt --ignore-missing` from the download directory. The signed release manifest also records each asset’s size, URL, and digest.
 

@@ -169,7 +169,8 @@ async function packageDesktop() {
       // The runtime installs its own verified provider before any update check.
       publish: { provider: 'generic', url: `https://github.com/${repository}/releases` },
       icon: path.join(desktop, 'public', 'aria-icon.png'),
-      artifactName: 'Aria-${version}-' + platform + '-${arch}.${ext}',
+      // Electron Builder uses distro-specific architecture names for Linux packages.
+      artifactName: 'Aria-${version}-' + platform + '-' + arch + '.${ext}',
       forceCodeSigning: Boolean(windows) || platform === 'macos',
       win: {
         signExecutable: Boolean(windows),

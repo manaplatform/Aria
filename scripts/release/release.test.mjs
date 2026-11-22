@@ -13,7 +13,7 @@ import {
 } from './generate-metadata.mjs';
 import { formatNotes } from './generate-notes.mjs';
 import { findRelease, GitHubError, releaseNoteMarker, tagAnnotation } from './github.mjs';
-import { publishDraft, publishRelease, reserveTag, uploadAssets, verifyBuilds } from './run.mjs';
+import { claimDraftRequest, publishDraft, publishRelease, reserveTag, uploadAssets, verifyBuilds } from './run.mjs';
 import { windowsSignerPins } from './windows-signer-pins.mjs';
 
 const commit = 'a'.repeat(40);
@@ -99,6 +99,19 @@ test('release identity rejects duplicate precedence and recovers only its own dr
   const reserved = state({ reservations: [published(version)], releases: [draft] });
   assert.deepEqual(findRelease(reserved, version, commit), { tag, draft });
   assert.throws(() => findRelease(reserved, version, 'b'.repeat(40)), /reserved/);
+});
+
+test('the recurring scan leaves drafts outside the current release request alone', async () => {
+  const candidate = { id: 23, draft: true, tag_name: `aria-auto-${version}`, target_commitish: 'main', assets: [] };
+  const drafts = [
+    { ...candidate, tag_name: 'aria-auto-0.0.2' },
+    { ...candidate, target_commitish: 'feature' },
+    { ...candidate, body: 'Handwritten notes' },
+    { ...candidate, assets: [{ name: 'manual.zip' }] },
+    { ...candidate, target_commitish: commit, body: '<!-- Aria release request run 25 -->' },
+  ];
+  const api = { pages: async (route) => route === '/releases' ? drafts : [] };
+  assert.equal(await claimDraftRequest(api, { version, source: commit, branch: 'main', runId: '42' }), undefined);
 });
 
 test('first-release notes avoid unsupported claims and deduplicate PR commits', () => {
@@ -275,7 +288,14 @@ test('a lost publication response is reconciled by release ID', async () => {
   assert.equal(await publishDraft(api, 23, { tag, beta: true, name: 'title', body: 'notes' }), response);
 });
 
-test('verified build through publication signs metadata, rejects corrupt uploads and retries the same tag', async (t) => {
+test('verified build through publication signs metadata, rejects corrupt uploads and retries the same tag',
+  (t) => exercisePublication(t));
+test('a GitHub draft request is claimed and filled in place before publication',
+  (t) => exercisePublication(t, 'schedule'));
+test('an automatic version release fills a matching GitHub draft already waiting for it',
+  (t) => exercisePublication(t, 'push'));
+
+async function exercisePublication(t, trigger) {
   const { builds, output, version, commit } = await buildFixture(t, true);
   await verifyBuilds(builds, output, true);
   const { privateKey, publicKey } = generateKeyPairSync('ed25519');
@@ -285,8 +305,12 @@ test('verified build through publication signs metadata, rejects corrupt uploads
   const sample = buildInventory(version)[0].filename;
   const remote = new Map();
   const uploads = [];
+  const runId = '42';
+  const draftId = 23;
   let tagObject;
-  let draft;
+  let draft = trigger ? {
+    id: draftId, draft: true, tag_name: `aria-auto-${version}`, target_commitish: 'main', body: '',
+  } : undefined;
   let ref;
   let corrupt = true;
   const api = {
@@ -307,6 +331,7 @@ test('verified build through publication signs metadata, rejects corrupt uploads
     },
     async json(route, options) {
       if (route === '/git/tags/reservation') return tagObject;
+      if (route === '/releases/23' && !options) return { ...draft, assets: [...remote.values()] };
       const { method, body } = options;
       if (route === '/git/tags') {
         assert.equal(tagObject, undefined, 'retry must reuse the annotated tag');
@@ -335,6 +360,7 @@ test('verified build through publication signs metadata, rejects corrupt uploads
         return ref;
       }
       if (route === '/releases') {
+        assert.equal(trigger, undefined, 'an existing request must keep its release ID');
         assert.equal(draft, undefined, 'retry must reuse the existing draft');
         assert.equal(body.tag_name, reserved);
         assert.equal(body.target_commitish, commit);
@@ -351,10 +377,16 @@ test('verified build through publication signs metadata, rejects corrupt uploads
         return null;
       }
       if (route === '/releases/23' && method === 'PATCH') {
-        assert.equal(body.make_latest, channelFor(version) === 'stable' ? 'true' : 'false');
-        assert.ok(!corrupt && !body.draft);
+        if (body.draft === false) {
+          assert.equal(body.make_latest, channelFor(version) === 'stable' ? 'true' : 'false');
+          assert.ok(!corrupt);
+        } else {
+          assert.equal(body.draft, undefined);
+          assert.equal(body.target_commitish, commit);
+          assert.ok(draft.draft);
+        }
         draft = { ...draft, ...body };
-        return draft;
+        return { ...draft, assets: [...remote.values()] };
       }
       throw new Error(`Unexpected mutation ${route}`);
     },
@@ -372,17 +404,36 @@ test('verified build through publication signs metadata, rejects corrupt uploads
     },
   };
 
+  const selection = { version, source: commit, branch: 'main', runId };
+  const request = trigger ? { branch: 'main', runId } : undefined;
+  if (trigger === 'schedule') {
+    request.id = await claimDraftRequest(api, selection);
+    assert.equal(request.id, draftId);
+    assert.match(draft.body, /Follow the build/);
+    assert.equal(await claimDraftRequest(api, { ...selection, runId: '43' }), undefined);
+    assert.equal(await claimDraftRequest(api, selection), draftId);
+  }
+  const publishAt = (date) => publishRelease(api, output, timestamp, privateKey, date, request);
+  if (trigger === 'schedule') {
+    draft.target_commitish = 'feature';
+    await assert.rejects(() => publishAt(now), /requested release draft changed/);
+    assert.equal(tagObject, undefined);
+    draft.target_commitish = commit;
+  }
   await rm(path.join(output, sample));
-  await assert.rejects(() => publishRelease(api, output, timestamp, privateKey, now), /ENOENT/);
+  await assert.rejects(() => publishAt(now), /ENOENT/);
   assert.equal(tagObject, undefined);
   await writeFile(path.join(output, sample), sample);
-  await assert.rejects(() => publishRelease(api, output, timestamp, privateKey, now), /asset verification failed/);
+  await assert.rejects(() => publishAt(now), /asset verification failed/);
   assert.ok(draft.draft);
+  if (trigger === 'schedule') assert.equal(await claimDraftRequest(api, selection), draftId);
   const firstUploads = uploads.length;
 
   corrupt = false;
   const later = new Date('2026-11-23T12:00:00Z');
-  const result = await publishRelease(api, output, timestamp, privateKey, later);
+  const result = await publishAt(later);
+  assert.equal(result.id, draftId);
+  assert.equal(result.draft, false);
   assert.equal(result.tag_name, reserved);
   assert.equal(result.name, releaseTitle(version, reserved));
   assert.equal(result.prerelease, channelFor(version) === 'beta');
@@ -394,6 +445,6 @@ test('verified build through publication signs metadata, rejects corrupt uploads
   assert.match(result.body, /Apple Silicon \(arm64\)[\s\S]*Intel \(x64\)[\s\S]*### Windows[\s\S]*### Linux/);
   assert.match(result.body, /self-signed Authenticode certificate/);
   assert.match(result.body, /Full changelog/);
-  assert.equal(await publishRelease(api, output, timestamp, privateKey, later), undefined);
+  assert.equal(await publishAt(later), undefined);
   assert.equal(uploads.length, firstUploads + 1);
-});
+}
