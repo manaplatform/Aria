@@ -1,5 +1,5 @@
 import { app, dialog, shell } from 'electron';
-import { AppImageUpdater, MacUpdater, NsisUpdater, Provider, type UpdateInfo } from 'electron-updater';
+import { AppImageUpdater, NsisUpdater, Provider, type UpdateInfo } from 'electron-updater';
 import type { ProviderRuntimeOptions } from 'electron-updater/out/providers/Provider';
 import type { AppUpdater } from 'electron-updater';
 import { execFile } from 'node:child_process';
@@ -11,6 +11,9 @@ import { prerelease } from 'semver';
 import { z } from 'zod';
 import type { UpdateCommand, UpdateState } from '@aria/shared';
 import { findUpdate, releasePage, type VerifiedUpdate } from './update-feed';
+import { downloadMacUpdate, verifyMacUpdate } from './mac-update';
+
+const automaticCheckInterval = 6 * 60 * 60_000;
 
 const trustSchema = z.object({
   version: z.string(),
@@ -46,13 +49,12 @@ function updaterForDevice(pins: string[]): AppUpdater | undefined {
     updater.verifyUpdateCodeSignature = (_publishers, file) => windowsSigner(file, pins);
     return updater;
   }
-  if (process.platform === 'darwin') return new MacUpdater();
   if (process.platform === 'linux' && process.env.APPIMAGE && existsSync(process.env.APPIMAGE))
     return new AppImageUpdater();
 }
 
 function setVerifiedProvider(updater: AppUpdater, release: VerifiedUpdate) {
-  const file = release.download!;
+  const file = release.download;
   const info: UpdateInfo = {
     version: release.version,
     files: [{ url: file.url, size: file.size, sha512: file.sha512 }],
@@ -83,7 +85,7 @@ export class DesktopUpdates {
   private writing = false;
   private readonly file: string;
 
-  constructor(directory: string, private readonly emit: (state: UpdateState) => void) {
+  constructor(private readonly directory: string, private readonly emit: (state: UpdateState) => void) {
     this.file = path.join(directory, 'update-settings.json');
     const version = app.getVersion();
     this.state = { version, channel: prerelease(version) ? 'beta' : 'stable', status: 'unsupported', mode: 'manual' };
@@ -107,8 +109,7 @@ export class DesktopUpdates {
         this.updater.disableDifferentialDownload = true;
         this.updater.disableWebInstaller = true;
         this.updater.on('error', () => {
-          // Download failures reject the caller. Squirrel.Mac can report a
-          // separate installation failure after the application has shut down.
+          // Download errors reject the caller. Handle asynchronous installer errors during handoff.
           if (this.state.status === 'installing') {
             dialog.showErrorBox('Update installation failed', 'Open Aria and try the update again.');
             app.quit();
@@ -118,7 +119,7 @@ export class DesktopUpdates {
           if (this.state.status === 'downloading') this.set({ progress: Math.min(100, Math.floor(percent)) });
         });
       }
-      this.set({ status: 'idle', mode: this.updater ? 'install' : 'manual' });
+      this.set({ status: 'idle', mode: process.platform === 'darwin' ? 'disk-image' : this.updater ? 'install' : 'manual' });
     } catch {
       this.set({ status: 'unsupported', error: 'Update configuration is unavailable in this build.' });
     }
@@ -128,12 +129,21 @@ export class DesktopUpdates {
     return this.state;
   }
 
+  startAutomaticChecks() {
+    if (this.state.mode !== 'disk-image') return;
+    const check = () => {
+      if (['idle', 'current', 'error'].includes(this.state.status)) void this.command({ action: 'check' });
+    };
+    check();
+    setInterval(check, automaticCheckInterval).unref();
+  }
+
   private set(update: Partial<UpdateState>) {
     this.state = { ...this.state, ...update };
     this.emit(this.state);
   }
 
-  async command(command: UpdateCommand, install: (perform: () => void) => void) {
+  async command(command: UpdateCommand, install?: (perform: () => void) => void) {
     if (command.action === 'open-release') {
       await shell.openExternal(this.candidate?.url ?? releasePage);
       return;
@@ -155,7 +165,13 @@ export class DesktopUpdates {
         this.set({ channel: command.channel, status: 'idle', available: undefined, error: undefined, progress: undefined });
       } else if (command.action === 'check') await this.check();
       else if (command.action === 'download' && this.state.status === 'available') await this.download();
-      else if (command.action === 'install' && this.state.status === 'ready' && this.updater) {
+      else if (command.action === 'open-installer' && this.state.status === 'ready' && this.state.mode === 'disk-image') {
+        const expected = this.candidate?.download;
+        if (!this.installer || !expected) throw new Error('Download the verified disk image before opening it.');
+        await verifyMacUpdate(this.installer, expected);
+        const failure = await shell.openPath(this.installer);
+        if (failure) throw new Error('macOS could not open the disk image. Download the update again or open the release in your browser.');
+      } else if (command.action === 'install' && this.state.status === 'ready' && this.updater && install) {
         await this.verifyInstaller();
         this.set({ status: 'installing' });
         const updater = this.updater;
@@ -192,24 +208,34 @@ export class DesktopUpdates {
   }
 
   private async download() {
-    if (!this.updater || !this.candidate?.download) return;
+    if (!this.candidate || this.state.mode === 'manual') return;
     this.set({ status: 'downloading', progress: 0, error: undefined });
-    setVerifiedProvider(this.updater, this.candidate);
-    this.updater.allowPrerelease = this.state.channel === 'beta';
-    this.updater.allowDowngrade = false;
-    const result = await this.updater.checkForUpdates();
+    if (this.state.mode === 'disk-image') {
+      this.installer = await downloadMacUpdate(this.directory, this.candidate.download, (progress) => {
+        if (progress !== this.state.progress) this.set({ progress });
+      });
+    } else if (this.updater) {
+      await this.downloadNativeUpdate(this.updater, this.candidate);
+    }
+    this.set({ status: 'ready', progress: 100 });
+  }
+
+  private async downloadNativeUpdate(updater: AppUpdater, candidate: VerifiedUpdate) {
+    setVerifiedProvider(updater, candidate);
+    updater.allowPrerelease = this.state.channel === 'beta';
+    updater.allowDowngrade = false;
+    const result = await updater.checkForUpdates();
     if (!result?.isUpdateAvailable) throw new Error('The verified update is no longer available for installation.');
     const received = ({ downloadedFile }: { downloadedFile: string }) => {
       this.installer = downloadedFile;
     };
-    this.updater.once('update-downloaded', received);
+    updater.once('update-downloaded', received);
     try {
-      await this.updater.downloadUpdate();
+      await updater.downloadUpdate();
     } finally {
-      this.updater.removeListener('update-downloaded', received);
+      updater.removeListener('update-downloaded', received);
     }
     await this.verifyInstaller();
-    this.set({ status: 'ready', progress: 100 });
   }
 
   private async verifyInstaller() {

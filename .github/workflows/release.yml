@@ -180,8 +180,7 @@ jobs:
         env:
           RELEASE_MODE: ${{ needs.prepare-release.outputs.mode }}
         run: node scripts/release/run.mjs verify-builds incoming verified "$RELEASE_MODE"
-      - if: needs.prepare-release.outputs.mode == 'publish'
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+      - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
         with:
           subject-path: verified/*
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7

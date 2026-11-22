@@ -62,7 +62,8 @@ export function platformAssets(version, platform, arch) {
   return platforms[platform].map((format) => ({
     filename: format === 'portable.exe' ? `${prefix}-portable.exe` : `${prefix}.${format}`,
     platform, arch, format,
-    inAppUpdate: ['exe', 'zip', 'AppImage'].includes(format),
+    inAppUpdate: ['exe', 'dmg', 'AppImage'].includes(format),
+    ...(platform === 'macos' ? { signing: 'ad-hoc', notarized: false } : {}),
   }));
 }
 
