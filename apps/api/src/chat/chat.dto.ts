@@ -45,10 +45,36 @@ class AvailableAssetDto {
   size!: number;
 }
 
+class MemoryTurnDto {
+  @IsBoolean()
+  enabled!: boolean;
+
+  @IsBoolean()
+  suggestions!: boolean;
+
+  @IsOptional()
+  @IsBoolean()
+  temporary?: boolean;
+
+  @IsOptional()
+  @IsBoolean()
+  privateHistory?: boolean;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(2400)
+  workingSummary?: string;
+}
+
 export class ChatRequestDto {
   @IsOptional()
   @IsBoolean()
   programPrivateHistory?: boolean;
+
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => MemoryTurnDto)
+  memory?: MemoryTurnDto;
 
   @IsOptional()
   @IsArray()

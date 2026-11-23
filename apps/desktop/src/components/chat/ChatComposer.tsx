@@ -221,8 +221,8 @@ export function ChatComposer() {
                 size="icon"
                 variant="ghost"
                 aria-label="Start live voice conversation"
-                title={status.voiceReady ? 'Start Live Voice' : 'Configure Live Voice in AI Models'}
-                disabled={busy || !status.voiceReady}
+                title={conversation?.temporary ? 'Live Voice is unavailable in temporary chat' : status.voiceReady ? 'Start Live Voice' : 'Configure Live Voice in AI Models'}
+                disabled={busy || !status.voiceReady || conversation?.temporary}
                 onClick={() => void startLiveVoice()}
               >
                 <Mic size={17} />

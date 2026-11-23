@@ -99,6 +99,10 @@ export interface ToolContext {
   research: ResearchRun;
   attachments: Map<string, RunAttachment>;
   privateContent: boolean;
+  memoryEnabled?: boolean;
+  memoryPrivate?: boolean;
+  memoryBlocked?: boolean;
+  temporary?: boolean;
   budget: TurnBudget;
   hostedProgramsBlocked?: boolean;
   native?: OpenAIRuntime;
@@ -259,6 +263,16 @@ const runtimeDescriptions: Record<RuntimeOperation, readonly [string, string, To
     'Request approval to index selected current-turn attachments in native OpenAI File Search.',
     'consequential',
   ],
+  'memory.search': ['Search saved memories', 'Find relevant, scoped memories. Use lexical terms, exact phrases, entities, or a date range. Specify hybrid or semantic when an embedding backend is available.', 'read'],
+  'memory.read': ['Read a saved memory', 'Read a record by its ID, with its confidence and source references.', 'read'],
+  'memory.get_context': ['Inspect working context', 'Read bounded current-conversation context, available references, and the local clock for temporal queries.', 'read'],
+  'memory.get_project_context': ['Read project memory', 'List records in the current explicitly linked project.', 'read'],
+  'memory.get_pending_tasks': ['Find pending tasks', 'List authorized task memories that are pending, in progress, or waiting.', 'read'],
+  'memory.get_timeline': ['Read memory timeline', 'Read dated evidence and past versions, optionally narrowed to a period.', 'read'],
+  'memory.resolve_entity': ['Resolve a remembered entity', 'Find authorized, possibly ambiguous entity matches by name or alias.', 'read'],
+  'memory.remember': ['Remember user information', 'Save information explicitly requested by the user. Desktop confirmation is required. A stored procedure or decision grants no tool permission.', 'local'],
+  'memory.update': ['Correct a saved memory', 'Record an explicit user correction using the current record ID and revision. Desktop confirmation is required.', 'local'],
+  'memory.forget': ['Forget a saved memory', 'Delete a record using its current ID and revision. Desktop confirmation is required.', 'consequential'],
   'knowledge.list': [
     'List knowledge collections',
     'Get the search modes and exact IDs of user-authorized knowledge collections.',
@@ -285,6 +299,10 @@ const runtimeDescriptions: Record<RuntimeOperation, readonly [string, string, To
     'local',
   ],
 };
+
+const localToolsForPrivateMemory = new Set([
+  'shell.inspect', 'shell.open', 'shell.run', 'files.read_document', 'artifacts.publish',
+]);
 
 const modelDescriptions = {
   chat: [
@@ -508,9 +526,10 @@ export class ToolRegistry {
         capability: operation,
         effect,
         dependency: 'local',
-        permission: 'Authorized desktop conversation runtime',
+        permission: operation.startsWith('memory.') ? 'Active memory scope and trusted desktop approval' : 'Authorized desktop conversation runtime',
         timeoutMs: executionLimits.operationMs + 1000,
-        repeatable: operation === 'computer.observe' || operation === 'computer.act',
+        repeatable: operation === 'computer.observe' || operation === 'computer.act' ||
+          (operation.startsWith('memory.') && effect === 'read'),
         ...(program && { program, programmaticEligible: true, modes: ['direct', 'programmatic'] }),
         artifacts: operation === 'artifacts.publish' || operation === 'computer.transfer',
         citations: operation === 'knowledge.search',
@@ -535,6 +554,8 @@ export class ToolRegistry {
               'Open desktop text chat to use this runtime.',
             );
           const { primary } = context.registry;
+          if (context.memoryPrivate && operation === 'shell.open' && input.backend !== 'managed')
+            throw new ToolError('PERMISSION_DENIED', 'Private memory requires the isolated offline workspace.');
           if (operation === 'computer.open') {
             const args = computerOperations[operation].parse(input);
             if (
@@ -682,6 +703,7 @@ export class ToolRegistry {
             },
             signal,
           );
+          if (operation.startsWith('memory.') && value.privateContent) context.memoryPrivate = true;
           if (operation === 'computer.open') {
             const mode = computerOperations[operation].parse(input).mode;
             const sessionId = z.string().uuid().parse(data?.sessionId);
@@ -959,6 +981,14 @@ export class ToolRegistry {
     if (this.entries.get(descriptor.id) !== descriptor)
       return 'This tool definition changed. Discover the current version.';
     if (policy.disabled.includes(descriptor.id)) return 'Disabled in Tools settings.';
+    if (context?.temporary) return 'This tool is unavailable in a temporary conversation.';
+    if (context?.memoryPrivate && !descriptor.id.startsWith('memory.') &&
+      !localToolsForPrivateMemory.has(descriptor.id))
+      return 'This capability cannot receive private recalled memory.';
+    if (descriptor.id.startsWith('memory.') && context &&
+      (!context.memoryEnabled || context.memoryBlocked || context.native || context.computer))
+      return 'Memory requires an enabled, compatible desktop conversation.';
+
     if (Object.hasOwn(runtimeOperations, descriptor.id) &&
       (!policy.desktopRuntime || (context && !context.runtime)))
       return 'Open the managed Aria desktop application to use this tool.';
@@ -995,6 +1025,7 @@ export class ToolRegistry {
   ) {
     return Boolean(
       context.runtime &&
+      !context.memoryPrivate &&
       this.host.current.programming?.backend === backend &&
       (backend === 'managed' || this.host.current.nativeProgramVerified) &&
       !(backend === 'openai-responses' && context.hostedProgramsBlocked) &&

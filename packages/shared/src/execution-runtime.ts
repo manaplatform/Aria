@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { memoryOperations } from './memory.js';
 import { computerImage, computerOperations } from './computer-use.js';
 
 const id = z.string().uuid();
@@ -29,6 +30,7 @@ export const workspaceFilename = z
 
 export const runtimeOperations = {
   ...computerOperations,
+  ...memoryOperations,
   'shell.inspect': z.strictObject({}),
   'shell.open': z.strictObject({
     inlineSkills: z

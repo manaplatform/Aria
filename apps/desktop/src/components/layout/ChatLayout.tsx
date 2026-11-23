@@ -26,10 +26,10 @@ export default function ChatLayout() {
   const navigate = useNavigate();
   const browserMode = useBrowserStore((state) => state.mode);
   const playing = useBrowserStore((state) => state.state.tabs.find((tab) => tab.playingMedia));
-  const showBrowser = browserMode !== 'chat' && location.pathname === '/chat';
+  const conversation = chat.conversations.find((item) => item.id === chat.selectedId);
+  const showBrowser = browserMode !== 'chat' && location.pathname === '/chat' && !conversation?.temporary;
   const slot = useBrowserSlot(chat.selectedId, showBrowser && !drawer);
   useEffect(connectBrowser, []);
-  const conversation = chat.conversations.find((item) => item.id === chat.selectedId);
   const newChat = () => {
     selectChat(null);
     navigate('/chat');

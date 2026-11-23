@@ -1,6 +1,8 @@
 import { z } from 'zod';
 import {
   activitySchema,
+  memoryCandidates,
+  memorySuggestions,
   artifactReferenceSchema,
   runInfoSchema,
   toolProblemSchema,
@@ -36,6 +38,10 @@ export const chatRequestSchema = z
 
 export const managedChatRequestSchema = chatRequestSchema.safeExtend({
   programPrivateHistory: z.boolean().optional(),
+  memory: z.strictObject({
+    enabled: z.boolean(), suggestions: z.boolean(), temporary: z.boolean().optional(),
+    workingSummary: z.string().max(2400).optional(), privateHistory: z.boolean().optional(),
+  }).optional(),
 });
 
 const envelope = z.object({
@@ -53,6 +59,8 @@ export const conductorEventSchema = z.discriminatedUnion('type', [
   z.strictObject({
     type: z.literal('completed'),
     partial: z.boolean().optional(),
+    suggestions: memorySuggestions.optional(),
+    memoryCandidates: memoryCandidates.optional(),
     run: runInfoSchema.optional(),
   }),
   z.strictObject({ type: z.literal('stopped') }),

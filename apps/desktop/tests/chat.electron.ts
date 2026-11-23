@@ -34,15 +34,27 @@ async function launch(
   env.ARIA_SYSTEM_PROMPT = '';
   if (development) env.VITE_DEV_SERVER_URL = 'http://127.0.0.1:5174';
   else delete env.VITE_DEV_SERVER_URL;
+  const executablePath = !development ? process.env.ARIA_TEST_PACKAGED_APP : undefined;
   app = await electron.launch({
+    ...(executablePath && { executablePath }),
     args: [
       ...(fakeMicrophone
         ? ['--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream']
         : []),
-      root,
+      ...(executablePath ? [] : [root]),
     ],
     env,
   });
+  if (executablePath && process.env.ARIA_PACKAGED_PROVIDER_FIXTURE === '1') {
+    await app.evaluate(({ safeStorage }) => {
+      safeStorage.isAsyncEncryptionAvailable = async () => true;
+      safeStorage.encryptStringAsync = async (value) => Buffer.from('fixture:' + Buffer.from(value).toString('base64'));
+      safeStorage.decryptStringAsync = async (value) => ({
+        result: Buffer.from(value.toString().slice('fixture:'.length), 'base64').toString(),
+        shouldReEncrypt: false,
+      });
+    });
+  }
   page = await app.firstWindow();
   page.on('pageerror', (error) => errors.push(error.message));
   // A cold Vite server needs time to transform the lazy chat route.
@@ -642,6 +654,42 @@ test('verifies remote embeddings separately from runtime settings', async () => 
   await page.getByRole('button', { name: 'Back to chat', exact: true }).click();
   await send('Ordinary chat after an embedding rejection');
   await expect(page.locator('.from-assistant[data-status="completed"]')).toHaveCount(1);
+  await app.evaluate(({ dialog }) => {
+    const fetch = globalThis.fetch;
+    let memorySends = 0;
+    let consent = false;
+    dialog.showMessageBox = async () => ({ response: consent ? 1 : 0, checkboxChecked: false });
+    globalThis.fetch = async (url, options) => {
+      if (url !== 'https://embeddings.fixture.test/v1/embeddings') return fetch(url, options);
+      const { model, input } = JSON.parse(String(options?.body));
+      if (model !== 'working') return new Response('', { status: 503 });
+      if (input[0] !== 'Synthetic Aria memory embedding verification.') {
+        if (!consent) return new Response('Transfer attempted without permission', { status: 400 });
+        memorySends++;
+      }
+      return Response.json({ data: input.map((_: string, index: number) => ({
+        index, embedding: Array(8).fill(0.1),
+      })) });
+    };
+    Object.assign(globalThis, {
+      approveMemoryTransfer: () => { consent = true; },
+      memoryTransfers: () => memorySends,
+    });
+  });
+  await page.evaluate(async (connectionId) => {
+    const { settings } = await window.aria!.memoryStatus();
+    await window.aria!.saveMemorySettings({
+      ...settings, enabled: true, embedding: { mode: 'remote', connectionId, model: 'working' },
+    });
+  }, embeddingConnection);
+  await expect(page.evaluate(() => window.aria!.searchMemories({ query: 'synthetic recall', match: 'semantic' })))
+    .rejects.toThrow(/transfer was declined/);
+  expect(await app.evaluate(() => (globalThis as unknown as { memoryTransfers: () => number }).memoryTransfers())).toBe(0);
+  await app.evaluate(() => (globalThis as unknown as { approveMemoryTransfer: () => void }).approveMemoryTransfer());
+  await expect(page.evaluate(() => window.aria!.searchMemories({ query: 'synthetic recall', match: 'semantic' })))
+    .resolves.toEqual({ records: [] });
+  expect(await app.evaluate(() => (globalThis as unknown as { memoryTransfers: () => number }).memoryTransfers())).toBe(1);
+
 });
 
 async function enableFixtureModels(ids: string[], voice = false) {
@@ -1475,4 +1523,124 @@ test('keeps direct chat lazy and explains an unavailable sandbox', async () => {
   await expect(
     page.locator('.from-assistant').getByRole('button', { name: 'Save file', exact: true }),
   ).toHaveCount(0);
+});
+
+test('recalls memory across conversations and restart, then forgets it without rebuilding from chat history', async () => {
+  await launch();
+  await page.getByRole('button', { name: 'Open settings', exact: true }).click();
+  await page.getByRole('checkbox', { name: 'Enable persistent memory' }).check();
+  await page.getByRole('checkbox', { name: 'Show follow-up suggestions' }).check();
+  await page.getByRole('button', { name: 'Save memory settings' }).click();
+  await expect(page.getByText('Memory settings saved.')).toBeVisible();
+  await page.getByRole('button', { name: 'Back to chat', exact: true }).click();
+  const preference = 'For build notes, I prefer a list of verified commands.';
+  fixture.queueTool(preference, 'aria_reply_metadata', {
+    candidates: [{ category: 'preference', content: preference }],
+    suggestions: ['Show a build note example'],
+  }, 'I can format build notes that way.');
+  const before = fixture.received.length;
+  await send(preference);
+  await expect(page.getByRole('button', { name: 'Show a build note example' })).toBeVisible();
+  expect(fixture.received.slice(before).filter(({ body }) =>
+    body.messages.some(({ content }) => content === preference))).toHaveLength(1);
+  await expect.poll(async () => (await page.evaluate(() => window.aria!.searchMemories({ query: 'verified commands' })))
+    .records.length).toBe(1);
+  await page.getByRole('button', { name: 'Show a build note example' }).click();
+  await expect(page.locator('.from-user').last()).toContainText('Show a build note example');
+  await expect(page.locator('.from-assistant[data-status="completed"]')).toHaveCount(2);
+  await app.close();
+
+  await launch(false, false, true);
+  await app.evaluate(({ dialog }) => {
+    dialog.showMessageBox = async () => ({ response: 1, checkboxChecked: false });
+  });
+  await page.getByRole('button', { name: 'New chat', exact: true }).click();
+  const prompt = 'How did I ask you to format build notes?';
+  scriptRuntime(prompt, ['memory.search'], (result, step) => {
+    if (!step)
+      return { name: 'memory_search', input: { query: 'build notes verified commands' } };
+    const record = (result.data as { records?: { id: string; content: string }[] } | undefined)?.records?.[0];
+    fixture.finalReply(prompt, record?.content === preference
+      ? `Use a list of verified commands. [Saved preference](aria-memory:${record.id})`
+      : 'No verified preference found.');
+  });
+  await send(prompt);
+  await expect(page.getByRole('button', { name: 'Saved preference' })).toBeVisible();
+  await page.getByRole('button', { name: 'Saved preference' }).click();
+  await expect(page.getByRole('dialog', { name: 'Recalled memory' })).toContainText(preference);
+  await page.getByRole('button', { name: 'Close dialog' }).click();
+  const [remembered] = (await page.evaluate(() => window.aria!.searchMemories({ query: 'verified commands' }))).records;
+  await page.evaluate(({ id, revision }) => window.aria!.deleteMemory({ id, revision }), remembered);
+  await expect.poll(() => page.evaluate(async () => (await window.aria!.searchMemories({})).records.length)).toBe(0);
+  expect(await fs.readFile(path.join(temporary, 'aria-v3.json'), 'utf8')).toContain(preference);
+  await app.close();
+  await launch(false, false, true);
+  await expect.poll(() => page.evaluate(async () => (await window.aria!.searchMemories({})).records.length)).toBe(0);
+});
+
+test('keeps temporary chat out of history and memory after a normal app close', async () => {
+  await launch();
+  await page.evaluate(async () => {
+    const { settings } = await window.aria!.memoryStatus();
+    await window.aria!.saveMemorySettings({ ...settings, enabled: true });
+  });
+  await page.getByRole('button', { name: 'Start temporary chat' }).click();
+  await expect(page.getByText('Temporary chat · session only · persistent memory off')).toBeVisible();
+  const prompt = 'A temporary reference to orange track markers';
+  await send(prompt);
+  await expect(page.locator('.from-assistant[data-status="completed"]')).toHaveCount(1);
+  expect(fixture.received.at(-1)?.body.tools).not.toEqual(expect.arrayContaining([
+    expect.objectContaining({ function: expect.objectContaining({ name: 'aria_reply_metadata' }) }),
+  ]));
+  await app.close();
+  expect(await fs.readFile(path.join(temporary, 'aria-v3.json'), 'utf8')).not.toContain(prompt);
+  await launch(false, false, true);
+  await expect(page.locator('.from-user')).toHaveCount(0);
+  expect((await page.evaluate(() => window.aria!.searchMemories({}))).records).toEqual([]);
+});
+
+test('opens the desktop memory worker and restores settings without a provider', async () => {
+  await launch(false);
+  const initial = await page.evaluate(() => window.aria!.memoryStatus());
+  expect(initial).toMatchObject({ state: 'ready', settings: { enabled: false } });
+  await page.evaluate(async () => {
+    const { settings } = await window.aria!.memoryStatus();
+    await window.aria!.saveMemorySettings({ ...settings, enabled: true, suggestions: true });
+  });
+  await app.close();
+  await launch(false);
+  expect(await page.evaluate(() => window.aria!.memoryStatus())).toMatchObject({
+    state: 'ready', settings: { enabled: true, suggestions: true },
+  });
+});
+
+test('requires native approval for explicit memory mutations through Conductor', async () => {
+  await launch();
+  await page.evaluate(async () => {
+    const { settings } = await window.aria!.memoryStatus();
+    await window.aria!.saveMemorySettings({ ...settings, enabled: true });
+  });
+  const updatePrompt = 'Please remember that our release window starts Thursday.';
+  const candidate = { category: 'fact', content: 'The release window starts Thursday.', factKey: 'release window' };
+  const prepare = (prompt: string) => scriptRuntime(prompt, ['memory.remember'], (_result, step) => {
+    if (!step) return { name: 'memory_remember', input: { value: candidate } };
+    fixture.finalReply(prompt, 'The release window is saved.');
+  });
+  await app.evaluate(({ dialog }) => {
+    dialog.showMessageBox = async () => ({ response: 0, checkboxChecked: false });
+  });
+  prepare(updatePrompt);
+  await send(updatePrompt);
+  await expect(page.locator('.from-assistant[data-status="failed"]')).toHaveCount(1);
+  expect((await page.evaluate(() => window.aria!.searchMemories({}))).records).toEqual([]);
+
+  await app.evaluate(({ dialog }) => {
+    dialog.showMessageBox = async () => ({ response: 1, checkboxChecked: false });
+  });
+  const retryPrompt = 'Remember the Thursday release window.';
+  prepare(retryPrompt);
+  await send(retryPrompt);
+  await expect(page.locator('.from-assistant[data-status="completed"]')).toHaveCount(1);
+  await expect.poll(() => page.evaluate(async () => (await window.aria!.searchMemories({})).records))
+    .toMatchObject([{ confirmation: 'confirmed', value: candidate }]);
 });

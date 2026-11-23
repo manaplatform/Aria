@@ -1,3 +1,5 @@
+import type { MemoryDiagnostics, MemoryRecord, MemorySearch, MemorySearchResult, MemorySettings, MemoryStatus, MemoryTurnOptions } from './memory.js';
+export * from './memory.js';
 import type {
   DocumentEvidence,
   ExecutionHistoryEntry,
@@ -245,6 +247,8 @@ export interface ChatConversation {
   createdAt: string;
   updatedAt: string;
   attachments?: MediaAsset[];
+  projectId?: string;
+  temporary?: boolean;
 }
 export type ChatMessageStatus =
   'pending' | 'streaming' | 'completed' | 'stopped' | 'failed' | 'interrupted';
@@ -270,6 +274,8 @@ export interface ChatMessage {
   liveSessionId?: string;
   delegatedFromVoice?: boolean;
   liveConfig?: { model: string; chatModel: string; voice: string };
+  suggestions?: string[];
+  memoryReferences?: string[];
   fragments?: { text: string; startMs: number; endMs: number }[];
 }
 export interface ChatData {
@@ -288,6 +294,7 @@ export interface ChatRequest {
   availableAssets?: MediaAsset[];
   expectedRevision?: string;
   programPrivateHistory?: boolean;
+  memory?: MemoryTurnOptions;
 }
 export type ChatEvent = {
   requestId: string;
@@ -297,7 +304,7 @@ export type ChatEvent = {
 } & (
   | ConductorEvent
   | { type: 'asset'; asset: MediaAsset }
-  | { type: 'completed'; assets?: MediaAsset[] }
+  | { type: 'completed'; assets?: MediaAsset[]; suggestions?: string[]; memoryReferences?: string[] }
 );
 export interface ChatCapabilities {
   configured: boolean;
@@ -472,6 +479,18 @@ export interface DesktopBridge {
   muteLive(sessionId: string, muted: boolean): Promise<void>;
   endLive(): Promise<void>;
   onLiveEvent(callback: (event: LiveEvent) => void): () => void;
+  memoryStatus(): Promise<MemoryStatus>;
+  memoryDiagnostics(): Promise<MemoryDiagnostics>;
+  saveMemorySettings(settings: MemorySettings): Promise<MemoryStatus>;
+  rememberChatMessage(conversationId: string, messageId: string, category: MemoryRecord['value']['category']): Promise<MemoryRecord>;
+  memoryEvidence(conversationId: string, recordId: string): Promise<MemoryRecord | null>;
+  searchMemories(query: MemorySearch): Promise<MemorySearchResult>;
+  editMemory(record: Pick<MemoryRecord, 'id' | 'revision' | 'value'>): Promise<MemoryRecord>;
+  deleteMemory(record: Pick<MemoryRecord, 'id' | 'revision'>): Promise<void>;
+  clearMemories(filter: { category?: MemoryRecord['value']['category']; projectId?: string }): Promise<number>;
+  exportMemories(): Promise<boolean>;
+  startTemporaryChat(conversationId: string): Promise<void>;
+  attachChatProject(conversationId: string, projectId: string | null): Promise<void>;
   submitChat(request: ChatRequest): Promise<void>;
   cancelChat(requestId: string): Promise<void>;
   onChatEvent(callback: (event: ChatEvent) => void): () => void;

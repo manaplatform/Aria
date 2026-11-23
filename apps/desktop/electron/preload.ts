@@ -121,6 +121,18 @@ const bridge: DesktopBridge = {
     ipcRenderer.on('aria:live-event', listener);
     return () => ipcRenderer.removeListener('aria:live-event', listener);
   },
+  memoryStatus: () => ipcRenderer.invoke('aria:memory-status'),
+  memoryDiagnostics: () => ipcRenderer.invoke('aria:memory-diagnostics'),
+  saveMemorySettings: (settings) => ipcRenderer.invoke('aria:save-memory-settings', settings),
+  rememberChatMessage: (conversation, message, category) => ipcRenderer.invoke('aria:remember-chat-message', conversation, message, category),
+  memoryEvidence: (conversation, id) => ipcRenderer.invoke('aria:memory-evidence', conversation, id),
+  searchMemories: (query) => ipcRenderer.invoke('aria:search-memories', query),
+  editMemory: (record) => ipcRenderer.invoke('aria:edit-memory', record),
+  deleteMemory: (record) => ipcRenderer.invoke('aria:delete-memory', record),
+  clearMemories: (filter) => ipcRenderer.invoke('aria:clear-memories', filter),
+  exportMemories: () => ipcRenderer.invoke('aria:export-memories'),
+  startTemporaryChat: (id) => ipcRenderer.invoke('aria:start-temporary-chat', id),
+  attachChatProject: (conversation, project) => ipcRenderer.invoke('aria:attach-chat-project', conversation, project),
   submitChat: (request) => ipcRenderer.invoke('aria:submit-chat', request),
   cancelChat: (id) => ipcRenderer.invoke('aria:cancel-chat', id),
   onChatEvent: (callback) => {
