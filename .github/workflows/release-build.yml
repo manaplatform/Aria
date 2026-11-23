@@ -2,6 +2,11 @@ name: Aria native release build
 
 on:
   workflow_call:
+    secrets:
+      WIN_CSC_LINK:
+        required: false
+      WIN_CSC_KEY_PASSWORD:
+        required: false
     inputs:
       platform:
         type: string
