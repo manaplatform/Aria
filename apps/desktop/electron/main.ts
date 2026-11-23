@@ -31,6 +31,12 @@ import {
   capabilityId,
   effectSchema,
   modelReference,
+  memoryClear,
+  memoryCategory,
+  memoryManagementSearch,
+  memoryOperations,
+  memorySettingsSchema,
+  type ChatConversation,
   skillRefSchema,
   toolDiscoverySchema,
   type RuntimeRegistry,
@@ -47,6 +53,8 @@ import {
   programSettingsSchema,
 } from '@aria/shared';
 import { ChatService } from './chat-service';
+import { DesktopMemory } from './memory/service';
+import { WorkingContext } from './memory/working-context';
 import { DesktopRuntime } from './runtime/controller';
 import { ComputerRuntime } from './runtime/computer';
 import { VirtualComputer } from './runtime/virtual-computer';
@@ -105,6 +113,48 @@ let virtualComputer: VirtualComputer;
 let localComputer: LocalComputer;
 let localSelection: AbortController | undefined;
 let media: MediaService;
+let memory: DesktopMemory;
+const workingContext = new WorkingContext();
+const temporaryConversations = new Set<string>();
+const pendingChatProjects = new Map<string, string | null>();
+let drainingMemory = false;
+
+async function drainMemoryOutbox() {
+  if (drainingMemory || !storage.memoryOutbox.length) return;
+  drainingMemory = true;
+  try {
+    const accepted = await memory.ingest(storage.memoryOutbox);
+    if (accepted.length) {
+      const ids = new Set(accepted);
+      storage.memoryOutbox = storage.memoryOutbox.filter(({ id }) => !ids.has(id));
+    }
+  } catch {
+    // The outbox remains on disk for recovery when memory storage is available.
+  } finally {
+    drainingMemory = false;
+  }
+}
+
+function purgeMemoryOutbox() {
+  if (!storage.hasPersistedOutbox) return Promise.resolve();
+  saving = saving.catch(() => undefined).then(async () => {
+    const { data } = initial;
+    const eligible = memory.outbox(storage.memoryOutbox, data.chat.messages, data.chat.conversations);
+    await storage.save(data, eligible);
+  });
+  return saving;
+}
+
+function savedConversation(id: string): ChatConversation | undefined {
+  return initial.data.chat.conversations.find((item) => item.id === id);
+}
+
+function registeredMemoryProject(id: string) {
+  if (!initial.data.workspaces.some((workspace) => workspace.id === id))
+    throw new Error('Choose a registered project folder.');
+  storage.root(id);
+  return id;
+}
 let saving = Promise.resolve();
 let configuring = false;
 let shutdownComplete = false;
@@ -328,18 +378,129 @@ function registerIpc(): void {
       },
     },
   }));
+  handle('aria:memory-status', () => memory.status());
+  handle('aria:memory-diagnostics', () => memory.diagnosticSnapshot());
+  handle('aria:save-memory-settings', (input) => memory.saveSettings(memorySettingsSchema.parse(input)));
+  handle('aria:remember-chat-message', (conversationInput, messageInput, categoryInput) => {
+    const conversation = savedConversation(identifier.parse(conversationInput));
+    const messageId = identifier.parse(messageInput);
+    const category = memoryCategory.parse(categoryInput);
+    const message = initial.data.chat.messages.find((item) =>
+      item.id === messageId && item.conversationId === conversation?.id && item.role === 'user' &&
+      item.status === 'completed' && !item.liveSessionId);
+    if (!conversation || !message || conversation.temporary)
+      throw new Error('Choose a saved user message.');
+    if (conversation.projectId) registeredMemoryProject(conversation.projectId);
+    return memory.rememberSource(conversation, message, category);
+  });
+  handle('aria:memory-evidence', async (conversationInput, recordInput) => {
+    const conversationId = identifier.parse(conversationInput);
+    const id = z.string().uuid().parse(recordInput);
+    const owner = savedConversation(conversationId);
+    if (!owner || owner.temporary || !memory.settings.enabled ||
+      !(memory.canInspect(conversationId, id) ||
+        initial.data.chat.messages.some((message) => message.conversationId === conversationId && message.memoryReferences?.includes(id))))
+      return null;
+    return await memory.client.call('read', id, { conversationId, projectId: owner.projectId }, true) ?? null;
+  });
+  handle('aria:search-memories', (input) => memory.search(memoryManagementSearch.parse(input)));
+  handle('aria:edit-memory', (input) => memory.edit(memoryOperations['memory.update'].parse(input)));
+  handle('aria:delete-memory', (input) => memory.forget(memoryOperations['memory.forget'].parse(input)));
+  handle('aria:clear-memories', async (input) => {
+    const filter = memoryClear.parse(input);
+    if (filter.projectId) registeredMemoryProject(filter.projectId);
+    const { response } = await dialog.showMessageBox(mainWindow!, {
+      type: 'warning', message: 'Delete the selected saved memories?',
+      detail: 'Chat history has its own controls.',
+      buttons: ['Cancel', 'Delete memories'], cancelId: 0, defaultId: 0, noLink: true,
+    });
+    return response === 1 ? memory.clear(filter) : 0;
+  });
+  handle('aria:export-memories', async () => {
+    const destination = await dialog.showSaveDialog(mainWindow!, {
+      title: 'Export saved memories', defaultPath: 'aria-memories.json',
+      filters: [{ name: 'JSON', extensions: ['json'] }],
+    });
+    if (destination.canceled || !destination.filePath) return false;
+    const temporary = `${destination.filePath}.${randomUUID()}.tmp`;
+    const file = await fs.open(temporary, 'wx', 0o600);
+    try {
+      await file.writeFile('{"version":1,"memories":[');
+      const revision = (await memory.client.call('status')).revision;
+      let cursor = '';
+      let separator = '';
+      for (;;) {
+        const records = await memory.client.call('exportPage', cursor);
+        if (!records.length) break;
+        await file.writeFile(separator + records.map((record) => JSON.stringify(record)).join(',\n'));
+        cursor = records.at(-1)!.id;
+        separator = ',\n';
+        if ((await memory.client.call('status')).revision !== revision)
+          throw new Error('Memories changed during export. Try again.');
+      }
+      await file.writeFile(']}\n');
+      await file.sync();
+      await file.close();
+      await fs.rename(temporary, destination.filePath);
+      return true;
+    } finally {
+      await file.close().catch(() => undefined);
+      await fs.rm(temporary, { force: true }).catch(() => undefined);
+    }
+  });
+  handle('aria:start-temporary-chat', (input) => {
+    const id = z.string().uuid().parse(input);
+    if (!memory.settings.temporaryChats || temporaryConversations.size >= 20 || savedConversation(id))
+      throw new Error('Temporary chat is unavailable.');
+    temporaryConversations.add(id);
+  });
+  handle('aria:attach-chat-project', (conversation, project) => {
+    const id = z.string().uuid().parse(conversation);
+    const projectId = z.string().nullable().parse(project);
+    if (projectId) registeredMemoryProject(projectId);
+    if (temporaryConversations.has(id) ||
+      initial.data.chat.messages.some((item) => item.conversationId === id))
+      throw new Error('Choose a project before sending the first message.');
+    if (!savedConversation(id)) throw new Error('Save the conversation before choosing its project.');
+    pendingChatProjects.set(id, projectId);
+  });
   handle('aria:save', async (data) => {
     const parsed = localDataSchema.parse(data);
     saving = saving
       .catch(() => undefined)
       .then(async () => {
         const previous = initial.data;
-        await storage.save(parsed);
+        for (const item of parsed.chat.conversations) {
+          const previousConversation = savedConversation(item.id);
+          const expectedProject = pendingChatProjects.has(item.id)
+            ? pendingChatProjects.get(item.id) ?? undefined
+            : previousConversation?.projectId;
+          if (Boolean(item.temporary) !== temporaryConversations.has(item.id) || item.projectId !== expectedProject)
+            throw new Error('The conversation mode or project was not authorized.');
+        }
+        const previousMessages = new Map(previous.chat.messages.map((item) => [item.id, item]));
+        for (const item of parsed.chat.messages) {
+          if (!item.memoryReferences?.length) continue;
+          const old = previousMessages.get(item.id);
+          const permitted = item.memoryReferences.filter((id) =>
+            old?.memoryReferences?.includes(id) || memory.canInspect(item.conversationId, id, item.id));
+          item.memoryReferences = permitted.length ? permitted : undefined;
+        }
+        const outbox = memory.outbox(storage.memoryOutbox, parsed.chat.messages, parsed.chat.conversations);
+        await storage.save(parsed, outbox);
         initial = { data: parsed };
+        for (const { id } of parsed.chat.conversations) pendingChatProjects.delete(id);
+        void drainMemoryOutbox();
         browser.pruneConversations(parsed.chat.conversations);
         const retained = new Set(parsed.chat.conversations.map(({ id }) => id));
         for (const { id } of previous.chat.conversations)
-          if (!retained.has(id)) executionRuntime.store.deletePrograms(id);
+          if (!retained.has(id)) {
+            temporaryConversations.delete(id);
+            pendingChatProjects.delete(id);
+            workingContext.clear(id);
+            executionRuntime.store.deletePrograms(id);
+            void memory.removeConversation(id).catch(() => undefined);
+          }
         await assets.prune(previous, parsed).catch(() => undefined);
       });
     await saving;
@@ -399,7 +560,9 @@ function registerIpc(): void {
   handle('aria:browser-command', (input) => browser.command(browserCommandSchema.parse(input)));
   handle('aria:browser-layout', (input) => {
     const previous = browser.activeConversation();
-    browser.setLayout(browserLayoutSchema.parse(input));
+    const next = browserLayoutSchema.parse(input);
+    browser.setLayout(next.conversationId && temporaryConversations.has(next.conversationId)
+      ? { ...next, conversationId: null, bounds: null } : next);
     if (previous && previous !== browser.activeConversation()) computerRuntime.leave(previous);
   });
   handle('aria:computer-sessions', (conversation) =>
@@ -613,6 +776,9 @@ function registerIpc(): void {
     if (configuring) throw new Error('Wait for connection settings to finish saving.');
     const parsed = chatRequestSchema.parse(input);
     media.assertIdle();
+    const conversation = savedConversation(parsed.conversationId);
+    if (!conversation) throw new Error('Save this conversation before sending.');
+    if (conversation.projectId) registeredMemoryProject(conversation.projectId);
     const messages = initial.data.chat.messages.filter(
       (message) => message.conversationId === parsed.conversationId,
     );
@@ -636,11 +802,20 @@ function registerIpc(): void {
     )
       throw new Error('Attach the files to this turn before sending them.');
     const context = selectChatContext(messages, chat.getStatus().revision ?? '');
-    chat.submit({
-      ...parsed,
-      programPrivateHistory: context.privateContent,
-      messages: context.messages,
-    });
+    const options = memory.admit(conversation, latest, assistant);
+    const workingSummary = conversation.temporary ? undefined :
+      workingContext.capture(conversation.id, messages, context.messages.length, memory.cutoff);
+    try {
+      chat.submit({
+        ...parsed,
+        memory: { ...options, workingSummary, privateHistory: context.memoryPrivate },
+        programPrivateHistory: context.privateContent,
+        messages: context.messages,
+      });
+    } catch (error) {
+      memory.event({ ...parsed, sequence: 1, type: 'stopped' });
+      throw error;
+    }
   });
   handle('aria:execution-history', () => executionRuntime.history());
   handle('aria:runtime-settings', () => executionRuntime.settings());
@@ -864,7 +1039,10 @@ function registerIpc(): void {
   handle('aria:start-live', async (input) => {
     if (configuring) throw new Error('Wait for settings to finish saving.');
     chat.assertIdle();
-    await media.startLive(liveRequestSchema.parse(input));
+    const request = liveRequestSchema.parse(input);
+    if (temporaryConversations.has(request.conversationId))
+      throw new Error('Live voice is unavailable in temporary chat.');
+    await media.startLive(request);
   });
   ipcMain.on('aria:live-audio', (event, sessionId: unknown, audio: unknown) => {
     try {
@@ -1058,6 +1236,25 @@ app
       () => provider.resolve(),
       cipher,
     );
+    memory = new DesktopMemory(directory, executionRuntime.embeddings, () => provider.resolve(),
+      (_kind, title, detail, signal) => approve(title, detail, signal),
+      (request) => { void chat.cancel(request); }, (id) => {
+        const result = savedConversation(id);
+        if (result?.projectId && !initial.data.workspaces.some((project) => project.id === result.projectId))
+          return undefined;
+        return result;
+      },
+      (conversation) => workingContext.get(conversation),
+      (project) => initial.data.tasks.filter((task) => task.workspaceId === project &&
+        ['idle', 'pending', 'running', 'blocked'].includes(task.status)).slice(0, 8)
+        .map(({ id, title, status, dependencies, revision }) => ({
+          id, title, status, dependencies: dependencies.slice(0, 8), revision,
+        })),
+      () => workingContext.clear(), purgeMemoryOutbox);
+    void memory.start().then(drainMemoryOutbox);
+    const memoryDrainTimer = setInterval(() => void drainMemoryOutbox(), 4000);
+    memoryDrainTimer.unref();
+    app.once('will-quit', () => clearInterval(memoryDrainTimer));
     if (!initial.warning) {
       try {
         const previous = initial.data;
@@ -1168,8 +1365,15 @@ app
           serviceName: 'Aria Chat API',
         }),
       (event) => {
+        const references = memory.event(event);
+        const visible = event.type === 'completed' && 'run' in event ? {
+          type: event.type, requestId: event.requestId, conversationId: event.conversationId,
+          assistantMessageId: event.assistantMessageId, sequence: event.sequence,
+          partial: event.partial, run: event.run, suggestions: event.suggestions,
+          ...(references?.length && { memoryReferences: references }),
+        } : event;
         if (mainWindow && !mainWindow.webContents.isDestroyed())
-          mainWindow.webContents.send('aria:chat-event', event);
+          mainWindow.webContents.send('aria:chat-event', visible);
       },
       (status) => {
         if (mainWindow && !mainWindow.webContents.isDestroyed())
@@ -1256,9 +1460,11 @@ app
                 conversation: request.conversationId, request: request.requestId, step: request.stepId,
                 operation: request.operation,
                 binding: [request.revision, request.primary, request.input, request.programId],
-              }, () => request.operation.startsWith('computer.')
-                ? computerRuntime.dispatch(request, signal)
-                : executionRuntime.dispatch(request, signal));
+              }, () => {
+                if (request.operation.startsWith('memory.')) return memory.dispatch(request, signal);
+                return request.operation.startsWith('computer.') ? computerRuntime.dispatch(request, signal)
+                  : executionRuntime.dispatch(request, signal);
+              });
             },
           ),
       },
@@ -1295,6 +1501,7 @@ app.on('before-quit', (event) => {
       .then(() => chat.close())
       .then(() => computerRuntime.shutdown())
       .then(() => localComputer.reset())
+      .then(() => memory.close())
       .then(() => executionRuntime.close())
       .then(() => {
         browser.close();

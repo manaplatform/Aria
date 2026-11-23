@@ -61,6 +61,34 @@ export function ensureChatDraft(): string {
   }));
   return id;
 }
+export async function newTemporaryChat() {
+  await endLiveVoice();
+  const id = crypto.randomUUID();
+  const now = new Date().toISOString();
+  await desktop().startTemporaryChat(id);
+  updateChat((current) => ({
+    ...current,
+    selectedId: id,
+    conversations: [...current.conversations, {
+      id, title: 'Temporary chat', draft: '', pinned: false,
+      createdAt: now, updatedAt: now, temporary: true,
+    }],
+  }));
+  await flushPersistence();
+}
+
+export async function chooseChatProject(projectId: string | null) {
+  const id = ensureChatDraft();
+  await flushPersistence();
+  await desktop().attachChatProject(id, projectId);
+  updateChat((current) => ({
+    ...current,
+    conversations: current.conversations.map((item) => item.id === id
+      ? { ...item, projectId: projectId ?? undefined } : item),
+  }));
+  await flushPersistence();
+}
+
 export function setChatDraft(
   draft: string,
   id = useWorkspaceStore.getState().data.chat.selectedId,
@@ -164,6 +192,8 @@ export function applyChatEvent(event: ChatEvent): void {
         return {
           ...next,
           status: 'completed',
+          ...('suggestions' in event ? { suggestions: event.suggestions } : {}),
+          ...('memoryReferences' in event ? { memoryReferences: event.memoryReferences } : {}),
           ...('assets' in event ? { assets: event.assets } : {}),
           ...('run' in event ? { run: event.run, partial: event.partial } : {}),
         };
@@ -212,7 +242,7 @@ async function submitRequest(request: ChatRequest): Promise<void> {
     });
   }
 }
-export async function sendChat(): Promise<void> {
+export async function sendChat(suggestion?: string): Promise<void> {
   const { status } = useChatStore.getState();
   if (
     status.state !== 'ready' ||
@@ -222,8 +252,8 @@ export async function sendChat(): Promise<void> {
     return;
   const chat = useWorkspaceStore.getState().data.chat;
   const selected = chat.conversations.find((item) => item.id === chat.selectedId);
-  const prompt = (selected?.draft ?? chat.newDraft).trim();
-  const attachments = selected?.attachments ?? chat.newAttachments ?? [];
+  const prompt = (suggestion ?? (selected?.draft ?? chat.newDraft)).trim();
+  const attachments = suggestion ? [] : selected?.attachments ?? chat.newAttachments ?? [];
   const text = prompt || (attachments.length ? 'See attached files.' : '');
   if (
     !text ||
@@ -282,7 +312,8 @@ export async function sendChat(): Promise<void> {
     conversations: selected
       ? current.conversations.map((item) =>
           item.id === conversation.id
-            ? { ...item, title: firstTitle, draft: '', attachments: [], updatedAt: now }
+            ? { ...item, title: firstTitle, draft: suggestion ? item.draft : '',
+                attachments: suggestion ? item.attachments : [], updatedAt: now }
             : item,
         )
       : [...current.conversations, conversation],
@@ -345,6 +376,8 @@ export async function regenerateChat(id: string, expectedRevision?: string): Pro
             run: undefined,
             activity: undefined,
             citations: undefined,
+            suggestions: undefined,
+            memoryReferences: undefined,
             attempts: attempts.slice(-2),
             partial: undefined,
             retryConfirmed: undefined,

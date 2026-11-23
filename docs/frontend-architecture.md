@@ -85,3 +85,7 @@ The local chat benchmark used 20 warm turns with the same fixture, browser polic
 ## Execution and knowledge
 
 Desktop text chat extends the Part 1 capability bridge with conversation-scoped operations for offline Shell, local and hosted retrieval, reviewed skill execution, and artifact publication. The desktop runtime opens its SQLite index and journal lazily. Ordinary chat remains independent of the execution substrate. See [execution and knowledge](execution-knowledge-runtime.md) for setup and verification.
+
+## Persistent memory
+
+Electron owns the per-profile memory worker, scope checks, trusted confirmations, and chat outbox. Conductor offers optional retrieval to the configured primary. The renderer receives typed settings, scoped source references, and optional suggestion chips through the preload bridge. See [Memory architecture](memory-engine.md).

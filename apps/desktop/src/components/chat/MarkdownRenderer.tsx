@@ -80,6 +80,8 @@ export default function MarkdownRenderer({
   research = false,
   evidenceIds = [],
   onEvidence,
+  memoryIds = [],
+  onMemory,
   rich = false,
   streaming = false,
 }: {
@@ -88,6 +90,8 @@ export default function MarkdownRenderer({
   research?: boolean;
   evidenceIds?: string[];
   onEvidence?: (id: string) => void;
+  memoryIds?: string[];
+  onMemory?: (id: string) => void;
   rich?: boolean;
   streaming?: boolean;
 }): ReactNode {
@@ -104,7 +108,8 @@ export default function MarkdownRenderer({
             : [remarkGfm]
         }
         urlTransform={(value) =>
-          value.startsWith('aria-evidence:') && evidenceIds.includes(value.slice(14))
+          (value.startsWith('aria-evidence:') && evidenceIds.includes(value.slice(14))) ||
+          (value.startsWith('aria-memory:') && memoryIds.includes(value.slice(12)))
             ? value
             : defaultUrlTransform(value)
         }
@@ -113,7 +118,11 @@ export default function MarkdownRenderer({
           code: MarkdownCode,
           ...(rich && { table: MarkdownTable }),
           a: ({ href, children }) =>
-            href?.startsWith('aria-evidence:') && evidenceIds.includes(href.slice(14)) ? (
+            href?.startsWith('aria-memory:') && memoryIds.includes(href.slice(12)) ? (
+              <button className="document-evidence-link" type="button" onClick={() => onMemory?.(href.slice(12))}>
+                {children}
+              </button>
+            ) : href?.startsWith('aria-evidence:') && evidenceIds.includes(href.slice(14)) ? (
               <button
                 className="document-evidence-link"
                 type="button"

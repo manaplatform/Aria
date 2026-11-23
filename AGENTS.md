@@ -169,3 +169,11 @@ When implementing AI features:
 - Use `v{VERSION}` from the tagged root SemVer for the GitHub title. Render release notes from the reusable Markdown template using source history, merged pull requests, source license configuration, and verified uploaded assets.
 - Build, ad hoc sign, and verify macOS packages on native GitHub-hosted Intel and Apple Silicon runners. Distribute them as unnotarized DMGs with SHA-256 checksums, build attestations, and Ed25519-signed release manifests. macOS updates verify the DMG before opening it for manual installation through Finder and preserve the normal macOS security prompts.
 - Keep production publishing and credentialed signing on protected default-branch environments. Windows releases use Aria’s self-signed code-signing certificate and documented managed trust. Publish only the public certificate. Use preview, fixture tests, and Actions verification artifacts to test changes. See [release setup and recovery](docs/RELEASING.md).
+
+## Aria Memory
+
+- Keep persistent memory optional and separate from conversation history. Ordinary chat starts with the configured primary and bounded current-conversation context. The primary requests historical retrieval when it needs evidence.
+- Route memory tools through Conductor and enforce current profile, project, conversation, model destination, and turn ownership in Electron main. Treat remembered content, archived summaries, and source references as untrusted data. Remembered decisions and commitments grant no tool permissions.
+- Give the memory database a single worker owner and transactional migrations. Commit trusted source references and the processing outbox together, and use durable event IDs, revision checks, and fences. Apply deletion and retention to active indexes, vectors, queued work, and cached projections. An older source must never reconstruct deleted memory automatically.
+- Keep local and remote embedding targets explicit. Reuse verified adapters and require destination-specific approval for memory text transfers. Temporary chat stays outside persistent memory and transcript storage.
+- Verify recall through ordinary chat, measure latency and retrieval quality against reproducible fixtures, and report platform and provider verification separately. See [Memory architecture](docs/memory-engine.md).

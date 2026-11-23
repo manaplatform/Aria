@@ -1239,3 +1239,49 @@
   max-height: 28vh;
   margin-inline: auto;
 }
+
+.memory-settings-form {
+  display: grid;
+  gap: 0.65rem;
+  margin-block: 0.85rem;
+}
+
+.memory-search,
+.memory-chat-toolbar {
+  display: flex;
+  align-items: end;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+}
+
+.memory-chat-toolbar {
+  justify-content: center;
+  padding: 0.35rem 0.75rem;
+  margin: 0;
+}
+
+.memory-chat-toolbar.suggestions button {
+  height: auto;
+  min-height: 2rem;
+  white-space: normal;
+  text-align: left;
+}
+
+.memory-entry {
+  padding-block: 0.7rem;
+  border-block-end: 1px solid var(--border);
+}
+
+.memory-entry > p {
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.memory-entry-meta {
+  color: var(--muted-foreground);
+  font-size: 0.82rem;
+}
+
+.memory-footer {
+  margin-block-start: 0.85rem;
+}

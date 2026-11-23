@@ -6,12 +6,16 @@ import {
   evidenceSchema,
   runInfoSchema,
   sourceSchema,
+  memoryCandidates,
+  memorySource,
+  memorySuggestions,
 } from '@aria/shared';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
 import type { InitialState, LocalData } from '@aria/shared';
 import { assetSchema } from './media-storage';
+import type { MemoryIntake } from './memory/store';
 
 const id = z.string().min(1).max(200);
 const text = z.string().max(100_000);
@@ -117,6 +121,8 @@ const chatSchema = z
           title: z.string().min(1).max(1000),
           draft: text,
           pinned: z.boolean(),
+          projectId: id.optional(),
+          temporary: z.boolean().optional(),
           attachments: z.array(assetSchema).max(4).optional(),
           createdAt: z.string(),
           updatedAt: z.string(),
@@ -147,6 +153,8 @@ const chatSchema = z
           settingsHelp: z.boolean().optional(),
           partial: z.boolean().optional(),
           delegatedFromVoice: z.boolean().optional(),
+          suggestions: memorySuggestions.optional(),
+          memoryReferences: z.array(z.string().uuid()).max(24).optional(),
           assets: z.array(assetSchema).max(4).optional(),
           liveSessionId: id.optional(),
           liveConfig: z.object({ model: id, chatModel: id, voice: id }).strict().optional(),
@@ -230,7 +238,22 @@ export function emptyData(): LocalData {
     },
   };
 }
+const outboxSchema = z.array(z.strictObject({
+  id: z.string().regex(/^[0-9a-f]{64}$/),
+  epoch: z.number().int().positive(),
+  observedAt: z.number().int().nonnegative(),
+  scope: z.discriminatedUnion('kind', [
+    z.strictObject({ kind: z.literal('profile') }),
+    z.strictObject({ kind: z.literal('project'), id }),
+    z.strictObject({ kind: z.literal('conversation'), id }),
+  ]),
+  source: memorySource,
+  candidates: memoryCandidates,
+})).max(192);
+
 export class LocalStorage {
+  memoryOutbox: MemoryIntake[] = [];
+  hasPersistedOutbox = false;
   private data = emptyData();
   private queue: Promise<void> = Promise.resolve();
   private readonly registered = new Map<string, string>();
@@ -259,6 +282,11 @@ export class LocalStorage {
         migrated = true;
       }
       const input = JSON.parse(serialized);
+      const outbox = outboxSchema.safeParse(input.memoryOutbox);
+      if (outbox.success) {
+        this.memoryOutbox = outbox.data;
+        this.hasPersistedOutbox = outbox.data.length > 0;
+      }
       this.data =
         input.version === 1
           ? migrateLegacy(input)
@@ -299,12 +327,23 @@ export class LocalStorage {
       workspaces: [...this.data.workspaces.filter((w) => w.root !== workspace.root), workspace],
     });
   }
-  save(input: unknown): Promise<void> {
+  save(input: unknown, outbox = this.memoryOutbox): Promise<void> {
     const data = localDataSchema.parse(input);
     for (const workspace of data.workspaces)
       if (this.registered.get(workspace.id) !== workspace.root)
         throw new Error('Project folder is not registered. Use the folder picker.');
-    const serialized = JSON.stringify(data, null, 2);
+    const temporary = new Set(data.chat.conversations.filter((item) => item.temporary).map(({ id }) => id));
+    const persisted: LocalData = temporary.size ? {
+      ...data,
+      chat: {
+        ...data.chat,
+        conversations: data.chat.conversations.filter(({ id }) => !temporary.has(id)),
+        messages: data.chat.messages.filter(({ conversationId }) => !temporary.has(conversationId)),
+        selectedId: data.chat.selectedId && temporary.has(data.chat.selectedId) ? null : data.chat.selectedId,
+      },
+    } : data;
+    const trustedOutbox = outboxSchema.parse(outbox).filter(({ source }) => !temporary.has(source.conversationId));
+    const serialized = JSON.stringify({ ...persisted, ...(trustedOutbox.length && { memoryOutbox: trustedOutbox }) }, null, 2);
     if (Buffer.byteLength(serialized) > 8_000_000)
       throw new Error('Local data exceeds the 8 MB storage limit.');
     const write = this.queue
@@ -314,6 +353,8 @@ export class LocalStorage {
         await fs.writeFile(`${this.filename}.tmp`, serialized, { mode: 0o600 });
         await fs.rename(`${this.filename}.tmp`, this.filename);
         this.data = data;
+        this.memoryOutbox = trustedOutbox;
+        this.hasPersistedOutbox = trustedOutbox.length > 0;
       });
     this.queue = write;
     return write;

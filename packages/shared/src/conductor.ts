@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import type { MemoryInput } from './memory.js';
 import { evidenceSchema } from './execution-runtime.js';
 import { capabilityId, effectSchema, type ToolProblem } from './capabilities.js';
 import { browserOps, browserToolArgs } from './browser.js';
@@ -10,7 +11,7 @@ import type { ChatMessage, ChatRequest } from './index.js';
 export function selectChatContext(
   messages: readonly ChatMessage[],
   revision?: string,
-): { messages: ChatRequest['messages']; privateContent: boolean } {
+): { messages: ChatRequest['messages']; privateContent: boolean; memoryPrivate?: boolean } {
   let lastUser = messages.length - 1;
   while (lastUser >= 0 && messages[lastUser].role !== 'user') lastUser--;
   if (lastUser < 0) return { messages: [], privateContent: false };
@@ -42,6 +43,7 @@ export function selectChatContext(
       { role: 'user', content: latest.content },
     ],
     privateContent: recent.some((pair) => pair.privateContent),
+    ...(recent.some((pair) => pair.assistant.run?.memoryContent) && { memoryPrivate: true }),
   };
 }
 
@@ -207,6 +209,7 @@ export const runInfoSchema = z
     primaryName: z.string().max(310).optional(),
     billableChildStarted: z.boolean(),
     privateContent: z.boolean().optional(),
+    memoryContent: z.boolean().optional(),
     storedResponses: z.boolean().optional(),
     usage: z.strictObject({
       providerRequests: z.number().int().nonnegative(),
@@ -217,6 +220,7 @@ export const runInfoSchema = z
       nativeToolCalls: z.number().int().nonnegative().optional(),
       accountedCostUsdMicros: z.number().int().nonnegative().optional(),
       inputTokens: z.number().int().nonnegative().optional(),
+      memoryInputEstimate: z.number().int().nonnegative().optional(),
       outputTokens: z.number().int().nonnegative().optional(),
     }).optional(),
   })
@@ -254,7 +258,7 @@ export type ConductorEvent =
   | { type: 'reset' }
   | { type: 'activity'; activity: ConductorActivity }
   | { type: 'artifact'; artifact: ArtifactReference }
-  | { type: 'completed'; partial?: boolean; run?: ConductorRunInfo }
+  | { type: 'completed'; partial?: boolean; run?: ConductorRunInfo; suggestions?: string[]; memoryCandidates?: MemoryInput[] }
   | {
       type: 'failed';
       error: string;

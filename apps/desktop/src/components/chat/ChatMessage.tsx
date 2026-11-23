@@ -1,11 +1,12 @@
 import { useMemo, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { Activity, ExternalLink, RotateCcw } from 'lucide-react';
-import type { ChatMessage as Message, ConductorActivity } from '@aria/shared';
-import { generating, regenerateChat, updateChat, useChatStore } from '../../stores/chatStore';
+import type { ChatMessage as Message, ConductorActivity, MemoryRecord } from '@aria/shared';
+import { generating, regenerateChat, selectChat, updateChat, useChatStore } from '../../stores/chatStore';
 import { AriaMark } from '../layout/AriaMark';
-import { Button, CopyButton } from '../ui';
+import { Button, CopyButton, Modal } from '../ui';
 import { desktop, errorMessage, openExternal } from '../../services/desktop';
+import { notify } from '../../stores/uiStore';
 import { openResearchSource } from '../../stores/browserStore';
 import MarkdownRenderer from './MarkdownRenderer';
 import { ArtifactCard } from './ArtifactCard';
@@ -136,12 +137,16 @@ export function ChatMessage({
   last,
   canRegenerate,
   name,
+  canRemember = false,
 }: {
   message: Message;
   last: boolean;
   canRegenerate: boolean;
   name: string;
+  canRemember?: boolean;
 }) {
+  const [memorySource, setMemorySource] = useState<MemoryRecord | null>();
+  const navigate = useNavigate();
   const [selectedEvidence, setSelectedEvidence] = useState<string | null>(null);
   const [recovery, setRecovery] = useState<{ pending: boolean; error?: string }>({ pending: false });
   const evidence = useMemo(
@@ -170,6 +175,8 @@ export function ChatMessage({
 
   return (
     <article
+      id={`chat-message-${message.id}`}
+      tabIndex={-1}
       className={`conversation-message from-${message.role}`}
       aria-label={`${message.role === 'user' ? name : 'Aria'} message`}
       data-status={message.status}
@@ -195,6 +202,9 @@ export function ChatMessage({
             research={research}
             evidenceIds={evidence.map((item) => item.id)}
             onEvidence={setSelectedEvidence}
+            memoryIds={message.memoryReferences}
+            onMemory={(id) => void desktop().memoryEvidence(message.conversationId, id)
+              .then(setMemorySource).catch(() => setMemorySource(null))}
             rich={!message.liveSessionId}
             streaming={busy}
           />
@@ -206,6 +216,29 @@ export function ChatMessage({
           </div>
         ) : null}
       </div>
+      {canRemember && message.role === 'user' && !message.liveSessionId &&
+        message.content.length <= 1400 && (
+          <Button size="sm" variant="ghost" onClick={() => {
+            void desktop().rememberChatMessage(message.conversationId, message.id, 'episode')
+              .then(() => notify('Message saved to Memory.'))
+              .catch((error) => notify(errorMessage(error), true));
+          }}>Save to Memory</Button>
+        )}
+      {memorySource !== undefined && (
+        <Modal open onOpenChange={(open) => { if (!open) setMemorySource(undefined); }}
+          title="Recalled memory" description={memorySource
+            ? `${memorySource.confirmation} · ${new Date(memorySource.observedAt).toLocaleDateString()}`
+            : 'This memory is unavailable.'}>
+          {memorySource && <p>{memorySource.value.content}</p>}
+          {memorySource?.sources.slice(-3).map((source) => (
+            <Button key={source.messageId} variant="ghost" size="sm" onClick={() => {
+              selectChat(source.conversationId);
+              navigate('/chat', { state: { messageId: source.messageId } });
+              setMemorySource(undefined);
+            }}>Open source message</Button>
+          ))}
+        </Modal>
+      )}
       {message.activity?.length ? (
         <details className="conductor-activity">
           <summary>
