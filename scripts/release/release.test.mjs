@@ -299,6 +299,8 @@ test('a GitHub draft keeps its existing tag and builds from the tagged ancestor'
   (t) => exercisePublication(t, 'schedule'));
 test('an automatic version release fills a matching GitHub draft already waiting for it',
   (t) => exercisePublication(t, 'push'));
+test('a public placeholder stays visible until all packages are ready to upload to its draft',
+  (t) => exercisePublication(t, 'published'));
 
 async function exercisePublication(t, trigger) {
   const { builds, output, version, commit } = await buildFixture(t, true, trigger === 'schedule' ? 'HEAD^' : 'HEAD');
@@ -315,7 +317,8 @@ async function exercisePublication(t, trigger) {
   const draftId = 23;
   let tagObject;
   let draft = trigger ? {
-    id: draftId, draft: true, tag_name: reserved, target_commitish: 'main', body: '',
+    id: draftId, draft: trigger !== 'published', tag_name: reserved, target_commitish: 'main',
+    name: '', body: '', immutable: false,
   } : undefined;
   let taggedCommit = commit;
   let ref;
@@ -380,6 +383,11 @@ async function exercisePublication(t, trigger) {
         if (body.draft === false) {
           assert.equal(body.make_latest, channelFor(version) === 'stable' ? 'true' : 'false');
           assert.ok(!corrupt);
+        } else if (body.draft === true) {
+          assert.equal(trigger, 'published');
+          assert.equal(draft.draft, false);
+          assert.equal(remote.size, 0);
+          assert.equal((await readJson(path.join(output, manifestName))).tag, reserved);
         } else {
           assert.equal(body.draft, undefined);
           assert.ok(draft.draft);
@@ -422,13 +430,15 @@ async function exercisePublication(t, trigger) {
   const selection = { versionFor: (source) => source === commit ? version : undefined, runId };
   const claim = { id: draftId, source: commit, tag: reserved };
   let request = trigger ? { runId } : undefined;
-  if (trigger === 'schedule') {
+  if (trigger === 'schedule' || trigger === 'published') {
     assert.deepEqual(await claimDraftRequest(api, selection), claim);
     request = { ...request, ...claim };
+    assert.deepEqual(await claimDraftRequest(api, selection), claim);
+  }
+  if (trigger === 'schedule') {
     assert.equal(draft.name, `v${version}`);
     assert.match(draft.body, /Follow the build/);
     assert.equal(await claimDraftRequest(api, { ...selection, runId: '43' }), undefined);
-    assert.deepEqual(await claimDraftRequest(api, selection), claim);
   }
   const publishAt = (date) => publishRelease(api, output, timestamp, privateKey, date, request);
   if (trigger === 'schedule') {
@@ -440,6 +450,14 @@ async function exercisePublication(t, trigger) {
   await rm(path.join(output, sample));
   await assert.rejects(() => publishAt(now), /ENOENT/);
   assert.equal(tagObject, undefined);
+  if (trigger === 'published') {
+    assert.equal(draft.draft, false);
+    assert.equal(draft.body, '');
+    draft.name = 'Manual release';
+    assert.equal(await claimDraftRequest(api, selection), undefined);
+    await assert.rejects(() => publishAt(now), /has no assets/);
+    draft.name = '';
+  }
   await writeFile(path.join(output, sample), sample);
   await assert.rejects(() => publishAt(now), /asset verification failed/);
   assert.ok(draft.draft);
