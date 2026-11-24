@@ -312,6 +312,11 @@ export class ConductorLoopExecutor {
               'To play requested audio or music on a public site, use the browser media capability. Use a user-supplied URL or discover a suitable playable source with Web Search. Report playback only after the tool confirms it. Ask a specific question if source choice requires user input, and explain the actual limitation if playback is unavailable.',
             ]
           : []),
+        ...(context.research.native && !context.privateContent && !context.temporary
+          ? [
+              `Web and browser turn limits: up to ${context.research.policy.searches} searches, ${context.research.policy.fetches} page fetches, and ${context.research.policy.screenshots} browser screenshots. Plan focused queries and reuse observed results rather than repeating searches.`,
+            ]
+          : []),
         `Preference: ${registry.config.preference}. Available namespaces: ${namespaces.join('; ') || 'none'}.`,
         ...((context.runtime && request.availableAssets?.length) || attachments.size
           ? [

@@ -286,6 +286,8 @@ export class ExecutionEngine {
     let lease: Awaited<ReturnType<ToolRegistry['scheduler']['acquire']>> | undefined;
     let operation: Promise<StepValue> | undefined;
     let readKey: string | undefined;
+    let previousAttempt: { count: number; retryable: boolean } | undefined;
+    let budgetKey: ToolDescriptor['budget'] | undefined;
     let admittedFingerprint: string | undefined;
     let settleArtifact: ReturnType<ToolContext['budget']['artifact']> | undefined;
     let reservation: { fingerprint: string; revision: string } | undefined;
@@ -407,19 +409,36 @@ export class ExecutionEngine {
           canonical([descriptor.id, step.target, step.args ?? (descriptor.normalize ? step.instructions : input.data), step.inputs]),
         )
         .digest('hex');
-      if (descriptor.effect === 'read' && descriptor.program?.retry === 'verified-read' && this.context.execution) {
-        const previous = this.readAttempts.get(fingerprint);
-        if (previous && (!previous.retryable || previous.count > this.context.execution.readRetries))
+      const verifiedReadRetry =
+        descriptor.effect === 'read' &&
+        descriptor.program?.retry === 'verified-read' &&
+        Boolean(this.context.execution);
+      if (verifiedReadRetry) {
+        previousAttempt = this.readAttempts.get(fingerprint);
+        if (
+          previousAttempt &&
+          (!previousAttempt.retryable || previousAttempt.count > this.context.execution!.readRetries)
+        )
           throw new ToolError('DUPLICATE_DISPATCH', 'This read already ran or reached its retry limit.');
-        this.readAttempts.set(fingerprint, { count: (previous?.count ?? 0) + 1, retryable: false });
-        readKey = fingerprint;
       } else if (!descriptor.repeatable && this.dispatched.has(fingerprint))
         throw new ToolError('DUPLICATE_DISPATCH', 'This operation already ran.');
-      if (
-        descriptor.budget &&
-        ++this.counters[descriptor.budget] > this.context.research.policy[descriptor.budget]
-      )
-        throw new ToolError('BUDGET_EXCEEDED', `The turn reached its ${descriptor.budget} limit.`);
+      if (descriptor.budget) {
+        const limit = this.context.research.policy[descriptor.budget];
+        if (this.counters[descriptor.budget] >= limit)
+          throw new ToolError(
+            'BUDGET_EXCEEDED',
+            `The turn reached its ${descriptor.budget} limit (${limit}).`,
+          );
+        this.counters[descriptor.budget]++;
+        budgetKey = descriptor.budget;
+      }
+      if (verifiedReadRetry) {
+        this.readAttempts.set(fingerprint, {
+          count: (previousAttempt?.count ?? 0) + 1,
+          retryable: false,
+        });
+        readKey = fingerprint;
+      }
       this.dispatched.add(fingerprint);
       admittedFingerprint = fingerprint;
       activity('queued');
@@ -642,8 +661,16 @@ export class ExecutionEngine {
           result.status === 'completed' ? 'completed' : 'failed',
       }, AbortSignal.any([parent, AbortSignal.timeout(2000)])).catch(() => undefined);
     }
-    if (!launched && admittedFingerprint && result.problem?.code === 'CANCELLED')
-      this.dispatched.delete(admittedFingerprint);
+    if (budgetKey && (!launched || result.status !== 'completed'))
+      this.counters[budgetKey] = Math.max(0, this.counters[budgetKey] - 1);
+    if (!launched && result.problem?.code === 'CANCELLED') {
+      if (admittedFingerprint) this.dispatched.delete(admittedFingerprint);
+      if (readKey) {
+        if (previousAttempt) this.readAttempts.set(readKey, previousAttempt);
+        else this.readAttempts.delete(readKey);
+        readKey = undefined;
+      }
+    }
     if (result.problem?.code === 'OUTCOME_UNCERTAIN')
       this.uncertainCapabilities.add(descriptor.capability);
     if (readKey) {

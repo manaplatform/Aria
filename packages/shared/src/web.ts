@@ -61,12 +61,22 @@ export const webToolArgs = {
   web_find: z.strictObject({ documentId: webReference, query: z.string().trim().min(1).max(200) }),
 } as const;
 
+export const webPolicyLimits = {
+  searches: { min: 1, default: 8, max: 12 },
+  fetches: { min: 1, default: 8, max: 12 },
+  screenshots: { min: 1, default: 2, max: 6 },
+} as const;
+
 export const webPolicySchema = z.strictObject({
   enabled: z.boolean(),
   aiBrowser: z.boolean(),
-  searches: z.number().int().min(1).max(2),
-  fetches: z.number().int().min(1).max(4),
-  screenshots: z.number().int().min(1).max(2),
+  searches: z.number().int().min(webPolicyLimits.searches.min).max(webPolicyLimits.searches.max),
+  fetches: z.number().int().min(webPolicyLimits.fetches.min).max(webPolicyLimits.fetches.max),
+  screenshots: z
+    .number()
+    .int()
+    .min(webPolicyLimits.screenshots.min)
+    .max(webPolicyLimits.screenshots.max),
   addressSearch: z.boolean(),
   persistentSiteData: z.boolean(),
   history: z.boolean(),
@@ -75,9 +85,9 @@ export const webPolicySchema = z.strictObject({
 export const defaultWebPolicy: z.infer<typeof webPolicySchema> = {
   enabled: true,
   aiBrowser: false,
-  searches: 2,
-  fetches: 4,
-  screenshots: 2,
+  searches: webPolicyLimits.searches.default,
+  fetches: webPolicyLimits.fetches.default,
+  screenshots: webPolicyLimits.screenshots.default,
   addressSearch: false,
   persistentSiteData: false,
   history: false,

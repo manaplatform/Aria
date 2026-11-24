@@ -206,3 +206,26 @@ it('does not treat links in a quoted website selection as destinations supplied 
     run.invoke('web_fetch', { url: 'https://example.com/' }, step, AbortSignal.timeout(2000)),
   ).rejects.toThrow(/run web_search with a query first/);
 });
+
+it('preserves structured browser error codes and messages from ResearchRun', async () => {
+  const invoke = vi.fn().mockResolvedValueOnce({
+    ok: false,
+    code: 'SEARCH_UNAVAILABLE',
+    message: 'The search page was unavailable. Try the query in a Personal tab.',
+  });
+  const run = new ResearchRun(
+    {
+      requestId: randomUUID(),
+      conversationId: 'test',
+      messages: [{ role: 'user', content: 'Look up Aria.' }],
+    },
+    { ...defaultWebPolicy, aiBrowser: true },
+    { invoke } as unknown as BrowserPortClient,
+  );
+  await expect(
+    run.invoke('web_search', { query: 'Aria' }, searchStep('search'), signal),
+  ).rejects.toMatchObject({
+    code: 'EXECUTION_FAILED',
+    message: 'The search page was unavailable. Try the query in a Personal tab.',
+  });
+});

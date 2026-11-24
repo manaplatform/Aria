@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { webPolicySchema, type WebSettings } from '@aria/shared';
+import { webPolicyLimits, webPolicySchema, type WebSettings } from '@aria/shared';
 import { Button, Field } from '../ui';
 import { browserCommand, useBrowserStore } from '../../stores/browserStore';
 import { errorMessage } from '../../services/desktop';
@@ -71,9 +71,9 @@ export function WebBrowserSettings() {
       <div className="web-settings-grid">
         {(
           [
-            ['searches', 'Searches per turn', 2],
-            ['fetches', 'Pages fetched per turn', 4],
-            ['screenshots', 'Screenshots per turn', 2],
+            ['searches', 'Searches per turn', webPolicyLimits.searches.max],
+            ['fetches', 'Pages fetched per turn', webPolicyLimits.fetches.max],
+            ['screenshots', 'Screenshots per turn', webPolicyLimits.screenshots.max],
           ] as const
         ).map(([name, label, max]) => (
           <Field key={name} label={label}>

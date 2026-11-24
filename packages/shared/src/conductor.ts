@@ -3,7 +3,7 @@ import type { MemoryInput } from './memory.js';
 import { evidenceSchema } from './execution-runtime.js';
 import { capabilityId, effectSchema, type ToolProblem } from './capabilities.js';
 import { browserOps, browserToolArgs } from './browser.js';
-import { webToolArgs } from './web.js';
+import { webPolicyLimits, webToolArgs } from './web.js';
 import { identifier, modelCapabilitySchema, modelRefSchema } from './model-registry.js';
 import type { ChatMessage, ChatRequest } from './index.js';
 import type { ExecutionSnapshot } from './loop.js';
@@ -56,7 +56,7 @@ export const conductorLimits = {
   steps: 12,
   parallel: 3,
   turns: 4,
-  searches: 2,
+  searches: webPolicyLimits.searches.default,
   inputTokens: 600_000,
   outputTokens: 65_536,
   maxModelOutputTokens: 4096,

@@ -246,7 +246,7 @@ export class ResearchRun {
           : undefined,
       };
     } catch (error) {
-      if (error instanceof RunError) throw error;
+      if (error instanceof RunError || error instanceof ToolError) throw error;
       if (signal.aborted) throw error;
       throw new RunError('The web operation did not return a usable response.');
     }
