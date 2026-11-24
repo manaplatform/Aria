@@ -4,7 +4,7 @@ Memory starts disabled. **Settings → Memory** enables it, controls retention a
 
 ## Data flow
 
-Electron main reads the saved latest user message and projects a bounded working snapshot. Short chats use their normal turn history. Longer chats can include earlier source-labelled excerpts when the model budget has space. The API carries those excerpts as untrusted conversation content. No memory query runs as a prerequisite to the primary response.
+Electron main reads the saved latest user message and projects a bounded working snapshot. Short chats use their normal turn history. Longer chats can include earlier source-labelled excerpts when the model budget has space. When memory is enabled and the user has granted standing recall consent for the active primary model and endpoint, Electron main can also attach a bounded, selective FTS5 context hint block (`<= 4` records, `<= 1,000` chars) within a 150 ms budget. The API carries those excerpts as untrusted conversation content. Empty recall results do not taint a turn, and safe local tools (`workspace.*`, `knowledge.*`, `files.*`, `calc.*`) remain usable when private recalled memory is in context.
 
 The configured primary can discover and call the `memory` namespace through the ordinary Tool Registry. Searches can use phrases, terms, entities and aliases, relationship expansion, metadata filters, time ranges, and optional vectors. Results carry stable IDs and provenance. A grounded `aria-memory:` link uses IDs acknowledged by the desktop and validates the reader's scope again. Evidence results are private and restrict outbound tools while present in the turn. Model-generated content cannot authorize an action.
 

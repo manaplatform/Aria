@@ -8,6 +8,7 @@ import {
   type ConductorEvent,
   type ExecutionStep,
   type LoopBudget,
+  type ToolEffect,
   type ToolProblem,
 } from '@aria/shared';
 import { providerError } from '../ai/ai.service';
@@ -64,7 +65,8 @@ function stableResult(value: unknown): unknown {
 export class ExecutionEngine {
   private readonly results = new Map<string, Outcome>();
   private readonly corrected = new Set<string>();
-  private readonly recoverable = new Map<string, string>();
+  private readonly effectFailed = new Set<string>();
+  private readonly recoverable = new Map<string, { toolId: string; effect: ToolEffect }>();
   private readonly restricted = new Set<string>();
   private readonly dispatched = new Set<string>();
   private readonly uncertainCapabilities = new Set<string>();
@@ -123,6 +125,15 @@ export class ExecutionEngine {
   get failed() {
     return [...this.results.values()].some(
       (result) => result.status !== 'completed' && !this.corrected.has(result.id),
+    );
+  }
+
+  get hasUnrecoveredEffectFailure() {
+    return [...this.results.values()].some(
+      (result) =>
+        result.status !== 'completed' &&
+        !this.corrected.has(result.id) &&
+        this.effectFailed.has(result.id),
     );
   }
 
@@ -609,9 +620,18 @@ export class ExecutionEngine {
           this.observations.set(id, { target, ordinal: ++this.ordinal });
         }
       }
-      if (commandProblem?.code === 'EXECUTION_FAILED' && !this.context.execution) this.recoverable.set(id, descriptor.id);
-      for (const [failedId, toolId] of this.recoverable) {
-        if (!commandProblem && toolId === descriptor.id) {
+      if (
+        commandProblem?.code === 'EXECUTION_FAILED' &&
+        (descriptor.effect === 'read' || !this.context.execution)
+      )
+        this.recoverable.set(id, { toolId: descriptor.id, effect: descriptor.effect });
+      for (const [failedId, entry] of this.recoverable) {
+        if (
+          !commandProblem &&
+          (entry.toolId === descriptor.id ||
+            (entry.effect === 'read' &&
+              (descriptor.effect === 'read' || descriptor.id === 'browser.browser_extract')))
+        ) {
           this.corrected.add(failedId);
           this.recoverable.delete(failedId);
         }
@@ -631,8 +651,12 @@ export class ExecutionEngine {
         : error instanceof RunError
           ? error.message
           : providerError(error);
-      if (!launched && (code === 'INVALID_ARGUMENT' || code === 'CAPABILITY_UNAVAILABLE'))
-        this.recoverable.set(id, descriptor.id);
+      if (descriptor.effect !== 'read' && code !== 'CANCELLED') this.effectFailed.add(id);
+      if (
+        (!launched && (code === 'INVALID_ARGUMENT' || code === 'CAPABILITY_UNAVAILABLE')) ||
+        (descriptor.effect === 'read' && !['CANCELLED', 'OUTCOME_UNCERTAIN'].includes(code))
+      )
+        this.recoverable.set(id, { toolId: descriptor.id, effect: descriptor.effect });
       if (!launched && code === 'CANCELLED' && this.context.execution) this.corrected.add(id);
       result = {
         id,

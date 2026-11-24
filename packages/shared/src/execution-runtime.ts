@@ -104,6 +104,24 @@ export const runtimeOperations = {
     sessionId: id,
     filename: workspaceFilename,
   }),
+  'workspace.list_projects': z.strictObject({}),
+  'workspace.repo_info': z.strictObject({ projectId: id }),
+  'workspace.list_files': z.strictObject({
+    projectId: id,
+    path: z.string().max(500).optional(),
+  }),
+  'workspace.search_files': z.strictObject({
+    projectId: id,
+    query: z.string().trim().min(1).max(300),
+    path: z.string().max(500).optional(),
+    limit: z.number().int().min(1).max(40).optional(),
+  }),
+  'workspace.read_file': z.strictObject({
+    projectId: id,
+    path: z.string().min(1).max(500),
+    startLine: z.number().int().min(1).max(100_000).optional(),
+    maxLines: z.number().int().min(1).max(400).optional(),
+  }),
 } as const;
 
 export type RuntimeOperation = keyof typeof runtimeOperations;

@@ -41,9 +41,33 @@ export const chatRequestSchema = z
 export const managedChatRequestSchema = chatRequestSchema.safeExtend({
   execution: managedExecutionSchema.optional(),
   programPrivateHistory: z.boolean().optional(),
+  activeProjectId: id.optional(),
+  availableProjects: z
+    .array(
+      z.strictObject({
+        id,
+        name: z.string().max(200),
+        branch: z.string().max(200).nullable(),
+      }),
+    )
+    .max(100)
+    .optional(),
   memory: z.strictObject({
     enabled: z.boolean(), suggestions: z.boolean(), temporary: z.boolean().optional(),
     workingSummary: z.string().max(2400).optional(), privateHistory: z.boolean().optional(),
+    contextHints: z
+      .array(
+        z.strictObject({
+          id: z.string().uuid(),
+          scope: z.enum(['profile', 'project', 'conversation']),
+          category: z.enum(['episode', 'fact', 'preference', 'procedure', 'project', 'task']),
+          content: z.string().max(300),
+          confirmation: z.enum(['confirmed', 'inferred']),
+          observedAt: z.number().int().nonnegative(),
+        }),
+      )
+      .max(6)
+      .optional(),
   }).optional(),
 });
 

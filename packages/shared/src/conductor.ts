@@ -51,8 +51,8 @@ export function selectChatContext(
 export const conductorLimits = {
   milliseconds: 300_000,
   primaryCalls: 12,
-  controlCalls: 6,
-  activity: 24,
+  controlCalls: 16,
+  activity: 36,
   steps: 12,
   parallel: 3,
   turns: 4,

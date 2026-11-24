@@ -123,7 +123,8 @@ const bridge: DesktopBridge = {
   },
   memoryStatus: () => ipcRenderer.invoke('aria:memory-status'),
   memoryDiagnostics: () => ipcRenderer.invoke('aria:memory-diagnostics'),
-  saveMemorySettings: (settings) => ipcRenderer.invoke('aria:save-memory-settings', settings),
+  saveMemorySettings: (settings, allowAutoRecall) =>
+    ipcRenderer.invoke('aria:save-memory-settings', settings, allowAutoRecall),
   rememberChatMessage: (conversation, message, category) => ipcRenderer.invoke('aria:remember-chat-message', conversation, message, category),
   memoryEvidence: (conversation, id) => ipcRenderer.invoke('aria:memory-evidence', conversation, id),
   searchMemories: (query) => ipcRenderer.invoke('aria:search-memories', query),

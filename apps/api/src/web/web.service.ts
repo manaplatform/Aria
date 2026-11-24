@@ -100,7 +100,7 @@ export class ResearchRun {
       }
     }
     throw new RunError(
-      'Use the user’s URL or a source from a declared dependency. If you only have a topic or question, run web_search with a query first.',
+      'Use the user’s URL or a source from a declared dependency (`dependsOn: ["<stepId>"]`). If you only have a topic or question, run web_search with a query first.',
     );
   }
 
@@ -160,13 +160,13 @@ export class ResearchRun {
         const response = await this.browse(op, args, step, signal, approval);
         const { results } = browserSearchResultsSchema.parse(JSON.parse(response.text));
         const seen = new Set<string>();
-        const links = results.flatMap(({ url: raw, title }) => {
+        const links = results.flatMap(({ url: raw, title, snippet }) => {
           const url = normalized(raw);
           if (seen.has(url)) return [];
           seen.add(url);
           const sourceId = randomUUID();
           this.sources.set(sourceId, { url, producer: step.id });
-          return [{ sourceId, url, title }];
+          return [{ sourceId, url, title, ...(snippet ? { snippet } : {}) }];
         });
         return { data: { status: links.length ? 'results' : 'no_results', results: links } };
       }

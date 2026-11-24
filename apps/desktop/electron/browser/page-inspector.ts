@@ -58,10 +58,17 @@ const resultSchema = z.strictObject({
   field: z.string().max(80).optional(),
   playingMedia: z.boolean().optional(),
   results: z
-    .array(z.strictObject({ url: z.string().max(2000), title: z.string().max(300) }))
+    .array(
+      z.strictObject({
+        url: z.string().max(2000),
+        title: z.string().max(300),
+        snippet: z.string().max(400).optional(),
+      }),
+    )
     .max(8)
     .optional(),
   searchEmpty: z.boolean().optional(),
+  captchaDetected: z.boolean().optional(),
 });
 
 function execute(command: Command) {
@@ -198,7 +205,7 @@ function execute(command: Command) {
     });
   }
   if (command.op === 'search-results') {
-    const results: { url: string; title: string }[] = [];
+    const results: { url: string; title: string; snippet?: string }[] = [];
     for (const anchor of document.querySelectorAll<HTMLAnchorElement>(
       '[data-type="web"] .result-content a[href]',
     )) {
@@ -214,7 +221,21 @@ function execute(command: Command) {
         .filter(Boolean)
         .at(-1);
       if (!title || results.some((result) => result.url === anchor.href)) continue;
-      results.push({ url: anchor.href, title: title.slice(0, 300) });
+      const container = anchor.closest('.result-content') ?? anchor.closest('[data-type="web"]');
+      const rawSnippet =
+        container?.querySelector<HTMLElement>('.snippet-description, .result-snippet, .generic-snippet, p')
+          ?.innerText ||
+        (container instanceof HTMLElement
+          ? container.innerText
+              .replace(anchor.innerText, '')
+              .replace(/\bhttps?:\/\/\S+/gi, '')
+          : '');
+      const snippet = rawSnippet.replace(/\s+/g, ' ').trim().slice(0, 400);
+      results.push({
+        url: anchor.href,
+        title: title.slice(0, 300),
+        ...(snippet && snippet !== title ? { snippet } : {}),
+      });
       if (results.length === 8) break;
     }
     const searchEmpty = [...document.querySelectorAll('h1, h2, [role="heading"]')].some(
@@ -222,7 +243,17 @@ function execute(command: Command) {
         /^no (?:search )?results(?: found)?[.!]?$/i.test(heading.textContent?.trim() ?? '') &&
         visible(heading),
     );
-    return { results, searchEmpty };
+    const captchaDetected =
+      !results.length &&
+      (Boolean(
+        document.querySelector(
+          '[data-testid="captcha"], .cf-turnstile, iframe[src*="captcha"], iframe[src*="turnstile"], iframe[src*="hcaptcha"], iframe[src*="recaptcha"]',
+        ),
+      ) ||
+        /verify (?:that )?you are human|complete the (?:security|captcha) check|unusual traffic/i.test(
+          document.body?.innerText?.slice(0, 2000) ?? '',
+        ));
+    return { results, searchEmpty, ...(captchaDetected ? { captchaDetected: true } : {}) };
   }
   if (command.op === 'selected')
     return { selected: window.getSelection()?.toString().slice(0, 4000) || '' };

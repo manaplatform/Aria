@@ -43,7 +43,15 @@ export const webSearchArgs = z.strictObject({
   query: z.string().trim().min(1).max(400),
 });
 export const browserSearchResultsSchema = z.strictObject({
-  results: z.array(z.strictObject({ url: webUrlSchema, title: z.string().max(300) })).max(8),
+  results: z
+    .array(
+      z.strictObject({
+        url: webUrlSchema,
+        title: z.string().max(300),
+        snippet: z.string().max(400).optional(),
+      }),
+    )
+    .max(8),
 });
 export function browserSearchUrl(query: string): string {
   const url = new URL('https://search.brave.com/search');
@@ -84,7 +92,7 @@ export const webPolicySchema = z.strictObject({
 });
 export const defaultWebPolicy: z.infer<typeof webPolicySchema> = {
   enabled: true,
-  aiBrowser: false,
+  aiBrowser: true,
   searches: webPolicyLimits.searches.default,
   fetches: webPolicyLimits.fetches.default,
   screenshots: webPolicyLimits.screenshots.default,

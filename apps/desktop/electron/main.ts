@@ -36,6 +36,8 @@ import {
   memoryManagementSearch,
   memoryOperations,
   memorySettingsSchema,
+  toolAvailabilitySchema,
+  toolHealthSchema,
   type ChatConversation,
   type ChatMessage,
   loopCommandSchema,
@@ -298,6 +300,30 @@ const toolList = z
       available: z.boolean(),
       reason: z.string().max(200).optional(),
       programmatic: z.array(z.enum(['managed', 'openai-responses'])).max(2).optional(),
+      output: z.enum(['text', 'image', 'audio', 'file', 'sources', 'data']).optional(),
+      availability: toolAvailabilitySchema.optional(),
+      health: toolHealthSchema.optional(),
+      settingsSection: z.string().max(120).optional(),
+      tags: z.array(z.string().max(60)).max(16).optional(),
+      constraints: z
+        .strictObject({
+          timeoutMs: z.number().int().positive().optional(),
+          modes: z.array(z.enum(['direct', 'programmatic'])).max(2).optional(),
+          parallelRead: z.boolean().optional(),
+          parallelDelegate: z.boolean().optional(),
+          citations: z.boolean().optional(),
+          artifacts: z.boolean().optional(),
+          budget: z.enum(['searches', 'fetches', 'screenshots']).optional(),
+          requiredModelCapabilities: z.array(z.string().max(40)).max(8).optional(),
+        })
+        .optional(),
+      inputHint: z
+        .strictObject({
+          required: z.array(z.string().max(60)).max(16),
+          optional: z.array(z.string().max(60)).max(16),
+          summary: z.string().max(400),
+        })
+        .optional(),
     }),
   )
   .max(1024);
@@ -394,7 +420,25 @@ function registerIpc(): void {
     savedConversation(message.conversationId)));
   handle('aria:memory-status', () => memory.status());
   handle('aria:memory-diagnostics', () => memory.diagnosticSnapshot());
-  handle('aria:save-memory-settings', (input) => memory.saveSettings(memorySettingsSchema.parse(input)));
+  handle('aria:save-memory-settings', (input, rawConsent) => {
+    const parsed = memorySettingsSchema.parse(input);
+    const allowAutoRecall = z.boolean().optional().parse(rawConsent);
+    let next = parsed;
+    if (allowAutoRecall === true) {
+      const providerKey = chat.executionIdentity();
+      if (!providerKey || !chat.getStatus().configured)
+        throw new Error('Configure a primary model before enabling automatic memory recall.');
+      next = {
+        ...parsed,
+        recallConsent: parsed.enabled ? { providerKey, grantedAt: Date.now() } : undefined,
+      };
+    } else if (allowAutoRecall === false || !parsed.enabled) {
+      next = { ...parsed, recallConsent: undefined };
+    } else {
+      next = { ...parsed, recallConsent: memory.settings.recallConsent };
+    }
+    return memory.saveSettings(next);
+  });
   handle('aria:remember-chat-message', (conversationInput, messageInput, categoryInput) => {
     const conversation = savedConversation(identifier.parse(conversationInput));
     const messageId = identifier.parse(messageInput);
@@ -795,9 +839,10 @@ function registerIpc(): void {
     z.object({ verified: z.literal(true) }).parse(await response.json());
     provider.markVerified(draft, connection.apiKey, model);
   });
-  handle('aria:submit-chat', (input) => {
+  handle('aria:submit-chat', async (input) => {
     if (configuring) throw new Error('Wait for connection settings to finish saving.');
     const parsed = chatRequestSchema.parse(input);
+    if (chat.getStatus().state === 'failed') await chat.start();
     media.assertIdle();
     const conversation = savedConversation(parsed.conversationId);
     if (!conversation) throw new Error('Save this conversation before sending.');
@@ -828,6 +873,12 @@ function registerIpc(): void {
     if (loopRecovery.snapshot(conversation.id, assistant.id))
       throw new Error('Resume the interrupted execution from its activity before retrying the turn.');
     const options = memory.admit(conversation, latest, assistant);
+    const contextHints = await memory.selectiveContext(
+      conversation,
+      latest.content,
+      assistant.id,
+      parsed.requestId,
+    );
     const workingSummary = conversation.temporary ? undefined :
       workingContext.capture(conversation.id, messages, context.messages.length, memory.cutoff);
     try {
@@ -835,7 +886,18 @@ function registerIpc(): void {
       chat.submit({
         ...parsed,
         execution: { executionId: randomUUID(), generation: 1, userMessageId: latest.id },
-        memory: { ...options, workingSummary, privateHistory: context.memoryPrivate },
+        activeProjectId: conversation.projectId,
+        availableProjects: initial.data.workspaces.map(({ id, name, branch }) => ({
+          id,
+          name,
+          branch,
+        })),
+        memory: {
+          ...options,
+          workingSummary,
+          privateHistory: context.memoryPrivate || contextHints.length > 0,
+          ...(contextHints.length && { contextHints }),
+        },
         programPrivateHistory: context.privateContent,
         messages: context.messages,
       });
@@ -1317,6 +1379,7 @@ app
       () => chat.executionIdentity(),
       () => provider.resolve(),
       cipher,
+      () => initial.data.workspaces,
     );
     memory = new DesktopMemory(directory, executionRuntime.embeddings, () => provider.resolve(),
       (_kind, title, detail, signal) => approve(title, detail, signal),
@@ -1332,7 +1395,7 @@ app
         .map(({ id, title, status, dependencies, revision }) => ({
           id, title, status, dependencies: dependencies.slice(0, 8), revision,
         })),
-      () => workingContext.clear(), purgeMemoryOutbox);
+      () => workingContext.clear(), purgeMemoryOutbox, () => chat.executionIdentity());
     void memory.start().then(drainMemoryOutbox);
     const memoryDrainTimer = setInterval(() => void drainMemoryOutbox(), 4000);
     memoryDrainTimer.unref();
@@ -1510,6 +1573,19 @@ app
         policy: (registry) => ({
           ...runtimePolicy(registry),
           desktopRuntime: true,
+          dockerConfigured: Boolean(executionRuntime.settings().engineSocket.trim()),
+          workspacesCount: initial.data.workspaces.length,
+          connectors: [
+            {
+              id: 'coding.mana_agent',
+              name: 'Mana-Agent',
+              description: 'External coding agent connector for autonomous repository workflows.',
+              availability: 'unconfigured',
+              health: 'unavailable',
+              reason: 'No Mana-Agent connector is registered in this installation.',
+              settingsSection: 'Tools',
+            },
+          ],
           loop: executionRuntime.settings().loop,
           computerBrowser: browser.computerAvailable(),
           computerVirtual: virtualComputer.ready(),

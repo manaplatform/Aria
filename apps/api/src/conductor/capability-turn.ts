@@ -19,6 +19,7 @@ const findInput = z.strictObject({
   ids: z.array(capabilityId).max(8).optional(),
   kind: z.enum(['tools', 'skills']).optional(),
   namespace: z.string().max(40).optional(),
+  includeUnavailable: z.boolean().optional(),
   offset: z.number().int().min(0).max(2000).optional(),
   modelQuery: z.string().max(120).optional(),
   modelOffset: z.number().int().min(0).max(2400).optional(),
@@ -38,8 +39,30 @@ function terms(value: string) {
   return new Set(value.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []);
 }
 
-function tokensFor(card: { id: string; name: string; description: string }) {
-  return terms(`${card.id} ${card.name} ${card.description}`);
+function tokensFor(card: {
+  id: string;
+  namespace?: string;
+  name: string;
+  description: string;
+  tags?: string[];
+}) {
+  return terms(
+    `${card.id} ${card.namespace ?? ''} ${card.name} ${card.description} ${card.tags?.join(' ') ?? ''}`,
+  );
+}
+
+function matchScore(words: Set<string>, tokens: Set<string>) {
+  let score = 0;
+  const list = [...tokens];
+  for (const word of words) {
+    if (tokens.has(word)) {
+      score += 3;
+      continue;
+    }
+    if (word.length >= 3 && list.some((token) => token.startsWith(word) || word.startsWith(token)))
+      score += 1;
+  }
+  return score;
 }
 
 export class CapabilityTurn {
@@ -254,17 +277,19 @@ export class CapabilityTurn {
       this.registry.revision,
       this.registry.host.current.revision,
       this.context.privateContent,
+      this.context.memoryPrivate,
     ]);
     const cached = this.searches.get(key);
     if (cached) return cached;
     const words = terms(query.query);
-    const cards = [
-      ...(query.kind === 'skills' ? [] : this.registry.cards(this.context)),
+    const includeUnavailable = !query.ids?.length && query.includeUnavailable !== false;
+    const scored = [
+      ...(query.kind === 'skills' ? [] : this.registry.cards(this.context, includeUnavailable)),
       ...(query.kind === 'tools'
         ? []
         : this.registry.host.current.skills
             .filter((skill) => skill.enabled)
-            .map((skill) => ({ ...skill, namespace: 'skills' }))),
+            .map((skill) => ({ ...skill, namespace: 'skills', available: true as const }))),
     ]
       .filter(
         (card) =>
@@ -273,17 +298,31 @@ export class CapabilityTurn {
       )
       .map((card) => {
         const tokens = tokensFor(card);
-        return { card, score: [...words].filter((word) => tokens.has(word)).length };
-      })
+        return { card, score: matchScore(words, tokens) };
+      });
+    const hasMatches = words.size > 0 && !query.ids?.length && scored.some(({ score }) => score > 0);
+    const cards = scored
+      .filter(({ card, score }) =>
+        hasMatches
+          ? score > 0
+          : !words.size || Boolean(query.ids?.length) || score > 0 || card.available === true,
+      )
       .sort(
         (first, second) =>
-          second.score - first.score || first.card.id.localeCompare(second.card.id),
+          (hasMatches
+            ? second.score - first.score ||
+              Number(second.card.available !== false) - Number(first.card.available !== false)
+            : Number(second.card.available !== false) - Number(first.card.available !== false) ||
+              second.score - first.score) ||
+          first.card.id.localeCompare(second.card.id),
       );
+    const pageSize = query.query.trim() ? 12 : 10;
     const offset = query.offset ?? 0;
-    const page = cards.slice(offset, offset + 8);
+    const page = cards.slice(offset, offset + pageSize);
     const items = await Promise.all(
       page.map(async ({ card }) => {
         const descriptor = this.registry.get(card.id);
+        if (card.available === false) return card;
         if (descriptor?.dependency === 'delegate') {
           const roster = await this.delegates();
           const modelQuery = query.modelQuery?.toLowerCase();
@@ -328,7 +367,7 @@ export class CapabilityTurn {
     );
     const value = {
       items: items.filter(Boolean),
-      ...(cards.length > offset + 8 && { nextOffset: offset + 8 }),
+      ...(cards.length > offset + pageSize && { nextOffset: offset + pageSize }),
     };
     this.searches.set(key, value);
     return value;

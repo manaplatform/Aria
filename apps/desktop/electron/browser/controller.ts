@@ -1427,7 +1427,19 @@ export class BrowserController {
             'STALE_PAGE',
             'The page changed while Aria was reading it. Try again.',
           );
-        if (!searching) return output({ text: evidence.text ?? '' }, tab);
+        if (!searching) {
+          if (evidence.captchaDetected && !(evidence.text ?? '').trim())
+            throw new BrowserError(
+              'CAPTCHA_BLOCKED',
+              'The target site requested human verification and cannot be read automatically.',
+            );
+          return output({ text: evidence.text ?? '' }, tab);
+        }
+        if (evidence.captchaDetected && !evidence.results?.length)
+          throw new BrowserError(
+            'CAPTCHA_BLOCKED',
+            'The search site requested human verification and cannot be accessed automatically.',
+          );
         if (!evidence.results?.length && !evidence.searchEmpty)
           throw new BrowserError(
             'SEARCH_UNAVAILABLE',

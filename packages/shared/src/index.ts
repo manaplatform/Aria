@@ -298,6 +298,8 @@ export interface ChatRequest {
   availableAssets?: MediaAsset[];
   expectedRevision?: string;
   programPrivateHistory?: boolean;
+  activeProjectId?: string;
+  availableProjects?: { id: string; name: string; branch: string | null }[];
   memory?: MemoryTurnOptions;
   execution?: ManagedExecution;
 }
@@ -488,7 +490,7 @@ export interface DesktopBridge {
   onLiveEvent(callback: (event: LiveEvent) => void): () => void;
   memoryStatus(): Promise<MemoryStatus>;
   memoryDiagnostics(): Promise<MemoryDiagnostics>;
-  saveMemorySettings(settings: MemorySettings): Promise<MemoryStatus>;
+  saveMemorySettings(settings: MemorySettings, allowAutoRecall?: boolean): Promise<MemoryStatus>;
   rememberChatMessage(conversationId: string, messageId: string, category: MemoryRecord['value']['category']): Promise<MemoryRecord>;
   memoryEvidence(conversationId: string, recordId: string): Promise<MemoryRecord | null>;
   searchMemories(query: MemorySearch): Promise<MemorySearchResult>;

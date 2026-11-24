@@ -47,6 +47,45 @@ class AvailableAssetDto {
   size!: number;
 }
 
+class AvailableProjectDto {
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(200)
+  id!: string;
+
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(200)
+  name!: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(200)
+  branch!: string | null;
+}
+
+class MemoryContextHintDto {
+  @IsUUID()
+  id!: string;
+
+  @IsIn(['profile', 'project', 'conversation'])
+  scope!: 'profile' | 'project' | 'conversation';
+
+  @IsIn(['episode', 'fact', 'preference', 'procedure', 'project', 'task'])
+  category!: 'episode' | 'fact' | 'preference' | 'procedure' | 'project' | 'task';
+
+  @IsString()
+  @MaxLength(300)
+  content!: string;
+
+  @IsIn(['confirmed', 'inferred'])
+  confirmation!: 'confirmed' | 'inferred';
+
+  @IsInt()
+  @Min(0)
+  observedAt!: number;
+}
+
 class MemoryTurnDto {
   @IsBoolean()
   enabled!: boolean;
@@ -66,6 +105,13 @@ class MemoryTurnDto {
   @IsString()
   @MaxLength(2400)
   workingSummary?: string;
+
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(6)
+  @ValidateNested({ each: true })
+  @Type(() => MemoryContextHintDto)
+  contextHints?: MemoryContextHintDto[];
 }
 
 export class ChatRequestDto {
@@ -76,6 +122,18 @@ export class ChatRequestDto {
   @IsOptional()
   @IsBoolean()
   programPrivateHistory?: boolean;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(200)
+  activeProjectId?: string;
+
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(100)
+  @ValidateNested({ each: true })
+  @Type(() => AvailableProjectDto)
+  availableProjects?: AvailableProjectDto[];
 
   @IsOptional()
   @ValidateNested()

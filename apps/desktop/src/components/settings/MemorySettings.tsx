@@ -36,6 +36,7 @@ export function MemorySettings() {
   const [failure, setFailure] = useState('');
   const [diagnostics, setDiagnostics] = useState<MemoryDiagnostics>();
   const [busy, setBusy] = useState(false);
+  const [allowAutoRecall, setAllowAutoRecall] = useState<boolean>();
   const [confirmDelete, setConfirmDelete] = useState<string>();
   const projects = useWorkspaceStore((state) => state.data.workspaces);
   const conversations = useWorkspaceStore((state) => state.data.chat.conversations);
@@ -104,9 +105,10 @@ export function MemorySettings() {
     event.preventDefault();
     if (!settings) return;
     void run(async () => {
-      const next = await desktop().saveMemorySettings(settings);
+      const next = await desktop().saveMemorySettings(settings, allowAutoRecall);
       setStatus(next);
       setSettings(next.settings);
+      setAllowAutoRecall(Boolean(next.settings.recallConsent));
       window.dispatchEvent(new Event('aria:memory-settings'));
       setFeedback('Memory settings saved.');
     });
@@ -173,6 +175,16 @@ export function MemorySettings() {
             />{' '}
             Show follow-up suggestions
           </label>
+          {settings.enabled && (
+            <label>
+              <input
+                type="checkbox"
+                checked={allowAutoRecall ?? Boolean(settings.recallConsent)}
+                onChange={(event) => setAllowAutoRecall(event.target.checked)}
+              />{' '}
+              Allow automatic memory recall with the configured primary model
+            </label>
+          )}
           <Field label="Memory retention">
             <select
               value={settings.retentionDays ?? ''}

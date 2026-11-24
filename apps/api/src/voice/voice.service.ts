@@ -225,7 +225,7 @@ export class VoiceService implements OnApplicationBootstrap, OnModuleDestroy {
                   model: voiceModel.id,
                   store: false,
                   instructions:
-                    'You are Aria. Speak naturally and delegate user requests for information, reasoning, or action to the application. Report completed work only when the application confirms it.',
+                    'You are Aria, an intelligent, proactive AI assistant. Speak naturally and delegate user requests for research, tools, reasoning, or action to the application whenever available capabilities can resolve uncertainty or accomplish the task. Report completed work only when the application confirms it.',
                   audio: {
                     format: { type: 'audio/pcm', rate: 24000 },
                     output: { voice: profile.voice },
