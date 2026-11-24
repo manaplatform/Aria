@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { Activity, ExternalLink, RotateCcw } from 'lucide-react';
-import type { ChatMessage as Message, ConductorActivity, MemoryRecord } from '@aria/shared';
+import type { ChatMessage as Message, ConductorActivity, LoopCommand, MemoryRecord } from '@aria/shared';
 import { generating, regenerateChat, selectChat, updateChat, useChatStore } from '../../stores/chatStore';
 import { AriaMark } from '../layout/AriaMark';
 import { Button, CopyButton, Modal } from '../ui';
@@ -20,7 +20,8 @@ function ActivityRow({ step, children }: {
   return (
     <li>
       <span>
-        {step.summary} · {step.status === 'approval' ? 'Waiting for approval' : step.programStatus ?? step.status}
+        {step.summary} · {step.status === 'approval' ? 'Waiting for approval' :
+          step.outcomeUnverified ? 'Submitted' : step.programStatus ?? step.status}
       </span>
       <small>
         {step.target}
@@ -61,6 +62,66 @@ function ProgramControls({ message, id }: { message: Message; id: string }) {
       }}>
         {paused ? 'Resume program' : 'Pause program'}
       </Button>
+      {error && <small role="alert">{error}</small>}
+    </div>
+  );
+}
+
+function ExecutionControls({ message }: { message: Message }) {
+  const [editing, setEditing] = useState(false);
+  const [text, setText] = useState('');
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState('');
+  const execution = message.execution;
+  if (!execution) return null;
+  const { executionId, generation, question } = execution;
+  const paused = execution.state === 'paused';
+  const send = async (action: LoopCommand['action']) => {
+    if (pending) return;
+    const scope = { executionId, generation, requestId: message.requestId,
+      conversationId: message.conversationId, assistantMessageId: message.id, commandId: crypto.randomUUID() };
+    let command: LoopCommand;
+    if (action === 'answer') {
+      if (!question || !text.trim()) return;
+      command = { ...scope, action, questionId: question.id, text };
+    } else if (action === 'steer') {
+      if (!text.trim()) return;
+      command = { ...scope, action, text };
+    } else command = { ...scope, action };
+    setPending(true);
+    setError('');
+    try {
+      await desktop().controlExecution(command);
+      if (action === 'answer' || action === 'steer') {
+        setText('');
+        setEditing(false);
+      }
+    } catch (failure) {
+      setError(errorMessage(failure));
+    } finally {
+      setPending(false);
+    }
+  };
+  return (
+    <div className="chat-execution-controls">
+      {execution.durability === 'live' && <small>Available until this session closes</small>}
+      <div className="chat-message-actions">
+        <Button size="sm" variant="ghost" disabled={pending || execution.pausing || Boolean(question)}
+          onClick={() => void send(paused ? 'resume' : 'pause')}>
+          {paused ? 'Resume' : 'Pause'}
+        </Button>
+        {!question && <Button size="sm" variant="ghost" onClick={() => setEditing(!editing)}>Steer</Button>}
+      </div>
+      {(question || editing) && (
+        <form onSubmit={(event) => { event.preventDefault(); void send(question ? 'answer' : 'steer'); }}>
+          <label htmlFor={`execution-input-${message.id}`}>{question?.text ?? 'Update instructions for this execution'}</label>
+          <textarea id={`execution-input-${message.id}`} value={text} maxLength={2000} rows={2}
+            onChange={(event) => setText(event.target.value)} />
+          <Button size="sm" type="submit" disabled={pending || !text.trim()}>
+            {question ? 'Send answer' : 'Send instructions'}
+          </Button>
+        </form>
+      )}
       {error && <small role="alert">{error}</small>}
     </div>
   );
@@ -172,6 +233,15 @@ export function ChatMessage({
   const activeStep = message.activity?.find((step) =>
     ['running', 'approval', 'processing'].includes(step.status),
   );
+  const execution = message.execution;
+  const canResume = last && message.status === 'interrupted' && execution?.durability === 'saved' &&
+    !['completed', 'partial', 'failed', 'cancelled'].includes(execution.state);
+  const executionStatus = execution?.pausing ? 'Pausing' :
+    execution?.state === 'paused' ? 'Paused' :
+    execution?.state === 'waiting_for_user' ? 'Waiting for your answer' :
+    execution?.state === 'waiting_for_permission' ? 'Waiting for approval' :
+    execution?.state === 'recovering' ? 'Recovering execution' :
+    execution?.state === 'waiting_for_tool' ? activeStep?.summary || 'Running tools' : undefined;
 
   return (
     <article
@@ -187,7 +257,7 @@ export function ChatMessage({
           <strong>Aria</strong>
           {busy && (
             <span role="status">
-              {message.status === 'pending' ? 'Preparing response' : 'Responding'}
+              {executionStatus ?? (message.status === 'pending' ? 'Preparing response' : 'Responding')}
             </span>
           )}
         </div>
@@ -239,6 +309,7 @@ export function ChatMessage({
           ))}
         </Modal>
       )}
+      {busy && execution && <ExecutionControls message={message} />}
       {message.activity?.length ? (
         <details className="conductor-activity">
           <summary>
@@ -349,6 +420,18 @@ export function ChatMessage({
       {recovery.error && <p className="chat-response-error" role="alert">{recovery.error}</p>}
       {!busy && (
         <div className="chat-message-actions">
+          {canResume && (
+            <Button variant="ghost" size="sm" disabled={recovery.pending} onClick={async () => {
+              setRecovery({ pending: true });
+              try {
+                await desktop().resumeExecution({ executionId: execution.executionId, generation: execution.generation,
+                  conversationId: message.conversationId, assistantMessageId: message.id });
+                setRecovery({ pending: false });
+              } catch (error) {
+                setRecovery({ pending: false, error: errorMessage(error) });
+              }
+            }}>Resume execution</Button>
+          )}
           {message.status === 'interrupted' && message.run?.storedResponses && (
             <Button variant="ghost" size="sm" disabled={recovery.pending} onClick={async () => {
               setRecovery({ pending: true });
@@ -381,6 +464,7 @@ export function ChatMessage({
           )}
           {message.role === 'assistant' &&
             last &&
+            !canResume &&
             !message.liveSessionId &&
             !message.delegatedFromVoice && (
               <Button

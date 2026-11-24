@@ -1,5 +1,7 @@
 # Conductor runtime stabilization
 
+The original stabilization findings below describe the earlier runtime. The current lifecycle, tool batch contract, limits, and restart behavior are in [Conductor Loop Executor](conductor-loop-executor.md).
+
 The stabilization baseline is `142967a`. It contains the four prior phase branches, from Tool Intelligence through Programmatic Tool Calling. The stabilizing changes reuse the primary-model loop, the tool registry and scheduler, the scoped desktop ports, and the existing execution drivers.
 
 ## Runtime boundaries

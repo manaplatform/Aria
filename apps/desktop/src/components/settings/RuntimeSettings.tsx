@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react';
 import {
+  defaultLoopLimits,
   modelReference,
+  type LoopLimits,
   type ExecutionHistoryEntry,
   type LocalDesktopAccess,
   type OpenAIRuntimeFeature,
@@ -18,6 +20,15 @@ const nativeModes: { id: OpenAIRuntimeFeature; label: string }[] = [
   { id: 'file-search', label: 'OpenAI File Search' },
   { id: 'computer', label: 'OpenAI native Computer Use' },
   { id: 'computer-image', label: 'Aria Computer Use image observations' },
+];
+
+const loopFields: { name: keyof LoopLimits; label: string; min: number; max: number; scale?: number }[] = [
+  { name: 'iterations', label: 'Maximum model requests', min: 2, max: 48 },
+  { name: 'activeMs', label: 'Maximum active time (seconds)', min: 10, max: 1800, scale: 1000 },
+  { name: 'concurrency', label: 'Concurrent operations', min: 1, max: 6 },
+  { name: 'toolMs', label: 'Maximum tool time (seconds)', min: 1, max: 181, scale: 1000 },
+  { name: 'readRetries', label: 'Retries for verified reads', min: 0, max: 4 },
+  { name: 'stagnantRounds', label: 'Rounds without progress', min: 2, max: 8 },
 ];
 
 const desktopAccessMessage: Record<LocalDesktopAccess['state'], string> = {
@@ -289,6 +300,20 @@ export function RuntimeSettings() {
               }
             />
           </div>
+          <details>
+            <summary>Execution limits</summary>
+            {loopFields.map(({ name, label, min, max, scale = 1 }) => (
+              <div className="shortcut-row" key={name}>
+                <label htmlFor={`loop-${name}`}>{label}</label>
+                <input id={`loop-${name}`} type="number" min={min} max={max} disabled={busy}
+                  value={(value.loop ?? defaultLoopLimits)[name] / scale}
+                  onChange={(event) => {
+                    if (Number.isFinite(event.target.valueAsNumber))
+                      setValue({ ...value, loop: { ...(value.loop ?? defaultLoopLimits), [name]: event.target.valueAsNumber * scale } });
+                  }} />
+              </div>
+            ))}
+          </details>
           <div className="shortcut-row">
             <Button size="sm" disabled={busy} onClick={() => void save(false)}>
               Save runtime settings

@@ -413,6 +413,9 @@ export function openCapabilityBridge(
     request: Extract<CapabilityHostRequest, { type: 'runtime' }>,
     signal: AbortSignal,
   ) => Promise<RuntimeResult>,
+  checkpoint?: (
+    request: Extract<CapabilityHostRequest, { type: 'checkpoint' }>, signal: AbortSignal,
+  ) => Promise<boolean>,
 ) {
   const { port1, port2 } = new MessageChannelMain();
   const active = new Map<string, AbortController>();
@@ -461,6 +464,8 @@ export function openCapabilityBridge(
     ]);
     const execute = async (): Promise<CapabilityHostReply> => {
       const { id } = request;
+      if (request.type === 'checkpoint')
+        return { id, ok: true, checkpointed: Boolean(await checkpoint?.(request, signal)) };
       if (request.type === 'runtime') {
         if (
           !runtime ||

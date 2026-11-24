@@ -3,7 +3,7 @@ import { HashRouter, Navigate, Route, Routes } from 'react-router-dom';
 import ChatLayout from './components/layout/ChatLayout';
 import { Button, ErrorState, Skeleton, TooltipProvider } from './components/ui';
 import { flushPersistence, initializeWorkspace, useWorkspaceStore } from './stores/workspaceStore';
-import { bindChatBridge, stopAllChats } from './stores/chatStore';
+import { bindChatBridge } from './stores/chatStore';
 const ChatView = lazy(() => import('./components/chat/ChatView'));
 const SettingsView = lazy(() => import('./components/settings/SettingsView'));
 const LegacyWorkspace = lazy(() => import('./pages/LegacyWorkspace'));
@@ -33,7 +33,6 @@ function Application() {
   useEffect(
     () =>
       window.aria?.onBeforeClose(async () => {
-        await stopAllChats();
         await flushPersistence();
         if (useWorkspaceStore.getState().saveError)
           throw new Error(useWorkspaceStore.getState().saveError!);

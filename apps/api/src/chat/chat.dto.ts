@@ -12,10 +12,12 @@ import {
   Max,
   IsNotEmpty,
   IsOptional,
+  IsObject,
   IsString,
   MaxLength,
   ValidateNested,
 } from 'class-validator';
+import type { ManagedExecution } from '@aria/shared';
 
 export class ChatInputDto {
   @IsIn(['user', 'assistant'])
@@ -67,6 +69,10 @@ class MemoryTurnDto {
 }
 
 export class ChatRequestDto {
+  @IsOptional()
+  @IsObject()
+  execution?: ManagedExecution;
+
   @IsOptional()
   @IsBoolean()
   programPrivateHistory?: boolean;

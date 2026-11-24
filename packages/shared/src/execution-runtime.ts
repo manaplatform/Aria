@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { memoryOperations } from './memory.js';
 import { computerImage, computerOperations } from './computer-use.js';
+import { loopLimitsSchema } from './loop.js';
 
 const id = z.string().uuid();
 export const openAIRuntimeFeatureSchema = z.enum([
@@ -196,6 +197,7 @@ export const runtimeSettingsSchema = z.strictObject({
     .strictObject({ connectionId: id, model: z.string().min(1).max(200) })
     .optional(),
   commandMs: z.number().int().min(100).max(executionLimits.commandMs),
+  loop: loopLimitsSchema.optional(),
 });
 export type RuntimeSettings = z.infer<typeof runtimeSettingsSchema>;
 export interface KnowledgeCollection {

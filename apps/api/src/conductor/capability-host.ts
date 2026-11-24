@@ -19,6 +19,7 @@ type HostCommand = CapabilityHostRequest extends infer Request
     : never
   : never;
 type RuntimeCommand = Extract<HostCommand, { type: 'runtime' }>;
+type CheckpointCommand = Extract<HostCommand, { type: 'checkpoint' }>;
 
 export class ToolError extends RunError {
   constructor(
@@ -70,6 +71,10 @@ export class CapabilityHost implements OnModuleDestroy {
     if (!reply?.runtime)
       throw new ToolError('EXECUTION_FAILED', 'The desktop returned no runtime result.');
     return reply.runtime;
+  }
+
+  async checkpoint(command: CheckpointCommand, signal: AbortSignal) {
+    return (await this.dispatch(command, signal))?.checkpointed === true;
   }
 
   private async dispatch(command: HostCommand, signal: AbortSignal) {

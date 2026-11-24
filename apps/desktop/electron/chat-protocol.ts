@@ -4,6 +4,8 @@ import {
   memoryCandidates,
   memorySuggestions,
   artifactReferenceSchema,
+  executionSnapshotSchema,
+  managedExecutionSchema,
   runInfoSchema,
   toolProblemSchema,
   type ChatEvent,
@@ -37,6 +39,7 @@ export const chatRequestSchema = z
   );
 
 export const managedChatRequestSchema = chatRequestSchema.safeExtend({
+  execution: managedExecutionSchema.optional(),
   programPrivateHistory: z.boolean().optional(),
   memory: z.strictObject({
     enabled: z.boolean(), suggestions: z.boolean(), temporary: z.boolean().optional(),
@@ -49,9 +52,12 @@ const envelope = z.object({
   conversationId: id,
   assistantMessageId: id,
   sequence: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  executionId: z.uuid().optional(),
+  generation: z.number().int().positive().optional(),
 });
 export const conductorEventSchema = z.discriminatedUnion('type', [
   z.strictObject({ type: z.literal('started'), run: runInfoSchema.optional() }),
+  z.strictObject({ type: z.literal('execution'), execution: executionSnapshotSchema }),
   z.strictObject({ type: z.literal('delta'), text: z.string().max(100000) }),
   z.strictObject({ type: z.literal('reset') }),
   z.strictObject({ type: z.literal('activity'), activity: activitySchema }),
@@ -76,11 +82,14 @@ export const conductorEventSchema = z.discriminatedUnion('type', [
 
 function parseEvent(input: unknown): ChatEvent {
   const raw = z.record(z.string(), z.unknown()).parse(input);
-  const { requestId, conversationId, assistantMessageId, sequence, ...payload } = raw;
-  return {
-    ...envelope.parse({ requestId, conversationId, assistantMessageId, sequence }),
-    ...conductorEventSchema.parse(payload),
-  };
+  const { requestId, conversationId, assistantMessageId, sequence, executionId, generation, ...payload } = raw;
+  const scope = envelope.parse({ requestId, conversationId, assistantMessageId, sequence,
+    ...(executionId !== undefined && { executionId, generation }) });
+  const event = conductorEventSchema.parse(payload);
+  if ((scope.executionId === undefined) !== (generation === undefined) || event.type === 'execution' &&
+      (event.execution.executionId !== scope.executionId || event.execution.generation !== scope.generation))
+    throw new Error('Mismatched execution event.');
+  return { ...scope, ...event };
 }
 
 /** Decode across arbitrary byte/frame boundaries; comments are SSE heartbeats. */

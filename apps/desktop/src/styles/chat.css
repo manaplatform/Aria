@@ -576,6 +576,28 @@
 .chat-message-actions .button:hover {
   color: var(--foreground);
 }
+.chat-execution-controls {
+  margin-block: 0.7rem;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+.chat-execution-controls form {
+  display: grid;
+  gap: 0.45rem;
+  margin-block-start: 0.45rem;
+}
+.chat-execution-controls textarea {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 0.6rem;
+  padding: 0.55rem 0.7rem;
+  color: var(--foreground);
+  background: transparent;
+  resize: vertical;
+}
+.chat-execution-controls form .button {
+  justify-self: start;
+}
 .chat-response-error {
   color: var(--danger);
   font-size: 12px;

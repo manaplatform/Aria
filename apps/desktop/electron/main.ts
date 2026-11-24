@@ -37,6 +37,10 @@ import {
   memoryOperations,
   memorySettingsSchema,
   type ChatConversation,
+  type ChatMessage,
+  loopCommandSchema,
+  loopRecoveryRequestSchema,
+  projectChatEvent,
   skillRefSchema,
   toolDiscoverySchema,
   type RuntimeRegistry,
@@ -55,6 +59,7 @@ import {
 import { ChatService } from './chat-service';
 import { DesktopMemory } from './memory/service';
 import { WorkingContext } from './memory/working-context';
+import { LoopRecovery } from './loop-recovery';
 import { DesktopRuntime } from './runtime/controller';
 import { ComputerRuntime } from './runtime/computer';
 import { VirtualComputer } from './runtime/virtual-computer';
@@ -114,6 +119,9 @@ let localComputer: LocalComputer;
 let localSelection: AbortController | undefined;
 let media: MediaService;
 let memory: DesktopMemory;
+let loopRecovery: LoopRecovery;
+let approvals: OperationApproval;
+const activeMessages = new Map<string, ChatMessage>();
 const workingContext = new WorkingContext();
 const temporaryConversations = new Set<string>();
 const pendingChatProjects = new Map<string, string | null>();
@@ -315,7 +323,7 @@ async function changeCapabilities(
   if (configuring) throw new Error('Wait for settings to finish saving.');
   configuring = true;
   try {
-    await chat.cancelAll();
+    await chat.interruptAll();
     await media.close();
     await change();
     await chat.restart();
@@ -364,20 +372,26 @@ function registerIpc(): void {
       ...initial.data,
       chat: {
         ...initial.data.chat,
-        messages: initial.data.chat.messages.map((message) =>
-          ['pending', 'streaming'].includes(message.status)
-            ? {
-                ...message,
-                status: 'interrupted',
-                error: 'This response was interrupted. You can send it again.',
-                retryConfirmed: false,
-                activity: endActivity(message.activity),
-              }
-            : message,
-        ),
+        messages: initial.data.chat.messages.map((message) => {
+          if (message.role !== 'assistant') return message;
+          const projection = activeMessages.get(message.id);
+          const current = projection?.conversationId === message.conversationId ? projection : message;
+          if (chat.activeTurn(current)) return current;
+          if (!['pending', 'streaming', 'interrupted', 'failed'].includes(current.status)) return current;
+          const execution = loopRecovery.snapshot(current.conversationId, current.id);
+          if (execution)
+            return { ...current, status: 'interrupted', execution, retryConfirmed: false,
+              error: 'This execution was interrupted. Review its activity before resuming.', activity: endActivity(current.activity) };
+          if (['pending', 'streaming'].includes(current.status))
+            return { ...current, status: 'interrupted', retryConfirmed: false,
+              error: 'This response was interrupted. You can send it again.', activity: endActivity(current.activity) };
+          return current;
+        }),
       },
     },
   }));
+  handle('aria:active-chat-messages', () => [...activeMessages.values()].filter((message) =>
+    savedConversation(message.conversationId)));
   handle('aria:memory-status', () => memory.status());
   handle('aria:memory-diagnostics', () => memory.diagnosticSnapshot());
   handle('aria:save-memory-settings', (input) => memory.saveSettings(memorySettingsSchema.parse(input)));
@@ -489,6 +503,11 @@ function registerIpc(): void {
         const outbox = memory.outbox(storage.memoryOutbox, parsed.chat.messages, parsed.chat.conversations);
         await storage.save(parsed, outbox);
         initial = { data: parsed };
+        for (const message of parsed.chat.messages) {
+          const projection = activeMessages.get(message.id);
+          if (projection?.requestId === message.requestId && message.sequence >= projection.sequence &&
+              !chat.activeTurn(message)) activeMessages.delete(message.id);
+        }
         for (const { id } of parsed.chat.conversations) pendingChatProjects.delete(id);
         void drainMemoryOutbox();
         browser.pruneConversations(parsed.chat.conversations);
@@ -498,6 +517,10 @@ function registerIpc(): void {
             temporaryConversations.delete(id);
             pendingChatProjects.delete(id);
             workingContext.clear(id);
+            for (const [messageId, message] of activeMessages) if (message.conversationId === id) {
+              activeMessages.delete(messageId);
+              void chat.cancel(message.requestId);
+            }
             executionRuntime.store.deletePrograms(id);
             void memory.removeConversation(id).catch(() => undefined);
           }
@@ -802,17 +825,22 @@ function registerIpc(): void {
     )
       throw new Error('Attach the files to this turn before sending them.');
     const context = selectChatContext(messages, chat.getStatus().revision ?? '');
+    if (loopRecovery.snapshot(conversation.id, assistant.id))
+      throw new Error('Resume the interrupted execution from its activity before retrying the turn.');
     const options = memory.admit(conversation, latest, assistant);
     const workingSummary = conversation.temporary ? undefined :
       workingContext.capture(conversation.id, messages, context.messages.length, memory.cutoff);
     try {
+      activeMessages.set(assistant.id, assistant);
       chat.submit({
         ...parsed,
+        execution: { executionId: randomUUID(), generation: 1, userMessageId: latest.id },
         memory: { ...options, workingSummary, privateHistory: context.memoryPrivate },
         programPrivateHistory: context.privateContent,
         messages: context.messages,
       });
     } catch (error) {
+      activeMessages.delete(assistant.id);
       memory.event({ ...parsed, sequence: 1, type: 'stopped' });
       throw error;
     }
@@ -824,7 +852,8 @@ function registerIpc(): void {
       const current = executionRuntime.settings();
       const next = runtimeSettingsSchema.parse(value);
       await executionRuntime.configure(next);
-      if (current.engineSocket !== next.engineSocket || current.desktopImage !== next.desktopImage) {
+      if (current.engineSocket !== next.engineSocket || current.desktopImage !== next.desktopImage ||
+          JSON.stringify(current.loop) !== JSON.stringify(next.loop)) {
         await computerRuntime.shutdown();
         await chat.restart();
       }
@@ -930,6 +959,56 @@ function registerIpc(): void {
     ),
   );
   handle('aria:cancel-chat', (id) => chat.cancel(identifier.parse(id)));
+  handle('aria:control-execution', async (value) => {
+    const command = loopCommandSchema.parse(value);
+    if (!await chat.control(command)) return;
+    if (command.action === 'pause' || command.action === 'resume')
+      approvals.suspend(command.requestId, command.action === 'pause');
+    if (command.action === 'steer' || command.action === 'answer') {
+      approvals.revokeExecution(command.requestId);
+      executionRuntime.revokeExecution(command.requestId);
+    }
+  });
+  handle('aria:resume-execution', async (value) => {
+    const scope = loopRecoveryRequestSchema.parse(value);
+    if (configuring) throw new Error('Wait for Settings to finish saving.');
+    media.assertIdle();
+    const conversation = savedConversation(scope.conversationId);
+    if (!conversation || conversation.temporary) throw new Error('Choose a saved conversation.');
+    if (conversation.projectId) registeredMemoryProject(conversation.projectId);
+    const messages = initial.data.chat.messages.filter((message) => message.conversationId === scope.conversationId);
+    const assistant = messages.at(-1);
+    const user = messages.at(-2);
+    if (assistant?.id !== scope.assistantMessageId || assistant.role !== 'assistant' || user?.role !== 'user')
+      throw new Error('Resume the latest execution in this conversation.');
+    chat.assertExecutionCapacity(conversation.id);
+    if (chat.getStatus().state === 'failed') await chat.start();
+    if (!chat.getStatus().configured) throw new Error('Connect to the original primary in AI Models.');
+    const requestId = randomUUID();
+    const execution = await loopRecovery.restore(scope, user.id, requestId, () => {
+      chat.assertExecutionCapacity(conversation.id);
+      return !configuring && initial.data.chat.messages.filter((item) => item.conversationId === conversation.id).at(-1)?.id === assistant.id;
+    });
+    const context = selectChatContext(messages, chat.getStatus().revision ?? '');
+    const seed: ChatMessage = { ...assistant, execution: {
+      executionId: execution.executionId, generation: scope.generation, state: 'recovering', durability: 'saved',
+      iteration: execution.recovery?.iteration ?? 0,
+    } };
+    activeMessages.set(assistant.id, seed);
+    const memoryOptions = memory.admit(conversation, user, { ...assistant, requestId });
+    try {
+      chat.submit({
+        execution, requestId, conversationId: conversation.id, assistantMessageId: assistant.id,
+        expectedRevision: chat.getStatus().revision, messages: context.messages,
+        attachmentIds: user.assets?.map(({ id }) => id) ?? user.operation?.assetIds ?? [],
+        memory: { ...memoryOptions, privateHistory: context.memoryPrivate },
+        programPrivateHistory: context.privateContent || execution.recovery?.privateContent || execution.recovery?.memoryContent,
+      });
+    } catch (error) {
+      activeMessages.delete(assistant.id);
+      throw error;
+    }
+  });
   handle('aria:supervise-program', (request, conversation, id, paused) => {
     const requestId = identifier.parse(request);
     const conversationId = identifier.parse(conversation);
@@ -1082,13 +1161,11 @@ function createWindow(icon: NativeImage | undefined): void {
     closeFlushEnabled = false;
     closePending = false;
     browser.resetRenderer();
-    void chat.cancelAll();
     void media.close();
   });
   mainWindow.webContents.on('did-start-navigation', (event) => {
     if (event.isMainFrame && !event.isSameDocument) {
       browser.resetRenderer();
-      void chat.cancelAll();
       void media.close();
     }
   });
@@ -1119,7 +1196,7 @@ function createWindow(icon: NativeImage | undefined): void {
   mainWindow.on('closed', () => {
     void browser.detach();
     void media.close();
-    void chat.cancelAll();
+    void chat.interruptAll();
     mainWindow = null;
   });
   mainWindow.on('close', (event) => {
@@ -1202,25 +1279,30 @@ app
     provider = new ProviderStorage(directory, cipher);
     capabilities = new CapabilityStorage(directory);
     await capabilities.load();
-    const approvals = new OperationApproval(async (message, detail, signal) => {
+    approvals = new OperationApproval(async (message, detail, signal, allowExecution) => {
       signal.throwIfAborted();
       if (!mainWindow || mainWindow.isDestroyed()) return false;
       const { response } = await dialog.showMessageBox(mainWindow, {
         type: 'warning',
         message,
         detail,
-        buttons: ['Decline', 'Allow once'],
+        buttons: allowExecution ? ['Decline', 'Allow once', 'Allow for this execution'] : ['Decline', 'Allow once'],
         cancelId: 0,
         defaultId: 0,
         noLink: true,
         signal,
       });
-      return response === 1 && !signal.aborted;
+      return signal.aborted ? false : response === 2 && allowExecution ? 'execution' : response === 1;
     }, {
       begin: (scope, fingerprint) => capabilities.runtimeStore.beginApproval(scope, fingerprint),
       finish: (id, decision) => capabilities.runtimeStore.finishApproval(id, decision),
     });
     const approve = approvals.approve.bind(approvals);
+    loopRecovery = new LoopRecovery(capabilities.runtimeStore, cipher, () => chat.executionIdentity(),
+      (id, conversation) => {
+        try { return Boolean(executionRuntime.evidence(id, conversation)); }
+        catch { return false; }
+      });
     executionRuntime = new DesktopRuntime(
       directory,
       assets,
@@ -1369,9 +1451,16 @@ app
         const visible = event.type === 'completed' && 'run' in event ? {
           type: event.type, requestId: event.requestId, conversationId: event.conversationId,
           assistantMessageId: event.assistantMessageId, sequence: event.sequence,
+          executionId: event.executionId, generation: event.generation,
           partial: event.partial, run: event.run, suggestions: event.suggestions,
           ...(references?.length && { memoryReferences: references }),
         } : event;
+        const message = activeMessages.get(event.assistantMessageId);
+        if (message) activeMessages.set(message.id, projectChatEvent(message, visible));
+        if (activeMessages.size > 12) for (const [id, item] of activeMessages) {
+          if (activeMessages.size <= 12) break;
+          if (!chat.activeTurn(item)) activeMessages.delete(id);
+        }
         if (mainWindow && !mainWindow.webContents.isDestroyed())
           mainWindow.webContents.send('aria:chat-event', visible);
       },
@@ -1391,10 +1480,9 @@ app
               if (!signal) return;
               const turn = initial.data.chat.messages.find(
                 (message) =>
-                  message.requestId === request.requestId &&
+                  message.id === chat.assistantForTurn(request.requestId) &&
                   message.conversationId === request.conversationId &&
-                  message.role === 'assistant' &&
-                  ['pending', 'streaming'].includes(message.status),
+                  message.role === 'assistant',
               );
               return turn ? signal : undefined;
             },
@@ -1422,6 +1510,7 @@ app
         policy: (registry) => ({
           ...runtimePolicy(registry),
           desktopRuntime: true,
+          loop: executionRuntime.settings().loop,
           computerBrowser: browser.computerAvailable(),
           computerVirtual: virtualComputer.ready(),
           computerLocal: localComputer.configured(),
@@ -1431,9 +1520,11 @@ app
         adoptArtifact: (asset, conversation, request, execution, signal) =>
           executionRuntime.adoptArtifact(asset, conversation, request, execution, signal),
         release: (request) => {
+          approvals.release(request);
           executionRuntime.release(request);
           computerRuntime.release(request);
         },
+        cancelExecution: (request) => executionRuntime.store.cancelLoop(request),
         availableAssets: (conversation) =>
           [
             ...new Map(
@@ -1465,6 +1556,16 @@ app
                 return request.operation.startsWith('computer.') ? computerRuntime.dispatch(request, signal)
                   : executionRuntime.dispatch(request, signal);
               });
+            },
+            (request, signal) => {
+              const active = chat.executionForTurn(request.requestId);
+              const conversation = savedConversation(request.conversationId);
+              if (!active || request.checkpoint.executionId !== active.executionId ||
+                  request.checkpoint.generation !== active.generation ||
+                  request.checkpoint.userMessageId !== active.userMessageId ||
+                  !conversation || conversation.temporary)
+                return Promise.resolve(false);
+              return loopRecovery.save(request, signal);
             },
           ),
       },

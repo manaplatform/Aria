@@ -8,6 +8,7 @@ import {
   defaultWebPolicy,
   capabilityHostRequest,
   type ChatEvent,
+  type LoopCheckpoint,
 } from '@aria/shared';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { z } from 'zod';
@@ -69,8 +70,8 @@ async function chat(content: string, privateHistory = false) {
   return events;
 }
 
-function registerExample(programmatic = false) {
-  const run = vi.fn((input: { question: string }) => ({
+function registerExample(programmatic = false, parallelRead = false) {
+  const run = vi.fn((input: { question: string }): { text: string } | Promise<{ text: string }> => ({
     text: `Example result for ${input.question}`,
   }));
   const remove = app.get(ToolRegistry).register({
@@ -84,6 +85,7 @@ function registerExample(programmatic = false) {
     capability: 'example.lookup',
     output: 'text',
     effect: 'read',
+    parallelRead,
     permission: 'Use the example reference',
     dependency: 'local',
     requiredModelCapabilities: [],
@@ -103,6 +105,124 @@ function registerExample(programmatic = false) {
   });
   return { run, remove };
 }
+
+function executionPort() {
+  const checkpoints: LoopCheckpoint[] = [];
+  const port = Object.assign(new EventEmitter(), {
+    start: () => undefined,
+    close: () => undefined,
+    postMessage: (input: unknown) => {
+      const parsed = capabilityHostRequest.safeParse(input);
+      if (!parsed.success || parsed.data.type !== 'checkpoint') return;
+      checkpoints.push(parsed.data.checkpoint);
+      queueMicrotask(() => port.emit('message', { data: { id: parsed.data.id, ok: true, checkpointed: true } }));
+    },
+  });
+  app.get(CapabilityHost).install({ ...defaultToolPolicy, desktopRuntime: true }, port);
+  return checkpoints;
+}
+
+async function managedExecution(content: string) {
+  vi.stubEnv('ARIA_MANAGED', '1');
+  const controller = new AbortController();
+  const scope = { requestId: randomUUID(), conversationId: randomUUID(), assistantMessageId: randomUUID() };
+  const identity = { executionId: randomUUID(), generation: 1 };
+  const response = await fetch(url + '/chat/stream', {
+    method: 'POST', headers, signal: controller.signal,
+    body: JSON.stringify({ ...scope, execution: { ...identity, userMessageId: randomUUID() },
+      messages: [{ role: 'user', content }] }),
+  });
+  if (!response.ok || !response.body) throw new Error(`Chat status ${response.status}`);
+  const events: ChatEvent[] = [];
+  const completed = (async () => { for await (const event of readChatEvents(response.body!)) events.push(event); })();
+  return {
+    events, completed, controller,
+    command: (input: object) => fetch(`${url}/chat/${scope.requestId}/control`, {
+      method: 'POST', headers, body: JSON.stringify({ ...scope, ...identity, commandId: randomUUID(), ...input }),
+    }),
+  };
+}
+
+it('schedules batch prerequisites, overlaps independent reads and returns every outcome in request order', async () => {
+  const checkpoints = executionPort();
+  const { run } = registerExample(false, true);
+  let releaseLeft!: () => void;
+  const ready = new Promise<void>((resolve) => { releaseLeft = resolve; });
+  const order: string[] = [];
+  run.mockImplementation(async ({ question }) => {
+    order.push(`start ${question}`);
+    if (question === 'left') await ready;
+    if (question === 'right') releaseLeft();
+    if (question === 'failure') throw new Error('fixture failed');
+    order.push(`done ${question}`);
+    return { text: question };
+  });
+  const prompt = 'Compare two references, then check the result.';
+  fixture.queueTool(prompt, 'find_capabilities', { query: '', ids: ['example.lookup'] });
+  fixture.queueTool(prompt, 'load_capabilities', { ids: ['example.lookup'] });
+  const operation = (id: string, after: string[]) => ({ id, after, tool: 'example_lookup', args: { question: id } });
+  fixture.queueTool(prompt, 'aria_execute_batch', { operations: [
+    operation('join', ['left', 'right']), operation('left', []), operation('right', []),
+    operation('failure', []), operation('blocked', ['failure']),
+  ] });
+  const execution = await managedExecution(prompt);
+  try {
+    await execution.completed;
+    expect(order).toContain('done join');
+    expect(order.indexOf('start right')).toBeLessThan(order.indexOf('done left'));
+    expect(order.indexOf('start join')).toBeGreaterThan(order.indexOf('done left'));
+    expect(order).not.toContain('start blocked');
+    expect(checkpoints.at(-1)).toMatchObject({ state: 'partial', budget: { directToolCalls: 4 } });
+    expect(execution.events.at(-1)).toMatchObject({ type: 'completed', partial: true });
+    const request = fixture.received.find(({ body }) => body.messages.some(({ role, content }) =>
+      role === 'tool' && content.includes('A prerequisite did not complete.')));
+    expect(request?.body.messages.at(-1)?.content).toContain('"id":"join"');
+    expect(request?.body.messages.at(-1)?.content).toContain('"id":"blocked"');
+  } finally {
+    execution.controller.abort();
+  }
+});
+
+it('holds a clarification on the same stream and rejects stale or duplicate commands', async () => {
+  const checkpoints = executionPort();
+  const prompt = 'Find a convenient option for me.';
+  fixture.queueTool(prompt, 'aria_request_input', { question: 'Which city should I use?' });
+  fixture.finalReply('Tehran', 'I will use Tehran.');
+  const execution = await managedExecution(prompt);
+  try {
+    await vi.waitFor(() => expect(checkpoints.at(-1)?.state).toBe('waiting_for_user'));
+    const question = checkpoints.at(-1)!.question!;
+    expect((await execution.command({ action: 'answer', generation: 2, questionId: question.id, text: 'Tehran' })).status).toBe(409);
+    expect((await execution.command({ action: 'answer', questionId: randomUUID(), text: 'Tehran' })).status).toBe(409);
+    const command = { action: 'answer', commandId: randomUUID(), questionId: question.id, text: 'Tehran' };
+    expect((await execution.command(command)).status).toBe(201);
+    expect((await execution.command(command)).status).toBe(201);
+    await execution.completed;
+    expect(checkpoints.at(-1)).toMatchObject({ state: 'completed', steering: ['Tehran'] });
+    expect(execution.events.filter((event) => event.type === 'delta').map(({ text }) => text).join('')).toBe('I will use Tehran.');
+  } finally {
+    execution.controller.abort();
+  }
+});
+
+it('rejects a dependency cycle before any registered operation starts', async () => {
+  executionPort();
+  const { run } = registerExample();
+  const prompt = 'Try a malformed dependency graph.';
+  fixture.queueTool(prompt, 'find_capabilities', { query: '', ids: ['example.lookup'] });
+  fixture.queueTool(prompt, 'load_capabilities', { ids: ['example.lookup'] });
+  fixture.queueTool(prompt, 'aria_execute_batch', { operations: [
+    { id: 'cycle', after: ['cycle'], tool: 'example_lookup', args: { question: 'No effect' } },
+  ] });
+  const execution = await managedExecution(prompt);
+  try {
+    await execution.completed;
+    expect(run).not.toHaveBeenCalled();
+    expect(execution.events.at(-1)).toMatchObject({ type: 'failed', problem: { code: 'INVALID_ARGUMENT' } });
+  } finally {
+    execution.controller.abort();
+  }
+});
 
 function programPort(
   settings: Partial<typeof defaultProgramSettings>,

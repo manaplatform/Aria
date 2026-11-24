@@ -79,6 +79,16 @@ async function send(content: string) {
   await page.getByRole('button', { name: 'Send message', exact: true }).click();
 }
 
+async function savedExecutionState() {
+  return app.evaluate(({ app: desktop }) => {
+    const { DatabaseSync } = process.getBuiltinModule('node:sqlite')!;
+    const path = process.getBuiltinModule('node:path')!;
+    const db = new DatabaseSync(path.join(desktop.getPath('userData'), 'runtime.sqlite'), { readOnly: true });
+    try { return db.prepare('SELECT state FROM loop_checkpoints').get()?.state; }
+    finally { db.close(); }
+  });
+}
+
 function visualBlock(visual: object) {
   return `\`\`\`aria-visual\n${JSON.stringify({ v: 1, ...visual })}\n\`\`\``;
 }
@@ -337,6 +347,63 @@ test('streams through the managed NestJS API, renders Markdown, manages conversa
   await expect(
     page.getByRole('button', { name: 'A thoughtful conversation', exact: true }),
   ).toBeVisible();
+});
+
+test('pauses a reply at its boundary and continues with the steered objective', async () => {
+  await launch();
+  const prompt = '[slow] plan a quiet afternoon';
+  fixture.finalReply(prompt, 'Initial draft');
+  fixture.finalReply('Choose a rainy-day activity.', 'Spend the afternoon at the library.');
+  await send(prompt);
+  await expect(page.getByRole('button', { name: 'Pause', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Pause', exact: true }).click();
+  fixture.releaseSlow();
+  await expect(page.getByRole('status').filter({ hasText: /^Paused$/ })).toBeVisible();
+  await page.reload();
+  await expect(page.getByRole('status').filter({ hasText: /^Paused$/ })).toBeVisible();
+  await page.getByRole('button', { name: 'Steer', exact: true }).click();
+  await page.getByLabel('Update instructions for this execution').fill('Choose a rainy-day activity.');
+  await page.getByRole('button', { name: 'Send instructions' }).click();
+  await page.getByRole('button', { name: 'Resume', exact: true }).click();
+  await expect(page.locator('.from-assistant[data-status="completed"]')).toContainText('Spend the afternoon at the library.');
+  await expect(page.locator('.from-assistant')).not.toContainText('Initial draft');
+  await expect(page.locator('.from-user')).toHaveCount(1);
+});
+
+test('resumes a saved clarification after restarting the desktop', async () => {
+  await launch();
+  const prompt = 'Find an option near my preferred station.';
+  fixture.queueTool(prompt, 'aria_request_input', { question: 'Which station should I use?' });
+  fixture.finalReply('Central Station', 'I will use Central Station.');
+  await send(prompt);
+  await expect(page.getByLabel('Which station should I use?')).toBeVisible();
+  await expect.poll(savedExecutionState).toBe('waiting_for_user');
+  await app.close();
+  await launch();
+  await page.getByRole('button', { name: 'Resume execution', exact: true }).click();
+  await page.getByLabel('Which station should I use?').fill('Central Station');
+  await page.getByRole('button', { name: 'Send answer', exact: true }).click();
+  await expect(page.locator('.from-assistant[data-status="completed"]')).toContainText('I will use Central Station.');
+  await expect(page.locator('.from-user')).toHaveCount(1);
+});
+
+test('recovers a clarification after the managed API process exits', async () => {
+  await launch();
+  const prompt = 'Find a museum to visit this weekend.';
+  fixture.queueTool(prompt, 'aria_request_input', { question: 'Which neighborhood?' });
+  fixture.finalReply('Old town', 'I will use the old town.');
+  await send(prompt);
+  await expect(page.getByLabel('Which neighborhood?')).toBeVisible();
+  await expect.poll(savedExecutionState).toBe('waiting_for_user');
+  await app.evaluate(({ app: desktop }) => {
+    const child = desktop.getAppMetrics().find((metric) => metric.name === 'Aria Chat API');
+    if (!child) throw new Error('Chat utility process not found.');
+    process.kill(child.pid, 'SIGKILL');
+  });
+  await page.getByRole('button', { name: 'Resume execution', exact: true }).click();
+  await page.getByLabel('Which neighborhood?').fill('Old town');
+  await page.getByRole('button', { name: 'Send answer' }).click();
+  await expect(page.locator('.from-assistant[data-status="completed"]')).toContainText('I will use the old town.');
 });
 
 test('renders inline visuals from the primary text stream and restores them in a narrow chat', async () => {

@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   Body,
+  ConflictException,
   Controller,
   Delete,
   Get,
@@ -16,7 +17,7 @@ import {
 } from '@nestjs/common';
 import { FilesInterceptor } from '@nestjs/platform-express';
 import type { Request, Response } from 'express';
-import { artifactReferenceSchema, identifier } from '@aria/shared';
+import { artifactReferenceSchema, identifier, loopCommandSchema, managedExecutionSchema } from '@aria/shared';
 import { Conductor } from '../conductor/conductor.service';
 import { ToolRegistry } from '../conductor/tool-registry';
 import { WebService } from '../web/web.service';
@@ -24,6 +25,7 @@ import { RunAssets, RunError } from '../conductor/run-assets';
 import { ModelRegistry } from '../providers/model-registry.service';
 import { ChatRequestDto, AttachmentMetadataDto } from './chat.dto';
 import { LocalApiGuard } from './local-api.guard';
+import { ChatStream } from './chat-stream';
 
 @Controller('chat')
 @UseGuards(LocalApiGuard)
@@ -102,6 +104,8 @@ export class ChatController {
 
   @Post('stream')
   async stream(@Body() input: ChatRequestDto, @Req() request: Request, @Res() response: Response) {
+    if (input.execution && (process.env.ARIA_MANAGED !== '1' || !managedExecutionSchema.safeParse(input.execution).success))
+      throw new BadRequestException('Invalid managed execution identity.');
     if (
       input.messages.at(-1)?.role !== 'user' ||
       input.messages.some((message) => !message.content.trim()) ||
@@ -120,31 +124,11 @@ export class ChatController {
     response.setHeader('Cache-Control', 'no-cache, no-transform');
     response.setHeader('X-Accel-Buffering', 'no');
     response.flushHeaders();
-    let sequence = 0;
-    const write = (frame: string) => {
-      if (response.destroyed || response.writableEnded || controller.signal.aborted) return;
-      if (response.writableLength + Buffer.byteLength(frame) > 1_000_000) {
-        controller.abort();
-        response.destroy();
-        return;
-      }
-      response.write(frame);
-    };
-    const heartbeat = setInterval(() => {
-      write(': heartbeat\n\n');
-    }, 15000);
+    const stream = new ChatStream(response, controller, input);
+    const heartbeat = setInterval(() => stream.heartbeat(), 15_000);
     try {
-      await this.conductor.run(input, controller.signal, (event) => {
-          write(
-            `data: ${JSON.stringify({
-              requestId: input.requestId,
-              conversationId: input.conversationId,
-              assistantMessageId: input.assistantMessageId,
-              sequence: ++sequence,
-              ...event,
-            })}\n\n`,
-          );
-      });
+      await this.conductor.run(input, controller.signal, stream.push);
+      await stream.drain();
     } finally {
       clearInterval(heartbeat);
       controller.abort();
@@ -152,5 +136,19 @@ export class ChatController {
       response.off('close', disconnect);
       response.end();
     }
+  }
+
+  @Post(':requestId/control')
+  control(@Param('requestId') id: string, @Body() value: unknown) {
+    const parsed = loopCommandSchema.safeParse(value);
+    if (process.env.ARIA_MANAGED !== '1' || !parsed.success || parsed.data.requestId !== id)
+      throw new BadRequestException('Invalid execution control.');
+    try {
+      const result = this.conductor.control(parsed.data);
+      if (result) return { accepted: true, applied: result === 'applied' };
+    } catch (error) {
+      throw new ConflictException(error instanceof RunError ? error.message : 'The command could not be applied.');
+    }
+    throw new ConflictException('The execution is no longer active.');
   }
 }

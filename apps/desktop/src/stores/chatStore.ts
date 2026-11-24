@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import { conductorLimits, endActivity, selectChatContext } from '@aria/shared';
+import { endActivity, projectChatEvent, selectChatContext } from '@aria/shared';
 import type {
   ChatData,
   ChatEvent,
@@ -138,78 +138,13 @@ export function pinChat(id: string): void {
   }));
 }
 export function applyChatEvent(event: ChatEvent): void {
-  const chat = useWorkspaceStore.getState().data.chat;
-  const message = chat.messages.find((item) => item.id === event.assistantMessageId);
-  if (
-    !message ||
-    message.conversationId !== event.conversationId ||
-    message.requestId !== event.requestId ||
-    event.sequence <= message.sequence ||
-    !generating(message)
-  )
-    return;
+  const item = useWorkspaceStore.getState().data.chat.messages.find(({ id }) => id === event.assistantMessageId);
+  if (!item) return;
+  const next = projectChatEvent(item, event);
+  if (next === item) return;
   updateChat((current) => ({
     ...current,
-    messages: current.messages.map((item) => {
-      if (item.id !== message.id) return item;
-      const next = { ...item, sequence: event.sequence };
-      if (event.type === 'started') return { ...next, status: 'streaming', run: event.run };
-      if (event.type === 'reset') return { ...next, content: '' };
-      if (event.type === 'delta')
-        return {
-          ...next,
-          status: 'streaming',
-          content: (next.content + event.text).slice(0, 100000),
-        };
-      if (event.type === 'activity') {
-        const activity = next.activity ?? [];
-        const previous = activity.find((item) => item.stepId === event.activity.stepId);
-        const { sources, evidence } = event.activity;
-        const citations = sources?.length || evidence?.length
-          ? {
-              sources: [...new Map([
-                ...(next.citations?.sources ?? []), ...(sources ?? []),
-              ].map((source) => [source.url, source])).values()].slice(0, conductorLimits.steps * 8),
-              evidence: [...new Map([
-                ...(next.citations?.evidence ?? []), ...(evidence ?? []),
-              ].map((item) => [item.id, item])).values()].slice(0, conductorLimits.steps * 8),
-            }
-          : next.citations;
-        return {
-          ...next,
-          citations,
-          activity: previous
-            ? activity.map((item) =>
-                item.stepId === event.activity.stepId ? event.activity : item,
-              )
-            : [...activity, event.activity].slice(0, conductorLimits.activity),
-        };
-      }
-      if (event.type === 'artifact') return next;
-      if (event.type === 'asset')
-        return { ...next, assets: [...(next.assets ?? []), event.asset].slice(0, 4) };
-      if (event.type === 'completed')
-        return {
-          ...next,
-          status: 'completed',
-          ...('suggestions' in event ? { suggestions: event.suggestions } : {}),
-          ...('memoryReferences' in event ? { memoryReferences: event.memoryReferences } : {}),
-          ...('assets' in event ? { assets: event.assets } : {}),
-          ...('run' in event ? { run: event.run, partial: event.partial } : {}),
-        };
-      const settleActivity = endActivity(next.activity);
-      if (event.type === 'stopped')
-        return { ...next, status: 'stopped', activity: settleActivity, retryConfirmed: false };
-      return {
-        ...next,
-        status: event.interrupted ? 'interrupted' : 'failed',
-        error: event.error,
-        activity: settleActivity,
-        run: event.run ?? next.run,
-        settingsHelp: event.settingsHelp,
-        retryConfirmed: Boolean(event.run && !event.run.billableChildStarted),
-      };
-    }),
+    messages: current.messages.map((message) => message.id === item.id ? next : message),
   }));
 }
 
@@ -374,6 +309,7 @@ export async function regenerateChat(id: string, expectedRevision?: string): Pro
             assets: undefined,
             operation: undefined,
             run: undefined,
+            execution: undefined,
             activity: undefined,
             citations: undefined,
             suggestions: undefined,
@@ -430,16 +366,6 @@ export async function stopChat(id: string): Promise<void> {
     notify('Could not confirm cancellation. The response has been marked stopped locally.', true);
   }
 }
-export async function stopAllChats(): Promise<void> {
-  await endLiveVoice();
-  const ids = new Set(
-    useWorkspaceStore
-      .getState()
-      .data.chat.messages.filter(generating)
-      .map((item) => item.conversationId),
-  );
-  await Promise.all([...ids].map(stopChat));
-}
 export async function deleteChat(id: string): Promise<void> {
   await stopChat(id);
   updateChat((chat) => ({
@@ -466,6 +392,19 @@ export function bindChatBridge(): () => void {
   let active = true;
   let updated = false;
   const events = window.aria.onChatEvent(applyChatEvent);
+  void window.aria.activeChatMessages?.().then((items) => {
+    if (!active || !items.length) return;
+    const snapshots = new Map(items.map((item) => [item.id, item]));
+    updateChat((chat) => ({ ...chat, messages: chat.messages.map((item) => {
+      const snapshot = snapshots.get(item.id);
+      if (!snapshot || item.conversationId !== snapshot.conversationId) return item;
+      if (snapshot.requestId === item.requestId && snapshot.sequence > item.sequence && item.status !== 'stopped')
+        return snapshot;
+      if (snapshot.execution && item.execution?.executionId === snapshot.execution.executionId &&
+          snapshot.execution.generation > item.execution.generation) return snapshot;
+      return item;
+    }) }));
+  }).catch(() => undefined);
   const liveEvents = window.aria.onLiveEvent?.(applyLiveEvent);
   const status = window.aria.onChatStatus((value) => {
     updated = true;
