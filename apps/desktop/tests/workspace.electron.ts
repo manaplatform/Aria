@@ -21,6 +21,10 @@ async function launch(development = false) {
   app = await electron.launch({ args: [desktopRoot], env });
   page = await app.firstWindow();
   page.on('pageerror', (error) => errors.push(error.message));
+  // A cold Vite server needs time to transform the lazy chat route.
+  await expect(page.getByRole('textbox', { name: 'Message Aria', exact: true })).toBeVisible({
+    timeout: development ? 20_000 : 5_000,
+  });
   // CI displays can clamp the native window below the desktop layout breakpoint.
   await page.setViewportSize({ width: 1440, height: 960 });
   await expect(page.getByRole('navigation', { name: 'Chat navigation' })).toBeVisible();
