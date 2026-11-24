@@ -38,9 +38,9 @@ export function channelFor(version) {
 export function dateTag(date, tags) {
   const prefix = `v${date.toISOString().slice(0, 10).replaceAll('-', '.')}`;
   if (!tags.has(prefix)) return prefix;
-  let suffix = 2;
-  while (tags.has(`${prefix}-${suffix}`)) suffix++;
-  return `${prefix}-${suffix}`;
+  let suffix = 1;
+  while (tags.has(`${prefix}.${suffix}`)) suffix++;
+  return `${prefix}.${suffix}`;
 }
 
 export function releaseDate(tag) {

@@ -112,7 +112,7 @@ const claimedReleaseMarker = (version, source, runId, tag) =>
 
 function emptyReleaseRequest(release) {
   return !release.body?.trim() && release.assets.length === 0 &&
-    (release.draft || release.immutable === false && !release.name?.trim());
+    (release.draft || release.immutable === false && (!release.name?.trim() || release.name === release.tag_name));
 }
 
 function withoutRelease(state, id) {
@@ -129,24 +129,28 @@ function publicPlaceholder(state, request, source) {
       !release.draft && emptyReleaseRequest(release));
 }
 
-export async function claimDraftRequest(api, { versionFor, runId }, state) {
+export async function claimDraftRequest(api, { versionFor, runId, target }, state) {
   if (!/^\d+$/.test(runId)) throw new Error('The release request requires a GitHub Actions run ID.');
   state ??= await readReleaseState(api);
-  const candidates = state.releases.filter(({ tag_name: tag }) => tagPattern.test(tag) && state.tagCommits.has(tag))
+  const candidates = state.releases.filter(({ id, tag_name: tag }) => target ? id === target.id :
+    tagPattern.test(tag) && state.tagCommits.has(tag))
     .map((release) => ({
       release, resumed: release.draft && release.body?.includes(draftRequestMarker(runId, release.tag_name)),
     })).sort((a, b) => Number(!!b.resumed) - Number(!!a.resumed) || a.release.id - b.release.id);
   for (const { release, resumed } of candidates) {
-    if (!resumed && !emptyReleaseRequest(release)) continue;
     const { id, tag_name: tag } = release;
     const source = state.tagCommits.get(tag);
+    if (target && (tag !== target.tag || source !== target.source))
+      throw new Error('The published release tag or commit changed before it could be claimed.');
+    if (!resumed && (!emptyReleaseRequest(release) || (target && release.draft))) continue;
     let version, existing;
     try {
       version = versionFor(source);
+      if (!version && target) throw new Error('The published release must point to a commit in the default-branch history.');
       if (!version) continue;
       existing = findRelease(resumed ? state : withoutRelease(state, id), version, source);
     } catch (error) {
-      if (resumed) throw error;
+      if (resumed || target) throw error;
       console.log(`Skipping release request ${tag}. ${error.message}`);
       continue;
     }
@@ -170,20 +174,42 @@ export async function claimDraftRequest(api, { versionFor, runId }, state) {
   }
 }
 
+function dispatchedRelease(event) {
+  if (env.GITHUB_EVENT_NAME !== 'workflow_dispatch' || !event.inputs?.release_request) return;
+  const { id, tag, source } = JSON.parse(event.inputs.release_request) ?? {};
+  if (event.inputs.mode !== 'publish' || !Number.isSafeInteger(id) || id <= 0 ||
+      typeof tag !== 'string' || !tagPattern.test(tag) || typeof source !== 'string' || !sourcePattern.test(source))
+    throw new Error('A published release request requires its GitHub release ID, calendar tag, and source commit.');
+  return { id, tag, source };
+}
+
+function selectedRelease(event) {
+  const id = Number(env.RELEASE_DRAFT_ID || 0);
+  const tag = env.RELEASE_DRAFT_TAG;
+  const source = env.RELEASE_SOURCE || commit();
+  const target = dispatchedRelease(event);
+  if (target && (id !== target.id || tag !== target.tag || source !== target.source))
+    throw new Error('Publication requires the same release ID, tag, and commit selected by the release event.');
+  if (env.GITHUB_EVENT_NAME === 'schedule' && (!Number.isSafeInteger(id) || id <= 0 || !tagPattern.test(tag)))
+    throw new Error('Scheduled publication requires a claimed GitHub release and its tag.');
+  return { id, tag, source };
+}
+
 async function claimDraft() {
   const event = defaultBranch();
-  if (!['push', 'schedule'].includes(env.GITHUB_EVENT_NAME))
-    throw new Error('Release requests are processed on default-branch pushes and scheduled runs.');
+  const target = dispatchedRelease(event);
+  if (!target && !['push', 'schedule'].includes(env.GITHUB_EVENT_NAME))
+    throw new Error('Release requests require a default-branch push, scheduled run, or published release event.');
   required('GH_TOKEN');
   if (env.ARIA_RELEASE_ENABLED !== 'true' || env.ARIA_DISTRIBUTION_AUTHORIZED !== 'true')
     throw new Error('The repository has not enabled and authorized production releases.');
   const workflowCommit = commit();
-  const scanAncestors = env.GITHUB_EVENT_NAME === 'schedule' || (sourcePattern.test(event.before) &&
+  const scanAncestors = Boolean(target) || env.GITHUB_EVENT_NAME === 'schedule' || (sourcePattern.test(event.before) &&
     !/^0+$/.test(event.before) && versionAt(event.before) === versionAt(workflowCommit));
   const selected = await claimDraftRequest(github(), {
     versionFor: (source) => source === workflowCommit || (scanAncestors && isAncestor(source, workflowCommit))
       ? releaseVersion(source) : undefined,
-    runId: env.GITHUB_RUN_ID,
+    runId: env.GITHUB_RUN_ID, target,
   });
   if (selected) await outputs(selected);
 }
@@ -197,9 +223,10 @@ function reportPublished(state, tag, version) {
 
 async function prepare(mode) {
   if (!['preview', 'verify', 'publish'].includes(mode)) throw new Error('Select preview, verify, or publish.');
-  const request = { id: Number(env.RELEASE_DRAFT_ID || 0), tag: env.RELEASE_DRAFT_TAG };
+  let request;
   if (mode === 'publish') {
     const event = defaultBranch();
+    request = selectedRelease(event);
     if (env.GITHUB_EVENT_NAME === 'push' && !request.id) {
       if (!sourcePattern.test(event.before) || /^0+$/.test(event.before))
         throw new Error('The previous default branch commit is unavailable. Use manual release dispatch.');
@@ -216,7 +243,7 @@ async function prepare(mode) {
       }
     }
   }
-  const source = releaseSource(env.RELEASE_SOURCE || commit());
+  const source = releaseSource(request?.source ?? (env.RELEASE_SOURCE || commit()));
   const version = releaseVersion(source);
   if (mode === 'publish') {
     const state = await readReleaseState(github());
@@ -471,16 +498,12 @@ export async function publishRelease(api, directory, buildTimestamp, key, now = 
 }
 
 async function publish(directory, buildTimestamp) {
-  defaultBranch();
+  const request = selectedRelease(defaultBranch());
   required('GH_TOKEN');
   if (env.ARIA_RELEASE_ENABLED !== 'true' || env.ARIA_DISTRIBUTION_AUTHORIZED !== 'true')
     throw new Error('The repository has not enabled and authorized production releases.');
-  const id = Number(env.RELEASE_DRAFT_ID || 0);
-  const tag = env.RELEASE_DRAFT_TAG;
-  if (env.GITHUB_EVENT_NAME === 'schedule' && (!Number.isSafeInteger(id) || id <= 0 || !tagPattern.test(tag)))
-    throw new Error('Scheduled publication requires a claimed GitHub release draft and its tag.');
   const result = await publishRelease(github(), directory, buildTimestamp, trustKeys(), new Date(), {
-    id, source: env.RELEASE_SOURCE || commit(), tag, runId: env.GITHUB_RUN_ID,
+    ...request, runId: env.GITHUB_RUN_ID,
   });
   if (result) console.log(`Published ${result.html_url}`);
 }

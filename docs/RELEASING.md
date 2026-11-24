@@ -7,12 +7,12 @@ Aria Release Creator builds and verifies desktop packages on GitHub-hosted runne
 ### From GitHub Releases
 
 1. Open [Aria Releases](https://github.com/manaplatform/Aria/releases) and select **Draft a new release**.
-2. In **Choose a tag**, select an existing calendar tag such as `v2026.11.23.2`. The tag must point to a commit in the history of `main`.
-3. Leave the description and assets empty and select **Save draft** to request automatic publication.
+2. In **Choose a tag**, select an existing calendar tag such as `v2026.11.24.1`, or create a new one targeting `main`. An existing tag must point to a commit in the history of `main`.
+3. Leave the title, description, and assets empty and select **Publish release**. For repositories with immutable releases enabled, select an existing tag and use **Save draft** so Release Creator can finish the release before it becomes immutable.
 
-Release Creator checks for requests on pushes to `main` and every 15 minutes, subject to GitHub Actions scheduling. It builds the tagged commit, sets the title to the application version from that commit's root `package.json`, and links the draft to the workflow. For example, tag `v2026.11.23.2` for Aria 0.0.1 gets the title `v0.0.1`. It publishes the same draft and tag with generated release notes, verified installers, checksums, and update metadata. Keep the draft saved while the workflow is running. [GitHub Actions events](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#release)
+Publishing starts Release Creator on `main` for that release ID, tag, and commit. The workflow builds the tagged commit and fills the same release with the title from its root `package.json`, generated release notes, verified installers, checksums, and update metadata. For example, a tag for Aria 0.1.0 gets the title `v0.1.0`. A public placeholder stays visible while the packages build, then moves to draft for upload and verification before publication.
 
-If a calendar-tagged release was published with an empty title, description, and assets, Release Creator can complete it while it is mutable. It builds and verifies all packages before moving the placeholder to draft for upload and final publication.
+GitHub emits the publish event from the tagged commit, so that commit must include the release trigger. For older tags and saved drafts, Release Creator checks for requests on pushes to `main` and every 15 minutes, subject to GitHub Actions scheduling. Keep a requested draft saved while its linked workflow runs. [GitHub Actions release events](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#release)
 
 Native jobs build the app and use its lockfile from the tagged commit. The release workflow supplies its packaging and verification scripts so fixes to the release tools can be applied to an existing tag.
 
@@ -41,7 +41,7 @@ gh api --method POST repos/manaplatform/Aria/actions/workflows/release.yml/dispa
 JSON
 ```
 
-The application version and calendar tag are independent. If no matching draft exists, the publish job prepares the signed manifest and `SHA256SUMS.txt`, then reserves an annotated UTC tag such as `v2026.11.22`. Additional versions on that UTC date get `-2`, `-3`, and subsequent suffixes. A reservation records the application version and source commit, so retrying after midnight retains the tag. The release title is `v{VERSION}`.
+The application version and calendar tag are independent. If no matching draft exists, the publish job prepares the signed manifest and `SHA256SUMS.txt`, then reserves an annotated UTC tag such as `v2026.11.24`. If that tag is taken, Release Creator uses the first available dotted suffix, starting with `v2026.11.24.1`, then `v2026.11.24.2`, and so on. A reservation records the application version and source commit, so retrying after midnight retains the tag. The release title is `v{VERSION}`.
 
 Release Creator renders the [Markdown template](../scripts/release/release-notes.md) from the tagged source and the verified uploads. Highlights use actual commit subjects, merged PR titles and labels, and Conventional Commits. Empty categories are omitted. Stable notes cover changes since the last stable release with assets on the source branch. Beta notes can also use a previous prerelease with assets. The first release with assets uses repository history. Apply `skip-release-notes` to omit a PR from the highlights. The full changelog remains available through GitHub.
 

@@ -64,7 +64,9 @@ test('allocates UTC date tags and uses only SemVer in the title', () => {
   const local = new Date('2026-11-22T00:30:00+03:30');
   assert.equal(dateTag(local, new Set()), 'v2026.11.21');
   const utc = new Date('2026-11-22T23:00:00Z');
-  assert.equal(dateTag(utc, new Set([tag, tag + '-2', tag + '.1'])), tag + '-3');
+  assert.equal(dateTag(utc, new Set([tag, tag + '-2'])), tag + '.1');
+  assert.equal(dateTag(utc, new Set([tag, tag + '.1'])), tag + '.2');
+  assert.equal(dateTag(utc, new Set([tag, tag + '.1', tag + '.2'])), tag + '.3');
   assert.equal(releaseTitle('0.0.2-beta.1'), 'v0.0.2-beta.1');
 });
 
@@ -89,6 +91,34 @@ test('production preparation skips an unchanged main version and rejects a tag n
   const tag = prepare('refs/tags/main');
   assert.equal(tag.status, 1);
   assert.match(tag.stderr, /require manaplatform\/Aria’s default branch/);
+});
+
+test('published release dispatch cannot prepare another release when its claim is missing or changed', async (t) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'aria-release-dispatch-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const source = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+  const event = path.join(directory, 'event.json');
+  await writeFile(event, JSON.stringify({
+    repository: { default_branch: 'main' },
+    inputs: { mode: 'publish', release_request: JSON.stringify({ id: 23, tag, source }) },
+  }));
+  for (const { id, selectedTag, selectedSource } of [
+    { id: '', selectedTag: '', selectedSource: '' },
+    { id: '24', selectedTag: tag, selectedSource: source },
+    { id: '23', selectedTag: `${tag}.1`, selectedSource: source },
+    { id: '23', selectedTag: tag, selectedSource: 'b'.repeat(40) },
+  ]) {
+    const result = spawnSync(process.execPath,
+      [fileURLToPath(new URL('./run.mjs', import.meta.url)), 'prepare', 'publish'], {
+        encoding: 'utf8', env: {
+          ...process.env, GITHUB_EVENT_PATH: event, GITHUB_EVENT_NAME: 'workflow_dispatch',
+          GITHUB_REPOSITORY: 'manaplatform/Aria', GITHUB_SHA: source, GITHUB_REF: 'refs/heads/main',
+          RELEASE_DRAFT_ID: id, RELEASE_DRAFT_TAG: selectedTag, RELEASE_SOURCE: selectedSource,
+        },
+      });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /requires the same release ID, tag, and commit/);
+  }
 });
 
 test('release identity rejects duplicate precedence and recovers only its own draft', () => {
@@ -253,9 +283,9 @@ test('a same-day remote tag collision restages signed metadata for the new candi
     staged.push(candidate);
     return candidate;
   }, new Date('2026-11-22T11:00:00Z'));
-  assert.deepEqual(staged, [tag, tag + '-2']);
+  assert.deepEqual(staged, [tag, tag + '.1']);
   assert.deepEqual(attempts, staged.map((candidate) => `refs/tags/${candidate}`));
-  assert.deepEqual(result, { tag: tag + '-2', staged: tag + '-2' });
+  assert.deepEqual(result, { tag: tag + '.1', staged: tag + '.1' });
 });
 
 test('partial upload recovery skips matching bytes and verifies a lost upload response', async () => {
@@ -299,7 +329,7 @@ test('a GitHub draft keeps its existing tag and builds from the tagged ancestor'
   (t) => exercisePublication(t, 'schedule'));
 test('an automatic version release fills a matching GitHub draft already waiting for it',
   (t) => exercisePublication(t, 'push'));
-test('a public placeholder stays visible until all packages are ready to upload to its draft',
+test('a publication event fills the same GitHub release with verified assets and notes',
   (t) => exercisePublication(t, 'published'));
 
 async function exercisePublication(t, trigger) {
@@ -309,7 +339,7 @@ async function exercisePublication(t, trigger) {
   const { privateKey, publicKey } = generateKeyPairSync('ed25519');
   const timestamp = '2026-11-22T10:30:00Z';
   const now = new Date('2026-11-22T11:00:00Z');
-  const reserved = tag + (trigger ? '.2' : '-2');
+  const reserved = tag + (trigger ? '.2' : '.1');
   const sample = buildInventory(version)[0].filename;
   const remote = new Map();
   const uploads = [];
@@ -318,7 +348,7 @@ async function exercisePublication(t, trigger) {
   let tagObject;
   let draft = trigger ? {
     id: draftId, draft: trigger !== 'published', tag_name: reserved, target_commitish: 'main',
-    name: '', body: '', immutable: false,
+    name: trigger === 'published' ? reserved : '', body: '', immutable: false,
   } : undefined;
   let taggedCommit = commit;
   let ref;
@@ -427,8 +457,9 @@ async function exercisePublication(t, trigger) {
     },
   };
 
-  const selection = { versionFor: (source) => source === commit ? version : undefined, runId };
   const claim = { id: draftId, source: commit, tag: reserved };
+  const selection = { versionFor: (source) => source === commit ? version : undefined, runId,
+    ...(trigger === 'published' ? { target: claim } : {}) };
   let request = trigger ? { runId } : undefined;
   if (trigger === 'schedule' || trigger === 'published') {
     assert.deepEqual(await claimDraftRequest(api, selection), claim);
@@ -453,15 +484,21 @@ async function exercisePublication(t, trigger) {
   if (trigger === 'published') {
     assert.equal(draft.draft, false);
     assert.equal(draft.body, '');
+    assert.equal(await claimDraftRequest(api, { ...selection, target: { ...claim, id: draftId + 1 } }), undefined);
+    await assert.rejects(() => claimDraftRequest(api, { ...selection, target: { ...claim, source: 'b'.repeat(40) } }),
+      /changed before it could be claimed/);
     draft.name = 'Manual release';
     assert.equal(await claimDraftRequest(api, selection), undefined);
     await assert.rejects(() => publishAt(now), /has no assets/);
-    draft.name = '';
+    draft.name = reserved;
   }
   await writeFile(path.join(output, sample), sample);
   await assert.rejects(() => publishAt(now), /asset verification failed/);
   assert.ok(draft.draft);
-  if (trigger === 'schedule') assert.deepEqual(await claimDraftRequest(api, selection), claim);
+  if (trigger === 'schedule' || trigger === 'published') {
+    assert.deepEqual(await claimDraftRequest(api, selection), claim);
+    assert.equal(await claimDraftRequest(api, { ...selection, runId: '43' }), undefined);
+  }
   const firstUploads = uploads.length;
 
   corrupt = false;
@@ -481,5 +518,6 @@ async function exercisePublication(t, trigger) {
   assert.match(result.body, /self-signed Authenticode certificate/);
   assert.match(result.body, /Full changelog/);
   assert.equal(await publishAt(later), undefined);
+  if (trigger === 'published') assert.equal(await claimDraftRequest(api, selection), undefined);
   assert.equal(uploads.length, firstUploads + 1);
 }
