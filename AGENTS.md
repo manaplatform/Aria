@@ -127,6 +127,10 @@ When implementing AI features:
 - Require trusted user authorization for consequential browser actions. Apply public-network policy to page retrieval and Chromium egress. Keep personal sessions and credentials outside AI tool access.
 - Preserve conversation and settings data, and verify actual built macOS and Windows behavior when changing browser or process boundaries.
 - Update architecture, permissions, and test documentation when these boundaries change. Preserve third-party notices and add the standard MIT license and package metadata only after confirming authority to license the first-party work.
+- Let the primary choose independently between public search, credential-free HTTP retrieval, and rendered browsing. Accept authorized URL and bare-domain inputs directly. Scope opaque source, tab, and document references to completed producers in the current execution generation.
+- Return usable DOM evidence when ancillary assets are still loading. Correlate browser phases and cancellation with the owning operation and document. Bound HTTP redirects, bodies, and requests with the same public-address policy as browser egress.
+- Distinguish public entities from integration availability. Use actual evidence, active budgets, and structured failures to decide when to continue. Require an explicit, eligible retry for an unchanged failed research operation and verify consequential effects before reporting completion.
+- Keep discovered, inspected, partial, and metadata-only evidence distinguishable. Retain source and freshness information with the conversation. Use approved memory writes when the user requests persistent research memory. Test ordinary chat, direct browsing, and grounded news and site audits on deterministic sites, with public sites and live models available as opt-in checks.
 
 ## Conductor tools and skills
 

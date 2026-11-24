@@ -59,7 +59,7 @@ function matchScore(words: Set<string>, tokens: Set<string>) {
       score += 3;
       continue;
     }
-    if (word.length >= 3 && list.some((token) => token.startsWith(word) || word.startsWith(token)))
+    if (word.length >= 3 && list.some((token) => token.length >= 3 && (token.startsWith(word) || word.startsWith(token))))
       score += 1;
   }
   return score;
@@ -72,7 +72,10 @@ export class CapabilityTurn {
   private readonly selectedModels = new Map<string, Set<string>>();
   private readonly skills = new Set<string>();
   private readonly skillPages = new Map<string, NonNullable<Awaited<ReturnType<ToolRegistry['host']['request']>>>>();
-  private readonly searches = new Map<string, { items: unknown[]; nextOffset?: number }>();
+  private readonly searches = new Map<string, {
+    items: ({ id: string; name: string; available: boolean; reason?: string } | undefined)[];
+    nextOffset?: number;
+  }>();
   private delegateSnapshot?: ReturnType<ToolRegistry['delegates']>;
   progress = 0;
 
@@ -181,7 +184,7 @@ export class CapabilityTurn {
     name: string,
     raw: unknown,
     callId: string,
-  ): Promise<{ value: object; error?: ToolError; unavailable?: boolean }> {
+  ): Promise<{ value: object; error?: ToolError; unavailable?: boolean; availabilityOnly?: boolean }> {
     const stepId = randomUUID();
     const skill = name === 'load_skill' || name === 'read_skill_resource';
     const summary = skill
@@ -217,22 +220,34 @@ export class CapabilityTurn {
       this.context.budget.control();
       if (this.discoveryProblem) throw this.discoveryProblem;
       let value: object;
+      let availabilityOnly = false;
       if (name === 'find_capabilities') {
         const query = findInput.parse(raw);
         const found = await this.find(query);
         if (query.ids?.length && !query.offset && !query.modelOffset &&
-          !found.items.length && found.nextOffset === undefined) {
-          const message = this.registry.discoveryProblem(query.ids, this.context);
+          !found.items.some((item) => item?.available) && found.nextOffset === undefined) {
+          const message = found.items.flatMap((item) =>
+            item?.available === false && item.reason ? [item.reason] : []).join(' ').slice(0, 400) ||
+            this.registry.discoveryProblem(query.ids, this.context);
           const error = new ToolError('CAPABILITY_UNAVAILABLE', message);
           activity('failed', message);
-          return { value: { ...found, error: { code: error.code, message } }, error, unavailable: true };
+          return { value: { ...found, error: { code: error.code, message } }, error, unavailable: true, availabilityOnly: true };
         }
+        availabilityOnly = found.items.length > 0 && !found.items.some((item) => item?.available);
+        const requestedName = query.query.trim().toLowerCase();
+        availabilityOnly ||= found.items.some((item) => item?.available === false &&
+          (item.name.toLowerCase() === requestedName || item.id.toLowerCase() === requestedName));
         value = found;
         resultSummary = 'Capability metadata returned';
       } else if (name === this.protocol.name) {
-        const loaded = await this.load(this.protocol.selection(raw, callId));
+        const requested = this.protocol.selection(raw, callId);
+        const loaded = await this.load(requested);
         resultSummary = `${loaded.length} definitions loaded`;
         value = this.protocol.result(loaded.map((descriptor) => this.definition(descriptor)));
+        const skipped = requested.filter((id) => !this.loaded.has(this.registry.wireName(id)));
+        if (skipped.length && this.protocol.resultFormat === 'text') value = {
+          ...value, skipped: skipped.map((id) => ({ id, reason: this.registry.discoveryProblem([id], this.context) })),
+        };
       } else if (skill) {
         const reference =
           name === 'load_skill' ? skillRefSchema.parse(raw) : resourcesInput.parse(raw);
@@ -248,7 +263,7 @@ export class CapabilityTurn {
         throw new ToolError('CAPABILITY_UNAVAILABLE', 'This discovery operation is unavailable.');
       }
       activity('completed');
-      return { value };
+      return { value, availabilityOnly };
     } catch (failure) {
       this.signal.throwIfAborted();
       const error =
@@ -282,7 +297,7 @@ export class CapabilityTurn {
     const cached = this.searches.get(key);
     if (cached) return cached;
     const words = terms(query.query);
-    const includeUnavailable = !query.ids?.length && query.includeUnavailable !== false;
+    const includeUnavailable = query.includeUnavailable !== false;
     const scored = [
       ...(query.kind === 'skills' ? [] : this.registry.cards(this.context, includeUnavailable)),
       ...(query.kind === 'tools'
@@ -361,7 +376,7 @@ export class CapabilityTurn {
         const isNew = !this.discovered.has(card.id);
         this.discovered.add(card.id);
         if (descriptor) this.discoveredTools.set(card.id, descriptor);
-        if (isNew) this.progress++;
+        if (isNew && (descriptor || card.namespace === 'skills')) this.progress++;
         return card;
       }),
     );

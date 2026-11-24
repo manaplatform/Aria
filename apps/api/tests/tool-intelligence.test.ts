@@ -509,7 +509,8 @@ it('rejects an unavailable exact tool from discovery without loading it', async 
   expect(events.at(-1)).toMatchObject({
     type: 'failed', settingsHelp: true, problem: { code: 'CAPABILITY_UNAVAILABLE' },
   });
-  expect(fixture.received).toHaveLength(2);
+  expect(fixture.received).toHaveLength(3);
+  expect(fixture.received[2].body.messages[0].content).toContain('recoverable discovery');
 });
 
 it('rejects a spending-capped turn before sending an unpriced model request', async () => {

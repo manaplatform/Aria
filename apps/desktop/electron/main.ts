@@ -50,6 +50,7 @@ import {
   computerSupervision,
   computerUserInput,
   webSettingsInputSchema,
+  webBudgetKeySchema,
   connectionInputSchema,
   endActivity,
   identifier,
@@ -313,7 +314,7 @@ const toolList = z
           parallelDelegate: z.boolean().optional(),
           citations: z.boolean().optional(),
           artifacts: z.boolean().optional(),
-          budget: z.enum(['searches', 'fetches', 'screenshots']).optional(),
+          budget: webBudgetKeySchema.optional(),
           requiredModelCapabilities: z.array(z.string().max(40)).max(8).optional(),
         })
         .optional(),

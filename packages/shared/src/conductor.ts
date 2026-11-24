@@ -53,7 +53,7 @@ export const conductorLimits = {
   primaryCalls: 12,
   controlCalls: 16,
   activity: 36,
-  steps: 12,
+  steps: 32,
   parallel: 3,
   turns: 4,
   searches: webPolicyLimits.searches.default,
@@ -154,7 +154,10 @@ export const sourceSchema = z
     publishedAt: z.iso.datetime().optional(),
     retrievedAt: z.iso.datetime().optional(),
     contentType: z.string().max(100).optional(),
-    provenance: z.enum(['hosted', 'publisher', 'browser']).optional(),
+    provenance: z.enum(['hosted', 'publisher', 'browser', 'search']).optional(),
+    producerStepId: stepId.optional(),
+    evidenceStatus: z.enum(['discovered', 'inspected', 'partial', 'metadata']).optional(),
+    excerpt: z.string().max(500).optional(),
   })
   .strict();
 export const artifactReferenceSchema = z
@@ -196,6 +199,10 @@ export const activitySchema = z
     outcomeUnverified: z.boolean().optional(),
     at: z.number().int().nonnegative(),
     durationMs: z.number().int().nonnegative().optional(),
+    operationTarget: z.string().max(253).optional(),
+    phase: z.string().max(40).optional(),
+    failureCategory: z.string().max(40).optional(),
+    retryEligible: z.boolean().optional(),
     error: z.string().max(400).optional(),
     resultId: z.string().uuid().optional(),
     sources: z.array(sourceSchema).max(8).optional(),
@@ -228,6 +235,12 @@ export const runInfoSchema = z
       recoveries: z.number().int().nonnegative().optional(),
       noProgress: z.boolean().optional(),
       activeMs: z.number().int().nonnegative().optional(),
+      searches: z.number().int().nonnegative().optional(),
+      fetches: z.number().int().nonnegative().optional(),
+      navigations: z.number().int().nonnegative().optional(),
+      inspections: z.number().int().nonnegative().optional(),
+      screenshots: z.number().int().nonnegative().optional(),
+      validationFailures: z.number().int().nonnegative().optional(),
     }).optional(),
   })
   .strict();

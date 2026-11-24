@@ -24,6 +24,9 @@ const nativeModes: { id: OpenAIRuntimeFeature; label: string }[] = [
 
 const loopFields: { name: keyof LoopLimits; label: string; min: number; max: number; scale?: number }[] = [
   { name: 'iterations', label: 'Maximum model requests', min: 2, max: 48 },
+  { name: 'steps', label: 'Maximum tool attempts', min: 4, max: 32 },
+  { name: 'inputTokens', label: 'Maximum input tokens', min: 8192, max: 600_000 },
+  { name: 'outputTokens', label: 'Maximum output tokens', min: 4096, max: 65_536 },
   { name: 'activeMs', label: 'Maximum active time (seconds)', min: 10, max: 1800, scale: 1000 },
   { name: 'concurrency', label: 'Concurrent operations', min: 1, max: 6 },
   { name: 'toolMs', label: 'Maximum tool time (seconds)', min: 1, max: 181, scale: 1000 },

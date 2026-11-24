@@ -1,5 +1,22 @@
 import type { ChatEvent, ChatMessage } from './index.js';
-import { conductorLimits, endActivity } from './conductor.js';
+import { conductorLimits, endActivity, type ConductorSource } from './conductor.js';
+
+const evidenceRanks = { discovered: 0, metadata: 1, partial: 2, inspected: 3 };
+
+function mergeSources(previous: ConductorSource[], incoming: ConductorSource[]) {
+  const byUrl = new Map(previous.map((source) => [source.url, source]));
+  for (const source of incoming) {
+    const prior = byUrl.get(source.url);
+    if (!prior) {
+      byUrl.set(source.url, source);
+      continue;
+    }
+    if (evidenceRanks[source.evidenceStatus ?? 'inspected'] < evidenceRanks[prior.evidenceStatus ?? 'inspected'])
+      continue;
+    byUrl.set(source.url, { ...source, publishedAt: source.publishedAt ?? prior.publishedAt });
+  }
+  return [...byUrl.values()].slice(0, conductorLimits.steps * 8);
+}
 
 export function generating(message: ChatMessage) {
   return message.status === 'pending' || message.status === 'streaming';
@@ -52,14 +69,7 @@ export function projectChatEvent(item: ChatMessage, event: ChatEvent): ChatMessa
     const citations =
       sources?.length || evidence?.length
         ? {
-            sources: [
-              ...new Map(
-                [...(next.citations?.sources ?? []), ...(sources ?? [])].map((source) => [
-                  source.url,
-                  source,
-                ]),
-              ).values(),
-            ].slice(0, conductorLimits.steps * 8),
+            sources: mergeSources(next.citations?.sources ?? [], sources ?? []),
             evidence: [
               ...new Map(
                 [...(next.citations?.evidence ?? []), ...(evidence ?? [])].map((item) => [

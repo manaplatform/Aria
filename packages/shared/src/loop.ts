@@ -3,6 +3,9 @@ import { identifier } from './model-registry.js';
 
 export const loopLimitsSchema = z.strictObject({
   iterations: z.number().int().min(2).max(48),
+  steps: z.number().int().min(4).max(32).default(20),
+  inputTokens: z.number().int().min(8192).max(600_000).default(600_000),
+  outputTokens: z.number().int().min(4096).max(65_536).default(65_536),
   activeMs: z.number().int().min(10_000).max(1_800_000),
   concurrency: z.number().int().min(1).max(6),
   toolMs: z.number().int().min(1_000).max(181_000),
@@ -12,6 +15,9 @@ export const loopLimitsSchema = z.strictObject({
 export type LoopLimits = z.infer<typeof loopLimitsSchema>;
 export const defaultLoopLimits: LoopLimits = {
   iterations: 12,
+  steps: 20,
+  inputTokens: 600_000,
+  outputTokens: 65_536,
   activeMs: 300_000,
   concurrency: 3,
   toolMs: 181_000,
@@ -86,6 +92,9 @@ export const loopBudgetSchema = z.strictObject({
   searches: counter,
   fetches: counter,
   screenshots: counter,
+  navigations: counter.optional(),
+  inspections: counter.optional(),
+  validationFailures: counter.optional(),
 });
 export type LoopBudget = z.infer<typeof loopBudgetSchema>;
 
@@ -94,6 +103,15 @@ export const loopReceiptSchema = z.strictObject({
   operation: identifier,
   state: z.enum(['pending', 'completed', 'failed', 'uncertain', 'blocked']),
   evidenceIds: z.array(z.uuid()).max(6).optional(),
+  durationMs: counter.optional(),
+  fingerprint: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+  failureCategory: z.string().max(40).optional(),
+  phase: z.string().max(40).optional(),
+  retryEligible: z.boolean().optional(),
+  retryAt: counter.optional(),
+  attemptCount: z.number().int().min(1).max(32).optional(),
+  sourceId: z.uuid().optional(),
+  dependencyState: z.enum(['ready', 'invalid', 'none']).optional(),
 });
 export const loopCheckpointSchema = executionIdentitySchema.extend({
   version: z.literal(1),

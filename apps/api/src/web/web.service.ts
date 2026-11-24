@@ -3,9 +3,11 @@ import { randomUUID } from 'node:crypto';
 import {
   browserSearchResultsSchema,
   defaultWebPolicy,
+  normalizeWebDestination,
   publicWebUrl,
   runtimeWebSchema,
   sourceSchema,
+  webFetchResultSchema,
   type BrowserBridgeOp,
   type ChatRequest,
   type ConductorSource,
@@ -15,12 +17,13 @@ import {
 } from '@aria/shared';
 import { ToolError } from '../conductor/capability-host';
 import { RunError, type RunFile } from '../conductor/run-assets';
-import { BrowserPortClient } from './browser-port.client';
+import { BrowserPortClient, type BrowserProgress } from './browser-port.client';
 
 type ResearchResult = {
   text?: string;
   file?: RunFile;
   sources?: ConductorSource[];
+  references?: ConductorSource[];
   data?: Record<string, unknown>;
 };
 type ResearchContext = Pick<ChatRequest, 'requestId' | 'conversationId' | 'messages'>;
@@ -33,19 +36,13 @@ const nonDomainExtensions = new Set([
   'tar', 'gz', 'log', 'lock', 'sh', 'env', 'sql', 'db', 'sqlite',
 ]);
 
-function normalized(url: string) {
-  const address = new URL(url);
-  address.hash = '';
-  return address.href;
-}
-
 function trimCandidateUrl(raw: string) {
-  let candidate = raw.replace(/[.,;:!?'"*~\]}]+$/, '');
+  let candidate = raw.replace(/[.,;:!?'"*~،؛؟»\]}]+$/, '');
   while (candidate.endsWith(')')) {
     const opens = (candidate.match(/\(/g) ?? []).length;
     const closes = (candidate.match(/\)/g) ?? []).length;
     if (closes <= opens) break;
-    candidate = candidate.slice(0, -1).replace(/[.,;:!?'"*~\]}]+$/, '');
+    candidate = candidate.slice(0, -1).replace(/[.,;:!?'"*~،؛؟»\]}]+$/, '');
   }
   return candidate;
 }
@@ -72,51 +69,35 @@ export class ResearchRun {
   private readonly sources = new Map<string, { url: string; producer: string }>();
   private readonly documents = new Map<string, Document>();
   private readonly browserRefs = new Map<string, Set<string>>();
-  private readonly userMessages: string[];
+  private readonly userUrls = new Set<string>();
+  private readonly userOrigins = new Set<string>();
   constructor(
     private readonly request: ResearchContext,
     readonly policy: RuntimeWeb,
     private readonly browser?: BrowserPortClient,
   ) {
-    this.userMessages = request.messages
-      .filter((message) => message.role === 'user' && typeof message.content === 'string')
-      .map((message) => message.content);
+    for (const message of request.messages)
+      if (message.role === 'user' && typeof message.content === 'string')
+        this.observeUserMessage(message.content);
   }
 
   observeUserMessage(content: string) {
-    if (typeof content === 'string' && content.trim()) this.userMessages.push(content);
-  }
-
-  private hasUserUrl(targetUrl: string) {
-    for (const content of this.userMessages) {
-      const requestText = content
-        .split(/\r?\n/)
-        .filter((line) => !line.trimStart().startsWith('>'))
-        .join('\n');
-      for (const token of requestText.matchAll(/https?:\/\/[^\s<>"`]+/gi)) {
-        const candidate = trimCandidateUrl(token[0]);
-        try {
-          if (normalized(candidate) === targetUrl) return true;
-        } catch {
-          /* Invalid URL. */
-        }
-      }
-      for (const match of requestText.matchAll(
-        /(?:^|[\s(<"'`\[])((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}(?:\/[^\s<>"`\]}]+)?)/gi,
-      )) {
-        const raw = trimCandidateUrl(match[1]);
-        const host = raw.split('/', 1)[0].toLowerCase();
-        const tld = host.slice(host.lastIndexOf('.') + 1);
-        if (!raw.includes('/') && nonDomainExtensions.has(tld)) continue;
-        try {
-          const parsed = publicWebUrl(`https://${raw}`);
-          if (normalized(parsed.href) === targetUrl) return true;
-        } catch {
-          /* Invalid domain candidate. */
-        }
-      }
+    const requestText = content.split(/\r?\n/).filter((line) => !line.trimStart().startsWith('>')).join('\n');
+    const add = (raw: string) => {
+      try {
+        const url = normalizeWebDestination(trimCandidateUrl(raw));
+        this.userUrls.add(url);
+        this.userOrigins.add(new URL(url).origin);
+      } catch { /* Ignore text that is not an eligible destination. */ }
+    };
+    for (const token of requestText.matchAll(/https?:\/\/[^\s<>"`]+/gi)) add(token[0]);
+    for (const match of requestText.matchAll(
+      /(?:^|[\s(<"'`\[])((?:[\p{L}\p{N}-]+\.)+[\p{L}][\p{L}\p{N}-]+(?:[/?#][^\s<>"`\]}]*)?)/giu,
+    )) {
+      const domain = match[1].split(/[/?#]/, 1)[0].toLowerCase();
+      if (domain === match[1].toLowerCase() && nonDomainExtensions.has(domain.split('.').at(-1)!)) continue;
+      add(match[1]);
     }
-    return false;
   }
 
   get native() {
@@ -129,40 +110,80 @@ export class ResearchRun {
 
   observeSources(sources: ConductorSource[], producer: string) {
     for (const source of sources) {
+      if (!sourceSchema.safeParse(source).success) continue;
+      try { publicWebUrl(source.url); } catch { continue; }
       source.id ??= randomUUID();
+      source.producerStepId = producer;
       this.sources.set(source.id, { url: source.url, producer });
     }
   }
 
-  destination(args: Record<string, unknown>, dependsOn: string[]) {
+  destination(args: Record<string, unknown>, dependsOn: string[], siteResource = false) {
     if (typeof args.sourceId === 'string') {
       const source = this.sources.get(args.sourceId);
       if (source) {
         if (dependsOn.includes(source.producer)) return source.url;
-        throw new RunError(
+        throw new ToolError('INVALID_REFERENCE',
           `Declare the source dependency with \`dependsOn: ["${source.producer}"]\` to access this result.`,
+          'MISSING_DEPENDENCY',
         );
       }
+      throw new ToolError('INVALID_REFERENCE', 'This source reference is unavailable in the current execution. Select a source returned by a completed tool.', 'SOURCE_UNAVAILABLE');
     }
     if (typeof args.url === 'string') {
-      const url = normalized(args.url);
+      const url = normalizeWebDestination(args.url);
+      if (this.userUrls.has(url)) return url;
       let missingProducer: string | undefined;
       for (const source of this.sources.values()) {
-        if (normalized(source.url) === url) {
+        if (normalizeWebDestination(source.url) === url) {
           if (dependsOn.includes(source.producer)) return url;
           missingProducer ??= source.producer;
         }
       }
-      if (this.hasUserUrl(url)) return url;
+      const address = new URL(url);
+      if (siteResource && !address.search && !address.hash && ['/robots.txt', '/sitemap.xml'].includes(address.pathname) &&
+          (this.userOrigins.has(address.origin) || [...this.sources.values()].some((source) =>
+            dependsOn.includes(source.producer) && new URL(source.url).origin === address.origin))) return url;
       if (missingProducer) {
-        throw new RunError(
+        throw new ToolError('INVALID_REFERENCE',
           `Declare the source dependency with \`dependsOn: ["${missingProducer}"]\` to access this URL.`,
+          'MISSING_DEPENDENCY',
         );
       }
     }
-    throw new RunError(
-      'Use the user’s URL or a source from a declared dependency (`dependsOn: ["<stepId>"]`). If you only have a topic or question, run web_search with a query first.',
+    throw new ToolError('INVALID_REFERENCE',
+      'Use an exact user-provided destination or a source returned by a completed dependency.',
+      'DESTINATION_UNVERIFIED',
     );
+  }
+
+  preflight(op: ResearchToolId, args: Record<string, unknown>, step: ExecutionStep) {
+    if (op === 'web_read' || op === 'web_find') {
+      const entry = this.documents.get(String(args.documentId));
+      if (!entry || !step.dependsOn.includes(entry.producer))
+        throw new ToolError('INVALID_REFERENCE', entry
+          ? `Declare the fetch dependency with dependsOn: ["${entry.producer}"] to access this document.`
+          : 'Reference a document from a completed fetch in this execution.',
+          entry ? 'MISSING_DEPENDENCY' : 'DOCUMENT_UNAVAILABLE');
+      return args;
+    }
+    for (const id of [args.tabId, args.documentId, args.elementId].filter(
+      (value): value is string => typeof value === 'string',
+    )) {
+      const producers = this.browserRefs.get(id);
+      if (!producers || !step.dependsOn.some((dependency) => producers.has(dependency)))
+        throw new ToolError('INVALID_REFERENCE', producers?.size
+          ? `Declare the producing step dependency with dependsOn: ["${[...producers].at(-1)}"] to reference this browser target.`
+          : 'Reference a browser tab, page, or element returned by a completed dependency.',
+          producers ? 'MISSING_DEPENDENCY' : 'BROWSER_REFERENCE_UNAVAILABLE');
+    }
+    if (op === 'browser_open' || op === 'browser_navigate' || op === 'web_fetch')
+      return {
+        ...(typeof args.tabId === 'string' && { tabId: args.tabId }),
+        url: this.destination(args, step.dependsOn, op === 'web_fetch'),
+        ...(op === 'web_fetch' && { method: args.method ?? 'GET' }),
+      };
+    return args;
   }
 
   private async browse(
@@ -170,7 +191,7 @@ export class ResearchRun {
     args: Record<string, unknown>,
     step: ExecutionStep,
     signal: AbortSignal,
-    approval?: () => void,
+    progress?: (phase: BrowserProgress) => void,
   ) {
     if (!this.native || !this.browser)
       throw new RunError('Allow Aria to search and browse in Settings → Web & Browser.');
@@ -183,21 +204,21 @@ export class ResearchRun {
         args,
       },
       signal,
-      ...(approval ? [approval] : []),
+      ...(progress ? [progress] : []),
     );
     if (!result.ok) {
-      const code =
-        result.code === 'DUPLICATE_DISPATCH'
-          ? result.code
-          : result.code.startsWith('APPROVAL')
-            ? 'PERMISSION_DENIED'
-            : 'EXECUTION_FAILED';
-      throw new ToolError(code, result.message);
+      const code = result.code === 'DUPLICATE_DISPATCH' || result.code === 'TIMEOUT'
+        ? result.code
+        : result.code.startsWith('APPROVAL') || result.code === 'DESTINATION_BLOCKED'
+          ? 'PERMISSION_DENIED'
+          : ['RUN_UNAVAILABLE', 'UNAVAILABLE', 'TAB_UNAVAILABLE'].includes(result.code)
+            ? 'CAPABILITY_UNAVAILABLE' : 'EXECUTION_FAILED';
+      throw new ToolError(code, result.message, result.code, result.phase, result.retryAfterMs);
     }
     return result;
   }
 
-  private pageSource(url: string, title?: string) {
+  private pageSource(url: string, title?: string, fields?: Partial<ConductorSource>) {
     return sourceSchema.parse({
       id: randomUUID(),
       url,
@@ -206,6 +227,7 @@ export class ResearchRun {
       retrievedAt: new Date().toISOString(),
       provenance: 'browser',
       contentType: 'text/html',
+      ...fields,
     });
   }
 
@@ -214,37 +236,46 @@ export class ResearchRun {
     args: Record<string, unknown>,
     step: ExecutionStep,
     signal: AbortSignal,
-    approval?: () => void,
+    progress?: (phase: BrowserProgress) => void,
   ): Promise<ResearchResult> {
     try {
+      const dispatch = this.preflight(op, args, step);
       if (op === 'web_search') {
-        const response = await this.browse(op, args, step, signal, approval);
+        const response = await this.browse(op, dispatch, step, signal, progress);
         const { results } = browserSearchResultsSchema.parse(JSON.parse(response.text));
         const seen = new Set<string>();
+        const sources: ConductorSource[] = [];
         const links = results.flatMap(({ url: raw, title, snippet }) => {
-          const url = normalized(raw);
+          let url: string;
+          try { url = publicWebUrl(raw).href; } catch { return []; }
           if (seen.has(url)) return [];
           seen.add(url);
-          const sourceId = randomUUID();
-          this.sources.set(sourceId, { url, producer: step.id });
-          return [{ sourceId, url, title, ...(snippet ? { snippet } : {}) }];
+          const source = this.pageSource(url, title, {
+            provenance: 'search', contentType: undefined, evidenceStatus: 'discovered', excerpt: snippet,
+          });
+          sources.push(source);
+          return [{ sourceId: source.id!, producerStepId: step.id, url, title, ...(snippet ? { snippet } : {}) }];
         });
-        return { data: { status: links.length ? 'results' : 'no_results', results: links } };
+        this.observeSources(sources, step.id);
+        return { sources, data: { status: links.length ? 'results' : 'no_results', results: links } };
       }
       if (op === 'web_fetch') {
-        const url = this.destination(args, step.dependsOn);
-        const result = await this.browse(op, { url }, step, signal, approval);
-        const page: unknown = JSON.parse(result.text);
-        const text =
-          page && typeof page === 'object' && 'text' in page && typeof page.text === 'string'
-            ? page.text
-            : '';
-        if (!result.url || !text.trim()) throw new RunError('The page contained no readable text.');
-        const source = this.pageSource(result.url, result.title);
+        const result = await this.browse(op, dispatch, step, signal, progress);
+        const page = webFetchResultSchema.parse(JSON.parse(result.text));
+        const { text, title, metadata, links, ...summary } = page;
+        const source = this.pageSource(page.url, title, {
+          provenance: 'publisher', contentType: page.headers['content-type']?.slice(0, 100),
+          evidenceStatus: text ? page.truncated ? 'partial' : 'inspected' : 'metadata',
+          publishedAt: this.publication(metadata?.published),
+          excerpt: text?.slice(0, 500),
+        });
         this.observeSources([source], step.id);
-        const documentId = randomUUID();
-        this.documents.set(documentId, { producer: step.id, text, source });
-        return { data: { documentId, source, preview: text.slice(0, 1000) }, sources: [source] };
+        const documentId = text ? randomUUID() : undefined;
+        if (documentId && text) this.documents.set(documentId, { producer: step.id, text, source });
+        const references = this.linkSources(links ?? [], step.id);
+        return { data: {
+          ...summary, metadata, documentId, source, preview: text?.slice(0, 2000), links,
+        }, sources: [source], references };
       }
       if (op === 'web_read' || op === 'web_find') {
         const entry = this.documents.get(String(args.documentId));
@@ -267,43 +298,26 @@ export class ResearchRun {
         }
         return { data: { matches, source: entry.source }, sources: [entry.source] };
       }
-      for (const id of [args.tabId, args.documentId, args.elementId].filter(
-        (value): value is string => typeof value === 'string',
-      )) {
-        const producers = this.browserRefs.get(id);
-        if (!producers || !step.dependsOn.some((dependency) => producers.has(dependency)))
-          throw new RunError(
-            producers?.size
-              ? `Declare the producing step dependency with \`dependsOn: ["${[...producers][0]}"]\` to reference this browser target.`
-              : 'Reference a browser tab, page or element from a successful dependency.',
-          );
-      }
-      let browserArgs = args;
-      if (op === 'browser_open' || op === 'browser_navigate')
-        browserArgs = {
-          ...(args.tabId ? { tabId: args.tabId } : {}),
-          url: this.destination(args, step.dependsOn),
-        };
-      const result = await this.browse(op, browserArgs, step, signal, approval);
+      const result = await this.browse(op, dispatch, step, signal, progress);
       const json = JSON.parse(result.text) as Record<string, unknown>;
+      signal.throwIfAborted();
       this.observeBrowserRefs(json, step.id);
-      let sources: ConductorSource[] | undefined;
-      if (op === 'browser_extract' && result.url) {
-        sources = [this.pageSource(result.url, result.title)];
-        this.observeSources(sources, step.id);
-      }
-      if (Array.isArray(json.elements))
-        for (const item of json.elements) {
-          const link = sourceSchema.safeParse({ title: '', url: item.href });
-          if (link.success) {
-            link.data.id = randomUUID();
-            this.observeSources([link.data], step.id);
-            item.sourceId = link.data.id;
-          }
-        }
+      const sources = result.url && ['browser_get_page', 'browser_extract'].includes(op)
+        ? [this.pageSource(result.url, result.title, {
+            evidenceStatus: json.phase === 'partial' ? 'partial' : 'inspected',
+            excerpt: typeof json.text === 'string' ? json.text.slice(0, 500) : undefined,
+            publishedAt: this.publication((json.metadata as { published?: unknown } | undefined)?.published),
+          })]
+        : undefined;
+      if (sources) this.observeSources(sources, step.id);
+      const references = this.linkSources([
+        ...(Array.isArray(json.elements) ? json.elements : []),
+        ...(Array.isArray(json.links) ? json.links : []),
+      ], step.id);
       return {
         data: json,
         sources,
+        references,
         file: result.screenshot
           ? {
               name: 'aria-browser.png',
@@ -317,6 +331,34 @@ export class ResearchRun {
       if (signal.aborted) throw error;
       throw new RunError('The web operation did not return a usable response.');
     }
+  }
+
+  private publication(values: unknown) {
+    if (!Array.isArray(values)) return undefined;
+    for (const value of values) {
+      if (typeof value !== 'string' || !/^\d{4}-\d\d-\d\dT.*(?:Z|[+-]\d\d:\d\d)$/.test(value)) continue;
+      const parsed = Date.parse(value);
+      if (Number.isFinite(parsed)) return new Date(parsed).toISOString();
+    }
+  }
+
+  private linkSources(values: { href?: unknown; label?: unknown; sourceId?: string; producerStepId?: string }[], stepId: string) {
+    const references: ConductorSource[] = [];
+    for (const item of values.slice(0, 48)) {
+      if (!item || typeof item.href !== 'string') continue;
+      let url: string;
+      try { url = publicWebUrl(item.href).href; } catch { continue; }
+      const known = references.find((source) => source.url === url);
+      if (!known && references.length === 24) continue;
+      const source = known ?? this.pageSource(url, typeof item.label === 'string' ? item.label : undefined, {
+        evidenceStatus: 'discovered', contentType: undefined,
+      });
+      if (!known) references.push(source);
+      item.sourceId = source.id;
+      item.producerStepId = stepId;
+    }
+    this.observeSources(references, stepId);
+    return references;
   }
 
   private observeBrowserRefs(item: unknown, step: string) {

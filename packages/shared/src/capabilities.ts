@@ -7,6 +7,7 @@ import {
 import { identifier } from './model-registry.js';
 import { programSettingsSchema, type ProgramSettings } from './programmatic.js';
 import { loopCheckpointSchema, loopLimitsSchema } from './loop.js';
+import type { webBudgetKeySchema } from './web.js';
 
 export const capabilityId = z
   .string()
@@ -101,7 +102,7 @@ export interface ToolConstraints {
   parallelDelegate?: boolean;
   citations?: boolean;
   artifacts?: boolean;
-  budget?: 'searches' | 'fetches' | 'screenshots';
+  budget?: z.infer<typeof webBudgetKeySchema>;
   requiredModelCapabilities?: string[];
 }
 export interface ToolSummary {
@@ -163,6 +164,7 @@ export const toolProblemSchema = z.strictObject({
     'INVALID_REFERENCE',
   ]),
   message: z.string().max(2000),
+  category: z.string().max(40).optional(),
 });
 export type ToolProblem = z.infer<typeof toolProblemSchema>;
 

@@ -11,7 +11,7 @@ import { errorMessage } from '../../services/desktop';
 
 const toggles = [
   ['enabled', 'Web access'],
-  ['aiBrowser', 'Allow Aria to search and browse'],
+  ['aiBrowser', 'Allow Aria to search, fetch, and browse'],
   ['addressSearch', 'Search the web from the address bar'],
   ['persistentSiteData', 'Keep personal cookies and site data'],
   ['history', 'Save personal browsing history'],
@@ -91,6 +91,8 @@ export function WebBrowserSettings() {
           [
             ['searches', 'Searches per turn', webPolicyLimits.searches.max],
             ['fetches', 'Pages fetched per turn', webPolicyLimits.fetches.max],
+            ['navigations', 'Browser navigations per turn', webPolicyLimits.navigations.max],
+            ['inspections', 'Browser inspections per turn', webPolicyLimits.inspections.max],
             ['screenshots', 'Screenshots per turn', webPolicyLimits.screenshots.max],
           ] as const
         ).map(([name, label, max]) => (

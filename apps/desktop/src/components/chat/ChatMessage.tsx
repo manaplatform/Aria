@@ -13,6 +13,26 @@ import { ArtifactCard } from './ArtifactCard';
 import { DocumentEvidence } from './DocumentEvidence';
 import { MediaPreview } from './MediaPreview';
 
+const phaseLabels: Record<string, string> = {
+  initializing: 'Starting',
+  navigating: 'Opening page',
+  dom_available: 'Page available',
+  ready: 'Ready',
+  partial: 'Page partly loaded',
+  inspecting: 'Reading page',
+  navigation_failed: 'Navigation failed',
+  timed_out: 'Timed out',
+  unavailable: 'Tab unavailable',
+  cancelled: 'Cancelled',
+  closed: 'Tab closed',
+};
+
+function activityLabel(step: ConductorActivity) {
+  const label = step.phase && phaseLabels[step.phase];
+  const summary = step.status === 'running' && label ? label : step.summary;
+  return step.operationTarget ? `${summary} · ${step.operationTarget}` : summary;
+}
+
 function ActivityRow({ step, children }: {
   step: ConductorActivity;
   children?: React.ReactNode;
@@ -20,11 +40,11 @@ function ActivityRow({ step, children }: {
   return (
     <li>
       <span>
-        {step.summary} · {step.status === 'approval' ? 'Waiting for approval' :
+        {activityLabel(step)} · {step.status === 'approval' ? 'Waiting for approval' :
           step.outcomeUnverified ? 'Submitted' : step.programStatus ?? step.status}
       </span>
       <small>
-        {step.target}
+        {!step.operationTarget && step.target}
         {step.durationMs !== undefined ? ` · ${(step.durationMs / 1000).toFixed(1)} s` : ''}
       </small>
       {step.inputSummary && <small>{step.inputSummary}</small>}
@@ -36,6 +56,12 @@ function ActivityRow({ step, children }: {
         </details>
       )}
       {step.error && <small>{step.error}</small>}
+      {step.failureCategory && (
+        <small>
+          {step.failureCategory.toLowerCase().replaceAll('_', ' ')}
+          {step.retryEligible ? ' · Retry available after review' : ''}
+        </small>
+      )}
       {children}
     </li>
   );
@@ -318,7 +344,7 @@ export function ChatMessage({
               ? 'Waiting for approval'
               : activeStep?.status === 'processing'
                 ? 'Processing results'
-                : activeStep?.summary || 'Conductor activity'}{' '}
+                : activeStep ? activityLabel(activeStep) : 'Conductor activity'}{' '}
             · {message.activity.length}
           </summary>
           <ActivityList steps={message.activity} message={message} live={busy} />
@@ -340,7 +366,13 @@ export function ChatMessage({
               <Button
                 variant="ghost"
                 size="sm"
-                title={source.domain || source.url}
+                title={[
+                  source.domain || source.url,
+                  source.evidenceStatus === 'discovered' ? 'Discovered source' :
+                    source.evidenceStatus === 'partial' ? 'Partial page evidence' :
+                    source.evidenceStatus === 'metadata' ? 'HTTP metadata' : undefined,
+                  source.publishedAt && `Published ${new Date(source.publishedAt).toLocaleDateString()}`,
+                ].filter(Boolean).join(' · ')}
                 onClick={() => void openResearchSource(source.url)}
               >
                 {source.title}

@@ -26,6 +26,8 @@ import {
   type SkillSummary,
   type ToolAvailability,
   type ToolEffect,
+  type ToolConstraints,
+  type LoopCheckpoint,
   type ToolHealth,
   type ToolInputHint,
   type ToolSummary,
@@ -41,6 +43,7 @@ import { RunError, type RunAttachment, type RunFile } from './run-assets';
 import { programRequestSchema, programStatus, type ProgramRequest } from '@aria/shared';
 import { ExecutionScheduler } from './scheduler';
 import type { TurnBudget } from './turn-budget';
+import type { BrowserProgress } from '../web/browser-port.client';
 
 type Registry = Awaited<ReturnType<ModelRegistry['resolve']>>;
 export type StepInputs = { text: string[]; files: RunFile[] };
@@ -49,6 +52,7 @@ export type StepValue = {
   text?: string;
   file?: RunFile;
   sources?: ConductorSource[];
+  references?: ConductorSource[];
   data?: Record<string, unknown>;
   managedArtifact?: z.infer<typeof desktopArtifactSchema>;
   evidence?: z.infer<typeof evidenceSchema>[];
@@ -74,6 +78,7 @@ const resultSchema = z.strictObject({
     })
     .optional(),
   sources: z.array(sourceSchema).max(8).optional(),
+  references: z.array(sourceSchema).max(24).optional(),
   data: z.record(z.string(), z.unknown()).optional(),
   managedArtifact: desktopArtifactSchema.optional(),
   evidence: z.array(evidenceSchema).max(executionLimits.searchResults).optional(),
@@ -116,6 +121,7 @@ export interface ToolContext {
     admit(): void;
     beforeEffect(id: string, operation: string): Promise<void>;
     recordBudget(): Promise<void>;
+    observeAttempt?(receipt: LoopCheckpoint['receipts'][number]): void;
     blocked: ReadonlySet<string>;
   };
   hostedProgramsBlocked?: boolean;
@@ -134,6 +140,7 @@ type Invocation = {
   inputs: StepInputs;
   signal: AbortSignal;
   approval: () => void;
+  browserProgress: (phase: BrowserProgress) => void;
   callId: string;
   programId?: string;
 };
@@ -172,7 +179,8 @@ export interface ToolDescriptor<Input = unknown, Output extends StepValue = Step
   repeatable?: boolean;
   parallelRead?: boolean;
   parallelDelegate?: boolean;
-  budget?: 'searches' | 'fetches' | 'screenshots';
+  budget?: ToolConstraints['budget'];
+  preflight?: (step: ExecutionStep, context: ToolContext) => Record<string, unknown>;
   available?: (context: ToolContext) => boolean;
   prepareInput?: (input: unknown) => unknown;
   normalize?: (input: Input) => Partial<ExecutionStep>;
@@ -195,15 +203,17 @@ const base = {
 const researchDescriptions: Record<ResearchToolId, string> = {
   web_search: 'Find public webpages about a topic using a natural-language search query (args: { query }).',
   web_fetch:
-    'Read a public publisher page from a user-supplied URL or a search result (args: { sourceId } or { url }, with dependsOn: [<stepId>] for prior results). Do not guess unverified URLs.',
+    'Retrieve public HTTP status, headers, and static documents without opening a browser. Use a user-supplied URL or bare domain, or copy a tool result sourceId and its producerStepId into dependsOn. For an authorized site, this can also retrieve robots.txt and sitemap.xml. Use HEAD for metadata only.',
   web_read: 'Read the full bounded text of a fetched publisher document.',
   web_find: 'Find mentions of a term in a fetched publisher document.',
   browser_open:
-    'Open a public page in an isolated Aria browser tab using a user-supplied URL or an earlier search/page result (args: { url } or { sourceId }, with dependsOn: [<stepId>] for prior results). Use web_search for topic searches.',
+    'Open a user-supplied URL or bare domain directly in an isolated tab for rendered content. For an observed destination, copy sourceId and include producerStepId in dependsOn.',
   browser_navigate:
-    'Navigate an existing AI browser tab to a user-supplied URL or earlier result (args: { tabId, url } or { tabId, sourceId }, with dependsOn: [<stepId>]).',
+    'Navigate an owned AI tab using a user-supplied URL or bare domain, or an observed sourceId. Declare the completed producers of the tab and any source.',
   browser_get_tabs: 'List AI browser tabs that belong to this conversation.',
   browser_get_page: 'Inspect the current public page and its structured controls.',
+  browser_close: 'Close an owned AI tab returned by a completed dependency.',
+  browser_wait: 'Wait briefly for the current AI tab to reach readiness, display visible text, or change URL.',
   browser_media:
     'Start or stop audio or video playback in a public AI browser tab. For a request to play music or other audio, use a user-provided URL or a public Web Search result, open that source with browser_open, and play its media here. Reports whether the media advanced.',
   browser_click:
@@ -211,7 +221,7 @@ const researchDescriptions: Record<ResearchToolId, string> = {
   browser_type: 'Fill a referenced non-sensitive field after user approval.',
   browser_submit: 'Submit a validated public form after user approval.',
   browser_extract:
-    'Extract visible publisher content from an inspected page for evidence and citations.',
+    'Extract visible page text, links, metadata and dates, sanitized HTML, or measured performance from a current inspected document. Select a view and use nextOffset when returned.',
   browser_scroll: 'Scroll an AI tab to inspect more of the page.',
   browser_screenshot: 'Capture the current AI browser page as a PNG artifact.',
   browser_switch_tab: 'Select another AI browser tab in this conversation.',
@@ -400,8 +410,8 @@ function normalizeResearchInput(raw: unknown): unknown {
     }
     return { ...record, args };
   }
-  const { dependsOn: deps, ...args } = record;
-  return { args, ...(deps !== undefined && { dependsOn: deps }) };
+  const { dependsOn: deps, retryOf, ...args } = record;
+  return { args, ...(deps !== undefined && { dependsOn: deps }), ...(retryOf !== undefined && { retryOf }) };
 }
 
 function inputHintFromSchema(schema?: JSONSchema7): ToolInputHint | undefined {
@@ -1005,7 +1015,9 @@ export class ToolRegistry {
         'browser_get_tabs',
         'browser_extract',
         'browser_scroll',
+        'browser_wait',
       ].includes(op);
+      const readOnly = snapshot && op !== 'browser_scroll';
       const program: ToolDescriptor['program'] =
         ['web_search', 'web_fetch', 'web_find', 'web_read'].includes(op)
           ? { backends: ['managed', 'openai-responses'], scope: 'public', parallel: true, retry: 'verified-read' }
@@ -1017,10 +1029,13 @@ export class ToolRegistry {
         id: `${browser ? 'browser' : 'web'}.${op}`,
         name: op.replaceAll('_', ' '),
         description: researchDescriptions[op],
-        input: z.strictObject({ args: researchToolArgs[op], ...withDependencies }),
+        input: z.strictObject({
+          args: researchToolArgs[op], ...withDependencies,
+          retryOf: z.uuid().optional().describe('Execution ID of the prior failed attempt, only when it is marked retryable.'),
+        }),
         capability: op === 'web_search' ? 'web-search' : op,
         output: op === 'browser_screenshot' ? 'image' : op === 'web_read' ? 'text' : 'data',
-        effect: consequential ? 'consequential' : browser ? 'local' : 'read',
+        effect: consequential ? 'consequential' : browser && !readOnly ? 'local' : 'read',
         parallelRead: !browser,
         dependency: 'browser',
         permission: consequential
@@ -1033,15 +1048,16 @@ export class ToolRegistry {
             ? 'searches'
             : op === 'web_fetch'
               ? 'fetches'
-              : op === 'browser_screenshot'
-                ? 'screenshots'
-                : undefined,
+              : op === 'browser_screenshot' ? 'screenshots'
+              : ['browser_open', 'browser_navigate'].includes(op) ? 'navigations'
+              : snapshot ? 'inspections' : undefined,
         artifacts: op === 'browser_screenshot',
-        citations: ['web_fetch', 'web_find', 'web_read', 'browser_extract'].includes(op),
+        citations: ['web_search', 'web_fetch', 'web_find', 'web_read', 'browser_get_page', 'browser_extract'].includes(op),
         prepareInput: normalizeResearchInput,
         normalize: ({ args, dependsOn }) => ({ args, dependsOn: dependsOn ?? [] }),
-        execute: ({ args }, { context, step, signal, approval }) =>
-          context.research.invoke(op, args, step, signal, approval),
+        preflight: (step, context) => context.research.preflight(op, step.args ?? {}, step),
+        execute: ({ args }, { context, step, signal, browserProgress }) =>
+          context.research.invoke(op, args, step, signal, browserProgress),
       });
     }
 
@@ -1172,11 +1188,6 @@ export class ToolRegistry {
       if (!sample) continue;
       const reason = this.unavailable(sample, context.research.native, context);
       if (reason) notes.push(`${namespace}: ${reason}`);
-    }
-    for (const connector of this.host.current.connectors ?? []) {
-      if (connector.availability !== 'available') {
-        notes.push(`${connector.id} (${connector.name}): ${connector.reason ?? 'Unavailable'}`);
-      }
     }
     if (!context.temporary && !skills.some((skill) => skill.enabled)) {
       notes.push('skills: No skills currently enabled');
@@ -1344,7 +1355,8 @@ export class ToolRegistry {
         ];
       });
     if (!includeUnavailable) return tools;
-    const connectors: ToolSummary[] = (this.host.current.connectors ?? []).map((connector) => ({
+    const connectors: ToolSummary[] = (this.host.current.connectors ?? [])
+      .filter((connector) => !this.entries.has(connector.id)).map((connector) => ({
       id: connector.id,
       namespace: connector.id.split('.')[0],
       name: connector.name,
@@ -1353,10 +1365,10 @@ export class ToolRegistry {
       provenance: 'connector',
       effect: 'local',
       permission: 'Registered external connector',
-      available: connector.availability === 'available',
-      reason: connector.reason,
-      availability: connector.availability,
-      health: connector.health,
+      available: false,
+      reason: connector.reason ?? 'No executable tool is registered for this connector.',
+      availability: connector.availability === 'available' ? 'unconfigured' : connector.availability,
+      health: 'unavailable',
       settingsSection: connector.settingsSection,
       tags: ['connector', 'coding', 'external', connector.name.toLowerCase()],
     }));

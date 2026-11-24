@@ -219,7 +219,7 @@ export async function createProviderFixture() {
     const imageProbe = userPrompt === 'Request a screenshot and identify its color.';
     const latestResults: {
       id?: string;
-      items?: { id: string }[];
+      items?: { id: string; available?: boolean }[];
       problem?: { message: string };
       error?: string;
     }[] = [];
@@ -297,7 +297,7 @@ export async function createProviderFixture() {
       );
       if (missing.length && operation.phase === 'search') {
         const found = new Set(
-          (latestResults[0]?.items ?? []).map((item: { id: string }) => item.id),
+          (latestResults[0]?.items ?? []).filter((item) => item.available !== false).map((item) => item.id),
         );
         const ids = missing.filter((id) => found.has(id)).slice(0, 4);
         if (ids.length) {

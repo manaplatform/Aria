@@ -1,5 +1,6 @@
 import type { WebContents } from 'electron';
 import { randomUUID } from 'node:crypto';
+import { webLinkSchema, webMetadataSchema, webUrlSchema, type browserReadView } from '@aria/shared';
 import { z } from 'zod';
 
 type Command = {
@@ -20,6 +21,7 @@ type Command = {
     | 'stop-media'
     | 'media-state'
     | 'upload-target'
+    | 'read-view'
     | 'search-results';
   documentId: string;
   ids?: string[];
@@ -31,6 +33,8 @@ type Command = {
   selection?: boolean;
   fingerprint?: string;
   includeUploads?: boolean;
+  view?: z.infer<typeof browserReadView>;
+  offset?: number;
 };
 const element = z.strictObject({
   elementId: z.string().uuid(),
@@ -69,6 +73,21 @@ const resultSchema = z.strictObject({
     .optional(),
   searchEmpty: z.boolean().optional(),
   captchaDetected: z.boolean().optional(),
+  links: z.array(webLinkSchema).max(24).optional(),
+  metadata: webMetadataSchema.optional(),
+  html: z.string().max(5000).optional(),
+  nextOffset: z.number().int().max(200).optional(),
+  performance: z.strictObject({
+    domContentLoadedMs: z.number(),
+    loadMs: z.number().optional(),
+    measuredResources: z.number().int(),
+    timedResources: z.array(z.strictObject({
+      path: z.string().max(200),
+      durationMs: z.number(),
+      transferBytes: z.number(),
+    })).max(15),
+    viewport: z.strictObject({ width: z.number(), height: z.number(), dpr: z.number() }),
+  }).optional(),
 });
 
 function execute(command: Command) {
@@ -111,6 +130,113 @@ function execute(command: Command) {
     )
       .trim()
       .slice(0, 100);
+  if (command.op === 'read-view') {
+    const clip = (value: string | null | undefined, limit = 500) => value?.trim().slice(0, limit) || '';
+    const absolute = (value: string | null) => {
+      if (!value) return undefined;
+      try {
+        const url = new URL(value, document.baseURI);
+        return ['https:', 'http:'].includes(url.protocol) && !url.username && !url.password &&
+          url.href.length <= 2000 ? url.href : undefined;
+      } catch { return undefined; }
+    };
+    const offset = command.offset ?? 0;
+    const view = command.view ?? 'content';
+    if (view === 'links') {
+      const anchors = document.querySelectorAll('a[href]');
+      const links = [];
+      const seen = new Set<string>();
+      let capacity = 6400;
+      let i = offset;
+      for (; i < Math.min(200, anchors.length) && links.length < 18; i++) {
+        const anchor = anchors[i];
+        const href = absolute(anchor.getAttribute('href'));
+        if (href && !seen.has(href) && visible(anchor)) {
+          const item = { href, label: label(anchor) };
+          const length = JSON.stringify(item).length + 2;
+          if (length > capacity) break;
+          capacity -= length;
+          seen.add(href);
+          links.push(item);
+        }
+      }
+      return { links, ...(i < Math.min(200, anchors.length) && { nextOffset: i }) };
+    }
+    if (view === 'metadata') {
+      const meta = (name: string) => clip(document.querySelector(`meta[name="${name}"],meta[property="${name}"]`)?.getAttribute('content'));
+      const published = [meta('article:published_time')].filter(Boolean);
+      const modified = [meta('article:modified_time')].filter(Boolean);
+      const structuredTypes: string[] = [];
+      const scripts = document.querySelectorAll('script[type="application/ld+json"]');
+      for (let i = 0; i < Math.min(8, scripts.length); i++) {
+        const value = scripts[i].textContent ?? '';
+        if (value.length > 24_000) continue;
+        try {
+          const data = JSON.parse(value);
+          const items = Array.isArray(data) ? data : Array.isArray(data?.['@graph']) ? data['@graph'] : [data];
+          for (const item of items.slice(0, 16)) {
+            if (typeof item?.datePublished === 'string' && published.length < 6) published.push(clip(item.datePublished));
+            if (typeof item?.dateModified === 'string' && modified.length < 6) modified.push(clip(item.dateModified));
+            for (const type of [item?.['@type']].flat().slice(0, 8))
+              if (typeof type === 'string' && structuredTypes.length < 12) structuredTypes.push(clip(type, 100));
+          }
+        } catch { /* A malformed block is not evidence. */ }
+      }
+      return { metadata: {
+        description: meta('description'),
+        canonical: absolute(document.querySelector('link[rel~="canonical"]')?.getAttribute('href') ?? null),
+        robots: meta('robots'),
+        language: clip(document.documentElement?.lang, 80),
+        direction: clip(document.documentElement?.dir, 20),
+        viewport: meta('viewport'),
+        headings: Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,h6')).slice(0, 30)
+          .map((node) => ({ level: Number(node.tagName[1]), text: clip(node.textContent, 150) })),
+        images: { total: document.images.length, missingAlt: document.querySelectorAll('img:not([alt])').length },
+        semantic: ['main', 'article', 'section', 'nav', 'header', 'footer', 'aside', 'figure'].filter((tag) => document.querySelector(tag)),
+        alternates: Array.from(document.querySelectorAll('link[rel~="alternate"][hreflang]')).slice(0, 12)
+          .flatMap((node) => {
+            const href = absolute(node.getAttribute('href'));
+            return href ? [{ href, language: clip(node.getAttribute('hreflang'), 80) }] : [];
+          }),
+        structuredTypes, published, modified,
+        dates: Array.from(document.querySelectorAll('time')).slice(0, 8)
+          .map((node) => clip(node.getAttribute('datetime') || node.textContent, 150)),
+      } };
+    }
+    if (view === 'performance') {
+      const nav = performance.getEntriesByType('navigation')[0] as PerformanceNavigationTiming | undefined;
+      const resources = performance.getEntriesByType('resource') as PerformanceResourceTiming[];
+      if (!nav) return {};
+      return { performance: {
+        domContentLoadedMs: nav.domContentLoadedEventEnd,
+        ...(nav.loadEventEnd > 0 && { loadMs: nav.loadEventEnd }),
+        measuredResources: resources.length,
+        timedResources: resources.filter((resource) => resource.transferSize > 0 && resource.name.startsWith(location.origin + '/'))
+          .sort((a, b) => b.transferSize - a.transferSize).slice(0, 15)
+          .map((resource) => ({
+            path: new URL(resource.name).pathname.slice(0, 200), durationMs: resource.duration, transferBytes: resource.transferSize,
+          })),
+        viewport: { width: innerWidth, height: innerHeight, dpr: devicePixelRatio },
+      } };
+    }
+    if (view === 'html') {
+      const escape = (value: string) => value.replace(/[<>&]/g, (part) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' })[part]!);
+      const elements = (document.querySelector('main,article') ?? document.body)
+        ?.querySelectorAll('article,section,h1,h2,h3,h4,h5,h6,p,li,time,figure,figcaption');
+      if (!elements) return { html: '' };
+      const fragments: string[] = [];
+      for (let i = offset; i < Math.min(offset + 20, 200, elements.length); i++) {
+        const node = elements[i];
+        if (!visible(node)) continue;
+        const tag = node.tagName.toLowerCase();
+        fragments.push(`<${tag}>${escape(clip(node.childElementCount === 0 ? node.textContent : '', 150))}</${tag}>`);
+      }
+      return { html: fragments.join('\n').slice(0, 5000),
+        ...(offset + 20 < Math.min(200, elements.length) && { nextOffset: offset + 20 }) };
+    }
+    const main = document.querySelector<HTMLElement>('main,article,[role="main"]') ?? document.body;
+    return { text: clip(main?.innerText, 8000) };
+  }
   const safeField = (node: Element): node is HTMLInputElement | HTMLTextAreaElement =>
     (node instanceof HTMLTextAreaElement ||
       (node instanceof HTMLInputElement && ['text', 'search'].includes(node.type))) &&
@@ -236,18 +362,15 @@ function execute(command: Command) {
     for (const anchor of document.querySelectorAll<HTMLAnchorElement>(
       '[data-type="web"] .result-content a[href]',
     )) {
-      if (
-        !visible(anchor) ||
-        anchor.href.length > 2000 ||
-        !['http:', 'https:'].includes(anchor.protocol)
-      )
-        continue;
+      if (!visible(anchor)) continue;
+      const href = decodeSearchUrl(anchor.href);
+      if (!href || new URL(href).origin === location.origin) continue;
       const title = anchor.innerText
         .split('\n')
         .map((line) => line.trim())
         .filter(Boolean)
         .at(-1);
-      if (!title || results.some((result) => result.url === anchor.href)) continue;
+      if (!title || results.some((result) => result.url === href)) continue;
       const container = anchor.closest('.result-content') ?? anchor.closest('[data-type="web"]');
       const rawSnippet =
         container?.querySelector<HTMLElement>('.snippet-description, .result-snippet, .generic-snippet, p')
@@ -259,7 +382,7 @@ function execute(command: Command) {
           : '');
       const snippet = rawSnippet.replace(/\s+/g, ' ').trim().slice(0, 400);
       results.push({
-        url: anchor.href,
+        url: href,
         title: title.slice(0, 300),
         ...(snippet && snippet !== title ? { snippet } : {}),
       });
@@ -270,7 +393,8 @@ function execute(command: Command) {
         const anchor = item.querySelector<HTMLAnchorElement>('h2 a[href], .b_title a[href]');
         if (!anchor || !visible(anchor)) continue;
         const resolvedUrl = decodeSearchUrl(anchor.href);
-        if (!resolvedUrl || results.some((result) => result.url === resolvedUrl)) continue;
+        if (!resolvedUrl || new URL(resolvedUrl).origin === location.origin ||
+            results.some((result) => result.url === resolvedUrl)) continue;
         const title = (anchor.innerText || anchor.textContent || '')
           .replace(/\s+/g, ' ')
           .trim()
@@ -292,14 +416,15 @@ function execute(command: Command) {
       }
     }
     const bNo = document.querySelector('.b_no');
-    const searchEmpty =
-      Boolean(bNo && visible(bNo)) ||
+    const searchEmpty = !results.length && (
+      Boolean(location.hostname.endsWith('.bing.com') && bNo && visible(bNo)) ||
       [...document.querySelectorAll('h1, h2, [role="heading"]')].some(
         (heading) =>
           /^no (?:search )?results(?: found)?[.!]?$|^there are no results for\b/i.test(
             heading.textContent?.trim() ?? '',
           ) && visible(heading),
-      );
+      )
+    );
     const captchaDetected =
       !results.length &&
       (Boolean(
@@ -534,6 +659,19 @@ function execute(command: Command) {
   return {};
 }
 
+function parseInspection(raw: unknown) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return resultSchema.parse(raw);
+  const observed = raw as Record<string, unknown>;
+  if (Array.isArray(observed.links)) observed.links = observed.links.filter((link) => webLinkSchema.safeParse(link).success);
+  if (observed.metadata && typeof observed.metadata === 'object' && !Array.isArray(observed.metadata)) {
+    const metadata = observed.metadata as Record<string, unknown>;
+    if (!webUrlSchema.safeParse(metadata.canonical).success) delete metadata.canonical;
+    if (Array.isArray(metadata.alternates)) metadata.alternates = metadata.alternates.filter((item) =>
+      item && typeof item === 'object' && webUrlSchema.safeParse(item.href).success);
+  }
+  return resultSchema.parse(observed);
+}
+
 export async function inspectPage(contents: WebContents, command: Command) {
   const args =
     command.op === 'inspect'
@@ -548,5 +686,35 @@ export async function inspectPage(contents: WebContents, command: Command) {
     ],
     command.op === 'play-media',
   );
-  return resultSchema.parse(raw);
+  return parseInspection(raw);
+}
+
+export async function inspectWhileLoading(contents: WebContents, command: Command, signal: AbortSignal) {
+  if (command.op !== 'read-view' && command.op !== 'search-results')
+    throw new Error('Only fixed read operations may inspect an unfinished document.');
+  signal.throwIfAborted();
+  const client = contents.debugger;
+  if (client.isAttached()) throw new Error('The browser tab is already under inspection.');
+  client.attach('1.3');
+  const detach = () => { if (client.isAttached()) client.detach(); };
+  signal.addEventListener('abort', detach, { once: true });
+  try {
+    const { frameTree } = await client.sendCommand('Page.getFrameTree');
+    signal.throwIfAborted();
+    const { executionContextId } = await client.sendCommand('Page.createIsolatedWorld', {
+      frameId: frameTree.frame.id, worldName: 'aria-public-page-inspection',
+    });
+    signal.throwIfAborted();
+    const { result, exceptionDetails } = await client.sendCommand('Runtime.evaluate', {
+      contextId: executionContextId,
+      expression: `(${execute.toString()})(${JSON.stringify(command)})`,
+      returnByValue: true,
+    });
+    signal.throwIfAborted();
+    if (exceptionDetails) throw new Error('The page could not be inspected.');
+    return parseInspection(result.value);
+  } finally {
+    signal.removeEventListener('abort', detach);
+    detach();
+  }
 }

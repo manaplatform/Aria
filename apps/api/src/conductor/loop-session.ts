@@ -301,6 +301,14 @@ export class LoopSession {
     this.receipts.set(id, { id, operation, state: 'pending' });
   }
 
+  observeAttempt(receipt: LoopCheckpoint['receipts'][number]) {
+    const previous = this.receipts.get(receipt.id);
+    this.receipts.set(receipt.id, {
+      ...previous, ...receipt,
+      ...(previous?.state === 'uncertain' && { state: 'uncertain' }),
+    });
+  }
+
   save(snapshot: CheckpointState, signal = this.signal) {
     if (this.durability === 'live') return Promise.resolve();
     const budget: LoopBudget = snapshot.budget;

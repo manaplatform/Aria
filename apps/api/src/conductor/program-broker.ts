@@ -33,9 +33,11 @@ export const programChildOutput = z.strictObject({
   dataOmitted: z.boolean().optional(),
   resultRef: z.string().uuid().optional(),
   sources: z.array(sourceSchema).optional(),
+  references: z.array(sourceSchema).max(24).optional(),
   evidence: z.array(evidenceSchema).optional(),
   artifact: artifactReferenceSchema.optional(),
   problem: toolProblemSchema.optional(),
+  retry: z.strictObject({ eligible: z.boolean(), afterMs: z.number().optional(), phase: z.string().optional() }).optional(),
 });
 export const programWireOutput = z.toJSONSchema(programChildOutput, {
   target: 'draft-7',
@@ -449,15 +451,17 @@ export class ProgramExecution {
   }
 
   private project(outcome: Outcome): ChildOutput {
-    const { id, status, text, evidence, sources, artifact, problem: issue, data } = outcome;
+    const { id, status, text, evidence, sources, references, artifact, problem: issue, data, retry } = outcome;
     const value: ChildOutput = {
       id,
       status,
       text: text?.slice(0, 6000),
       evidence,
       sources,
+      references,
       artifact,
       problem: issue,
+      retry,
     };
     if (data) {
       try {

@@ -8,8 +8,10 @@ import {
   type ConductorEvent,
   type ExecutionStep,
   type LoopBudget,
+  type LoopCheckpoint,
   type ToolEffect,
   type ToolProblem,
+  type BrowserPhase,
 } from '@aria/shared';
 import { providerError } from '../ai/ai.service';
 import type { ResolvedModel } from '../providers/model-registry.service';
@@ -27,6 +29,7 @@ export type Outcome = StepValue & {
   status: 'completed' | 'failed' | 'blocked' | 'cancelled';
   problem?: ToolProblem;
   artifact?: ArtifactReference;
+  retry?: { eligible: boolean; afterMs?: number; phase?: BrowserPhase | string };
 };
 
 export type Invocation = {
@@ -36,6 +39,13 @@ export type Invocation = {
   program?: { id: string; backend: 'managed' | 'openai-responses'; revision: string; signal: AbortSignal };
 };
 export type BatchInvocation = { id: string; after: string[]; invocation?: Invocation };
+type ReadAttempt = {
+  id: string;
+  count: number;
+  retryable: boolean;
+  retryAt?: number;
+  ordinal: number;
+};
 
 function canonical(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
@@ -60,7 +70,7 @@ function formatSchemaError(prefix: string, error: z.ZodError) {
 
 const transientResultKeys = new Set([
   'stepId', 'attemptId', 'callId', 'sourceId', 'resultId', 'resultRef', 'observationId', 'retrievedAt',
-  'documentId', 'elementId', 'timestamp', 'durationMs', 'startedAt', 'finishedAt',
+  'documentId', 'elementId', 'producerStepId', 'tabId', 'timestamp', 'durationMs', 'startedAt', 'finishedAt',
 ]);
 
 function stableResult(value: unknown): unknown {
@@ -79,14 +89,15 @@ export class ExecutionEngine {
   private readonly restricted = new Set<string>();
   private readonly dispatched = new Set<string>();
   private readonly uncertainCapabilities = new Set<string>();
-  private readonly counters = { searches: 0, fetches: 0, screenshots: 0 };
+  private readonly counters = { searches: 0, fetches: 0, screenshots: 0, navigations: 0, inspections: 0 };
+  private validationFailures = 0;
   directToolCalls = 0;
   programChildCalls = 0;
   billableChildStarted = false;
   partial = false;
   progress = 0;
   private readonly evidence = new Set<string>();
-  private readonly readAttempts = new Map<string, { count: number; retryable: boolean }>();
+  private readonly readAttempts = new Map<string, ReadAttempt>();
   private readonly unverified = new Map<string, { target: string; ordinal: number }>();
   private readonly observations = new Map<string, { target: string; ordinal: number }>();
   private readonly verificationUpdates = new Map<string, () => void>();
@@ -101,6 +112,7 @@ export class ExecutionEngine {
     private readonly signal: AbortSignal,
     private readonly voiceSessionId?: string,
     prior?: LoopBudget,
+    receipts?: readonly LoopCheckpoint['receipts'][number][],
   ) {
     if (!prior) return;
     this.directToolCalls = prior.directToolCalls;
@@ -108,10 +120,30 @@ export class ExecutionEngine {
     this.counters.searches = prior.searches;
     this.counters.fetches = prior.fetches;
     this.counters.screenshots = prior.screenshots;
+    this.counters.navigations = prior.navigations ?? 0;
+    this.counters.inspections = prior.inspections ?? 0;
+    this.validationFailures = prior.validationFailures ?? 0;
+    for (const receipt of receipts ?? []) {
+      if (receipt.state === 'failed' && receipt.fingerprint && receipt.attemptCount)
+        this.readAttempts.set(receipt.fingerprint, { id: receipt.id, count: receipt.attemptCount,
+          retryable: receipt.retryEligible === true, retryAt: receipt.retryAt, ordinal: 0 });
+      else if (receipt.state === 'completed' && receipt.fingerprint)
+        this.readAttempts.delete(receipt.fingerprint);
+    }
   }
 
   snapshot() {
-    return { directToolCalls: this.directToolCalls, programChildCalls: this.programChildCalls, ...this.counters };
+    return {
+      directToolCalls: this.directToolCalls, programChildCalls: this.programChildCalls,
+      validationFailures: this.validationFailures, ...this.counters,
+    };
+  }
+
+  remainingWeb() {
+    return Object.fromEntries(Object.keys(this.counters).map((key) => {
+      const resource = key as keyof typeof this.counters;
+      return [resource, Math.max(0, this.context.research.policy[resource] - this.counters[resource])];
+    }));
   }
 
   get needsVerification() { return this.unverified.size > 0; }
@@ -263,6 +295,12 @@ export class ExecutionEngine {
     const id = randomUUID();
     const start = Date.now();
     let model: ResolvedModel | undefined;
+    let phase: BrowserPhase | string | undefined;
+    let operationTarget: string | undefined;
+    let sourceId: string | undefined;
+    let fingerprint: string | undefined;
+    let dependencyState: LoopCheckpoint['receipts'][number]['dependencyState'];
+    let networkStarted = false;
     const activity = (status: ConductorActivity['status'], outcome?: Outcome, verified = false) =>
       this.emit({
         type: 'activity',
@@ -280,6 +318,10 @@ export class ExecutionEngine {
           status,
           at: Date.now(),
           durationMs: outcome ? Date.now() - start : undefined,
+          operationTarget,
+          phase,
+          failureCategory: outcome?.problem?.category ?? outcome?.problem?.code,
+          retryEligible: outcome?.retry?.eligible,
           error: outcome?.problem?.message,
           ...(outcome && this.unverified.has(id) && { outcomeUnverified: true }),
           resultSummary:
@@ -306,7 +348,8 @@ export class ExecutionEngine {
     let lease: Awaited<ReturnType<ToolRegistry['scheduler']['acquire']>> | undefined;
     let operation: Promise<StepValue> | undefined;
     let readKey: string | undefined;
-    let previousAttempt: { count: number; retryable: boolean } | undefined;
+    let previousAttempt: ReadAttempt | undefined;
+    let retryDelay: number | undefined;
     let budgetKey: ToolDescriptor['budget'] | undefined;
     let admittedFingerprint: string | undefined;
     let settleArtifact: ReturnType<ToolContext['budget']['artifact']> | undefined;
@@ -349,6 +392,7 @@ export class ExecutionEngine {
         throw new ToolError(
           'INVALID_ARGUMENT',
           formatSchemaError('The arguments do not match the loaded tool schema', input.error),
+          'SCHEMA_VALIDATION',
         );
       if (program && (program.revision !== this.tools.host.current.revision ||
         !this.tools.allowedForProgram(descriptor, this.context, program.backend, input.data)))
@@ -367,11 +411,19 @@ export class ExecutionEngine {
       if (
         new Set(step.dependsOn).size !== step.dependsOn.length ||
         step.dependsOn.some((dependency) => this.results.get(dependency)?.status !== 'completed')
-      )
+      ) {
+        dependencyState = 'invalid';
         throw new ToolError(
           'INVALID_ARGUMENT',
           'Reference only successful execution IDs from this turn.',
+          'INVALID_DEPENDENCY',
         );
+      }
+      dependencyState = step.dependsOn.length ? 'ready' : 'none';
+      const originalArgs = step.args;
+      if (typeof originalArgs?.sourceId === 'string') sourceId = originalArgs.sourceId;
+      const dispatchInput = descriptor.preflight?.(step, this.context);
+      if (typeof dispatchInput?.url === 'string') operationTarget = new URL(dispatchInput.url).hostname.slice(0, 253);
       if (step.target.kind === 'model') {
         const available = await delegates();
         model = available.models.get(step.target.model);
@@ -427,24 +479,38 @@ export class ExecutionEngine {
         throw new ToolError('PERMISSION_DENIED', 'Web tools cannot receive attachment contents.');
       if (text.reduce((size, part) => size + part.length, 0) > 32_000)
         throw new ToolError('INVALID_ARGUMENT', 'The supplied text exceeds the step input limit.');
-      const fingerprint = createHash('sha256')
+      fingerprint = createHash('sha256')
         .update(
-          canonical([descriptor.id, step.target, step.args ?? (descriptor.normalize ? step.instructions : input.data), step.inputs]),
+          canonical([descriptor.id, step.target, dispatchInput ?? step.args ?? (descriptor.normalize ? step.instructions : input.data), step.inputs]),
         )
         .digest('hex');
+      const researchRetry = Boolean(descriptor.preflight && descriptor.effect !== 'consequential' &&
+        (descriptor.effect === 'read' || descriptor.budget === 'navigations'));
       const verifiedReadRetry =
-        descriptor.effect === 'read' &&
+        researchRetry || (descriptor.effect === 'read' &&
         descriptor.program?.retry === 'verified-read' &&
-        Boolean(this.context.execution);
+        Boolean(this.context.execution));
+      const retryOf = descriptor.preflight && typeof input.data === 'object' && input.data
+        ? Reflect.get(input.data, 'retryOf') : undefined;
       if (verifiedReadRetry) {
         previousAttempt = this.readAttempts.get(fingerprint);
+        const observation = typeof dispatchInput?.tabId === 'string' &&
+          [...this.observations.values()].some(({ target, ordinal }) =>
+            target === dispatchInput.tabId && ordinal > (previousAttempt?.ordinal ?? -1));
+        const windowElapsed = previousAttempt?.retryAt !== undefined && Date.now() >= previousAttempt.retryAt;
+        if (retryOf && retryOf !== previousAttempt?.id)
+          throw new ToolError('INVALID_REFERENCE', 'retryOf must reference the latest attempt of this same operation.', 'RETRY_REFERENCE_INVALID');
         if (
           previousAttempt &&
-          (!previousAttempt.retryable || previousAttempt.count > this.context.execution!.readRetries)
+          (!previousAttempt.retryable || previousAttempt.count > (this.context.execution?.readRetries ?? 2) ||
+            (researchRetry && (!retryOf || (!observation && !windowElapsed))))
         )
-          throw new ToolError('DUPLICATE_DISPATCH', 'This read already ran or reached its retry limit.');
+          if (!(researchRetry && descriptor.repeatable && this.results.get(previousAttempt.id)?.status === 'completed' && !retryOf))
+            throw new ToolError('DUPLICATE_DISPATCH', 'This operation already ran. For a retry, use the returned attempt ID after a fresh observation or the reported retry window.', 'UNCHANGED_ATTEMPT');
       } else if (!descriptor.repeatable && this.dispatched.has(fingerprint))
         throw new ToolError('DUPLICATE_DISPATCH', 'This operation already ran.');
+      else if (retryOf)
+        throw new ToolError('INVALID_ARGUMENT', 'This operation does not support retryOf.', 'RETRY_UNSUPPORTED');
       if (descriptor.budget) {
         const limit = this.context.research.policy[descriptor.budget];
         if (this.counters[descriptor.budget] >= limit)
@@ -457,8 +523,10 @@ export class ExecutionEngine {
       }
       if (verifiedReadRetry) {
         this.readAttempts.set(fingerprint, {
+          id,
           count: (previousAttempt?.count ?? 0) + 1,
           retryable: false,
+          ordinal: this.ordinal,
         });
         readKey = fingerprint;
       }
@@ -535,6 +603,15 @@ export class ExecutionEngine {
             context: this.context,
             signal,
             approval: () => activity('approval'),
+            browserProgress: (progress) => {
+              if (signal.aborted) return;
+              if (progress === 'approval') activity('approval');
+              else if (progress === 'network') networkStarted = true;
+              else {
+                phase = progress;
+                activity('running');
+              }
+            },
             programId: program?.id,
           }));
         raw = await waitForTool(operation, signal);
@@ -621,6 +698,10 @@ export class ExecutionEngine {
         this.progress++;
       }
       const target = result.data?.tabId ?? result.data?.sessionId ?? step.args?.sessionId;
+      if (typeof result.data?.phase === 'string') phase = result.data.phase.slice(0, 40);
+      if (!operationTarget && typeof result.data?.url === 'string') {
+        try { operationTarget = new URL(result.data.url).hostname.slice(0, 253); } catch { /* No public target. */ }
+      }
       if (typeof target === 'string' && result.status === 'completed') {
         const status = result.data?.status;
         const computerOutcomes = z.array(z.object({ status: z.string() })).safeParse(result.data?.outcomes);
@@ -628,7 +709,7 @@ export class ExecutionEngine {
             computerOutcomes.data?.some(({ status }) => status === 'submitted')) {
           this.unverified.set(id, { target, ordinal: ++this.ordinal });
           this.verificationUpdates.set(id, () => activity('completed', result, true));
-        } else if (['browser.browser_get_page', 'browser.browser_extract', 'computer.observe'].includes(descriptor.id)) {
+        } else if (['browser.browser_get_page', 'browser.browser_extract', 'browser.browser_wait', 'computer.observe'].includes(descriptor.id)) {
           this.observations.set(id, { target, ordinal: ++this.ordinal });
         }
       }
@@ -642,7 +723,7 @@ export class ExecutionEngine {
           !commandProblem &&
           (entry.toolId === descriptor.id ||
             (entry.effect === 'read' &&
-              (descriptor.effect === 'read' || descriptor.id === 'browser.browser_extract')))
+              (descriptor.effect === 'read' || descriptor.budget === 'navigations')))
         ) {
           this.corrected.add(failedId);
           this.recoverable.delete(failedId);
@@ -663,17 +744,26 @@ export class ExecutionEngine {
         : error instanceof RunError
           ? error.message
           : providerError(error);
-      if (descriptor.effect !== 'read' && code !== 'CANCELLED') this.effectFailed.add(id);
+      if (error instanceof ToolError) {
+        phase = error.phase ?? phase;
+        retryDelay = error.retryAfterMs;
+        if (error.category === 'MISSING_DEPENDENCY') dependencyState = 'invalid';
+      }
+      if (!launched && ['INVALID_ARGUMENT', 'INVALID_REFERENCE'].includes(code)) this.validationFailures++;
+      const recoverableRead = descriptor.effect === 'read' ||
+        (descriptor.preflight && descriptor.budget === 'navigations' && code !== 'OUTCOME_UNCERTAIN');
+      if (!recoverableRead && code !== 'CANCELLED') this.effectFailed.add(id);
       if (
-        (!launched && (code === 'INVALID_ARGUMENT' || code === 'CAPABILITY_UNAVAILABLE')) ||
-        (descriptor.effect === 'read' && !['CANCELLED', 'OUTCOME_UNCERTAIN'].includes(code))
+        (!launched && (code === 'INVALID_ARGUMENT' || code === 'INVALID_REFERENCE' || code === 'CAPABILITY_UNAVAILABLE')) ||
+        (recoverableRead && !['CANCELLED', 'OUTCOME_UNCERTAIN'].includes(code))
       )
-        this.recoverable.set(id, { toolId: descriptor.id, effect: descriptor.effect });
+        this.recoverable.set(id, { toolId: descriptor.id, effect: recoverableRead ? 'read' : descriptor.effect });
       if (!launched && code === 'CANCELLED' && this.context.execution) this.corrected.add(id);
       result = {
         id,
         status: code === 'CANCELLED' ? 'cancelled' : code === 'DUPLICATE_DISPATCH' ? 'blocked' : 'failed',
-        problem: { code, message: message.slice(0, 400) },
+        problem: { code, message: message.slice(0, 400),
+          category: error instanceof ToolError ? error.category : undefined },
       };
     } finally {
       settleArtifact?.();
@@ -697,7 +787,9 @@ export class ExecutionEngine {
           result.status === 'completed' ? 'completed' : 'failed',
       }, AbortSignal.any([parent, AbortSignal.timeout(2000)])).catch(() => undefined);
     }
-    if (budgetKey && (!launched || result.status !== 'completed'))
+    const networkBudget = budgetKey === 'searches' || budgetKey === 'fetches' || budgetKey === 'navigations';
+    if (budgetKey && (!launched ||
+      (networkBudget && !networkStarted && result.status !== 'completed' && result.problem?.category !== 'IPC_TIMEOUT')))
       this.counters[budgetKey] = Math.max(0, this.counters[budgetKey] - 1);
     if (!launched && result.problem?.code === 'CANCELLED') {
       if (admittedFingerprint) this.dispatched.delete(admittedFingerprint);
@@ -711,10 +803,32 @@ export class ExecutionEngine {
       this.uncertainCapabilities.add(descriptor.capability);
     if (readKey) {
       const attempt = this.readAttempts.get(readKey)!;
-      attempt.retryable = result.problem?.code === 'TIMEOUT' || result.problem?.code === 'EXECUTION_FAILED';
+      const research = Boolean(descriptor.preflight);
+      attempt.retryable = Boolean(launched && (research
+        ? retryDelay !== undefined || result.problem?.category === 'STALE_PAGE'
+        : result.problem?.code === 'TIMEOUT' || result.problem?.code === 'EXECUTION_FAILED'));
+      if (attempt.retryable && retryDelay !== undefined) attempt.retryAt = Date.now() + retryDelay;
+      if (research && result.problem) result.retry = {
+        eligible: attempt.retryable && attempt.count <= (this.context.execution?.readRetries ?? 2),
+        afterMs: retryDelay,
+        phase,
+      };
     }
     this.results.set(id, result);
     activity(result.problem?.code === 'OUTCOME_UNCERTAIN' ? 'uncertain' : result.status, result);
+    if (descriptor.preflight) this.context.execution?.observeAttempt?.({
+      id, operation: descriptor.id,
+      state: result.problem?.code === 'OUTCOME_UNCERTAIN' ? 'uncertain' :
+        result.status === 'cancelled' ? 'blocked' : result.status,
+      durationMs: Date.now() - start,
+      fingerprint, sourceId, dependencyState, phase,
+      failureCategory: result.problem?.category ?? result.problem?.code,
+      retryEligible: result.retry?.eligible,
+      ...(readKey && {
+        attemptCount: this.readAttempts.get(readKey)?.count,
+        retryAt: this.readAttempts.get(readKey)?.retryAt,
+      }),
+    });
     return result;
   }
 }

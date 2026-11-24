@@ -10,6 +10,8 @@ The configured primary can discover and call the `memory` namespace through the 
 
 The primary can attach optional structured metadata to a complete visible reply. Metadata proposals use exact spans from the newest saved user message. They are staged in a trusted outbox with their source in the same atomic chat save. Metadata cannot acknowledge an explicit mutation. Explicit remember, correct, and forget tools show a trusted confirmation and wait for the SQLite transaction. Suggestions use the same metadata channel and go through normal chat submission when clicked.
 
+Public research citations and retrieval dates are saved with the conversation. If the user asks Aria to remember a research finding, the primary can submit the finding, source links, and retrieval date through the existing confirmed memory write.
+
 ## Storage and migration
 
 Each desktop profile owns `memory.sqlite`. A worker thread owns its SQLite connection and prepared statements. The versioned schema stores authoritative records, sources, entities, aliases, links, FTS5 postings, vectors, jobs, execution receipts, and deletion fences. Conversation, project, and portable profile preferences have distinct scopes. A project is selected before the first message. Equal entity names can have distinct qualifiers. Conductor does not assign project ownership from a text reference.
