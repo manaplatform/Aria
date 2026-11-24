@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { z } from 'zod';
 import {
   conductorLimits,
   type ArtifactReference,
@@ -6,6 +7,7 @@ import {
   type ConductorActivity,
   type ConductorEvent,
   type ExecutionStep,
+  type LoopBudget,
   type ToolProblem,
 } from '@aria/shared';
 import { providerError } from '../ai/ai.service';
@@ -32,6 +34,7 @@ export type Invocation = {
   input: unknown;
   program?: { id: string; backend: 'managed' | 'openai-responses'; revision: string; signal: AbortSignal };
 };
+export type BatchInvocation = { id: string; after: string[]; invocation?: Invocation };
 
 function canonical(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
@@ -72,6 +75,11 @@ export class ExecutionEngine {
   partial = false;
   progress = 0;
   private readonly evidence = new Set<string>();
+  private readonly readAttempts = new Map<string, { count: number; retryable: boolean }>();
+  private readonly unverified = new Map<string, { target: string; ordinal: number }>();
+  private readonly observations = new Map<string, { target: string; ordinal: number }>();
+  private readonly verificationUpdates = new Map<string, () => void>();
+  private ordinal = 0;
 
   constructor(
     private readonly request: ChatRequest,
@@ -81,7 +89,36 @@ export class ExecutionEngine {
     private readonly emit: (event: ConductorEvent) => void,
     private readonly signal: AbortSignal,
     private readonly voiceSessionId?: string,
-  ) {}
+    prior?: LoopBudget,
+  ) {
+    if (!prior) return;
+    this.directToolCalls = prior.directToolCalls;
+    this.programChildCalls = prior.programChildCalls;
+    this.counters.searches = prior.searches;
+    this.counters.fetches = prior.fetches;
+    this.counters.screenshots = prior.screenshots;
+  }
+
+  snapshot() {
+    return { directToolCalls: this.directToolCalls, programChildCalls: this.programChildCalls, ...this.counters };
+  }
+
+  get needsVerification() { return this.unverified.size > 0; }
+
+  verify(steps: string[], resolutions: { stepId: string; evidenceStepId: string }[]) {
+    if (steps.some((id) => this.results.get(id)?.status !== 'completed')) return false;
+    for (const { stepId, evidenceStepId } of resolutions) {
+      const effect = this.unverified.get(stepId);
+      const observation = this.observations.get(evidenceStepId);
+      if (!effect || !observation || effect.target !== observation.target || effect.ordinal >= observation.ordinal) return false;
+    }
+    for (const { stepId } of resolutions) {
+      this.unverified.delete(stepId);
+      this.verificationUpdates.get(stepId)?.();
+      this.verificationUpdates.delete(stepId);
+    }
+    return true;
+  }
 
   get failed() {
     return [...this.results.values()].some(
@@ -132,7 +169,7 @@ export class ExecutionEngine {
       // before any later outbound invocation is authorized.
       if (this.canRunConcurrently(batch[0])) {
         while (
-          batch.length < conductorLimits.parallel &&
+          batch.length < (this.context.execution?.concurrency ?? conductorLimits.parallel) &&
           index < invocations.length &&
           this.canRunConcurrently(invocations[index])
         )
@@ -145,10 +182,54 @@ export class ExecutionEngine {
     return outcomes;
   }
 
+  async executeBatch(
+    batch: BatchInvocation[],
+    delegates: () => ReturnType<ToolRegistry['delegates']>,
+    discovered: (id: string, ref: string) => boolean,
+  ) {
+    const ids = new Set(batch.map(({ id }) => id));
+    if (ids.size !== batch.length || batch.some(({ after }) =>
+      new Set(after).size !== after.length || after.some((id) => !ids.has(id))))
+      throw new ToolError('INVALID_ARGUMENT', 'Use unique batch IDs and dependencies from the same batch.');
+    const waves: BatchInvocation[][] = [];
+    const remaining = new Set(batch);
+    const ordered = new Set<string>();
+    while (remaining.size) {
+      const ready = [...remaining].filter(({ after }) => after.every((id) => ordered.has(id)));
+      if (!ready.length) throw new ToolError('INVALID_ARGUMENT', 'The batch has a dependency cycle.');
+      waves.push(ready);
+      for (const item of ready) {
+        remaining.delete(item);
+        ordered.add(item.id);
+      }
+    }
+    const outcomes = new Map<string, Outcome>();
+    const reject = (item: BatchInvocation, code: ToolProblem['code'], message: string) => {
+      const result: Outcome = { id: randomUUID(), status: 'blocked', problem: { code, message } };
+      outcomes.set(item.id, result);
+      this.results.set(result.id, result);
+    };
+    for (const wave of waves) {
+      const pending = [];
+      for (const item of wave) {
+        if (item.after.some((id) => outcomes.get(id)?.status !== 'completed')) {
+          reject(item, 'INVALID_REFERENCE', 'A prerequisite did not complete.');
+        } else if (!item.invocation) {
+          reject(item, 'CAPABILITY_UNAVAILABLE', 'Load an eligible direct tool before using it in a batch.');
+        } else {
+          pending.push({ id: item.id, invocation: item.invocation });
+        }
+      }
+      const results = await this.execute(pending.map(({ invocation }) => invocation), delegates, discovered);
+      pending.forEach(({ id }, index) => outcomes.set(id, results[index]));
+    }
+    return batch.map(({ id }) => ({ id, outcome: outcomes.get(id)! }));
+  }
+
   private canRunConcurrently({ descriptor }: Invocation) {
     return (
-      descriptor.effect === 'billable' ||
-      (descriptor.effect === 'read' && descriptor.dependency === 'browser')
+      (descriptor.parallelDelegate === true && !this.context.privateContent) ||
+      (descriptor.effect === 'read' && descriptor.parallelRead === true)
     );
   }
 
@@ -162,7 +243,7 @@ export class ExecutionEngine {
     const id = randomUUID();
     const start = Date.now();
     let model: ResolvedModel | undefined;
-    const activity = (status: ConductorActivity['status'], outcome?: Outcome) =>
+    const activity = (status: ConductorActivity['status'], outcome?: Outcome, verified = false) =>
       this.emit({
         type: 'activity',
         activity: {
@@ -180,12 +261,13 @@ export class ExecutionEngine {
           at: Date.now(),
           durationMs: outcome ? Date.now() - start : undefined,
           error: outcome?.problem?.message,
+          ...(outcome && this.unverified.has(id) && { outcomeUnverified: true }),
           resultSummary:
             outcome?.status === 'completed'
-              ? outcome.artifact
+              ? verified ? 'Outcome verified by a subsequent observation'
+                : outcome.artifact
                 ? 'Artifact created'
-                : outcome.data?.status === 'dispatched_outcome_unverified' ||
-                    outcome.data?.status === 'action_dispatched'
+                : this.unverified.has(id)
                   ? 'Action sent. Outcome awaits verification.'
                 : outcome.sources?.length
                   ? `${outcome.sources.length} verified source references`
@@ -203,6 +285,8 @@ export class ExecutionEngine {
     let launched = false;
     let lease: Awaited<ReturnType<ToolRegistry['scheduler']['acquire']>> | undefined;
     let operation: Promise<StepValue> | undefined;
+    let readKey: string | undefined;
+    let admittedFingerprint: string | undefined;
     let settleArtifact: ReturnType<ToolContext['budget']['artifact']> | undefined;
     let reservation: { fingerprint: string; revision: string } | undefined;
     const scope = {
@@ -213,6 +297,7 @@ export class ExecutionEngine {
     };
     try {
       parent.throwIfAborted();
+      this.context.execution?.admit();
       if (!program) this.reserveProgram();
       if (!program && !descriptor.modes.includes('direct'))
         throw new ToolError('CALLER_MISMATCH', 'This tool is only available inside an authorized program.');
@@ -227,7 +312,7 @@ export class ExecutionEngine {
           'The selected tool is unavailable for this turn.',
         );
       }
-      if (this.uncertainCapabilities.has(descriptor.capability))
+      if (this.uncertainCapabilities.has(descriptor.capability) || this.context.execution?.blocked.has(descriptor.id))
         throw new ToolError(
           'OUTCOME_UNCERTAIN',
           'That capability already failed after dispatch. Reconcile the earlier operation before trying again.',
@@ -322,7 +407,13 @@ export class ExecutionEngine {
           canonical([descriptor.id, step.target, step.args ?? (descriptor.normalize ? step.instructions : input.data), step.inputs]),
         )
         .digest('hex');
-      if (!descriptor.repeatable && this.dispatched.has(fingerprint))
+      if (descriptor.effect === 'read' && descriptor.program?.retry === 'verified-read' && this.context.execution) {
+        const previous = this.readAttempts.get(fingerprint);
+        if (previous && (!previous.retryable || previous.count > this.context.execution.readRetries))
+          throw new ToolError('DUPLICATE_DISPATCH', 'This read already ran or reached its retry limit.');
+        this.readAttempts.set(fingerprint, { count: (previous?.count ?? 0) + 1, retryable: false });
+        readKey = fingerprint;
+      } else if (!descriptor.repeatable && this.dispatched.has(fingerprint))
         throw new ToolError('DUPLICATE_DISPATCH', 'This operation already ran.');
       if (
         descriptor.budget &&
@@ -330,14 +421,15 @@ export class ExecutionEngine {
       )
         throw new ToolError('BUDGET_EXCEEDED', `The turn reached its ${descriptor.budget} limit.`);
       this.dispatched.add(fingerprint);
+      admittedFingerprint = fingerprint;
       activity('queued');
-      const timeout = AbortSignal.timeout(descriptor.timeoutMs);
+      const timeout = AbortSignal.timeout(Math.min(descriptor.timeoutMs, this.context.execution?.toolMs ?? Infinity));
       const signal = AbortSignal.any([parent, timeout]);
       if (descriptor.id !== 'programs.run') {
         const resource = step.args?.sessionId ?? step.args?.tabId ??
           (step.args?.args as Record<string, unknown> | undefined)?.tabId;
         const locks = typeof resource === 'string'
-          ? [`${this.request.conversationId}/${resource}`]
+          ? [`resource/${resource}`]
           : descriptor.effect === 'local' || (program && !descriptor.program?.parallel)
             ? [`${this.request.conversationId}/state`]
             : [];
@@ -346,15 +438,15 @@ export class ExecutionEngine {
           provider: model?.connection.id,
           tool: descriptor.id,
           toolLimit: descriptor.program?.parallel ? 3 : 4,
-          limit: this.tools.host.current.programming?.backend !== 'off'
-            ? this.tools.host.current.programming?.parallel ?? conductorLimits.parallel
-            : conductorLimits.parallel,
+          limit: Math.min(this.context.execution?.concurrency ?? conductorLimits.parallel,
+            program ? this.tools.host.current.programming?.parallel ?? conductorLimits.parallel : Infinity),
           locks,
           signal,
         });
       }
       const authorize = () => {
         signal.throwIfAborted();
+        this.context.execution?.admit();
         if (!this.tools.allowed(descriptor, this.context) ||
           (program && (program.revision !== this.tools.host.current.revision ||
             !this.tools.allowedForProgram(descriptor, this.context, program.backend, input.data))) ||
@@ -364,8 +456,12 @@ export class ExecutionEngine {
           throw new ToolError('PERMISSION_DENIED', 'The operation was revoked before dispatch.');
       };
       authorize();
+      if (this.context.execution && descriptor.effect !== 'read') {
+        await this.context.execution.beforeEffect(id, descriptor.id);
+        authorize();
+      }
       if (descriptor.artifacts) settleArtifact = this.context.budget.artifact();
-      if (descriptor.effect === 'billable') {
+      if (descriptor.effect === 'billable' || this.context.execution && descriptor.effect === 'consequential' && !descriptor.repeatable) {
         const revision = this.tools.host.current.revision;
         await this.tools.host.request(
           {
@@ -378,7 +474,8 @@ export class ExecutionEngine {
           signal,
         );
         reservation = { fingerprint, revision };
-        this.billableChildStarted = reserved = true;
+        reserved = true;
+        this.billableChildStarted ||= descriptor.effect === 'billable';
       }
       authorize();
       activity('running');
@@ -481,7 +578,19 @@ export class ExecutionEngine {
         this.evidence.add(evidence);
         this.progress++;
       }
-      if (commandProblem?.code === 'EXECUTION_FAILED') this.recoverable.set(id, descriptor.id);
+      const target = result.data?.tabId ?? result.data?.sessionId ?? step.args?.sessionId;
+      if (typeof target === 'string' && result.status === 'completed') {
+        const status = result.data?.status;
+        const computerOutcomes = z.array(z.object({ status: z.string() })).safeParse(result.data?.outcomes);
+        if (status === 'dispatched_outcome_unverified' || status === 'action_dispatched' ||
+            computerOutcomes.data?.some(({ status }) => status === 'submitted')) {
+          this.unverified.set(id, { target, ordinal: ++this.ordinal });
+          this.verificationUpdates.set(id, () => activity('completed', result, true));
+        } else if (['browser.browser_get_page', 'browser.browser_extract', 'computer.observe'].includes(descriptor.id)) {
+          this.observations.set(id, { target, ordinal: ++this.ordinal });
+        }
+      }
+      if (commandProblem?.code === 'EXECUTION_FAILED' && !this.context.execution) this.recoverable.set(id, descriptor.id);
       for (const [failedId, toolId] of this.recoverable) {
         if (!commandProblem && toolId === descriptor.id) {
           this.corrected.add(failedId);
@@ -495,7 +604,7 @@ export class ExecutionEngine {
           descriptor.program?.retry === 'never') ? 'OUTCOME_UNCERTAIN' : 'CANCELLED'
         : error instanceof ToolError
           ? error.code
-          : reserved && !(error instanceof RunError)
+          : launched && (reserved || descriptor.effect === 'consequential') && !(error instanceof RunError)
             ? 'OUTCOME_UNCERTAIN'
             : 'EXECUTION_FAILED';
       const message = stopped
@@ -505,6 +614,7 @@ export class ExecutionEngine {
           : providerError(error);
       if (!launched && (code === 'INVALID_ARGUMENT' || code === 'CAPABILITY_UNAVAILABLE'))
         this.recoverable.set(id, descriptor.id);
+      if (!launched && code === 'CANCELLED' && this.context.execution) this.corrected.add(id);
       result = {
         id,
         status: code === 'CANCELLED' ? 'cancelled' : code === 'DUPLICATE_DISPATCH' ? 'blocked' : 'failed',
@@ -528,12 +638,18 @@ export class ExecutionEngine {
     if (reservation && !parent.aborted) {
       await this.tools.host.request({
         ...scope, ...reservation, type: 'receipt',
-        state: result.problem?.code === 'OUTCOME_UNCERTAIN' ? 'uncertain' :
+        state: !launched && this.context.execution ? 'not_started' : result.problem?.code === 'OUTCOME_UNCERTAIN' ? 'uncertain' :
           result.status === 'completed' ? 'completed' : 'failed',
       }, AbortSignal.any([parent, AbortSignal.timeout(2000)])).catch(() => undefined);
     }
+    if (!launched && admittedFingerprint && result.problem?.code === 'CANCELLED')
+      this.dispatched.delete(admittedFingerprint);
     if (result.problem?.code === 'OUTCOME_UNCERTAIN')
       this.uncertainCapabilities.add(descriptor.capability);
+    if (readKey) {
+      const attempt = this.readAttempts.get(readKey)!;
+      attempt.retryable = result.problem?.code === 'TIMEOUT' || result.problem?.code === 'EXECUTION_FAILED';
+    }
     this.results.set(id, result);
     activity(result.problem?.code === 'OUTCOME_UNCERTAIN' ? 'uncertain' : result.status, result);
     return result;

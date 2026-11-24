@@ -55,7 +55,8 @@ export class StandaloneDispatch {
     }
   }
 
-  settle(scope: Scope, state: 'completed' | 'failed' | 'uncertain') {
+  settle(scope: Scope, state: 'completed' | 'failed' | 'uncertain' | 'not_started') {
+    if (state === 'not_started') return false;
     return Boolean(this.database().prepare(`
       UPDATE receipts SET state = ?, finished = ?
       WHERE turn = ? AND fingerprint = ? AND state = 'reserved'

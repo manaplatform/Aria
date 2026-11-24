@@ -102,6 +102,8 @@ function testTone() {
 }
 
 test('browses from ordinary chat through the managed private port and keeps private destinations out', async () => {
+  // Cold Electron and API startup can take half the default budget on hosted runners.
+  test.setTimeout(90_000);
   const provider = await createProviderFixture();
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'aria-browser-electron-'));
   const traffic: string[] = [];

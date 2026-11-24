@@ -1,5 +1,5 @@
 import { asSchema, type LanguageModelUsage, type ModelMessage, type ToolSet } from 'ai';
-import { conductorLimits, modelOutputLimit } from '@aria/shared';
+import { conductorLimits, defaultLoopLimits, modelOutputLimit, type LoopBudget } from '@aria/shared';
 import type { ResolvedModel } from '../providers/model-registry.service';
 import { ToolError } from './capability-host';
 
@@ -36,10 +36,39 @@ export class TurnBudget {
   memoryInputEstimate = 0;
   outputTokens?: number;
 
-  constructor(private readonly spendingLimit?: number) {}
+  constructor(
+    readonly spendingLimit?: number,
+    private readonly iterations = defaultLoopLimits.iterations,
+    prior?: LoopBudget,
+  ) {
+    if (!prior) return;
+    this.steps = prior.steps;
+    this.inputReserved = prior.inputReserved;
+    this.outputReserved = prior.outputReserved;
+    this.cost = prior.cost;
+    this.artifactBytes = prior.artifactBytes;
+    for (const id of prior.artifactIds) this.artifacts.add(id);
+    this.providerRequests = prior.providerRequests;
+    this.responseContinuations = prior.responseContinuations;
+    this.controlCalls = prior.controlCalls;
+    this.nativeToolCalls = prior.nativeToolCalls;
+    this.inputTokens = prior.inputTokens;
+    this.outputTokens = prior.outputTokens;
+    this.memoryInputEstimate = prior.memoryInputEstimate;
+  }
 
-  get remainingSteps() { return conductorLimits.steps - this.steps; }
-  get remainingRequests() { return conductorLimits.primaryCalls - this.providerRequests; }
+  snapshot() {
+    return {
+      steps: this.steps, inputReserved: this.inputReserved, outputReserved: this.outputReserved,
+      cost: this.cost, artifactBytes: this.artifactBytes, artifactIds: [...this.artifacts],
+      providerRequests: this.providerRequests, responseContinuations: this.responseContinuations,
+      controlCalls: this.controlCalls, nativeToolCalls: this.nativeToolCalls, inputTokens: this.inputTokens,
+      outputTokens: this.outputTokens, memoryInputEstimate: this.memoryInputEstimate,
+    };
+  }
+
+  get remainingSteps() { return Math.max(0, conductorLimits.steps - this.steps); }
+  get remainingRequests() { return Math.max(0, this.iterations - this.providerRequests); }
   get accountedCostUsdMicros() { return this.spendingLimit === undefined ? undefined : this.cost; }
 
   step(count = 1) {
@@ -120,6 +149,26 @@ export class TurnBudget {
       messages.splice(0, 2);
       historicalMessages -= 2;
       input = encodedSize([messages, system, schemas]);
+    }
+    if (input > ceiling && !continuation) {
+      for (const [index, message] of messages.entries()) {
+        if (input <= ceiling || index >= messages.length - 2) break;
+        if (message.role !== 'tool') continue;
+        message.content = message.content.map((part) => {
+          if (part.type !== 'tool-result' || part.output.type !== 'text' || part.output.value.length <= 2_000)
+            return part;
+          try {
+            const value = JSON.parse(part.output.value);
+            const { id, status, problem, artifact, sources } = value;
+            if (typeof id !== 'string' || typeof status !== 'string') return part;
+            return { ...part, output: { type: 'text', value: JSON.stringify({ id, status, problem, artifact,
+              sources: Array.isArray(sources) ? sources.slice(0, 3) : undefined, compacted: true }) } };
+          } catch {
+            return part;
+          }
+        });
+        input = encodedSize([messages, system, schemas]);
+      }
     }
     if (input > ceiling) exceeds('model context');
     let inputMessages = messages;

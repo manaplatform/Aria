@@ -6,6 +6,7 @@ import {
 } from './execution-runtime.js';
 import { identifier } from './model-registry.js';
 import { programSettingsSchema, type ProgramSettings } from './programmatic.js';
+import { loopCheckpointSchema, loopLimitsSchema } from './loop.js';
 
 export const capabilityId = z
   .string()
@@ -49,6 +50,7 @@ export const toolPolicySchema = z.strictObject({
   programming: programSettingsSchema.optional(),
   nativeProgramVerified: z.boolean().optional(),
   skills: z.array(skillSummarySchema).max(128),
+  loop: loopLimitsSchema.optional(),
 });
 export const defaultToolPolicy: ToolPolicy = {
   revision: 'initial',
@@ -146,6 +148,10 @@ export const capabilityHostRequest = z.discriminatedUnion('type', [
   runtimeCallSchema.extend({ ...scope, id: z.string().uuid(), type: z.literal('runtime') }),
   z.strictObject({
     ...scope,
+    id: z.uuid(), type: z.literal('checkpoint'), checkpoint: loopCheckpointSchema,
+  }),
+  z.strictObject({
+    ...scope,
     id: z.string().uuid(),
     type: z.literal('reserve'),
     fingerprint: z.string().regex(/^[a-f0-9]{64}$/),
@@ -160,7 +166,7 @@ export const capabilityHostRequest = z.discriminatedUnion('type', [
     id: z.string().uuid(),
     type: z.literal('receipt'),
     fingerprint: z.string().regex(/^[a-f0-9]{64}$/),
-    state: z.enum(['completed', 'failed', 'uncertain']),
+    state: z.enum(['completed', 'failed', 'uncertain', 'not_started']),
   }),
   z.strictObject({
     ...scope,
@@ -176,6 +182,7 @@ export const capabilityHostReply = z.discriminatedUnion('ok', [
     id: z.string().uuid(),
     ok: z.literal(true),
     runtime: runtimeResultSchema.optional(),
+    checkpointed: z.boolean().optional(),
     content: z
       .strictObject({
         text: z.string().max(12_000),

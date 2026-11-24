@@ -116,6 +116,7 @@ When implementing AI features:
 - Return actionable errors for configuration, capability, and invocation failures. An explicit retry uses the same authorized configuration.
 - Application code validates every model request and enforces permissions, input provenance, dependency rules, cancellation, deduplication, and resource limits. Provider and tool output is untrusted. Show concise decision summaries and keep hidden reasoning and credentials private.
 - Start ordinary chat with the selected primary. Investigation, planning, verification, discovery, and program execution are optional decisions driven by the task and observed results. Spend inference on semantic decisions. Use deterministic code for validation, scheduling, accounting, and result projection.
+- Use `ConductorLoopExecutor` for model iterations and execution controls through the normal chat entry point. Bind managed checkpoints, controls, and observations to the execution generation. Resume explicitly under the original primary and current policy, reusing stable receipts and charging work to the remaining budget. See [Conductor Loop Executor](docs/conductor-loop-executor.md).
 
 ## Native web and browser
 

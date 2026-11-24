@@ -42,7 +42,7 @@ const storedCheckpointSchema = z.strictObject({
   final: z.boolean(),
   privateContent: z.boolean(),
 });
-type Grant = (title: string, detail: string, signal: AbortSignal) => Promise<boolean>;
+type Grant = (title: string, detail: string, signal: AbortSignal, executionGrant?: string) => Promise<boolean>;
 
 function checked<T>(result: { success: true; data: T } | { success: false }): T {
   if (!result.success) throw new RuntimeError('INVALID_ARGUMENT', 'The runtime input is invalid.');
@@ -614,26 +614,29 @@ ${
     };
   }
 
-  private async allowContent(request: RuntimeRequest, files: SearchFile[], signal: AbortSignal) {
+  private async allowContent(request: RuntimeRequest, files: SearchFile[], signal: AbortSignal, lexical = false) {
+    const versions = files.map(({ asset, bytes }) => [asset.id, digest(bytes)]).sort();
+    const scope = lexical && !request.programId
+      ? digest(JSON.stringify([request.primary, request.revision, request.operation, versions])) : undefined;
     const fingerprint = digest(
       JSON.stringify([
         request.primary,
-        files.map(({ asset, bytes }) => [asset.id, digest(bytes)]).sort(),
+        versions,
         request.revision, request.operation, request.input, request.programId ?? null,
       ]),
     );
     const grants = this.grants.get(request.requestId) ?? new Set<string>();
-    if (!grants.has(fingerprint)) {
+    if (scope || !grants.has(fingerprint)) {
       if (
         !(await this.approve(
           'Share document content with the configured model?',
-          `Allow excerpts or command results derived from the selected files in this turn and its active workspace to ${new URL(request.primary.endpoint).origin}.\n\n${files
+        `Allow results from the selected files to ${request.primary.model} at ${new URL(request.primary.endpoint).origin}.\n\n${files
             .map(({ asset }) => asset.name)
             .join('\n')
             .slice(0, 900)}` + (request.programId
               ? `\n\nProgram operation: ${request.operation}\nArguments: ${JSON.stringify(request.input)}`
               : ''),
-          signal,
+          signal, scope,
         ))
       )
         throw new RuntimeError(
@@ -641,18 +644,20 @@ ${
           'Sharing document content with the model was declined.',
         );
       signal.throwIfAborted();
-      this.grants.set(request.requestId, grants.add(fingerprint));
+      if (!scope) this.grants.set(request.requestId, grants.add(fingerprint));
     }
   }
 
   release(requestId: string) {
-    this.grants.delete(requestId);
+    this.revokeExecution(requestId);
     this.store.interruptDispatches(requestId);
     void this.programs.release(requestId);
     if (this.skills.policy().programming?.backend && this.skills.policy().programming?.backend !== 'off')
       this.store.interruptPrograms(requestId);
     if (this.store.hasHostedResources(requestId)) this.cleanHostedResources(requestId);
   }
+
+  revokeExecution(requestId: string) { this.grants.delete(requestId); }
 
   cleanHostedResources(requestId?: string) {
     if (!this.store.hasHostedResources(requestId)) return;
@@ -741,7 +746,7 @@ ${
     }
     if (files.reduce((size, file) => size + file.bytes.length, 0) > 80_000_000)
       throw new RuntimeError('BUDGET_EXCEEDED', 'Choose a smaller document scope for this search.');
-    if (files.length) await this.allowContent(request, files, signal);
+    if (files.length) await this.allowContent(request, files, signal, !semantic);
     const indexStarted = Date.now();
     const indexed: string[] = [];
     const problems: string[] = [];

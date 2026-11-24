@@ -6,6 +6,7 @@ import { browserOps, browserToolArgs } from './browser.js';
 import { webToolArgs } from './web.js';
 import { identifier, modelCapabilitySchema, modelRefSchema } from './model-registry.js';
 import type { ChatMessage, ChatRequest } from './index.js';
+import type { ExecutionSnapshot } from './loop.js';
 
 /** Select complete saved turns and keep their privacy metadata until the wire projection. */
 export function selectChatContext(
@@ -192,6 +193,7 @@ export const activitySchema = z
     programResultSaved: z.boolean().optional(),
     inputSummary: z.string().max(200).optional(),
     resultSummary: z.string().max(200).optional(),
+    outcomeUnverified: z.boolean().optional(),
     at: z.number().int().nonnegative(),
     durationMs: z.number().int().nonnegative().optional(),
     error: z.string().max(400).optional(),
@@ -222,6 +224,10 @@ export const runInfoSchema = z
       inputTokens: z.number().int().nonnegative().optional(),
       memoryInputEstimate: z.number().int().nonnegative().optional(),
       outputTokens: z.number().int().nonnegative().optional(),
+      iterations: z.number().int().nonnegative().optional(),
+      recoveries: z.number().int().nonnegative().optional(),
+      noProgress: z.boolean().optional(),
+      activeMs: z.number().int().nonnegative().optional(),
     }).optional(),
   })
   .strict();
@@ -254,6 +260,7 @@ export type ConductorSource = z.infer<typeof sourceSchema>;
 export type ConductorRunInfo = z.infer<typeof runInfoSchema>;
 export type ConductorEvent =
   | { type: 'started'; run?: ConductorRunInfo }
+  | { type: 'execution'; execution: ExecutionSnapshot }
   | { type: 'delta'; text: string }
   | { type: 'reset' }
   | { type: 'activity'; activity: ConductorActivity }

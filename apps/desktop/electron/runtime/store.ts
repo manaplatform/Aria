@@ -5,9 +5,14 @@ import { DatabaseSync } from 'node:sqlite';
 import { types } from 'node:util';
 import {
   executionLimits,
+  executionTerminalStates,
+  loopCheckpointLifetime,
+  loopReceiptSchema,
   programJournalSchema,
   runtimeSettingsSchema,
   type CapabilityHostRequest,
+  type ExecutionSnapshot,
+  type LoopCheckpoint,
   type RuntimeSettings,
   type ToolProblem,
 } from '@aria/shared';
@@ -46,7 +51,7 @@ export class RuntimeStore {
     try {
       db.exec('PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 2000; PRAGMA journal_mode = WAL;');
       const version = Number(db.prepare('PRAGMA user_version').get()?.user_version);
-      if (version > 7) throw new Error('This runtime profile requires a newer version of Aria.');
+      if (version > 8) throw new Error('This runtime profile requires a newer version of Aria.');
       if (version === 0) {
         db.exec(`
           BEGIN IMMEDIATE;
@@ -215,7 +220,24 @@ export class RuntimeStore {
           COMMIT;
         `);
       }
+      if (version < 8) {
+        db.exec(`
+          BEGIN IMMEDIATE;
+          CREATE TABLE loop_checkpoints (
+            id TEXT PRIMARY KEY, conversation TEXT NOT NULL, turn TEXT NOT NULL,
+            request TEXT NOT NULL, user_message TEXT NOT NULL, provider TEXT NOT NULL,
+            generation INTEGER NOT NULL, revision INTEGER NOT NULL, state TEXT NOT NULL,
+            payload BLOB NOT NULL, expires INTEGER NOT NULL, UNIQUE(conversation, turn)
+          );
+          CREATE INDEX loop_checkpoints_expiry ON loop_checkpoints(expires);
+          PRAGMA user_version = 8;
+          COMMIT;
+        `);
+      }
       db.exec(`
+        DELETE FROM loop_checkpoints WHERE expires <= unixepoch() * 1000;
+        UPDATE loop_checkpoints SET state = 'recovering'
+          WHERE state NOT IN ('completed', 'partial', 'failed', 'cancelled');
         DELETE FROM program_results WHERE expires <= unixepoch() * 1000;
         DELETE FROM provider_checkpoints WHERE expires <= unixepoch() * 1000;
         UPDATE program_children SET state = 'uncertain' WHERE state = 'reserved';
@@ -259,7 +281,9 @@ export class RuntimeStore {
   }
 
   get settings(): RuntimeSettings {
-    const row = this.db.prepare('SELECT value FROM settings WHERE id = 1').get();
+    const row = this.database || existsSync(this.databaseFile)
+      ? this.db.prepare('SELECT value FROM settings WHERE id = 1').get()
+      : undefined;
     return row
       ? runtimeSettingsSchema.parse(JSON.parse(String(row.value)))
       : { engineSocket: '', commandMs: executionLimits.commandMs };
@@ -280,6 +304,89 @@ export class RuntimeStore {
       db.exec('ROLLBACK');
       throw error;
     }
+  }
+
+  saveLoop(scope: { conversationId: string; assistantMessageId: string; requestId: string },
+    checkpoint: LoopCheckpoint, provider: string, payload: Buffer) {
+    return this.transaction(() => {
+      const now = Date.now();
+      this.db.prepare('DELETE FROM loop_checkpoints WHERE expires <= ?').run(now);
+      const existing = this.db.prepare('SELECT * FROM loop_checkpoints WHERE conversation = ? AND turn = ?')
+        .get(scope.conversationId, scope.assistantMessageId);
+      if (existing?.id === checkpoint.executionId) {
+        return Boolean(this.db.prepare(`UPDATE loop_checkpoints SET revision = ?, state = ?, payload = ?, expires = ?
+          WHERE id = ? AND request = ? AND generation = ? AND revision < ? AND provider = ?
+            AND state NOT IN ('completed', 'partial', 'failed', 'cancelled')`)
+          .run(checkpoint.revision, checkpoint.state, payload, now + loopCheckpointLifetime,
+            checkpoint.executionId, scope.requestId, checkpoint.generation, checkpoint.revision, provider).changes);
+      }
+      if (checkpoint.generation !== 1 || existing && !executionTerminalStates.has(existing.state as ExecutionSnapshot['state']))
+        return false;
+      if (existing) this.db.prepare('DELETE FROM loop_checkpoints WHERE id = ?').run(existing.id);
+      // Evict expired or terminal snapshots before rejecting a new durable execution.
+      this.db.prepare(`DELETE FROM loop_checkpoints WHERE id IN (
+        SELECT id FROM loop_checkpoints WHERE state IN ('completed', 'partial', 'failed', 'cancelled')
+        ORDER BY expires LIMIT MAX(0, (SELECT count(*) - 15 FROM loop_checkpoints))
+      )`).run();
+      if (Number(this.db.prepare('SELECT count(*) AS total FROM loop_checkpoints').get()?.total) >= 16) return false;
+      this.db.prepare('INSERT INTO loop_checkpoints VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(checkpoint.executionId, scope.conversationId, scope.assistantMessageId,
+          scope.requestId, checkpoint.userMessageId, provider, checkpoint.generation, checkpoint.revision,
+          checkpoint.state, payload, now + loopCheckpointLifetime);
+      return true;
+    });
+  }
+
+  loopForMessage(conversation: string, turn: string) {
+    if (!this.database && !existsSync(this.databaseFile)) return undefined;
+    return this.db.prepare('SELECT * FROM loop_checkpoints WHERE conversation = ? AND turn = ? AND expires > ?')
+      .get(conversation, turn, Date.now());
+  }
+
+  cancelLoop(request: string) {
+    this.database?.prepare(`UPDATE loop_checkpoints SET state = 'cancelled', payload = X'' WHERE request = ?
+      AND state NOT IN ('completed', 'partial', 'failed', 'cancelled')`).run(request);
+  }
+
+  claimLoop(conversation: string, turn: string, id: string, generation: number, revision: number,
+    provider: string, request: string) {
+    return this.transaction(() => {
+      const row = this.loopForMessage(conversation, turn);
+      if (!row || row.id !== id || row.generation !== generation || row.revision !== revision || row.provider !== provider ||
+          executionTerminalStates.has(row.state as ExecutionSnapshot['state']))
+        throw new RuntimeError('INVALID_REFERENCE', 'This execution checkpoint changed or expired.');
+      const previousRequest = String(row.request);
+      const owner = digest(conversation);
+      const logicalTurn = digest(turn);
+      this.interruptDispatches(previousRequest);
+      this.interruptPrograms(previousRequest);
+      this.db.prepare("UPDATE attempts SET state = 'uncertain' WHERE request = ? AND state IN ('running', 'authorized')")
+        .run(previousRequest);
+      this.db.prepare("UPDATE approval_receipts SET state = 'expired', decided = ? WHERE request = ? AND state = 'pending'")
+        .run(Date.now(), previousRequest);
+      const dispatchOwner = this.db.prepare('SELECT attempt FROM dispatch_turns WHERE conversation = ? AND turn = ?')
+        .get(owner, logicalTurn);
+      if (dispatchOwner && dispatchOwner.attempt !== digest(previousRequest))
+        throw new RuntimeError('OUTCOME_UNCERTAIN', 'The previous dispatch owner could not be reconciled.');
+      this.db.prepare('UPDATE dispatch_turns SET attempt = ? WHERE conversation = ? AND turn = ?')
+        .run(digest(request), owner, logicalTurn);
+      this.db.prepare(`UPDATE loop_checkpoints SET request = ?, generation = generation + 1, revision = 0,
+        state = 'recovering' WHERE id = ?`).run(request, id);
+      const receipts = this.db.prepare(`SELECT step AS id, operation, state FROM dispatch_receipts
+        WHERE conversation = ? AND turn = ? AND step IS NOT NULL ORDER BY started DESC LIMIT 48`)
+        .all(owner, logicalTurn);
+      const attempts = this.db.prepare(`SELECT step AS id, operation, state FROM attempts
+        WHERE conversation = ? AND turn = ? ORDER BY started DESC LIMIT 48`).all(conversation, turn);
+      for (const entry of attempts) {
+        if (['timeout', 'cancelled', 'running', 'authorized', 'submitted'].includes(String(entry.state)))
+          entry.state = 'uncertain';
+        if (['verified', 'confirmed', 'staged'].includes(String(entry.state))) entry.state = 'completed';
+      }
+      return [...attempts, ...receipts].flatMap((entry) => {
+        const parsed = loopReceiptSchema.safeParse(entry);
+        return parsed.success ? [parsed.data] : [];
+      });
+    });
   }
 
   reserveDispatch(
@@ -316,8 +423,11 @@ export class RuntimeStore {
 
   settleDispatch(
     conversation: string, turn: string, request: string, fingerprint: string,
-    state: 'completed' | 'failed' | 'uncertain',
+    state: 'completed' | 'failed' | 'uncertain' | 'not_started',
   ) {
+    if (state === 'not_started') return Boolean(this.db.prepare(`DELETE FROM dispatch_receipts
+      WHERE conversation = ? AND turn = ? AND request = ? AND fingerprint = ? AND state = 'reserved'`)
+      .run(digest(conversation), digest(turn), request, digest(fingerprint)).changes);
     return Boolean(this.db.prepare(`
       UPDATE dispatch_receipts SET state = ?, finished = ?
       WHERE conversation = ? AND turn = ? AND request = ? AND fingerprint = ? AND state = 'reserved'
@@ -502,6 +612,7 @@ export class RuntimeStore {
   }
 
   deletePrograms(conversation: string) {
+    this.db.prepare('DELETE FROM loop_checkpoints WHERE conversation = ?').run(conversation);
     this.db.prepare('DELETE FROM programs WHERE conversation = ?').run(conversation);
     this.db.prepare('DELETE FROM provider_checkpoints WHERE conversation = ?').run(conversation);
     this.db.prepare('DELETE FROM approval_receipts WHERE conversation = ?').run(conversation);

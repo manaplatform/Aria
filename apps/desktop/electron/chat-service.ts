@@ -13,6 +13,7 @@ import {
   type RuntimeRegistry,
   type CapabilityHostRequest,
   type ToolPolicy,
+  type LoopCommand,
 } from '@aria/shared';
 import { z } from 'zod';
 import WebSocket from 'ws';
@@ -39,6 +40,7 @@ interface CapabilityIntegration {
     signal: AbortSignal,
   ): Promise<void>;
   release?(request: string): void;
+  cancelExecution?(request: string): void;
   availableAssets?(conversation: string): MediaAsset[];
   open(
     revision: string,
@@ -87,6 +89,11 @@ export class ChatService {
   assertConversationIdle(conversationId: string): void {
     if ([...this.requests.values()].some((r) => r.request.conversationId === conversationId))
       throw new Error('This conversation already has a response in progress.');
+  }
+  assertExecutionCapacity(conversationId: string): void {
+    if (this.requests.size >= conductorLimits.turns)
+      throw new Error('Aria is handling too many turns. Stop a response or try again shortly.');
+    this.assertConversationIdle(conversationId);
   }
   assertIdle(): void {
     if (this.requests.size)
@@ -309,14 +316,8 @@ export class ChatService {
       throw new Error('Configure your provider in Settings before sending a message.');
     if (request.expectedRevision && this.status.revision !== request.expectedRevision)
       throw new Error('The AI Models configuration changed. Send again to use current settings.');
-    if (this.requests.size >= conductorLimits.turns)
-      throw new Error('Aria is handling too many turns. Stop a response or try again shortly.');
-    if (
-      this.requests.has(request.requestId) ||
-      [...this.requests.values()].some(
-        (item) => item.request.conversationId === request.conversationId,
-      )
-    )
+    this.assertExecutionCapacity(request.conversationId);
+    if (this.requests.has(request.requestId))
       throw new Error('This conversation already has a response in progress.');
     const active: ActiveRequest = {
       request,
@@ -364,6 +365,20 @@ export class ChatService {
   assistantForTurn(requestId: string) {
     return this.requests.get(requestId)?.request.assistantMessageId;
   }
+  executionForTurn(requestId: string) {
+    const turn = this.requests.get(requestId);
+    return turn?.stopped ? undefined : turn?.request.execution;
+  }
+  async control(command: LoopCommand) {
+    const turn = this.requests.get(command.requestId);
+    if (!turn || !this.activeTurn(command) || command.executionId !== turn.request.execution?.executionId ||
+        command.generation !== turn.request.execution.generation)
+      throw new Error('This execution is no longer active.');
+    const response = await this.http(`chat/${encodeURIComponent(command.requestId)}/control`, {
+      method: 'POST', headers: this.headers(), body: JSON.stringify(command), signal: AbortSignal.timeout(5000),
+    });
+    return z.strictObject({ accepted: z.literal(true), applied: z.boolean() }).parse(await response.json()).applied;
+  }
   submit(input: ChatRequest): void {
     this.begin(input);
   }
@@ -403,7 +418,9 @@ export class ChatService {
         if (
           event.requestId !== request.requestId ||
           event.conversationId !== request.conversationId ||
-          event.assistantMessageId !== request.assistantMessageId
+          event.assistantMessageId !== request.assistantMessageId ||
+          event.executionId !== request.execution?.executionId ||
+          event.generation !== request.execution?.generation
         )
           throw new Error('Mismatched stream.');
         if (event.sequence <= active.sequence) continue;
@@ -462,6 +479,8 @@ export class ChatService {
             conversationId: event.conversationId,
             assistantMessageId: event.assistantMessageId,
             sequence: event.sequence,
+            executionId: event.executionId,
+            generation: event.generation,
           });
         } else if (event.type === 'activity' && event.activity.resultId) {
           active.emit({
@@ -484,6 +503,8 @@ export class ChatService {
           conversationId: request.conversationId,
           assistantMessageId: request.assistantMessageId,
           sequence: active.sequence + 1,
+          executionId: request.execution?.executionId,
+          generation: request.execution?.generation,
           ...(active.stopped
             ? { type: 'stopped' as const }
             : {
@@ -502,11 +523,20 @@ export class ChatService {
     const active = this.requests.get(requestId);
     if (!active) return;
     active.stopped = true;
-    active.controller.abort();
-    await active.done;
+    try {
+      this.capabilities?.cancelExecution?.(requestId);
+    } finally {
+      active.controller.abort();
+      await active.done;
+    }
   }
   async cancelAll(): Promise<void> {
     await Promise.all([...this.requests.keys()].map((id) => this.cancel(id)));
+  }
+  async interruptAll(): Promise<void> {
+    const active = [...this.requests.values()];
+    active.forEach(({ controller }) => controller.abort());
+    await Promise.all(active.map(({ done }) => done));
   }
   private async stage(request: ChatRequest, signal: AbortSignal) {
     if (!this.assets) throw new Error('Local attachments are unavailable.');
@@ -589,7 +619,7 @@ export class ChatService {
   }
   async close(): Promise<void> {
     ++this.generation;
-    await this.cancelAll();
+    await this.interruptAll();
     this.browserSession?.close();
     this.capabilitySession?.close();
     const child = this.child;

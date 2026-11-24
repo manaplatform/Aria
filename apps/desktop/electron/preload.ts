@@ -135,6 +135,9 @@ const bridge: DesktopBridge = {
   attachChatProject: (conversation, project) => ipcRenderer.invoke('aria:attach-chat-project', conversation, project),
   submitChat: (request) => ipcRenderer.invoke('aria:submit-chat', request),
   cancelChat: (id) => ipcRenderer.invoke('aria:cancel-chat', id),
+  controlExecution: (command) => ipcRenderer.invoke('aria:control-execution', command),
+  resumeExecution: (scope) => ipcRenderer.invoke('aria:resume-execution', scope),
+  activeChatMessages: () => ipcRenderer.invoke('aria:active-chat-messages'),
   onChatEvent: (callback) => {
     const listener = (_event: Electron.IpcRendererEvent, event: ChatEvent) => callback(event);
     ipcRenderer.on('aria:chat-event', listener);

@@ -16,6 +16,7 @@ describe('durable runtime', () => {
         "INSERT INTO documents VALUES ('document', 'chat', NULL, 'notes.txt', 'version', 'ready')",
       ).run();
       store.db.exec(`
+        DROP TABLE loop_checkpoints;
         DROP TABLE local_desktop_grant;
         DROP TABLE approval_receipts;
         DROP TABLE provider_checkpoints;
@@ -24,7 +25,7 @@ describe('durable runtime', () => {
         PRAGMA user_version = 4;
       `);
       store.close();
-      expect(store.db.prepare('PRAGMA user_version').get()?.user_version).toBe(7);
+      expect(store.db.prepare('PRAGMA user_version').get()?.user_version).toBe(8);
       expect(store.db.prepare("SELECT name FROM documents WHERE id = 'document'").get())
         .toMatchObject({ name: 'notes.txt' });
       const approval = store.beginApproval({

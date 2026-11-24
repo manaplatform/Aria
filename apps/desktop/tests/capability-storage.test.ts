@@ -188,6 +188,29 @@ it('fences all waiters when an active approval is revoked', async () => {
   expect(prompt).toHaveBeenCalledTimes(1);
 });
 
+it('reuses only an exact execution grant and revokes it on steering or release', async () => {
+  const prompt = vi.fn(async () => 'execution' as const);
+  const approval = new OperationApproval(prompt);
+  const signal = new AbortController().signal;
+  const scope = { conversation: 'owner', request: 'first', step: 'step', operation: 'knowledge.search', binding: {} };
+  const ask = (grant: string, request = scope.request) => approval.within({ ...scope, request }, () =>
+    approval.approve('Share excerpts?', 'Named primary', signal, grant));
+  expect(await ask('file-version-a')).toBe(true);
+  expect(await ask('file-version-a')).toBe(true);
+  expect(prompt).toHaveBeenCalledTimes(1);
+  expect(await ask('file-version-b')).toBe(true);
+  expect(await ask('file-version-a', 'next-generation')).toBe(true);
+  expect(prompt).toHaveBeenCalledTimes(3);
+  approval.revokeExecution('first');
+  approval.suspend('first', true);
+  expect(await ask('file-version-a')).toBe(false);
+  approval.suspend('first', false);
+  expect(await ask('file-version-a')).toBe(true);
+  approval.release('first');
+  expect(await ask('file-version-a')).toBe(true);
+  expect(prompt).toHaveBeenCalledTimes(5);
+});
+
 function archive(files: { name: string; data: Buffer; mode?: number }[]) {
   const locals: Buffer[] = [];
   const directory: Buffer[] = [];

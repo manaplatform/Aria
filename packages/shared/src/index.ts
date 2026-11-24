@@ -38,6 +38,9 @@ import type {
 } from './conductor.js';
 export * from './model-registry.js';
 export * from './conductor.js';
+import type { ExecutionSnapshot, LoopCommand, LoopRecoveryRequest, ManagedExecution } from './loop.js';
+export * from './loop.js';
+export { projectChatEvent } from './chat-projection.js';
 
 export interface HealthResponse {
   status: 'ok';
@@ -267,6 +270,7 @@ export interface ChatMessage {
   citations?: { sources: ConductorSource[]; evidence: DocumentEvidence[] };
   attempts?: ConductorAttempt[];
   run?: ConductorRunInfo;
+  execution?: ExecutionSnapshot;
   retryConfirmed?: boolean;
   settingsHelp?: boolean;
   partial?: boolean;
@@ -295,12 +299,15 @@ export interface ChatRequest {
   expectedRevision?: string;
   programPrivateHistory?: boolean;
   memory?: MemoryTurnOptions;
+  execution?: ManagedExecution;
 }
 export type ChatEvent = {
   requestId: string;
   conversationId: string;
   assistantMessageId: string;
   sequence: number;
+  executionId?: string;
+  generation?: number;
 } & (
   | ConductorEvent
   | { type: 'asset'; asset: MediaAsset }
@@ -493,6 +500,9 @@ export interface DesktopBridge {
   attachChatProject(conversationId: string, projectId: string | null): Promise<void>;
   submitChat(request: ChatRequest): Promise<void>;
   cancelChat(requestId: string): Promise<void>;
+  controlExecution(command: LoopCommand): Promise<void>;
+  resumeExecution(request: LoopRecoveryRequest): Promise<void>;
+  activeChatMessages(): Promise<ChatMessage[]>;
   onChatEvent(callback: (event: ChatEvent) => void): () => void;
 }
 
