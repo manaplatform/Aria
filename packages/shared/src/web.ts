@@ -29,6 +29,7 @@ export function publicWebUrl(value: string): URL {
 
 export const webUrlSchema = z
   .string()
+  .trim()
   .max(2000)
   .refine((value) => {
     try {
@@ -53,15 +54,35 @@ export const browserSearchResultsSchema = z.strictObject({
     )
     .max(8),
 });
-export function browserSearchUrl(query: string): string {
-  const url = new URL('https://search.brave.com/search');
+export const webSearchEngineSchema = z.enum(['auto', 'brave', 'bing']);
+export type WebSearchEngine = z.infer<typeof webSearchEngineSchema>;
+export function browserSearchUrl(
+  query: string,
+  engine: Exclude<WebSearchEngine, 'auto'> = 'brave',
+): string {
+  const url = new URL(
+    engine === 'bing' ? 'https://www.bing.com/search' : 'https://search.brave.com/search',
+  );
   url.searchParams.set('q', query);
   return url.href;
 }
-export const webDestination = z.union([
-  z.strictObject({ url: webUrlSchema }),
-  z.strictObject({ sourceId: webReference }),
-]);
+export const webDestination = z
+  .strictObject({
+    url: webUrlSchema
+      .optional()
+      .describe(
+        'Authorized public HTTP or HTTPS URL supplied by the user or an earlier search/browser step.',
+      ),
+    sourceId: webReference
+      .optional()
+      .describe(
+        'Source UUID returned by web_search or browser_get_page in an earlier step (also pass that step ID in dependsOn).',
+      ),
+  })
+  .refine(
+    (value) => Boolean(value.url) !== Boolean(value.sourceId),
+    'Provide either url or sourceId, not both.',
+  );
 export const webToolArgs = {
   web_search: webSearchArgs,
   web_fetch: webDestination,
@@ -78,6 +99,7 @@ export const webPolicyLimits = {
 export const webPolicySchema = z.strictObject({
   enabled: z.boolean(),
   aiBrowser: z.boolean(),
+  searchEngine: webSearchEngineSchema.default('auto'),
   searches: z.number().int().min(webPolicyLimits.searches.min).max(webPolicyLimits.searches.max),
   fetches: z.number().int().min(webPolicyLimits.fetches.min).max(webPolicyLimits.fetches.max),
   screenshots: z
@@ -93,6 +115,7 @@ export const webPolicySchema = z.strictObject({
 export const defaultWebPolicy: z.infer<typeof webPolicySchema> = {
   enabled: true,
   aiBrowser: true,
+  searchEngine: 'auto',
   searches: webPolicyLimits.searches.default,
   fetches: webPolicyLimits.fetches.default,
   screenshots: webPolicyLimits.screenshots.default,

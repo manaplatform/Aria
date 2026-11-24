@@ -8,10 +8,16 @@ const value = z.string().max(1000);
 
 export const browserToolArgs = {
   browser_open: webDestination,
-  browser_navigate: z.union([
-    z.strictObject({ ...tab, url: webUrlSchema }),
-    z.strictObject({ ...tab, sourceId: webReference }),
-  ]),
+  browser_navigate: z
+    .strictObject({
+      ...tab,
+      url: webUrlSchema.optional().describe('Authorized public HTTP or HTTPS URL.'),
+      sourceId: webReference.optional().describe('Source UUID from an earlier step.'),
+    })
+    .refine(
+      (value) => Boolean(value.url) !== Boolean(value.sourceId),
+      'Provide either url or sourceId, not both.',
+    ),
   browser_get_tabs: z.strictObject({}),
   browser_switch_tab: z.strictObject(tab),
   browser_get_page: z.strictObject(tab),
