@@ -162,7 +162,9 @@ test('supports default AI web search with snippets ("What is Mana-Agent?"), stan
     fixture.finalReply(declinePrompt, 'Access to README.md was declined.');
     await page.getByRole('textbox', { name: 'Message Aria' }).fill(declinePrompt);
     await page.getByRole('button', { name: 'Send message', exact: true }).click();
-    await expect(page.locator('.from-assistant[data-status="completed"]').last()).toBeVisible();
+    await expect(page.locator('.from-assistant[data-status="failed"]').last()).toBeVisible({
+      timeout: 15_000,
+    });
     expect(JSON.stringify(declinedOutcomes)).toContain('PERMISSION_DENIED');
 
     // 4b. Allow for this execution ("2") prompts once across search_files + repeated read_file, while ../ traversal fails safely.

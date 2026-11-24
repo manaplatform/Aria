@@ -544,9 +544,17 @@ function registerIpc(): void {
             old?.memoryReferences?.includes(id) || memory.canInspect(item.conversationId, id, item.id));
           item.memoryReferences = permitted.length ? permitted : undefined;
         }
-        const outbox = memory.outbox(storage.memoryOutbox, parsed.chat.messages, parsed.chat.conversations);
-        await storage.save(parsed, outbox);
-        initial = { data: parsed };
+        const seenWorkspaces = new Set(parsed.workspaces.map((item) => item.id));
+        const mergedData = {
+          ...parsed,
+          workspaces: [
+            ...parsed.workspaces,
+            ...previous.workspaces.filter((item) => !seenWorkspaces.has(item.id)),
+          ],
+        };
+        const outbox = memory.outbox(storage.memoryOutbox, mergedData.chat.messages, mergedData.chat.conversations);
+        await storage.save(mergedData, outbox);
+        initial = { data: mergedData };
         for (const message of parsed.chat.messages) {
           const projection = activeMessages.get(message.id);
           if (projection?.requestId === message.requestId && message.sequence >= projection.sequence &&
@@ -589,10 +597,14 @@ function registerIpc(): void {
       updatedAt: new Date().toISOString(),
     };
     await storage.register(workspace);
+    const previousCount = initial.data.workspaces.length;
     initial.data = {
       ...initial.data,
       workspaces: [...initial.data.workspaces.filter((w) => w.id !== workspace.id), workspace],
     };
+    if (previousCount !== initial.data.workspaces.length && !configuring) {
+      return await changeCapabilities(async () => undefined, async () => workspace);
+    }
     return workspace;
   });
   handle('aria:repository', (id) => repository(storage.root(string.parse(id))));

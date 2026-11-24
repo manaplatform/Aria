@@ -206,6 +206,33 @@ function execute(command: Command) {
   }
   if (command.op === 'search-results') {
     const results: { url: string; title: string; snippet?: string }[] = [];
+    const decodeSearchUrl = (rawHref: string): string | undefined => {
+      try {
+        const parsed = new URL(rawHref);
+        if (parsed.hostname.endsWith('.bing.com') && parsed.pathname === '/ck/a') {
+          const encoded = parsed.searchParams.get('u');
+          if (encoded?.startsWith('a1')) {
+            const base64 = encoded.slice(2).replace(/-/g, '+').replace(/_/g, '/');
+            const padded = base64.padEnd(base64.length + ((4 - (base64.length % 4)) % 4), '=');
+            const bytes = Uint8Array.from(atob(padded), (char) => char.charCodeAt(0));
+            const decoded = new TextDecoder().decode(bytes);
+            const target = new URL(decoded);
+            if (['http:', 'https:'].includes(target.protocol) && target.href.length <= 2000)
+              return target.href;
+          }
+          if (encoded && /^https?:\/\//i.test(encoded)) {
+            const target = new URL(encoded);
+            if (target.href.length <= 2000) return target.href;
+          }
+          return undefined;
+        }
+        return ['http:', 'https:'].includes(parsed.protocol) && parsed.href.length <= 2000
+          ? parsed.href
+          : undefined;
+      } catch {
+        return undefined;
+      }
+    };
     for (const anchor of document.querySelectorAll<HTMLAnchorElement>(
       '[data-type="web"] .result-content a[href]',
     )) {
@@ -238,16 +265,46 @@ function execute(command: Command) {
       });
       if (results.length === 8) break;
     }
-    const searchEmpty = [...document.querySelectorAll('h1, h2, [role="heading"]')].some(
-      (heading) =>
-        /^no (?:search )?results(?: found)?[.!]?$/i.test(heading.textContent?.trim() ?? '') &&
-        visible(heading),
-    );
+    if (!results.length) {
+      for (const item of document.querySelectorAll('li.b_algo')) {
+        const anchor = item.querySelector<HTMLAnchorElement>('h2 a[href], .b_title a[href]');
+        if (!anchor || !visible(anchor)) continue;
+        const resolvedUrl = decodeSearchUrl(anchor.href);
+        if (!resolvedUrl || results.some((result) => result.url === resolvedUrl)) continue;
+        const title = (anchor.innerText || anchor.textContent || '')
+          .replace(/\s+/g, ' ')
+          .trim()
+          .slice(0, 300);
+        if (!title) continue;
+        const caption = item.querySelector<HTMLElement>('.b_caption p, .b_snippet, p');
+        const snippetNode = caption?.cloneNode(true) as HTMLElement | undefined;
+        snippetNode?.querySelectorAll('.b_algoReadMore').forEach((node) => node.remove());
+        const snippet = (snippetNode?.textContent ?? '')
+          .replace(/\s+/g, ' ')
+          .trim()
+          .slice(0, 400);
+        results.push({
+          url: resolvedUrl,
+          title,
+          ...(snippet && snippet !== title ? { snippet } : {}),
+        });
+        if (results.length === 8) break;
+      }
+    }
+    const bNo = document.querySelector('.b_no');
+    const searchEmpty =
+      Boolean(bNo && visible(bNo)) ||
+      [...document.querySelectorAll('h1, h2, [role="heading"]')].some(
+        (heading) =>
+          /^no (?:search )?results(?: found)?[.!]?$|^there are no results for\b/i.test(
+            heading.textContent?.trim() ?? '',
+          ) && visible(heading),
+      );
     const captchaDetected =
       !results.length &&
       (Boolean(
         document.querySelector(
-          '[data-testid="captcha"], .cf-turnstile, iframe[src*="captcha"], iframe[src*="turnstile"], iframe[src*="hcaptcha"], iframe[src*="recaptcha"]',
+          '[data-testid="captcha"], .cf-turnstile, iframe[src*="captcha"], iframe[src*="turnstile"], iframe[src*="hcaptcha"], iframe[src*="recaptcha"], #b_captcha, .b_captcha',
         ),
       ) ||
         /verify (?:that )?you are human|complete the (?:security|captcha) check|unusual traffic/i.test(

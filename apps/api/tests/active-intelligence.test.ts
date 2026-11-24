@@ -836,6 +836,76 @@ it('enforces approval on consequential operations without fabricating completion
   expect(approved.text).toContain('Friday 14:00 UTC');
 });
 
+it('exposes anyOf-free web/browser schemas, coerces unwrapped or nested-dependsOn calls, and explains real schema mismatches', async () => {
+  const tabId = randomUUID();
+  const { browserOps } = installRuntime({
+    onBrowser(req) {
+      if (req.op === 'web_search') {
+        return {
+          ok: true,
+          text: JSON.stringify({
+            results: [{ url: 'https://example.org/docs', title: 'Example Docs' }],
+          }),
+        };
+      }
+      if (req.op === 'browser_open') {
+        return { ok: true, text: JSON.stringify({ tabId, url: 'https://example.org/docs' }) };
+      }
+      return { ok: true, text: '{}' };
+    },
+  });
+
+  const prompt = 'Search and open example docs';
+  fixture.queueTool(prompt, 'find_capabilities', { query: 'web search browser open' });
+  fixture.queueTool(prompt, 'load_capabilities', {
+    ids: ['web.web_search', 'web.web_fetch', 'browser.browser_open'],
+  });
+  let searchStepId = '';
+  fixture.onToolResult(prompt, (raw) => {
+    const res = raw as {
+      loaded?: unknown;
+      id?: string;
+      status?: string;
+      data?: { results?: { sourceId: string }[] };
+    };
+    if (res.loaded) {
+      // Flat search arguments (missing `args` wrapper) and null optional dependsOn still succeed.
+      return { name: 'web_web_search', input: { query: 'example docs', dependsOn: null } };
+    }
+    if (res.data?.results?.length && res.id) {
+      searchStepId = res.id;
+      // Intentionally send an invalid public URL first to verify actionable Zod detail.
+      return { name: 'browser_browser_open', input: { args: { url: 'http://127.0.0.1/private' } } };
+    }
+    if (res.status === 'failed' && searchStepId) {
+      // Recover with flat args + nested dependsOn inside args.
+      return {
+        name: 'browser_browser_open',
+        input: { args: { url: 'https://example.org/docs', sourceId: null, dependsOn: [searchStepId] } },
+      };
+    }
+    return undefined;
+  });
+  fixture.finalReply(prompt, 'Opened https://example.org/docs');
+
+  const res = await runChat([{ role: 'user', content: prompt }]);
+  expect(res.events.at(-1)).toMatchObject({ type: 'completed', partial: false });
+  expect(browserOps).toEqual(['web_search', 'browser_open']);
+
+  // Verify the loaded tool definitions exposed to the model avoid `anyOf`.
+  const loadedToolsPayload = JSON.stringify(fixture.received[2]?.body.tools ?? []);
+  expect(loadedToolsPayload).toContain('browser_browser_open');
+  expect(loadedToolsPayload).not.toContain('"anyOf"');
+
+  // Verify the invalid URL schema error explains the failing field instead of an opaque message.
+  const schemaFailureEvent = res.events.find(
+    (e) => e.type === 'activity' && e.activity.target === 'browser.browser_open' && e.activity.status === 'failed',
+  );
+  expect(schemaFailureEvent?.type === 'activity' ? schemaFailureEvent.activity.error : '').toContain(
+    'args.url',
+  );
+});
+
 const liveEnabled = process.env.ARIA_RUN_MODEL_EVALS === '1';
 it.skipIf(!liveEnabled)(
   'resolves "What is Mana-Agent?" via capability discovery with a live configured model',

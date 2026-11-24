@@ -174,6 +174,7 @@ export interface ToolDescriptor<Input = unknown, Output extends StepValue = Step
   parallelDelegate?: boolean;
   budget?: 'searches' | 'fetches' | 'screenshots';
   available?: (context: ToolContext) => boolean;
+  prepareInput?: (input: unknown) => unknown;
   normalize?: (input: Input) => Partial<ExecutionStep>;
   execute: (input: Input, invocation: Invocation) => Promise<Output> | Output;
 }
@@ -192,14 +193,15 @@ const base = {
 };
 
 const researchDescriptions: Record<ResearchToolId, string> = {
-  web_search: 'Find public webpages about a topic using a natural-language search query.',
+  web_search: 'Find public webpages about a topic using a natural-language search query (args: { query }).',
   web_fetch:
-    'Read a public publisher page by search result source ID or a URL supplied by the user.',
+    'Read a public publisher page from a user-supplied URL or a search result (args: { sourceId } or { url }, with dependsOn: [<stepId>] for prior results). Do not guess unverified URLs.',
   web_read: 'Read the full bounded text of a fetched publisher document.',
   web_find: 'Find mentions of a term in a fetched publisher document.',
   browser_open:
-    'Open a public page in an isolated Aria browser tab using an authorized URL or source.',
-  browser_navigate: 'Navigate an existing AI browser tab to an authorized public source.',
+    'Open a public page in an isolated Aria browser tab using a user-supplied URL or an earlier search/page result (args: { url } or { sourceId }, with dependsOn: [<stepId>] for prior results). Use web_search for topic searches.',
+  browser_navigate:
+    'Navigate an existing AI browser tab to a user-supplied URL or earlier result (args: { tabId, url } or { tabId, sourceId }, with dependsOn: [<stepId>]).',
   browser_get_tabs: 'List AI browser tabs that belong to this conversation.',
   browser_get_page: 'Inspect the current public page and its structured controls.',
   browser_media:
@@ -380,15 +382,51 @@ function settingsSectionFor(id: string) {
   return 'Tools';
 }
 
+function stripNullishRecord(value: Record<string, unknown>) {
+  return Object.fromEntries(
+    Object.entries(value).filter(([, item]) => item !== undefined && item !== null),
+  );
+}
+
+function normalizeResearchInput(raw: unknown): unknown {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return raw;
+  const record = stripNullishRecord(raw as Record<string, unknown>);
+  if (Object.hasOwn(record, 'args')) {
+    if (!record.args || typeof record.args !== 'object' || Array.isArray(record.args)) return record;
+    const args = stripNullishRecord(record.args as Record<string, unknown>);
+    if (Object.hasOwn(args, 'dependsOn') && !Object.hasOwn(record, 'dependsOn')) {
+      const { dependsOn: nestedDeps, ...rest } = args;
+      return { ...record, args: rest, ...(nestedDeps != null && { dependsOn: nestedDeps }) };
+    }
+    return { ...record, args };
+  }
+  const { dependsOn: deps, ...args } = record;
+  return { args, ...(deps !== undefined && { dependsOn: deps }) };
+}
+
 function inputHintFromSchema(schema?: JSONSchema7): ToolInputHint | undefined {
   if (!schema || typeof schema !== 'object' || !schema.properties) return undefined;
   const required = (Array.isArray(schema.required) ? schema.required : []).slice(0, 16);
   const optional = Object.keys(schema.properties)
     .filter((key) => !required.includes(key))
     .slice(0, 16);
+  const formatField = (key: string) => {
+    const prop = schema.properties?.[key];
+    if (
+      key === 'args' &&
+      prop &&
+      typeof prop === 'object' &&
+      !Array.isArray(prop) &&
+      prop.properties &&
+      Object.keys(prop.properties).length
+    ) {
+      return `args.{${Object.keys(prop.properties).slice(0, 8).join(', ')}}`;
+    }
+    return key;
+  };
   const parts = [
-    required.length ? `required: ${required.join(', ')}` : '',
-    optional.length ? `optional: ${optional.join(', ')}` : '',
+    required.length ? `required: ${required.map(formatField).join(', ')}` : '',
+    optional.length ? `optional: ${optional.map(formatField).join(', ')}` : '',
   ].filter(Boolean);
   if (!parts.length) return undefined;
   return { required, optional, summary: parts.join(' | ').slice(0, 400) };
@@ -1000,6 +1038,7 @@ export class ToolRegistry {
                 : undefined,
         artifacts: op === 'browser_screenshot',
         citations: ['web_fetch', 'web_find', 'web_read', 'browser_extract'].includes(op),
+        prepareInput: normalizeResearchInput,
         normalize: ({ args, dependsOn }) => ({ args, dependsOn: dependsOn ?? [] }),
         execute: ({ args }, { context, step, signal, approval }) =>
           context.research.invoke(op, args, step, signal, approval),

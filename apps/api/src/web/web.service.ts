@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import {
   browserSearchResultsSchema,
   defaultWebPolicy,
+  publicWebUrl,
   runtimeWebSchema,
   sourceSchema,
   type BrowserBridgeOp,
@@ -25,10 +26,28 @@ type ResearchResult = {
 type ResearchContext = Pick<ChatRequest, 'requestId' | 'conversationId' | 'messages'>;
 type Document = { producer: string; text: string; source: ConductorSource };
 
+const nonDomainExtensions = new Set([
+  'ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs', 'json', 'md', 'txt', 'csv', 'tsv',
+  'py', 'go', 'rs', 'java', 'rb', 'php', 'yaml', 'yml', 'toml', 'xml', 'html',
+  'css', 'scss', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'pdf', 'zip',
+  'tar', 'gz', 'log', 'lock', 'sh', 'env', 'sql', 'db', 'sqlite',
+]);
+
 function normalized(url: string) {
   const address = new URL(url);
   address.hash = '';
   return address.href;
+}
+
+function trimCandidateUrl(raw: string) {
+  let candidate = raw.replace(/[.,;:!?'"*~\]}]+$/, '');
+  while (candidate.endsWith(')')) {
+    const opens = (candidate.match(/\(/g) ?? []).length;
+    const closes = (candidate.match(/\)/g) ?? []).length;
+    if (closes <= opens) break;
+    candidate = candidate.slice(0, -1).replace(/[.,;:!?'"*~\]}]+$/, '');
+  }
+  return candidate;
 }
 
 @Injectable()
@@ -53,11 +72,52 @@ export class ResearchRun {
   private readonly sources = new Map<string, { url: string; producer: string }>();
   private readonly documents = new Map<string, Document>();
   private readonly browserRefs = new Map<string, Set<string>>();
+  private readonly userMessages: string[];
   constructor(
     private readonly request: ResearchContext,
     readonly policy: RuntimeWeb,
     private readonly browser?: BrowserPortClient,
-  ) {}
+  ) {
+    this.userMessages = request.messages
+      .filter((message) => message.role === 'user' && typeof message.content === 'string')
+      .map((message) => message.content);
+  }
+
+  observeUserMessage(content: string) {
+    if (typeof content === 'string' && content.trim()) this.userMessages.push(content);
+  }
+
+  private hasUserUrl(targetUrl: string) {
+    for (const content of this.userMessages) {
+      const requestText = content
+        .split(/\r?\n/)
+        .filter((line) => !line.trimStart().startsWith('>'))
+        .join('\n');
+      for (const token of requestText.matchAll(/https?:\/\/[^\s<>"`]+/gi)) {
+        const candidate = trimCandidateUrl(token[0]);
+        try {
+          if (normalized(candidate) === targetUrl) return true;
+        } catch {
+          /* Invalid URL. */
+        }
+      }
+      for (const match of requestText.matchAll(
+        /(?:^|[\s(<"'`\[])((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}(?:\/[^\s<>"`\]}]+)?)/gi,
+      )) {
+        const raw = trimCandidateUrl(match[1]);
+        const host = raw.split('/', 1)[0].toLowerCase();
+        const tld = host.slice(host.lastIndexOf('.') + 1);
+        if (!raw.includes('/') && nonDomainExtensions.has(tld)) continue;
+        try {
+          const parsed = publicWebUrl(`https://${raw}`);
+          if (normalized(parsed.href) === targetUrl) return true;
+        } catch {
+          /* Invalid domain candidate. */
+        }
+      }
+    }
+    return false;
+  }
 
   get native() {
     return (
@@ -77,26 +137,27 @@ export class ResearchRun {
   destination(args: Record<string, unknown>, dependsOn: string[]) {
     if (typeof args.sourceId === 'string') {
       const source = this.sources.get(args.sourceId);
-      if (source && dependsOn.includes(source.producer)) return source.url;
+      if (source) {
+        if (dependsOn.includes(source.producer)) return source.url;
+        throw new RunError(
+          `Declare the source dependency with \`dependsOn: ["${source.producer}"]\` to access this result.`,
+        );
+      }
     }
     if (typeof args.url === 'string') {
       const url = normalized(args.url);
-      for (const source of this.sources.values())
-        if (dependsOn.includes(source.producer) && normalized(source.url) === url) return url;
-      const latest = this.request.messages.at(-1);
-      if (latest?.role === 'user') {
-        const requestText = latest.content
-          .split(/\r?\n/)
-          .filter((line) => !line.trimStart().startsWith('>'))
-          .join('\n');
-        for (const token of requestText.matchAll(/https?:\/\/[^\s<>"`]+/gi)) {
-          const candidate = token[0].replace(/[).,;!?\]}]+$/, '');
-          try {
-            if (normalized(candidate) === url) return url;
-          } catch {
-            /* Invalid URL. */
-          }
+      let missingProducer: string | undefined;
+      for (const source of this.sources.values()) {
+        if (normalized(source.url) === url) {
+          if (dependsOn.includes(source.producer)) return url;
+          missingProducer ??= source.producer;
         }
+      }
+      if (this.hasUserUrl(url)) return url;
+      if (missingProducer) {
+        throw new RunError(
+          `Declare the source dependency with \`dependsOn: ["${missingProducer}"]\` to access this URL.`,
+        );
       }
     }
     throw new RunError(
@@ -188,7 +249,11 @@ export class ResearchRun {
       if (op === 'web_read' || op === 'web_find') {
         const entry = this.documents.get(String(args.documentId));
         if (!entry || !step.dependsOn.includes(entry.producer))
-          throw new RunError('Reference a document from a successful fetch dependency.');
+          throw new RunError(
+            entry
+              ? `Declare the fetch dependency with \`dependsOn: ["${entry.producer}"]\` to access this document.`
+              : 'Reference a document from a successful fetch dependency.',
+          );
         if (op === 'web_read')
           return { text: entry.text.slice(0, 12_000), sources: [entry.source] };
         const query = String(args.query).toLowerCase();
@@ -208,7 +273,9 @@ export class ResearchRun {
         const producers = this.browserRefs.get(id);
         if (!producers || !step.dependsOn.some((dependency) => producers.has(dependency)))
           throw new RunError(
-            'Reference a browser tab, page or element from a successful dependency.',
+            producers?.size
+              ? `Declare the producing step dependency with \`dependsOn: ["${[...producers][0]}"]\` to reference this browser target.`
+              : 'Reference a browser tab, page or element from a successful dependency.',
           );
       }
       let browserArgs = args;

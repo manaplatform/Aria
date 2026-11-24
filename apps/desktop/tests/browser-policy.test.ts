@@ -10,7 +10,11 @@ it('blocks private destinations, strips AI credentials, and consumes only the ex
   const headersHook = vi.fn();
   const permissionHook = vi.fn();
   const hook = vi.fn();
+  const setUserAgent = vi.fn();
   const session = {
+    getUserAgent: () =>
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Aria/0.2.0 Chrome/136.0.0.0 Electron/45.3.2 Safari/537.36',
+    setUserAgent,
     setProxy: vi.fn(),
     closeAllConnections: vi.fn(),
     webRequest: {
@@ -31,6 +35,9 @@ it('blocks private destinations, strips AI credentials, and consumes only the ex
     () => undefined,
   );
   await policy.install({ start: async () => 4000 } as BrowserProxy);
+  expect(setUserAgent).toHaveBeenCalledWith(
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36',
+  );
   expect(session.setProxy).toHaveBeenCalledWith(
     expect.objectContaining({
       mode: 'fixed_servers',

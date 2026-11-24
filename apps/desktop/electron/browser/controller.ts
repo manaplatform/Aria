@@ -24,6 +24,7 @@ import {
   type ComputerAction,
   type ComputerObservation,
   type WebPolicy,
+  type WebSearchEngine,
 } from '@aria/shared';
 import { BrowserProxy } from './egress-proxy';
 import { inspectPage } from './page-inspector';
@@ -46,6 +47,7 @@ type Tab = {
   background: boolean;
   documentId: string;
   runId?: string;
+  httpStatus?: number;
   view: WebContentsView;
   profile: BrowserSessionPolicy;
   findId?: number;
@@ -493,6 +495,7 @@ export class BrowserController {
         this.stopPlayback(tab);
         tab.documentId = randomUUID();
         tab.runId = undefined;
+        tab.httpStatus = undefined;
         tab.state.error = undefined;
       }
     });
@@ -522,6 +525,7 @@ export class BrowserController {
     };
     wc.on('did-navigate', (_event, url, status) => {
       if (status >= 400) {
+        tab.httpStatus = status;
         tab.state.error = `The page returned HTTP ${status}.`;
         this.changed();
       } else completed(url);
@@ -768,7 +772,7 @@ export class BrowserController {
         'SEARCH_DISABLED',
         'Enable address bar search in Settings → Web & Browser.',
       );
-    return browserSearchUrl(input);
+    return browserSearchUrl(input, this.policy().searchEngine === 'bing' ? 'bing' : 'brave');
   }
 
   private async navigate(tab: Tab, url: string, signal?: AbortSignal) {
@@ -1354,6 +1358,75 @@ export class BrowserController {
     return { url: publicWebUrl(plan.action).href, field: plan.field };
   }
 
+  private async runSearch(
+    engine: Exclude<WebSearchEngine, 'auto'>,
+    query: string,
+    owner: string,
+    signal: AbortSignal,
+  ) {
+    const url = browserSearchUrl(query, engine);
+    const tab = await this.create(owner, true);
+    try {
+      const active = AbortSignal.any([signal, tab.lifetime.signal, AbortSignal.timeout(12_000)]);
+      await this.navigate(tab, url, active);
+      active.throwIfAborted();
+      const contents = tab.view.webContents;
+      const documentId = tab.documentId;
+      const page = new URL(contents.getURL());
+      const validSearchPage =
+        engine === 'brave'
+          ? page.origin === 'https://search.brave.com' && page.pathname === '/search'
+          : page.protocol === 'https:' &&
+            (page.hostname === 'bing.com' || page.hostname.endsWith('.bing.com')) &&
+            page.pathname === '/search';
+      if (!validSearchPage)
+        throw new BrowserError(
+          'SEARCH_UNAVAILABLE',
+          'The search page was unavailable. Try the query in a Personal tab.',
+        );
+      const evidence = await whenActive(
+        inspectPage(contents, { op: 'search-results', documentId }),
+        active,
+      );
+      if (tab.documentId !== documentId)
+        throw new BrowserError(
+          'STALE_PAGE',
+          'The page changed while Aria was reading it. Try again.',
+        );
+      if (evidence.captchaDetected && !evidence.results?.length)
+        throw new BrowserError(
+          'CAPTCHA_BLOCKED',
+          'The search site requested human verification and cannot be accessed automatically.',
+        );
+      if (!evidence.results?.length && !evidence.searchEmpty)
+        throw new BrowserError(
+          'SEARCH_UNAVAILABLE',
+          'Aria could not read the search results. Try the query in a Personal tab.',
+        );
+      const results = [];
+      let remaining = 9_000;
+      for (const result of evidence.results ?? []) {
+        if (!webUrlSchema.safeParse(result.url).success) continue;
+        const host = new URL(result.url).hostname;
+        if (
+          new URL(result.url).origin === page.origin ||
+          (engine === 'bing' && (host === 'bing.com' || host.endsWith('.bing.com')))
+        )
+          continue;
+        remaining -= JSON.stringify(result).length + 8;
+        if (remaining < 0) break;
+        results.push(result);
+      }
+      return results;
+    } catch (error) {
+      if (tab.httpStatus === 429 && error instanceof BrowserError)
+        throw Object.assign(error, { rateLimited: true });
+      throw error;
+    } finally {
+      this.closeTab(tab);
+    }
+  }
+
   async execute(
     request: BrowserRequest,
     signal: AbortSignal,
@@ -1396,30 +1469,48 @@ export class BrowserController {
         'TAB_UNAVAILABLE',
         'The user currently controls the computer browser.',
       );
-    if (request.op === 'web_search' || request.op === 'web_fetch') {
-      const searching = request.op === 'web_search';
-      const url = searching ? browserSearchUrl(args.query!) : args.url!;
+    if (request.op === 'web_search') {
+      const mode = this.policy().searchEngine ?? 'auto';
+      const engines: Exclude<WebSearchEngine, 'auto'>[] =
+        mode === 'brave' ? ['brave'] : mode === 'bing' ? ['bing'] : ['brave', 'bing'];
+      const overall = AbortSignal.any([signal, AbortSignal.timeout(25_000)]);
+      let lastError: unknown;
+      let sawRateLimit = false;
+      for (const engine of engines) {
+        overall.throwIfAborted();
+        try {
+          const results = await this.runSearch(engine, args.query!, owner, overall);
+          return output({ results });
+        } catch (error) {
+          if (signal.aborted) throw error;
+          lastError = error;
+          if ((error as { rateLimited?: boolean }).rateLimited) sawRateLimit = true;
+          const retryable =
+            error instanceof BrowserError
+              ? ['NAVIGATION_FAILED', 'SEARCH_UNAVAILABLE', 'CAPTCHA_BLOCKED', 'STALE_PAGE'].includes(
+                  error.code,
+                )
+              : !overall.aborted;
+          if (!retryable) throw error;
+        }
+      }
+      if (sawRateLimit)
+        throw new BrowserError(
+          'SEARCH_UNAVAILABLE',
+          'Web search was rate-limited (HTTP 429). Wait a moment before retrying, or search in a Personal tab.',
+        );
+      throw lastError;
+    }
+    if (request.op === 'web_fetch') {
       const tab = await this.create(owner, true);
       try {
         const active = AbortSignal.any([signal, tab.lifetime.signal, AbortSignal.timeout(20_000)]);
-        await this.navigate(tab, url, active);
+        await this.navigate(tab, args.url!, active);
         active.throwIfAborted();
         const contents = tab.view.webContents;
         const documentId = tab.documentId;
-        const page = new URL(contents.getURL());
-        if (
-          searching &&
-          (page.origin !== 'https://search.brave.com' || page.pathname !== '/search')
-        )
-          throw new BrowserError(
-            'SEARCH_UNAVAILABLE',
-            'The search page was unavailable. Try the query in a Personal tab.',
-          );
         const evidence = await whenActive(
-          inspectPage(contents, {
-            op: searching ? 'search-results' : 'extract',
-            documentId,
-          }),
+          inspectPage(contents, { op: 'extract', documentId }),
           active,
         );
         if (tab.documentId !== documentId)
@@ -1427,34 +1518,12 @@ export class BrowserController {
             'STALE_PAGE',
             'The page changed while Aria was reading it. Try again.',
           );
-        if (!searching) {
-          if (evidence.captchaDetected && !(evidence.text ?? '').trim())
-            throw new BrowserError(
-              'CAPTCHA_BLOCKED',
-              'The target site requested human verification and cannot be read automatically.',
-            );
-          return output({ text: evidence.text ?? '' }, tab);
-        }
-        if (evidence.captchaDetected && !evidence.results?.length)
+        if (evidence.captchaDetected && !(evidence.text ?? '').trim())
           throw new BrowserError(
             'CAPTCHA_BLOCKED',
-            'The search site requested human verification and cannot be accessed automatically.',
+            'The target site requested human verification and cannot be read automatically.',
           );
-        if (!evidence.results?.length && !evidence.searchEmpty)
-          throw new BrowserError(
-            'SEARCH_UNAVAILABLE',
-            'Aria could not read the search results. Try the query in a Personal tab.',
-          );
-        const results = [];
-        let remaining = 9_000;
-        for (const result of evidence.results ?? []) {
-          if (!webUrlSchema.safeParse(result.url).success) continue;
-          if (new URL(result.url).origin === page.origin) continue;
-          remaining -= JSON.stringify(result).length + 8;
-          if (remaining < 0) break;
-          results.push(result);
-        }
-        return output({ results });
+        return output({ text: evidence.text ?? '' }, tab);
       } finally {
         this.closeTab(tab);
       }

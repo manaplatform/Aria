@@ -72,10 +72,10 @@ it('migrates v1 ceiling defaults to higher turn limits while preserving stricter
     await restricted.load();
     expect(restricted.get()).toMatchObject({ searches: 1, fetches: 3 });
 
-    await restricted.save({ ...defaultWebPolicy, searches: 2, fetches: 4 });
+    await restricted.save({ ...defaultWebPolicy, searches: 2, fetches: 4, searchEngine: 'bing' });
     const explicit = new WebSettingsStorage(directory);
     await explicit.load();
-    expect(explicit.get()).toMatchObject({ searches: 2, fetches: 4 });
+    expect(explicit.get()).toMatchObject({ searches: 2, fetches: 4, searchEngine: 'bing' });
   } finally {
     await fs.rm(directory, { recursive: true, force: true });
   }

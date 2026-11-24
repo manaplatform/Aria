@@ -8,7 +8,11 @@ export async function scopedPath(root: string, relative: string): Promise<string
   if (path.isAbsolute(relative) || relative.includes('\0'))
     throw new Error('Use a relative project path.');
   const base = await fs.realpath(root);
-  const resolved = await fs.realpath(path.resolve(base, relative || '.'));
+  const candidate = path.resolve(base, relative || '.');
+  const lexical = path.relative(base, candidate);
+  if (lexical === '..' || lexical.startsWith(`..${path.sep}`) || path.isAbsolute(lexical))
+    throw new Error('Path is outside the selected project.');
+  const resolved = await fs.realpath(candidate);
   const within = path.relative(base, resolved);
   if (within === '..' || within.startsWith(`..${path.sep}`) || path.isAbsolute(within))
     throw new Error('Path is outside the selected project.');

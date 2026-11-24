@@ -592,7 +592,7 @@ Skills: ${[...references, ...inline].join(', ') || 'none'}`,
           runtimeOperations[request.operation].safeParse(request.input),
         );
         const project = this.resolveWorkspace(projectId);
-        const entries = await listFiles(project.root, relative ?? '');
+        const entries = await this.runWorkspaceIo(() => listFiles(project.root, relative ?? ''));
         return {
           data: {
             projectId: project.id,
@@ -608,12 +608,14 @@ Skills: ${[...references, ...inline].join(', ') || 'none'}`,
         );
         const project = this.resolveWorkspace(projectId);
         await this.allowWorkspaceContent(request, project, signal);
-        const result = await searchFiles(
-          project.root,
-          relative ?? '',
-          query,
-          limit ?? 20,
-          signal,
+        const result = await this.runWorkspaceIo(() =>
+          searchFiles(
+            project.root,
+            relative ?? '',
+            query,
+            limit ?? 20,
+            signal,
+          ),
         );
         return { data: { projectId: project.id, ...result }, privateContent: true };
       }
@@ -623,11 +625,13 @@ Skills: ${[...references, ...inline].join(', ') || 'none'}`,
         );
         const project = this.resolveWorkspace(projectId);
         await this.allowWorkspaceContent(request, project, signal);
-        const result = await readFileLines(
-          project.root,
-          relative,
-          startLine ?? 1,
-          maxLines ?? 200,
+        const result = await this.runWorkspaceIo(() =>
+          readFileLines(
+            project.root,
+            relative,
+            startLine ?? 1,
+            maxLines ?? 200,
+          ),
         );
         return { data: { projectId: project.id, ...result }, privateContent: true };
       }
@@ -643,6 +647,19 @@ Skills: ${[...references, ...inline].join(', ') || 'none'}`,
     if (!project)
       throw new RuntimeError('PERMISSION_DENIED', 'Choose a registered project folder.');
     return project;
+  }
+
+  private async runWorkspaceIo<T>(task: () => Promise<T>): Promise<T> {
+    try {
+      return await task();
+    } catch (error) {
+      if (error instanceof RuntimeError) throw error;
+      const message = error instanceof Error ? error.message : 'Unable to access project path.';
+      if (message.includes('outside') || message.includes('relative')) {
+        throw new RuntimeError('PERMISSION_DENIED', message);
+      }
+      throw error;
+    }
   }
 
   private async allowWorkspaceContent(

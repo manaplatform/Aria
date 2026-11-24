@@ -160,6 +160,7 @@ test('browses from ordinary chat through the managed private port and keeps priv
         session.fromPartition = (name, options) => {
           const profile = fromPartition(name, options);
           if (name.startsWith('aria-ai-')) {
+            if (profile.protocol.isProtocolHandled('https')) profile.protocol.unhandle('https');
             profile.protocol.handle('https', (request) => {
               const address = new URL(request.url);
               if (
@@ -639,6 +640,67 @@ test('browses from ordinary chat through the managed private port and keeps priv
         `http://${host}/music`,
       ),
     ).toBe(true);
+
+    // Verify web_search falls back to Bing and decodes /ck/a base64url links when Brave returns HTTP 429.
+    await app.evaluate(
+      ({ session }, { host }) => {
+        const fromPartition = session.fromPartition.bind(session);
+        session.fromPartition = (name, options) => {
+          const profile = fromPartition(name, options);
+          if (name.startsWith('aria-ai-')) {
+            if (profile.protocol.isProtocolHandled('https')) profile.protocol.unhandle('https');
+            profile.protocol.handle('https', (request) => {
+              const address = new URL(request.url);
+              if (address.origin === 'https://search.brave.com' && address.pathname === '/search') {
+                return new Response('Too Many Requests', {
+                  status: 429,
+                  headers: { 'Content-Type': 'text/html' },
+                });
+              }
+              if (address.origin === 'https://www.bing.com' && address.pathname === '/search') {
+                const encoded = Buffer.from(`http://${host}/study`, 'utf8').toString('base64url');
+                return new Response(
+                  `<title>Bing Search</title><ol id="b_results"><li class="b_algo">` +
+                    `<h2><a href="https://www.bing.com/ck/a?!&&u=a1${encoded}&ntb=1">Aria study via Bing</a></h2>` +
+                    `<div class="b_caption"><p>Fallback snippet from Bing.<a class="b_algoReadMore">Read more</a></p></div>` +
+                    `</li></ol>`,
+                  { headers: { 'Content-Type': 'text/html' } },
+                );
+              }
+              return profile.fetch(request, { bypassCustomProtocolHandlers: true });
+            });
+          }
+          return profile;
+        };
+      },
+      { host },
+    );
+    const fallbackPrompt = 'Search despite Brave 429';
+    provider.queueOperations(fallbackPrompt, {
+      steps: [tool('web_search', { query: 'semaphore fallback' })],
+    });
+    let fallbackResults: unknown;
+    provider.onToolResult(fallbackPrompt, (result) => {
+      if (!Array.isArray(result) || !result[0]) return;
+      if (result[0].id === 'web_search') fallbackResults = result[0];
+      return undefined;
+    });
+    await page.getByRole('textbox', { name: 'Message Aria' }).fill(fallbackPrompt);
+    await page.getByRole('button', { name: 'Send message', exact: true }).click();
+    await expect.poll(() => fallbackResults, { timeout: 20_000 }).toBeDefined();
+    expect(fallbackResults).toMatchObject({
+      status: 'completed',
+      data: {
+        status: 'results',
+        results: [
+          expect.objectContaining({
+            url: `http://${host}/study`,
+            title: 'Aria study via Bing',
+            snippet: 'Fallback snippet from Bing.',
+          }),
+        ],
+      },
+    });
   } finally {
     await app?.close();
     site.closeAllConnections();

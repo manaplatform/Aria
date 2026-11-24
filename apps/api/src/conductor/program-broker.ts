@@ -371,7 +371,8 @@ export class ProgramExecution {
     } catch {
       return reject('INVALID_ARGUMENT', 'The arguments exceed the program JSON limits.');
     }
-    const parsed = descriptor.input.safeParse(value);
+    const prepared = (descriptor.prepareInput ? descriptor.prepareInput(value) : value) as Json;
+    const parsed = descriptor.input.safeParse(prepared);
     if (!parsed.success)
       return reject('INVALID_ARGUMENT', 'The arguments do not match the tool schema.');
     if (
@@ -379,7 +380,7 @@ export class ProgramExecution {
     )
       return reject('PERMISSION_DENIED', 'These arguments are outside program authorization.');
     const fingerprint = createHash('sha256')
-      .update(canonical([descriptor.id, descriptor.version, value]))
+      .update(canonical([descriptor.id, descriptor.version, prepared]))
       .digest('hex');
     const prior = this.calls.get(callId);
     if (prior) {
@@ -387,7 +388,7 @@ export class ProgramExecution {
         ? prior.value
         : reject('CALLER_MISMATCH', 'The program reused a call ID with different arguments.');
     }
-    const operation = this.dispatch(descriptor, callId, fingerprint, value);
+    const operation = this.dispatch(descriptor, callId, fingerprint, prepared);
     this.calls.set(callId, { tool: descriptor.id, fingerprint, value: operation });
     return operation;
   }

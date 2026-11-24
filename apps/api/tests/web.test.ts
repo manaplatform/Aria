@@ -229,3 +229,47 @@ it('preserves structured browser error codes and messages from ResearchRun', asy
     message: 'The search page was unavailable. Try the query in a Personal tab.',
   });
 });
+
+it('recognizes user URLs from earlier messages, steered updates, bare domains, and balanced parens while reporting missing dependency IDs', async () => {
+  const invoke = vi.fn().mockResolvedValue({
+    ok: true,
+    url: 'https://en.wikipedia.org/wiki/Semaphore_(programming)',
+    title: 'Semaphore',
+    text: JSON.stringify({ text: 'Evidence text.' }),
+  });
+  const run = new ResearchRun(
+    {
+      requestId: randomUUID(),
+      conversationId: 'test',
+      messages: [
+        { role: 'user', content: 'Start with https://en.wikipedia.org/wiki/Semaphore_(programming)' },
+        { role: 'assistant', content: 'Let me know what to open.' },
+        { role: 'user', content: 'Now check docs.example.com/guide and open Wikipedia.' },
+      ],
+    },
+    { ...defaultWebPolicy, aiBrowser: true },
+    { invoke } as unknown as BrowserPortClient,
+  );
+  run.observeUserMessage('Also inspect https://steered.example/notes:');
+  const fetchStep: ExecutionStep = {
+    ...searchStep('fetch'),
+    target: { kind: 'tool', tool: 'web_fetch', model: null },
+    capability: 'web_fetch',
+  };
+  await expect(
+    run.invoke('web_fetch', { url: 'https://en.wikipedia.org/wiki/Semaphore_(programming)' }, fetchStep, signal),
+  ).resolves.toMatchObject({ data: { preview: 'Evidence text.' } });
+  expect(
+    run.destination({ url: 'https://docs.example.com/guide' }, []),
+  ).toBe('https://docs.example.com/guide');
+  expect(
+    run.destination({ url: 'https://steered.example/notes' }, []),
+  ).toBe('https://steered.example/notes');
+  run.observeSources(
+    [{ id: '11111111-1111-4111-8111-111111111111', url: 'https://result.example/page', title: 'Page' }],
+    'search-step-1',
+  );
+  expect(() =>
+    run.destination({ sourceId: '11111111-1111-4111-8111-111111111111' }, []),
+  ).toThrow(/dependsOn: \["search-step-1"\]/);
+});

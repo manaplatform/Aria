@@ -49,6 +49,15 @@ function canonical(value: unknown): string {
   return JSON.stringify(value) ?? 'null';
 }
 
+function formatSchemaError(prefix: string, error: z.ZodError) {
+  const detail = error.issues
+    .slice(0, 2)
+    .map((issue) => `${issue.path.length ? `${issue.path.join('.')}: ` : ''}${issue.message}`)
+    .join('; ')
+    .slice(0, 220);
+  return detail ? `${prefix} (${detail}).` : `${prefix}.`;
+}
+
 const transientResultKeys = new Set([
   'stepId', 'attemptId', 'callId', 'sourceId', 'resultId', 'resultRef', 'observationId', 'retrievedAt',
   'documentId', 'elementId', 'timestamp', 'durationMs', 'startedAt', 'finishedAt',
@@ -332,11 +341,14 @@ export class ExecutionEngine {
         );
       if (Buffer.byteLength(JSON.stringify(invocation.input ?? null)) > 48_000)
         throw new ToolError('INVALID_ARGUMENT', 'The tool input exceeds its size limit.');
-      const input = descriptor.input.safeParse(invocation.input);
+      const preparedInput = descriptor.prepareInput
+        ? descriptor.prepareInput(invocation.input)
+        : invocation.input;
+      const input = descriptor.input.safeParse(preparedInput);
       if (!input.success)
         throw new ToolError(
           'INVALID_ARGUMENT',
-          'The arguments do not match the loaded tool schema.',
+          formatSchemaError('The arguments do not match the loaded tool schema', input.error),
         );
       if (program && (program.revision !== this.tools.host.current.revision ||
         !this.tools.allowedForProgram(descriptor, this.context, program.backend, input.data)))

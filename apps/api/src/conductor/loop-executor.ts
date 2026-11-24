@@ -293,7 +293,7 @@ export class ConductorLoopExecutor {
         ...(process.env.ARIA_MANAGED === '1' && !voiceSessionId ? [replyFormattingPrompt] : []),
         'Answer directly when you already possess sufficient reliable information. When information is missing, uncertain, time-sensitive, or refers to an unfamiliar term, product, project, person, error, or repository, proactively check available capabilities (memory, web search, workspace, knowledge, skills, or connectors) instead of asking the user to supply links or perform discovery yourself. Do not invent facts, sources, execution results, or capabilities.',
         ...(discoveryProblem ? [discoveryProblem.message] : []),
-        'Use find_capabilities (with a topic query or empty query + namespace/kind) to inspect metadata and availability, then load needed direct tool schemas by ID before invoking them. If a capability fails or is disabled/unconfigured, evaluate alternative authorized capabilities or explain the real limitation transparently. For model operations, choose an exact discovered modelRef and delegate the minimum context. Refer to preceding results by execution ID (`dependsOn`). URLs for browser navigation and publisher reads require user or tool provenance. Prefer primary, authoritative sources and stop searching once sufficient reliable evidence is obtained. Cite publisher evidence using its returned links. Wait for any required approval and verify consequential outcomes where possible.',
+        'Use find_capabilities (with a topic query or empty query + namespace/kind) to inspect metadata and availability, then load needed direct tool schemas by ID before invoking them. If a capability fails or is disabled/unconfigured, evaluate alternative authorized capabilities or explain the real limitation transparently. For model operations, choose an exact discovered modelRef and delegate the minimum context. Refer to preceding results by execution ID (`dependsOn`). URLs for browser navigation and publisher reads require user or tool provenance; if web_search fails or is unavailable, do not guess URLs with web_fetch or browser_open. Prefer primary, authoritative sources and stop searching once sufficient reliable evidence is obtained. Cite publisher evidence using its returned links. Wait for any required approval and verify consequential outcomes where possible.',
         ...(context.runtime
           ? [
               `Current time: ${new Date().toISOString()} (${Intl.DateTimeFormat().resolvedOptions().timeZone}). Use workspace tools to inspect registered repositories/projects and files when available. Use small authorized document reads for full context, and knowledge search for targeted passages. Cite returned evidence IDs with [Evidence](aria-evidence:ID). Use calc_evaluate for quick arithmetic/math verification, or inspect execution capabilities and use the sandbox for scripts/files and publish each verified output before reporting it. Skills can supply reviewed procedures and scripts.`,
@@ -359,7 +359,10 @@ export class ConductorLoopExecutor {
         const steering = await session?.boundary(checkpointState);
         if (steering?.length) {
           stagnant = 0;
-          for (const content of steering) messages.push({ role: 'user', content });
+          for (const content of steering) {
+            messages.push({ role: 'user', content });
+            context.research.observeUserMessage(content);
+          }
         }
         return Boolean(steering?.length);
       };
