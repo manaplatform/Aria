@@ -112,9 +112,11 @@ test('supports default AI web search with snippets ("What is Mana-Agent?"), stan
     await page.getByRole('textbox', { name: 'Message Aria' }).fill(pref);
     await page.getByRole('button', { name: 'Send message', exact: true }).click();
     await expect(page.locator('.from-assistant[data-status="completed"]').last()).toBeVisible();
-    await expect
-      .poll(async () => (await page.evaluate(() => window.aria!.searchMemories({ query: 'Horizon-9' }))).records.length)
-      .toBe(1);
+    // The memory worker indexes candidates in batches after the chat is saved.
+    await expect.poll(
+      () => page.evaluate(() => window.aria!.searchMemories({ query: 'Horizon-9' })),
+      { timeout: 15_000 },
+    ).toMatchObject({ records: [{ value: { content: pref } }] });
 
     // Ensure modal dialog would fail if triggered during automatic recall!
     await app.evaluate(({ dialog }) => {

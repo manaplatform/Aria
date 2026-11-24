@@ -1610,8 +1610,11 @@ test('recalls memory across conversations and restart, then forgets it without r
   await expect(page.getByRole('button', { name: 'Show a build note example' })).toBeVisible();
   expect(fixture.received.slice(before).filter(({ body }) =>
     body.messages.some(({ content }) => content === preference))).toHaveLength(1);
-  await expect.poll(async () => (await page.evaluate(() => window.aria!.searchMemories({ query: 'verified commands' })))
-    .records.length).toBe(1);
+  // The memory worker indexes candidates in batches after the chat is saved.
+  await expect.poll(
+    () => page.evaluate(() => window.aria!.searchMemories({ query: 'verified commands' })),
+    { timeout: 15_000 },
+  ).toMatchObject({ records: [{ value: { content: preference } }] });
   await page.getByRole('button', { name: 'Show a build note example' }).click();
   await expect(page.locator('.from-user').last()).toContainText('Show a build note example');
   await expect(page.locator('.from-assistant[data-status="completed"]')).toHaveCount(2);
