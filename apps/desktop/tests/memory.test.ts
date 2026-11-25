@@ -274,15 +274,24 @@ it('filters elapsed retention immediately and paginates beyond the retrieval can
     epoch,
     Date.now() - 80 * 86_400_000,
   );
-  store.saveSettings({ ...defaultMemorySettings, enabled: true, retentionDays: 30 });
+  const { epoch: seedEpoch } = store.saveSettings({
+    ...defaultMemorySettings,
+    enabled: true,
+    retentionDays: 30,
+  });
   expect(store.exportPage()).toEqual([]);
+
+  // Avoid a WAL sync for each insert while seeding the temporary database.
+  store.db.exec('PRAGMA synchronous=NORMAL');
   for (let i = 0; i < 188; i++)
     store.remember(
       profile,
       { category: 'episode', content: `Timeline note ${i}` },
       undefined,
-      store.state.epoch,
+      seedEpoch,
     );
+  store.db.exec('PRAGMA synchronous=FULL');
+
   const seen = new Set<string>();
   let cursor: string | undefined;
   do {
