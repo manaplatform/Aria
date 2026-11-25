@@ -2,6 +2,7 @@
 @import './styles/tokens.css';
 @import './styles/chat.css';
 @import './styles/reply.css';
+@import './styles/settings.css';
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);

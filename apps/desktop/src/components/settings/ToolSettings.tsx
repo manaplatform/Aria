@@ -7,7 +7,7 @@ import { KnowledgeSettings } from './KnowledgeSettings';
 import { RuntimeSettings } from './RuntimeSettings';
 import { ProgramSettings } from './ProgramSettings';
 
-export function ToolSettings() {
+export function ToolSettings({ includeRuntime = true }: { includeRuntime?: boolean }) {
   const [settings, setSettings] = useState<Settings>();
   const [preview, setPreview] = useState<SkillPreview | null>();
   const [busy, setBusy] = useState(false);
@@ -42,8 +42,7 @@ export function ToolSettings() {
 
   return (
     <>
-      <RuntimeSettings />
-      <KnowledgeSettings />
+      {includeRuntime && <><RuntimeSettings /><KnowledgeSettings /></>}
       <section className="settings-section" id="tools">
         <div className="settings-section-heading">
           <h2>Tools</h2>
@@ -90,7 +89,7 @@ export function ToolSettings() {
               </div>
             )}
             {settings.tools.map((tool) => (
-              <div className="shortcut-row" key={tool.id}>
+              <div className="shortcut-row" id={`settings-tool-${tool.id}`} key={tool.id}>
                 <div>
                   <strong>{tool.name}</strong>
                   <p className="muted">{tool.description}</p>
@@ -197,7 +196,7 @@ export function ToolSettings() {
           </div>
         )}
         {settings?.skills.map((skill) => (
-          <div className="shortcut-row" key={`${skill.id}/${skill.version}`}>
+          <div className="shortcut-row" id={`settings-skill-${skill.id}-${skill.version}`} key={`${skill.id}/${skill.version}`}>
             <div>
               <strong>{skill.name}</strong>
               <p className="muted">{skill.description}</p>

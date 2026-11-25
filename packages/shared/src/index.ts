@@ -41,6 +41,26 @@ export * from './conductor.js';
 import type { ExecutionSnapshot, LoopCommand, LoopRecoveryRequest, ManagedExecution } from './loop.js';
 export * from './loop.js';
 export { projectChatEvent } from './chat-projection.js';
+import type {
+  AboutInfo,
+  AccentColor,
+  CustomizableShortcutId,
+  FontSize,
+  InterfaceDensity,
+  LogLevel,
+  MotionPreference,
+  NotificationPreferences,
+  OsPermissionsStatus,
+  ResetConfigurationScope,
+  ResponseStyle,
+  SettingsCategoryId,
+  ShortcutsMap,
+  StartupBehavior,
+  StorageInfo,
+  SystemBehaviorState,
+  UserPersonalization,
+} from './settings.js';
+export * from './settings.js';
 
 export interface HealthResponse {
   status: 'ok';
@@ -232,6 +252,21 @@ export interface Preferences {
   apiUrl: string;
   chatSidebarCollapsed: boolean;
   profileName: string;
+  settingsCategory?: SettingsCategoryId;
+  settingsSidebarCollapsed?: boolean;
+  startupBehavior?: StartupBehavior;
+  minimizeToTray?: boolean;
+  accentColor?: AccentColor;
+  fontSize?: FontSize;
+  density?: InterfaceDensity;
+  reducedMotion?: MotionPreference;
+  expandActivityByDefault?: boolean;
+  profileBio?: string;
+  responseStyle?: ResponseStyle;
+  communicationLanguage?: string;
+  notifications?: NotificationPreferences;
+  shortcuts?: ShortcutsMap;
+  logLevel?: LogLevel;
 }
 export interface LocalData {
   version: 3;
@@ -302,6 +337,7 @@ export interface ChatRequest {
   availableProjects?: { id: string; name: string; branch: string | null }[];
   memory?: MemoryTurnOptions;
   execution?: ManagedExecution;
+  personalization?: UserPersonalization;
 }
 export type ChatEvent = {
   requestId: string;
@@ -506,6 +542,21 @@ export interface DesktopBridge {
   resumeExecution(request: LoopRecoveryRequest): Promise<void>;
   activeChatMessages(): Promise<ChatMessage[]>;
   onChatEvent(callback: (event: ChatEvent) => void): () => void;
+  systemBehavior(): Promise<SystemBehaviorState>;
+  setSystemBehavior(patch: { openAtLogin?: boolean; minimizeToTray?: boolean }): Promise<SystemBehaviorState>;
+  testNotification(): Promise<void>;
+  removeWorkspace(workspaceId: string): Promise<boolean>;
+  storageInfo(): Promise<StorageInfo>;
+  openStorageFolder(): Promise<void>;
+  pruneMediaCache(): Promise<{ removed: number; freedBytes: number }>;
+  clearBrowserCache(): Promise<void>;
+  osPermissions(): Promise<OsPermissionsStatus>;
+  clearChatHistory(): Promise<boolean>;
+  clearLegacyData(): Promise<boolean>;
+  exportDiagnostics(): Promise<boolean>;
+  resetConfiguration(scope: ResetConfigurationScope): Promise<boolean>;
+  aboutInfo(): Promise<AboutInfo>;
+  openDevTools(): Promise<void>;
 }
 
 export * from './execution-runtime.js';

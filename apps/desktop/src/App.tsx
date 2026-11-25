@@ -30,6 +30,7 @@ function Application() {
   const ready = useWorkspaceStore((state) => state.ready);
   const error = useWorkspaceStore((state) => state.loadError);
   const theme = useWorkspaceStore((state) => state.data.preferences.theme);
+  const appearance = useWorkspaceStore((state) => state.data.preferences);
   useEffect(
     () =>
       window.aria?.onBeforeClose(async () => {
@@ -58,6 +59,13 @@ function Application() {
     query.addEventListener('change', apply);
     return () => query.removeEventListener('change', apply);
   }, [theme]);
+  useEffect(() => {
+    const root = document.documentElement;
+    root.dataset.accent = appearance.accentColor ?? 'violet';
+    root.dataset.fontSize = appearance.fontSize ?? 'default';
+    root.dataset.density = appearance.density ?? 'comfortable';
+    root.dataset.motion = appearance.reducedMotion ?? 'system';
+  }, [appearance.accentColor, appearance.fontSize, appearance.density, appearance.reducedMotion]);
   if (error) return <ErrorState message={error} retry={() => window.location.reload()} />;
   if (!ready)
     return (
@@ -72,6 +80,7 @@ function Application() {
           <Route element={<ChatLayout />}>
             <Route path="/chat" element={<ChatView />} />
             <Route path="/settings" element={<SettingsView />} />
+            <Route path="/settings/:category" element={<SettingsView />} />
           </Route>
           <Route path="/advanced/*" element={<LegacyWorkspace />} />
           <Route path="*" element={<Navigate to="/chat" replace />} />

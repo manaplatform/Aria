@@ -183,3 +183,8 @@ When implementing AI features:
 - Give the memory database a single worker owner and transactional migrations. Commit trusted source references and the processing outbox together, and use durable event IDs, revision checks, and fences. Apply deletion and retention to active indexes, vectors, queued work, and cached projections. An older source must never reconstruct deleted memory automatically.
 - Keep local and remote embedding targets explicit. Reuse verified adapters and require destination-specific approval for memory text transfers. Temporary chat stays outside persistent memory and transcript storage.
 - Verify recall through ordinary chat, measure latency and retrieval quality against reproducible fixtures, and report platform and provider verification separately. See [Memory architecture](docs/memory-engine.md).
+
+## Settings experience
+
+- Keep ordinary chat independent of Settings and project selection. The primary Settings workspace uses grouped category navigation, accessible search, and persisted local appearance and shortcut preferences; preserve legacy deep links and the separate `/advanced/*` workspace.
+- Keep provider and model configuration in Settings using verified capabilities and the existing registry. Electron main owns system integration, permissions, destructive confirmations, and private data; renderer controls must reflect real supported behavior and actionable errors.

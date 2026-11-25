@@ -10,7 +10,7 @@ import {
 } from '@aria/shared';
 import { desktop, errorMessage } from '../../services/desktop';
 import { ensureChatDraft } from '../../stores/chatStore';
-import { useProviderStore } from '../../stores/providerStore';
+import { refreshProvider, useProviderStore } from '../../stores/providerStore';
 import { Button } from '../ui';
 import { flushPersistence, useWorkspaceStore } from '../../stores/workspaceStore';
 
@@ -77,6 +77,7 @@ export function RuntimeSettings() {
   const unavailableEmbedding = Boolean(embeddingSelection && !selectedEmbedding);
 
   useEffect(() => {
+    void refreshProvider();
     let mounted = true;
     void Promise.resolve()
       .then(() => desktop().runtimeSettings())

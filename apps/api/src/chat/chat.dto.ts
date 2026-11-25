@@ -17,7 +17,7 @@ import {
   MaxLength,
   ValidateNested,
 } from 'class-validator';
-import type { ManagedExecution } from '@aria/shared';
+import type { ManagedExecution, UserPersonalization } from '@aria/shared';
 
 export class ChatInputDto {
   @IsIn(['user', 'assistant'])
@@ -114,7 +114,33 @@ class MemoryTurnDto {
   contextHints?: MemoryContextHintDto[];
 }
 
+class PersonalizationDto implements UserPersonalization {
+  @IsOptional()
+  @IsString()
+  @MaxLength(80)
+  profileName?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(160)
+  profileBio?: string;
+
+  @IsOptional()
+  @IsIn(['balanced', 'concise', 'detailed'])
+  responseStyle?: 'balanced' | 'concise' | 'detailed';
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(60)
+  communicationLanguage?: string;
+}
+
 export class ChatRequestDto {
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => PersonalizationDto)
+  personalization?: PersonalizationDto;
+
   @IsOptional()
   @IsObject()
   execution?: ManagedExecution;

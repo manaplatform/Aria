@@ -158,6 +158,19 @@ export class CapabilityStorage {
     return this.save({ discovery, proof: discovery === 'openai-responses' ? proof : undefined });
   }
 
+  resetPolicy() {
+    return this.save({
+      disabled: [],
+      discovery: 'aria',
+      proof: undefined,
+      builtinEnabled: true,
+      disabledExamples: [],
+      nativeRuntimeProofs: undefined,
+      programming: undefined,
+      programProof: undefined,
+    });
+  }
+
   private programProof(primary: string, settings: ProgramSettings) {
     return hash(Buffer.from(JSON.stringify([primary, this.data.discovery, settings.continuation, 'program/1'])));
   }

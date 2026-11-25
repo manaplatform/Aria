@@ -305,3 +305,32 @@ it('requires an exact endpoint and key match for a compatible primary verificati
   store.markVerified(configured.connections[0], 'secret', 'saved-model');
   expect((await store.save(configured, unknown)).connections[0].verified).toEqual(['saved-model']);
 });
+
+it('loads existing preferences without the new settings fields and persists category changes', async () => {
+  const data = emptyData();
+  const oldPreferences: Record<string, unknown> = { ...data.preferences };
+  for (const key of ['settingsCategory', 'settingsSidebarCollapsed', 'startupBehavior',
+    'minimizeToTray', 'accentColor', 'fontSize', 'density', 'reducedMotion',
+    'expandActivityByDefault', 'profileBio', 'responseStyle', 'communicationLanguage',
+    'notifications', 'shortcuts', 'logLevel']) delete oldPreferences[key];
+  await fs.writeFile(path.join(directory, 'aria-v3.json'), JSON.stringify({ ...data, preferences: oldPreferences }));
+  const store = new LocalStorage(directory);
+  const loaded = await store.load();
+  expect(loaded.warning).toBeUndefined();
+  loaded.data.preferences.settingsCategory = 'appearance';
+  await store.save(loaded.data);
+  expect((await new LocalStorage(directory).load()).data.preferences.settingsCategory).toBe('appearance');
+});
+
+it('revokes a registered directory without deleting its files', async () => {
+  const store = new LocalStorage(directory);
+  await store.load();
+  const root = path.join(directory, 'project');
+  await fs.mkdir(root);
+  await fs.writeFile(path.join(root, 'keep.txt'), 'keep');
+  await store.register({ id: 'project', name: 'Project', root, branch: null, updatedAt: '' });
+  await store.unregister('project');
+  expect(() => store.root('project')).toThrow();
+  expect((await new LocalStorage(directory).load()).data.workspaces).toEqual([]);
+  expect(await fs.readFile(path.join(root, 'keep.txt'), 'utf8')).toBe('keep');
+});

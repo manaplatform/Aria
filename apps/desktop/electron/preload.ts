@@ -154,5 +154,20 @@ const bridge: DesktopBridge = {
       ipcRenderer.removeListener('aria:chat-status-update', listener);
     };
   },
+  systemBehavior: () => ipcRenderer.invoke('aria:system-behavior'),
+  setSystemBehavior: (patch) => ipcRenderer.invoke('aria:set-system-behavior', patch),
+  testNotification: () => ipcRenderer.invoke('aria:test-notification'),
+  removeWorkspace: (workspaceId) => ipcRenderer.invoke('aria:remove-workspace', workspaceId),
+  storageInfo: () => ipcRenderer.invoke('aria:storage-info'),
+  openStorageFolder: () => ipcRenderer.invoke('aria:open-storage-folder'),
+  pruneMediaCache: () => ipcRenderer.invoke('aria:prune-media-cache'),
+  clearBrowserCache: () => ipcRenderer.invoke('aria:clear-browser-cache'),
+  osPermissions: () => ipcRenderer.invoke('aria:os-permissions'),
+  clearChatHistory: () => ipcRenderer.invoke('aria:clear-chat-history'),
+  clearLegacyData: () => ipcRenderer.invoke('aria:clear-legacy-data'),
+  exportDiagnostics: () => ipcRenderer.invoke('aria:export-diagnostics'),
+  resetConfiguration: (scope) => ipcRenderer.invoke('aria:reset-configuration', scope),
+  aboutInfo: () => ipcRenderer.invoke('aria:about-info'),
+  openDevTools: () => ipcRenderer.invoke('aria:open-devtools'),
 };
 contextBridge.exposeInMainWorld('aria', bridge);

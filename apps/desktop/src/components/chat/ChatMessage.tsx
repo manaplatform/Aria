@@ -7,6 +7,7 @@ import { AriaMark } from '../layout/AriaMark';
 import { Button, CopyButton, Modal } from '../ui';
 import { desktop, errorMessage, openExternal } from '../../services/desktop';
 import { notify } from '../../stores/uiStore';
+import { useWorkspaceStore } from '../../stores/workspaceStore';
 import { openResearchSource } from '../../stores/browserStore';
 import MarkdownRenderer from './MarkdownRenderer';
 import { ArtifactCard } from './ArtifactCard';
@@ -269,6 +270,7 @@ export function ChatMessage({
     execution?.state === 'recovering' ? 'Recovering execution' :
     execution?.state === 'waiting_for_tool' ? activeStep?.summary || 'Running tools' : undefined;
 
+  const expandActivity = useWorkspaceStore((state) => Boolean(state.data.preferences.expandActivityByDefault));
   return (
     <article
       id={`chat-message-${message.id}`}
@@ -337,7 +339,7 @@ export function ChatMessage({
       )}
       {busy && execution && <ExecutionControls message={message} />}
       {message.activity?.length ? (
-        <details className="conductor-activity">
+        <details className="conductor-activity" open={expandActivity}>
           <summary>
             <Activity size={13} aria-hidden="true" />{' '}
             {activeStep?.status === 'approval'

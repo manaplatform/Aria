@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { eventMatchesShortcut, resolveShortcuts } from '@aria/shared';
 import { useLocation, useNavigate, Outlet } from 'react-router-dom';
 import { Globe2, PanelLeftOpen, Search, Sparkles, VolumeX } from 'lucide-react';
 import { useWorkspaceStore, flushPersistence } from '../../stores/workspaceStore';
@@ -18,6 +19,7 @@ export default function ChatLayout() {
   const chat = useWorkspaceStore((state) => state.data.chat);
   const collapsed = useWorkspaceStore((state) => state.data.preferences.chatSidebarCollapsed);
   const preferences = useWorkspaceStore((state) => state.preferences);
+  const shortcuts = useWorkspaceStore((state) => state.data.preferences.shortcuts);
   const saveError = useWorkspaceStore((state) => state.saveError);
   const status = useChatStore((state) => state.status);
   const [narrow, setNarrow] = useState(window.innerWidth < 900);
@@ -47,32 +49,46 @@ export default function ChatLayout() {
   }, []);
   useEffect(() => {
     const keyboard = (event: KeyboardEvent) => {
-      if (!(event.metaKey || event.ctrlKey)) return;
-      if (event.shiftKey && event.key.toLowerCase() === 'o') {
+      if (event.defaultPrevented || event.repeat) return;
+      const keys = resolveShortcuts(shortcuts);
+      const matches = (key: keyof typeof keys) => eventMatchesShortcut(event, keys[key], window.aria?.platform);
+      if (matches('newChat')) {
         event.preventDefault();
         selectChat(null);
         navigate('/chat');
         setDrawer(false);
         requestAnimationFrame(() => window.dispatchEvent(new Event('aria:focus-chat')));
-      }
-      if (event.key.toLowerCase() === 'k') {
+      } else if (matches('searchConversations')) {
         event.preventDefault();
         if (window.innerWidth < 900) setDrawer(true);
         else preferences({ chatSidebarCollapsed: false });
-        requestAnimationFrame(() =>
-          document.querySelector<HTMLInputElement>('.conversation-search input')?.focus(),
-        );
-      }
-      if (event.key.toLowerCase() === 'l') {
+        requestAnimationFrame(() => document.querySelector<HTMLInputElement>('.conversation-search input')?.focus());
+      } else if (matches('focusComposer')) {
         event.preventDefault();
         navigate('/chat');
         if (useBrowserStore.getState().mode === 'browser') setBrowserMode('split');
         requestAnimationFrame(() => window.dispatchEvent(new Event('aria:focus-chat')));
+      } else if (matches('openSettings')) {
+        event.preventDefault();
+        navigate('/settings');
+      } else if (matches('toggleSidebar')) {
+        event.preventDefault();
+        if (window.innerWidth < 900) setDrawer((open) => !open);
+        else preferences({ chatSidebarCollapsed: !useWorkspaceStore.getState().data.preferences.chatSidebarCollapsed });
+      } else if (matches('toggleBrowser')) {
+        event.preventDefault();
+        navigate('/chat');
+        setBrowserMode(useBrowserStore.getState().mode === 'chat' ? 'split' : 'chat');
       }
     };
     window.addEventListener('keydown', keyboard);
     return () => window.removeEventListener('keydown', keyboard);
-  }, [navigate, preferences]);
+  }, [navigate, preferences, shortcuts]);
+  useEffect(() => {
+    const open = () => narrow ? setDrawer(true) : preferences({ chatSidebarCollapsed: false });
+    window.addEventListener('aria:open-sidebar', open);
+    return () => window.removeEventListener('aria:open-sidebar', open);
+  }, [narrow, preferences]);
   return (
     <div className={`chat-shell ${collapsed ? 'sidebar-collapsed' : ''}`}>
       {!narrow && (
@@ -85,7 +101,7 @@ export default function ChatLayout() {
         />
       )}
       <main className="chat-main">
-        <header className="chat-header">
+        {!location.pathname.startsWith('/settings') && <header className="chat-header">
           <div className="chat-header-title">
             {(narrow || collapsed) && (
               <IconButton
@@ -149,7 +165,7 @@ export default function ChatLayout() {
               {status.configured ? status.model : 'Connect a model'}
             </Button>
           </div>
-        </header>
+        </header>}
         {saveError && (
           <ErrorState
             message={`Changes could not be saved: ${saveError}`}

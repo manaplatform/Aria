@@ -8,7 +8,8 @@ import {
   type DiscoveredModel,
   type RegistrySettings,
 } from '@aria/shared';
-import { ModelSettings } from '../src/components/settings/ModelSettings';
+import ModelSettings from '../src/components/settings/pages/ModelSettings';
+import ProviderSettings from '../src/components/settings/pages/ProviderSettings';
 import { useChatStore } from '../src/stores/chatStore';
 import { useProviderStore } from '../src/stores/providerStore';
 
@@ -23,7 +24,7 @@ const settings: RegistrySettings = {
       id: connectionId,
       name: 'Fixture',
       baseUrl: 'https://compatible.example/v1',
-      keyConfigured: false,
+      keyConfigured: true,
       models: [],
       webSearch: false,
       verified: [],
@@ -31,7 +32,7 @@ const settings: RegistrySettings = {
   ],
 };
 beforeEach(() => {
-  useProviderStore.setState({ settings: null, loading: false, error: '' });
+  useProviderStore.setState({ settings: null, loading: false, error: '', catalogs: {} });
   useChatStore.setState({ status: { state: 'ready', configured: false, model: '' } });
   window.aria = {
     registrySettings: vi.fn().mockResolvedValue(settings),
@@ -48,35 +49,30 @@ afterEach(() => {
   delete window.aria;
 });
 
-it('selects only enabled discovered primary models and sends draft credentials only through the bridge', async () => {
+it('sends draft credentials only through the provider bridge and clears the input after saving', async () => {
   const user = userEvent.setup();
-  render(<ModelSettings />);
+  render(<ProviderSettings />);
   await user.type(await screen.findByLabelText('API key'), 'unsaved-secret');
   await user.click(screen.getByRole('button', { name: 'Discover models' }));
-  expect(window.aria!.discoverModels).toHaveBeenCalledWith(
-    expect.objectContaining({ apiKey: 'unsaved-secret' }),
-  );
+  expect(window.aria!.discoverModels).toHaveBeenCalledWith(expect.objectContaining({ apiKey: 'unsaved-secret' }));
+  await user.click(screen.getByRole('button', { name: 'Save providers' }));
+  await waitFor(() => expect(window.aria!.saveRegistry).toHaveBeenCalledWith(expect.objectContaining({
+    connections: [expect.objectContaining({ apiKey: 'unsaved-secret' })],
+  })));
+  expect(screen.getByLabelText('API key')).toHaveValue('');
+});
+it('selects only enabled discovered primary models on the models page', async () => {
+  const user = userEvent.setup();
+  render(<ModelSettings />);
+  await user.click(await screen.findByRole('button', { name: 'Discover models' }));
   expect(screen.queryByRole('option', { name: 'Fixture · fetched-chat' })).toBeNull();
   await user.click(await screen.findByRole('checkbox', { name: 'Enable fetched-chat' }));
-  await user.selectOptions(
-    screen.getByRole('combobox', { name: 'Primary model' }),
-    modelReference(connectionId, 'fetched-chat'),
-  );
+  await user.selectOptions(screen.getByRole('combobox', { name: 'Primary model' }), modelReference(connectionId, 'fetched-chat'));
   await user.click(screen.getByRole('button', { name: 'Save AI Models' }));
-  await waitFor(() =>
-    expect(window.aria!.saveRegistry).toHaveBeenCalledWith(
-      expect.objectContaining({
-        primary: modelReference(connectionId, 'fetched-chat'),
-        connections: [
-          expect.objectContaining({
-            apiKey: 'unsaved-secret',
-            models: [expect.objectContaining({ id: 'fetched-chat', enabled: true })],
-          }),
-        ],
-      }),
-    ),
-  );
-  expect(screen.getByLabelText('API key')).toHaveValue('');
+  await waitFor(() => expect(window.aria!.saveRegistry).toHaveBeenCalledWith(expect.objectContaining({
+    primary: modelReference(connectionId, 'fetched-chat'),
+    connections: [expect.objectContaining({ models: [expect.objectContaining({ id: 'fetched-chat', enabled: true })] })],
+  })));
 });
 it('invalidates discovery when connection inputs change and ignores a late response', async () => {
   let complete!: (models: DiscoveredModel[]) => void;
@@ -87,7 +83,7 @@ it('invalidates discovery when connection inputs change and ignores a late respo
       }),
   );
   const user = userEvent.setup();
-  render(<ModelSettings />);
+  render(<ProviderSettings />);
   await user.type(await screen.findByLabelText('API key'), 'old-key');
   await user.click(screen.getByRole('button', { name: 'Discover models' }));
   await user.type(screen.getByLabelText('Provider endpoint'), '/different');

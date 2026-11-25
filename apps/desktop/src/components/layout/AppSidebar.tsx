@@ -1,6 +1,7 @@
 import { useRef, useState } from 'react';
 import { PanelLeftClose, Plus, Search, Settings, UserRound } from 'lucide-react';
-import { useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
+import { formatShortcutChord, resolveShortcuts } from '@aria/shared';
 import { useWorkspaceStore } from '../../stores/workspaceStore';
 import { AriaMark } from './AriaMark';
 import { ConversationList } from '../conversations/ConversationList';
@@ -22,6 +23,8 @@ export function AppSidebar({
   const [query, setQuery] = useState('');
   const name = useWorkspaceStore((state) => state.data.preferences.profileName);
   const navigate = useNavigate();
+  const location = useLocation();
+  const shortcuts = useWorkspaceStore((state) => state.data.preferences.shortcuts);
   const input = useRef<HTMLInputElement>(null);
   const settings = () => {
     navigate('/settings');
@@ -45,7 +48,7 @@ export function AppSidebar({
         <button className="new-chat" aria-label="New chat" onClick={onNewChat}>
           <Plus size={18} />
           <span>New chat</span>
-          <kbd>{window.aria?.platform === 'darwin' ? '⌘' : 'Ctrl'} ⇧ O</kbd>
+          <kbd>{formatShortcutChord(resolveShortcuts(shortcuts).newChat, window.aria?.platform)}</kbd>
         </button>
         {compact ? (
           <IconButton
@@ -81,7 +84,7 @@ export function AppSidebar({
         />
       )}
       <div className="chat-sidebar-footer">
-        <button className="sidebar-settings" aria-label="Open settings" onClick={settings}>
+        <button className={`sidebar-settings ${location.pathname.startsWith('/settings') ? 'active' : ''}`} aria-current={location.pathname.startsWith('/settings') ? 'page' : undefined} aria-label="Open settings" onClick={settings}>
           <Settings size={18} />
           <span>Settings</span>
         </button>

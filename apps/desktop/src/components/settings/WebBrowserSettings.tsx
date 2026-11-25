@@ -8,6 +8,7 @@ import {
 import { Button, Field } from '../ui';
 import { browserCommand, useBrowserStore } from '../../stores/browserStore';
 import { errorMessage } from '../../services/desktop';
+import { SettingsDialog } from './components';
 
 const toggles = [
   ['enabled', 'Web access'],
@@ -22,6 +23,7 @@ export function WebBrowserSettings() {
   const [settings, setSettings] = useState<WebSettings>();
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState('');
+  const [confirmation, setConfirmation] = useState<'clear-history' | 'revoke-permissions'>();
   const permissions = useBrowserStore((state) => state.state.permissions);
   useEffect(() => {
     if (!window.aria?.webSettings) return;
@@ -116,7 +118,7 @@ export function WebBrowserSettings() {
       {settings.warning && <p role="alert">{settings.warning}</p>}
       {status && <p role="status">{status}</p>}
       <div className="web-settings-data">
-        <Button size="sm" onClick={() => void browserCommand({ kind: 'clear-history' })}>
+        <Button size="sm" onClick={() => setConfirmation('clear-history')}>
           Clear browser history
         </Button>
         <Button size="sm" onClick={() => void browserCommand({ kind: 'clear-site-data' })}>
@@ -125,11 +127,21 @@ export function WebBrowserSettings() {
         <Button
           size="sm"
           disabled={!permissions.length}
-          onClick={() => void browserCommand({ kind: 'revoke-permissions' })}
+          onClick={() => setConfirmation('revoke-permissions')}
         >
           Revoke website permissions
         </Button>
       </div>
+      <SettingsDialog open={Boolean(confirmation)} onOpenChange={(open) => { if (!open) setConfirmation(undefined); }}
+        title={confirmation === 'clear-history' ? 'Clear browser history?' : 'Revoke website permissions?'}
+        description={confirmation === 'clear-history' ? 'Remove saved personal browsing history.' : 'Remove all saved website permission grants.'}
+        confirmLabel={confirmation === 'clear-history' ? 'Clear history' : 'Revoke permissions'}
+        onConfirm={() => {
+          if (!confirmation) return;
+          const kind = confirmation;
+          setConfirmation(undefined);
+          void browserCommand({ kind }).catch((error) => setStatus(errorMessage(error)));
+        }} />
       {!!permissions.length && (
         <ul>
           {permissions.map(({ origin, permission }) => (

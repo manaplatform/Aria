@@ -4,11 +4,16 @@ import {
   clipboard,
   dialog,
   ipcMain,
+  Menu,
   nativeImage,
+  Notification,
   powerMonitor,
   screen,
+  session,
   shell,
   safeStorage,
+  systemPreferences,
+  Tray,
   utilityProcess,
   protocol,
   type IpcMainInvokeEvent,
@@ -20,7 +25,7 @@ import { promises as fs } from 'node:fs';
 import { mkdirSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import { z } from 'zod';
-import { LocalStorage, localDataSchema } from './storage';
+import { defaultPreferences, LocalStorage, localDataSchema } from './storage';
 import { BrowserController } from './browser/controller';
 import { openBrowserBridge } from './browser/bridge';
 import { CapabilityStorage, openCapabilityBridge } from './capability-storage';
@@ -29,6 +34,7 @@ import { ProviderStorage } from './provider-storage';
 import {
   browserCommandSchema,
   capabilityId,
+  defaultWebPolicy,
   effectSchema,
   modelReference,
   memoryClear,
@@ -36,10 +42,15 @@ import {
   memoryManagementSearch,
   memoryOperations,
   memorySettingsSchema,
+  resetConfigurationScopeSchema,
+  systemBehaviorInputSchema,
   toolAvailabilitySchema,
   toolHealthSchema,
   type ChatConversation,
   type ChatMessage,
+  type LogLevel,
+  type StorageAreaUsage,
+  type UserPersonalization,
   loopCommandSchema,
   loopRecoveryRequestSchema,
   projectChatEvent,
@@ -108,6 +119,9 @@ if (process.env.ARIA_TEST_DATA_DIR) {
   app.setPath('userData', path.resolve(process.env.ARIA_TEST_DATA_DIR));
 }
 let mainWindow: BrowserWindow | null = null;
+let appTray: Tray | null = null;
+let appIcon: NativeImage | undefined;
+let dataDirectory = '';
 let storage: LocalStorage;
 let webSettings: WebSettingsStorage;
 let capabilities: CapabilityStorage;
@@ -129,6 +143,130 @@ const workingContext = new WorkingContext();
 const temporaryConversations = new Set<string>();
 const pendingChatProjects = new Map<string, string | null>();
 let drainingMemory = false;
+const diagnosticEvents: { at: string; level: LogLevel; area: string; message: string }[] = [];
+const logPriority: Record<LogLevel, number> = { error: 0, warn: 1, info: 2 };
+
+function recordDiagnostic(level: LogLevel, area: string, message: string) {
+  const configured = initial?.data?.preferences.logLevel ?? 'info';
+  if (logPriority[level] > logPriority[configured]) return;
+  diagnosticEvents.push({
+    at: new Date().toISOString(),
+    level,
+    area: area.slice(0, 40),
+    message: message.slice(0, 240),
+  });
+  if (diagnosticEvents.length > 200) diagnosticEvents.shift();
+}
+
+function syncTray(enabled: boolean): boolean {
+  if (!enabled || !appIcon) {
+    appTray?.destroy();
+    appTray = null;
+    return !enabled;
+  }
+  if (appTray) return true;
+  try {
+    const icon = appIcon.resize({ width: 18, height: 18 });
+    appTray = new Tray(icon);
+    appTray.setToolTip('Aria');
+    appTray.setContextMenu(
+      Menu.buildFromTemplate([
+        {
+          label: 'Open Aria',
+          click: () => {
+            if (!mainWindow || mainWindow.isDestroyed()) createWindow(appIcon);
+            else {
+              if (mainWindow.isMinimized()) mainWindow.restore();
+              mainWindow.show();
+              mainWindow.focus();
+            }
+          },
+        },
+        { type: 'separator' },
+        {
+          label: 'Quit Aria',
+          click: () => {
+            quitting = true;
+            app.quit();
+          },
+        },
+      ]),
+    );
+    appTray.on('click', () => {
+      if (!mainWindow || mainWindow.isDestroyed()) createWindow(appIcon);
+      else if (mainWindow.isVisible()) mainWindow.focus();
+      else {
+        mainWindow.show();
+        mainWindow.focus();
+      }
+    });
+  } catch {
+    recordDiagnostic('warn', 'tray', 'Tray unavailable');
+    appTray = null;
+    return false;
+  }
+  return true;
+}
+
+async function pathBytes(target: string): Promise<number> {
+  try {
+    const stat = await fs.lstat(target);
+    if (stat.isFile()) return stat.size;
+    if (!stat.isDirectory()) return 0;
+    const entries = await fs.readdir(target, { withFileTypes: true });
+    const sizes = await Promise.all(
+      entries.map((entry) =>
+        entry.isFile()
+          ? fs.lstat(path.join(target, entry.name)).then((s) => s.size).catch(() => 0)
+          : entry.isDirectory()
+            ? pathBytes(path.join(target, entry.name))
+            : 0,
+      ),
+    );
+    return sizes.reduce((sum, n) => sum + n, 0);
+  } catch {
+    return 0;
+  }
+}
+
+function personalizationContext(): UserPersonalization | undefined {
+  const prefs = initial?.data?.preferences;
+  if (!prefs) return undefined;
+  const profileName = prefs.profileName?.trim();
+  const profileBio = prefs.profileBio?.trim();
+  const responseStyle = prefs.responseStyle;
+  const communicationLanguage = prefs.communicationLanguage?.trim();
+  const payload: UserPersonalization = {
+    ...(profileName && profileName !== 'You' ? { profileName } : {}),
+    ...(profileBio ? { profileBio } : {}),
+    ...(responseStyle && responseStyle !== 'balanced' ? { responseStyle } : {}),
+    ...(communicationLanguage && communicationLanguage !== 'auto' ? { communicationLanguage } : {}),
+  };
+  return Object.keys(payload).length ? payload : undefined;
+}
+
+function notifyBackground(kind: 'task' | 'background', title: string, body: string) {
+  const prefs = initial?.data?.preferences.notifications;
+  if (!prefs?.enabled || !Notification.isSupported()) return;
+  if (kind === 'task' && !prefs.taskCompletion) return;
+  if (kind === 'background' && !prefs.backgroundExecution) return;
+  if (mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible() && mainWindow.isFocused() && !mainWindow.isMinimized())
+    return;
+  try {
+    const note = new Notification({ title, body, silent: !prefs.sound });
+    note.on('click', () => {
+      if (!mainWindow || mainWindow.isDestroyed()) createWindow(appIcon);
+      else {
+        if (mainWindow.isMinimized()) mainWindow.restore();
+        mainWindow.show();
+        mainWindow.focus();
+      }
+    });
+    note.show();
+  } catch {
+    // Ignore notification errors on unsupported desktop environments.
+  }
+}
 
 async function drainMemoryOutbox() {
   if (drainingMemory || !storage.memoryOutbox.length) return;
@@ -556,6 +694,7 @@ function registerIpc(): void {
         const outbox = memory.outbox(storage.memoryOutbox, mergedData.chat.messages, mergedData.chat.conversations);
         await storage.save(mergedData, outbox);
         initial = { data: mergedData };
+        syncTray(Boolean(mergedData.preferences.minimizeToTray));
         for (const message of parsed.chat.messages) {
           const projection = activeMessages.get(message.id);
           if (projection?.requestId === message.requestId && message.sequence >= projection.sequence &&
@@ -895,6 +1034,7 @@ function registerIpc(): void {
     const workingSummary = conversation.temporary ? undefined :
       workingContext.capture(conversation.id, messages, context.messages.length, memory.cutoff);
     try {
+      const personalization = personalizationContext();
       activeMessages.set(assistant.id, assistant);
       chat.submit({
         ...parsed,
@@ -912,6 +1052,7 @@ function registerIpc(): void {
           ...(contextHints.length && { contextHints }),
         },
         programPrivateHistory: context.privateContent,
+        ...(personalization && { personalization }),
         messages: context.messages,
       });
     } catch (error) {
@@ -1072,12 +1213,14 @@ function registerIpc(): void {
     activeMessages.set(assistant.id, seed);
     const memoryOptions = memory.admit(conversation, user, { ...assistant, requestId });
     try {
+      const personalization = personalizationContext();
       chat.submit({
         execution, requestId, conversationId: conversation.id, assistantMessageId: assistant.id,
         expectedRevision: chat.getStatus().revision, messages: context.messages,
         attachmentIds: user.assets?.map(({ id }) => id) ?? user.operation?.assetIds ?? [],
         memory: { ...memoryOptions, privateHistory: context.memoryPrivate },
         programPrivateHistory: context.privateContent || execution.recovery?.privateContent || execution.recovery?.memoryContent,
+        ...(personalization && { personalization }),
       });
     } catch (error) {
       activeMessages.delete(assistant.id);
@@ -1213,6 +1356,422 @@ function registerIpc(): void {
     media.mute(z.string().min(1).max(200).parse(sessionId), z.boolean().parse(muted)),
   );
   handle('aria:end-live', () => media.endLive());
+  handle('aria:system-behavior', () => {
+    const loginSupported = app.isPackaged && (process.platform === 'darwin' || process.platform === 'win32');
+    const loginReason = !loginSupported
+      ? process.platform === 'linux'
+        ? 'System login item configuration is available on macOS and Windows.'
+        : 'Launch at system startup is available in packaged Aria desktop builds.'
+      : undefined;
+    return {
+      openAtLogin: loginSupported ? app.getLoginItemSettings().openAtLogin : false,
+      loginSupported,
+      loginReason,
+      minimizeToTray: Boolean(initial?.data?.preferences.minimizeToTray),
+      traySupported: Boolean(appIcon),
+    };
+  });
+  handle('aria:set-system-behavior', async (raw) => {
+    const patch = systemBehaviorInputSchema.parse(raw);
+    const loginSupported = app.isPackaged && (process.platform === 'darwin' || process.platform === 'win32');
+    if (patch.openAtLogin !== undefined) {
+      if (!loginSupported)
+        throw new Error(
+          process.platform === 'linux'
+            ? 'Launch at system startup is not supported on Linux.'
+            : 'Launch at system startup requires a packaged Aria build.',
+        );
+      app.setLoginItemSettings({ openAtLogin: patch.openAtLogin });
+    }
+    if (patch.minimizeToTray !== undefined) {
+      const previousTray = Boolean(initial.data.preferences.minimizeToTray);
+      if (patch.minimizeToTray && !syncTray(true)) throw new Error('The system tray could not be initialized on this desktop.');
+      saving = saving.catch(() => undefined).then(async () => {
+        const next = {
+          ...initial.data,
+          preferences: { ...initial.data.preferences, minimizeToTray: patch.minimizeToTray },
+        };
+        await storage.save(next);
+        initial = { data: next };
+        syncTray(Boolean(patch.minimizeToTray));
+      });
+      try {
+        await saving;
+      } catch (error) {
+        syncTray(previousTray);
+        throw error;
+      }
+    }
+    return {
+      openAtLogin: loginSupported ? app.getLoginItemSettings().openAtLogin : false,
+      loginSupported,
+      loginReason: !loginSupported
+        ? process.platform === 'linux'
+          ? 'System login item configuration is available on macOS and Windows.'
+          : 'Launch at system startup is available in packaged Aria desktop builds.'
+        : undefined,
+      minimizeToTray: Boolean(initial?.data?.preferences.minimizeToTray),
+      traySupported: Boolean(appIcon),
+    };
+  });
+  handle('aria:test-notification', () => {
+    if (!Notification.isSupported())
+      throw new Error('Desktop notifications are not supported in this environment.');
+    const sound = initial?.data?.preferences.notifications?.sound ?? true;
+    const note = new Notification({
+      title: 'Aria Desktop',
+      body: 'Desktop notifications are working.',
+      silent: !sound,
+    });
+    note.on('click', () => mainWindow?.focus());
+    note.show();
+  });
+  handle('aria:remove-workspace', async (rawId) => {
+    const id = identifier.parse(rawId);
+    chat.assertIdle();
+    const workspace = initial.data.workspaces.find((item) => item.id === id);
+    if (!workspace) return false;
+    if (initial.data.chat.conversations.some((conversation) => conversation.projectId === id))
+      throw new Error('This directory is attached to saved conversations. Remove those conversations before revoking access.');
+    if (!mainWindow || mainWindow.isDestroyed()) throw new Error('Open Aria to confirm directory removal.');
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      const { response } = await dialog.showMessageBox(mainWindow, {
+        type: 'warning',
+        message: `Remove authorized directory “${workspace.name}”?`,
+        detail: 'Aria will stop accessing files in this folder. Local files on disk are never deleted.',
+        buttons: ['Cancel', 'Remove directory'],
+        cancelId: 0,
+        defaultId: 0,
+        noLink: true,
+      });
+      if (response !== 1) return false;
+    }
+    chat.assertIdle();
+    if (initial.data.chat.conversations.some((conversation) => conversation.projectId === id))
+      throw new Error('This directory is attached to saved conversations. Remove those conversations before revoking access.');
+    media.assertIdle();
+    await changeCapabilities(async () => {
+      saving = saving.catch(() => undefined).then(async () => {
+        await storage.unregister(id);
+        initial = {
+          data: {
+            ...initial.data,
+            workspaces: initial.data.workspaces.filter((item) => item.id !== id),
+            preferences: {
+              ...initial.data.preferences,
+              activeWorkspaceId:
+                initial.data.preferences.activeWorkspaceId === id
+                  ? null
+                  : initial.data.preferences.activeWorkspaceId,
+            },
+          },
+        };
+      });
+      await saving;
+    }, async () => undefined);
+    return true;
+  });
+  handle('aria:storage-info', async () => {
+    const dir = dataDirectory;
+    const [
+      dataFileBytes,
+      providerBytes,
+      webBytes,
+      browserStateBytes,
+      capabilitiesBytes,
+      runtimeBytes,
+      runtimeWalBytes,
+      mediaBytes,
+      memoryBytes,
+      memoryWalBytes,
+      skillsBytes,
+      dispatchBytes,
+      libraryBytes,
+      embeddingsBytes,
+      cacheBytes,
+    ] = await Promise.all([
+      pathBytes(path.join(dir, 'aria-v3.json')),
+      pathBytes(path.join(dir, 'provider-v2.json')),
+      pathBytes(path.join(dir, 'web-settings-v1.json')),
+      pathBytes(path.join(dir, 'browser-state-v1.json')),
+      pathBytes(path.join(dir, 'capabilities-v1.json')),
+      pathBytes(path.join(dir, 'runtime.sqlite')),
+      pathBytes(path.join(dir, 'runtime.sqlite-wal')),
+      pathBytes(path.join(dir, 'media')),
+      pathBytes(path.join(dir, 'memory.sqlite')),
+      pathBytes(path.join(dir, 'memory.sqlite-wal')),
+      pathBytes(path.join(dir, 'approved-skills')),
+      pathBytes(path.join(dir, 'tool-dispatch')),
+      pathBytes(path.join(dir, 'library')),
+      pathBytes(path.join(dir, 'runtime-model')),
+      session.fromPartition('persist:aria-web-personal').getCacheSize().catch(() => 0),
+    ]);
+    const areas: StorageAreaUsage[] = [
+      {
+        id: 'conversations',
+        label: 'Conversations & preferences',
+        bytes: dataFileBytes + providerBytes + webBytes + browserStateBytes + capabilitiesBytes,
+      },
+      { id: 'media', label: 'Attachments & generated media', bytes: mediaBytes },
+      { id: 'memory', label: 'Persistent memory database', bytes: memoryBytes + memoryWalBytes },
+      {
+        id: 'library',
+        label: 'Knowledge libraries & local embeddings',
+        bytes: libraryBytes + embeddingsBytes,
+      },
+      {
+        id: 'runtime',
+        label: 'Conductor journal & approved skills',
+        bytes: runtimeBytes + runtimeWalBytes + skillsBytes + dispatchBytes,
+      },
+      { id: 'browser-cache', label: 'Browser HTTP cache', bytes: cacheBytes },
+    ];
+    return {
+      dataDir: dir,
+      totalBytes: areas.reduce((sum, area) => sum + area.bytes, 0),
+      areas,
+    };
+  });
+  handle('aria:open-storage-folder', async () => {
+    const failure = await shell.openPath(dataDirectory);
+    if (failure) throw new Error('Could not open the storage directory.');
+  });
+  handle('aria:prune-media-cache', async () => {
+    chat.assertIdle();
+    const before = await pathBytes(assets.directory);
+    const names = await fs.readdir(assets.directory).catch(() => [] as string[]);
+    const beforeCount = names.filter((name) => !name.endsWith('.json') && !name.endsWith('.tmp')).length;
+    await assets.pruneUnreferenced(initial.data);
+    const after = await pathBytes(assets.directory);
+    const afterNames = await fs.readdir(assets.directory).catch(() => [] as string[]);
+    const afterCount = afterNames.filter((name) => !name.endsWith('.json') && !name.endsWith('.tmp')).length;
+    return {
+      removed: Math.max(0, beforeCount - afterCount),
+      freedBytes: Math.max(0, before - after),
+    };
+  });
+  handle('aria:clear-browser-cache', async () => {
+    await session.fromPartition('persist:aria-web-personal').clearCache();
+  });
+  handle('aria:os-permissions', () => ({
+    platform: process.platform,
+    microphone:
+      process.platform === 'darwin' || process.platform === 'win32'
+        ? systemPreferences.getMediaAccessStatus('microphone')
+        : 'unsupported',
+    screen:
+      process.platform === 'darwin' || process.platform === 'win32'
+        ? systemPreferences.getMediaAccessStatus('screen')
+        : 'unsupported',
+    notificationsSupported: Notification.isSupported(),
+  }));
+  handle('aria:clear-chat-history', async () => {
+    chat.assertIdle();
+    media.assertIdle();
+    if (!mainWindow || mainWindow.isDestroyed()) throw new Error('Open Aria to confirm clearing chat history.');
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      const { response } = await dialog.showMessageBox(mainWindow, {
+        type: 'warning',
+        message: 'Clear all saved conversations and chat history?',
+        detail: 'Saved memories, API connections, and authorized directories are preserved.',
+        buttons: ['Cancel', 'Clear chat history'],
+        cancelId: 0,
+        defaultId: 0,
+        noLink: true,
+      });
+      if (response !== 1) return false;
+    }
+    chat.assertIdle();
+    media.assertIdle();
+    if (configuring) throw new Error('Wait for settings to finish saving.');
+    configuring = true;
+    try {
+      saving = saving.catch(() => undefined).then(async () => {
+        const previous = initial.data;
+        const next = {
+          ...previous,
+          chat: { conversations: [], messages: [], selectedId: null, newDraft: '', newAttachments: [] },
+        };
+        await storage.save(next, []);
+        initial = { data: next };
+        for (const { id } of previous.chat.conversations) {
+          temporaryConversations.delete(id);
+          pendingChatProjects.delete(id);
+          workingContext.clear(id);
+          executionRuntime.store.deletePrograms(id);
+        }
+        browser.pruneConversations([]);
+        await assets.pruneUnreferenced(next);
+      });
+      await saving;
+      return true;
+    } finally {
+      configuring = false;
+    }
+  });
+  handle('aria:clear-legacy-data', async () => {
+    chat.assertIdle();
+    media.assertIdle();
+    if (!mainWindow || mainWindow.isDestroyed()) throw new Error('Open Aria to confirm clearing legacy data.');
+    const { response } = await dialog.showMessageBox(mainWindow, {
+      type: 'warning', message: 'Clear local legacy workspace data?',
+      detail: 'This removes local legacy drafts, tasks, and plans. Authorized folders, files, chat history, and data in external services are preserved.',
+      buttons: ['Cancel', 'Clear local legacy data'], cancelId: 0, defaultId: 0, noLink: true,
+    });
+    if (response !== 1) return false;
+    chat.assertIdle();
+    media.assertIdle();
+    if (configuring) throw new Error('Wait for settings to finish saving.');
+    configuring = true;
+    try {
+      saving = saving.catch(() => undefined).then(async () => {
+        const next = { ...initial.data, conversations: [], tasks: [], plans: [] };
+        await storage.save(next);
+        initial = { data: next };
+      });
+      await saving;
+      return true;
+    } finally {
+      configuring = false;
+    }
+  });
+  handle('aria:export-diagnostics', async () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return false;
+    const destination = await dialog.showSaveDialog(mainWindow, {
+      title: 'Export redacted diagnostics',
+      defaultPath: `aria-diagnostics-${new Date().toISOString().slice(0, 10)}.json`,
+      filters: [{ name: 'JSON', extensions: ['json'] }],
+    });
+    if (destination.canceled || !destination.filePath) return false;
+    const [memDiag, memStatus, tools] = await Promise.all([
+      memory.diagnosticSnapshot().catch(() => null),
+      Promise.resolve().then(() => memory.status()).catch(() => null),
+      toolSettings().catch(() => null),
+    ]);
+    const report = {
+      exportedAt: new Date().toISOString(),
+      app: {
+        version: app.getVersion(),
+        electron: process.versions.electron,
+        node: process.versions.node,
+        platform: process.platform,
+        arch: process.arch,
+        packaged: app.isPackaged,
+      },
+      chatService: { state: chat.getStatus().state, configured: chat.getStatus().configured },
+      runtimeSettings: {
+        ...executionRuntime.settings(),
+        engineSocketConfigured: Boolean(executionRuntime.settings().engineSocket.trim()),
+        engineSocket: undefined,
+      },
+      tools: tools
+        ? {
+            discovery: tools.discovery,
+            nativeVerified: tools.nativeVerified,
+            availableCount: tools.tools.filter((t) => t.available).length,
+            totalCount: tools.tools.length,
+            enabledSkills: tools.skills.filter((s) => s.enabled).length,
+          }
+        : null,
+      memory: memStatus
+        ? { state: memStatus.state, embedding: memStatus.embedding, records: memStatus.records, diagnostics: memDiag }
+        : null,
+      executionHistory: executionRuntime.history().slice(0, 25).map(({ state, elapsed, exitCode }) => ({ state, elapsed, exitCode })),
+      events: diagnosticEvents,
+    };
+    const temporary = `${destination.filePath}.${randomUUID()}.tmp`;
+    await fs.writeFile(temporary, JSON.stringify(report, null, 2), { mode: 0o600 });
+    await fs.rename(temporary, destination.filePath);
+    return true;
+  });
+  handle('aria:reset-configuration', async (rawScope) => {
+    const scope = resetConfigurationScopeSchema.parse(rawScope);
+    chat.assertIdle();
+    media.assertIdle();
+    if (!mainWindow || mainWindow.isDestroyed()) throw new Error('Open Aria to confirm resetting settings.');
+    const { response } = await dialog.showMessageBox(mainWindow, {
+      type: 'warning', message: `Reset ${scope} settings?`,
+      detail: 'Provider credentials and conversation history will be preserved.',
+      buttons: ['Cancel', 'Reset settings'], cancelId: 0, defaultId: 0, noLink: true,
+    });
+    if (response !== 1) return false;
+    chat.assertIdle();
+    media.assertIdle();
+    if (scope === 'preferences') {
+      saving = saving.catch(() => undefined).then(async () => {
+        const defaults = defaultPreferences();
+        const next = {
+          ...initial.data,
+          preferences: {
+            ...defaults,
+            activeWorkspaceId: initial.data.preferences.activeWorkspaceId,
+          },
+        };
+        await storage.save(next);
+        initial = { data: next };
+        syncTray(false);
+      });
+      await saving;
+      return true;
+    }
+    if (scope === 'web') {
+      chat.assertIdle();
+      media.assertIdle();
+      const previous = webSettings.get();
+      await webSettings.save(defaultWebPolicy);
+      await browser.applyPolicy(previous);
+      await chat.restart();
+      return true;
+    }
+    await changeCapabilities(() => capabilities.resetPolicy());
+    return true;
+  });
+  handle('aria:about-info', async () => {
+    const distDir = path.join(__dirname, '../dist');
+    const rootDir = path.resolve(__dirname, '../../..');
+    const readFirst = async (paths: string[]) => {
+      for (const candidate of paths) {
+        try {
+          return await fs.readFile(candidate, 'utf8');
+        } catch {
+          // Try next candidate path.
+        }
+      }
+      return '';
+    };
+    const mitLicense = await readFirst([
+      path.join(distDir, 'LICENSE'),
+      path.join(rootDir, 'LICENSE'),
+    ]);
+    const thirdPartyNotices = await readFirst([
+      path.join(distDir, 'third-party', 'THIRD_PARTY_NOTICES.md'),
+      path.join(rootDir, 'THIRD_PARTY_NOTICES.md'),
+    ]);
+    let thirdPartyInventory: { name: string; version: string; license: string | null }[] = [];
+    const inventoryRaw = await readFirst([path.join(distDir, 'third-party', 'inventory.json')]);
+    if (inventoryRaw) {
+      try {
+        thirdPartyInventory = JSON.parse(inventoryRaw);
+      } catch {
+        thirdPartyInventory = [];
+      }
+    }
+    return {
+      version: app.getVersion(),
+      electronVersion: process.versions.electron,
+      nodeVersion: process.versions.node,
+      platform: process.platform,
+      arch: process.arch,
+      repositoryUrl: 'https://github.com/manaplatform/Aria',
+      releaseNotesUrl: 'https://github.com/manaplatform/Aria/releases',
+      mitLicense,
+      thirdPartyNotices,
+      thirdPartyInventory,
+    };
+  });
+  handle('aria:open-devtools', () => {
+    mainWindow?.webContents.openDevTools({ mode: 'detach' });
+  });
 }
 function createWindow(icon: NativeImage | undefined): void {
   closeFlushEnabled = false;
@@ -1275,6 +1834,11 @@ function createWindow(icon: NativeImage | undefined): void {
     mainWindow = null;
   });
   mainWindow.on('close', (event) => {
+    if (!quitting && initial?.data?.preferences.minimizeToTray && appTray) {
+      event.preventDefault();
+      mainWindow?.hide();
+      return;
+    }
     if (!closeFlushEnabled) return;
     event.preventDefault();
     if (!closePending) {
@@ -1291,6 +1855,7 @@ app
     const iconDirectory = devServerUrl ? '../public' : '../dist';
     const image = nativeImage.createFromPath(path.join(__dirname, iconDirectory, 'aria-icon.png'));
     const icon = image.isEmpty() ? undefined : image;
+    appIcon = icon;
     if (icon) app.dock?.setIcon(icon);
     if (!app.isPackaged) {
       try {
@@ -1300,6 +1865,7 @@ app
       }
     }
     const directory = process.env.ARIA_TEST_DATA_DIR || app.getPath('userData');
+    dataDirectory = directory;
     updates = new DesktopUpdates(directory, (state) => {
       if (mainWindow && !mainWindow.webContents.isDestroyed())
         mainWindow.webContents.send('aria:update-state-changed', state);
@@ -1539,8 +2105,17 @@ app
         }
         if (mainWindow && !mainWindow.webContents.isDestroyed())
           mainWindow.webContents.send('aria:chat-event', visible);
+        if (visible.type === 'completed') {
+          notifyBackground('task', 'Aria finished your response', 'Return to Aria to view the result.');
+        } else if (visible.type === 'failed') {
+          recordDiagnostic('error', 'chat', 'Chat response failed');
+          notifyBackground('background', 'Aria response failed', 'Return to Aria for details.');
+        } else if (visible.type === 'activity' && visible.activity.status === 'approval') {
+          notifyBackground('background', 'Aria needs your approval', 'Return to Aria to review the request.');
+        }
       },
       (status) => {
+        recordDiagnostic(status.state === 'failed' ? 'error' : 'info', 'service', `Chat service ${status.state}`);
         if (mainWindow && !mainWindow.webContents.isDestroyed())
           mainWindow.webContents.send('aria:chat-status-update', status);
       },
@@ -1667,6 +2242,7 @@ app
       app.quit();
       return;
     }
+    syncTray(Boolean(initial.data.preferences.minimizeToTray));
     createWindow(icon);
     updates.startAutomaticChecks();
     void chat.start().then(() => executionRuntime.cleanHostedResources());
@@ -1683,6 +2259,8 @@ app.on('window-all-closed', () => {
 });
 app.on('before-quit', (event) => {
   quitting = true;
+  appTray?.destroy();
+  appTray = null;
   // The window close handshake flushes renderer state before this final shutdown.
   if (!mainWindow && chat && !shutdownComplete) {
     event.preventDefault();
