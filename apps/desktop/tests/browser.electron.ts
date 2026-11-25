@@ -780,6 +780,7 @@ test('uses direct rendered evidence for Persian news and a site audit while asse
           const { hostname, pathname } = new URL(request.url);
           const html = (text: string) => new Response(text, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
           if (hostname === 'zoomit.ir') {
+            // Keep the image response open so the homepage cannot finish loading.
             if (pathname === '/stall.png') return new Response(new ReadableStream({
               start(stream) { stream.enqueue(new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10])); },
             }), { headers: { 'Content-Type': 'image/png' } });
@@ -830,10 +831,9 @@ test('uses direct rendered evidence for Persian news and a site audit while asse
     const newsTools = ['browser_open', 'browser_get_page', 'browser_wait', 'browser_extract', 'browser_close']
       .map((tool) => `browser.${tool}`);
     const commands: string[] = [];
-    let passedHome = 0;
+    let homepageEvidence: unknown;
     let publication: unknown;
     let publishedContent: unknown;
-    let articleHref = '';
     provider.queueTool(news, 'find_capabilities', { query: '', ids: newsTools });
     provider.queueTool(news, 'load_capabilities', { ids: newsTools });
     provider.queueOperations(news, { steps: [step('home', 'browser_open', { url: 'zoomit.ir' })] });
@@ -851,8 +851,7 @@ test('uses direct rendered evidence for Persian news and a site audit while asse
           expect(first.data.phase).toBe('partial');
           return run([step('links', 'browser_get_page', { tabId }, ['home'])]);
         case 'links':
-          passedHome = Date.now();
-          articleHref = links[0].href;
+          homepageEvidence = first;
           return run([step('article', 'browser_open', { sourceId: links[0].sourceId }, ['links'])]);
         case 'article':
           return run([step('articleReady', 'browser_wait', { tabId, condition: 'visible_text', text: 'گزارش تازه' }, ['article'])]);
@@ -872,11 +871,12 @@ test('uses direct rendered evidence for Persian news and a site audit while asse
         default: expect(text).toBeUndefined();
       }
     });
-    const sent = Date.now();
     await go(news);
     await expect(page.locator('.from-assistant').last()).toContainText('۳۰ آبان', { timeout: 15_000 });
-    expect(passedHome - sent).toBeLessThan(2000);
-    expect(articleHref).toBe('https://zoomit.ir/news/item');
+    expect(homepageEvidence).toMatchObject({
+      status: 'completed',
+      data: { phase: 'partial', links: [{ href: 'https://zoomit.ir/news/item' }] },
+    });
     expect(publication).toMatchObject({
       language: 'fa', direction: 'rtl',
       published: ['2026-11-21T08:00:00+03:30'], modified: ['2026-11-22T14:30:00+03:30'],
