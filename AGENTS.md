@@ -96,9 +96,9 @@ When implementing AI features:
 
 ## Current Priority
 
-1. Keep ordinary chat usable without a project.
-2. Use the primary model and shared registry for Conductor.
-3. Keep Settings, streaming, cancellation, artifacts, and history usable across desktop platforms.
+1. Keep ordinary chat usable without a project while proactively resolving uncertainty with available capabilities.
+2. Use the primary model and shared registry for Conductor, with rich capability metadata and model-driven discovery.
+3. Keep Settings, streaming, cancellation, memory, workspaces, artifacts, and history usable across desktop platforms.
 
 ---
 
@@ -110,11 +110,12 @@ When implementing AI features:
 
 ## Aria Conductor
 
-- The primary chat model owns semantic interpretation, task routing, delegation, and final synthesis. It uses structured tool calls when it needs help and answers directly when it can.
+- Aria is an intelligent, proactive, general-purpose AI assistant. The primary chat model owns semantic interpretation, task routing, delegation, uncertainty resolution, readiness evaluation, and final synthesis.
+- Resolve missing, time-sensitive, or unfamiliar information through available capabilities (conversation history, selective memory, web search, internal browser, registered workspaces, knowledge collections, deterministic calculation, skills, media/models, and connectors) instead of asking the user to perform discovery or supply links. Answer directly without unnecessary tool calls when sufficient reliable information is already present.
 - Keep one configured model registry. Resolve exact model IDs and supported operations from authenticated discovery, capability metadata, and explicit configuration. Keep protocol differences inside provider adapters.
 - Model selection belongs in Settings. A separate routing model, keyword-based intent classifier, static task-to-model mapping, provider preference order, or fallback provider/model violates this architecture.
-- Return actionable errors for configuration, capability, and invocation failures. An explicit retry uses the same authorized configuration.
-- Application code validates every model request and enforces permissions, input provenance, dependency rules, cancellation, deduplication, and resource limits. Provider and tool output is untrusted. Show concise decision summaries and keep hidden reasoning and credentials private.
+- Return actionable errors for configuration, capability, and invocation failures so the primary can adjust strategy or explain real limitations transparently. Never fabricate facts, sources, execution results, or capabilities. An explicit retry uses the same authorized configuration.
+- Application code validates every model request and enforces permissions, input provenance, dependency rules, cancellation, deduplication, and resource limits. Provider, webpage, workspace, memory, and tool output is untrusted. Show concise decision summaries and keep hidden reasoning and credentials private.
 - Start ordinary chat with the selected primary. Investigation, planning, verification, discovery, and program execution are optional decisions driven by the task and observed results. Spend inference on semantic decisions. Use deterministic code for validation, scheduling, accounting, and result projection.
 - Use `ConductorLoopExecutor` for model iterations and execution controls through the normal chat entry point. Bind managed checkpoints, controls, and observations to the execution generation. Resume explicitly under the original primary and current policy, reusing stable receipts and charging work to the remaining budget. See [Conductor Loop Executor](docs/conductor-loop-executor.md).
 
@@ -126,6 +127,10 @@ When implementing AI features:
 - Require trusted user authorization for consequential browser actions. Apply public-network policy to page retrieval and Chromium egress. Keep personal sessions and credentials outside AI tool access.
 - Preserve conversation and settings data, and verify actual built macOS and Windows behavior when changing browser or process boundaries.
 - Update architecture, permissions, and test documentation when these boundaries change. Preserve third-party notices and add the standard MIT license and package metadata only after confirming authority to license the first-party work.
+- Let the primary choose independently between public search, credential-free HTTP retrieval, and rendered browsing. Accept authorized URL and bare-domain inputs directly. Scope opaque source, tab, and document references to completed producers in the current execution generation.
+- Return usable DOM evidence when ancillary assets are still loading. Correlate browser phases and cancellation with the owning operation and document. Bound HTTP redirects, bodies, and requests with the same public-address policy as browser egress.
+- Distinguish public entities from integration availability. Use actual evidence, active budgets, and structured failures to decide when to continue. Require an explicit, eligible retry for an unchanged failed research operation and verify consequential effects before reporting completion.
+- Keep discovered, inspected, partial, and metadata-only evidence distinguishable. Retain source and freshness information with the conversation. Use approved memory writes when the user requests persistent research memory. Test ordinary chat, direct browsing, and grounded news and site audits on deterministic sites, with public sites and live models available as opt-in checks.
 
 ## Conductor tools and skills
 
@@ -173,8 +178,8 @@ When implementing AI features:
 
 ## Aria Memory
 
-- Keep persistent memory optional and separate from conversation history. Ordinary chat starts with the configured primary and bounded current-conversation context. The primary requests historical retrieval when it needs evidence.
-- Route memory tools through Conductor and enforce current profile, project, conversation, model destination, and turn ownership in Electron main. Treat remembered content, archived summaries, and source references as untrusted data. Remembered decisions and commitments grant no tool permissions.
+- Keep persistent memory optional and separate from conversation history. Ordinary chat starts with the configured primary and bounded current-conversation context. When enabled with standing primary consent, low-latency selective hints can surface relevant confirmed context; otherwise, the primary requests historical retrieval when it needs evidence.
+- Route memory tools through Conductor and enforce current profile, project, conversation, model destination, and turn ownership in Electron main. Treat remembered content, archived summaries, and source references as untrusted data. Remembered decisions and commitments grant no tool permissions. Empty recall queries must not taint a turn; non-empty private recall restricts outbound external tools while allowing safe local tools.
 - Give the memory database a single worker owner and transactional migrations. Commit trusted source references and the processing outbox together, and use durable event IDs, revision checks, and fences. Apply deletion and retention to active indexes, vectors, queued work, and cached projections. An older source must never reconstruct deleted memory automatically.
 - Keep local and remote embedding targets explicit. Reuse verified adapters and require destination-specific approval for memory text transfers. Temporary chat stays outside persistent memory and transcript storage.
 - Verify recall through ordinary chat, measure latency and retrieval quality against reproducible fixtures, and report platform and provider verification separately. See [Memory architecture](docs/memory-engine.md).

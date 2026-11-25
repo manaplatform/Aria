@@ -100,6 +100,9 @@ export function ToolSettings() {
                       backend === 'managed' ? 'Aria' : 'OpenAI Responses').join(', ')}</small>
                   ) : null}
                   {tool.reason && <p className="muted">{tool.reason}</p>}
+                  {!tool.reason && tool.health === 'unavailable' && tool.settingsSection && (
+                    <p className="muted">Configure runtime in {tool.settingsSection} before running.</p>
+                  )}
                 </div>
                 <Button
                   size="sm"

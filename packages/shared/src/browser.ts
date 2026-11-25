@@ -1,25 +1,46 @@
 import { z } from 'zod';
-import { webDestination, webReference, webUrlSchema, webSearchArgs } from './web.js';
+import { hasOneWebDestination, webDestination, webDestinationFields, webMethod, webReference, webUrlSchema, webSearchArgs } from './web.js';
 
 const tab = { tabId: webReference };
 const page = { ...tab, documentId: webReference };
 const element = { ...page, elementId: webReference };
 const value = z.string().max(1000);
+export const browserReadView = z.enum(['content', 'metadata', 'links', 'html', 'performance']);
+export const browserPhaseSchema = z.enum([
+  'initializing', 'navigating', 'dom_available', 'ready', 'partial', 'inspecting',
+  'navigation_failed', 'timed_out', 'unavailable', 'cancelled', 'closed',
+]);
+export type BrowserPhase = z.infer<typeof browserPhaseSchema>;
 
 export const browserToolArgs = {
   browser_open: webDestination,
-  browser_navigate: z.union([
-    z.strictObject({ ...tab, url: webUrlSchema }),
-    z.strictObject({ ...tab, sourceId: webReference }),
-  ]),
+  browser_navigate: z
+    .strictObject({
+      ...tab,
+      ...webDestinationFields,
+    })
+    .refine(
+      hasOneWebDestination,
+      'Provide exactly one of url or sourceId.',
+    ),
   browser_get_tabs: z.strictObject({}),
   browser_switch_tab: z.strictObject(tab),
+  browser_close: z.strictObject(tab),
   browser_get_page: z.strictObject(tab),
+  browser_wait: z.strictObject({
+    ...tab,
+    condition: z.enum(['dom_available', 'ready', 'visible_text', 'url_changed']),
+    text: z.string().trim().min(1).max(200).optional(),
+    timeoutMs: z.number().int().min(100).max(10_000).optional(),
+  }).refine((args) => (args.condition === 'visible_text') === Boolean(args.text),
+    'Supply text for the visible_text condition.'),
   browser_media: z.strictObject({ ...tab, action: z.enum(['play', 'stop']) }),
   browser_extract: z.strictObject({
     ...page,
     selection: z.boolean().optional(),
     query: z.string().min(1).max(200).optional(),
+    view: browserReadView.optional(),
+    offset: z.number().int().min(0).max(200).optional(),
   }),
   browser_scroll: z.strictObject({ ...page, delta: z.number().int().min(-2000).max(2000) }),
   browser_click: z.strictObject(element),
@@ -34,8 +55,10 @@ export const browserOps = Object.keys(browserToolArgs) as [BrowserOp, ...Browser
 export type BrowserOp = keyof typeof browserToolArgs;
 export const browserBridgeArgs = {
   ...browserToolArgs,
+  browser_open: z.strictObject({ url: webUrlSchema }),
+  browser_navigate: z.strictObject({ ...tab, url: webUrlSchema }),
   web_search: webSearchArgs,
-  web_fetch: z.strictObject({ url: webUrlSchema }),
+  web_fetch: z.strictObject({ url: webUrlSchema, method: webMethod.optional() }),
 } as const;
 export type BrowserBridgeOp = keyof typeof browserBridgeArgs;
 const bridgeOps = [...browserOps, 'web_search', 'web_fetch'] as const;
@@ -70,11 +93,13 @@ export const browserResponseSchema = z.strictObject({
       ok: z.literal(false),
       code: z.string().max(40),
       message: z.string().max(400),
+      phase: browserPhaseSchema.optional(),
+      retryAfterMs: z.number().int().min(0).max(60_000).optional(),
     }),
   ]),
 });
 export const browserProgressSchema = browserResponseSchema.omit({ result: true }).extend({
-  progress: z.literal('approval'),
+  progress: z.enum(['approval', 'network', ...browserPhaseSchema.options]),
 });
 export const browserCancelSchema = z.strictObject({
   generation: webReference,

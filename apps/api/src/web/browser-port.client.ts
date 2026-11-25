@@ -6,6 +6,9 @@ import {
   type BrowserRequest,
   type BrowserResponse,
 } from '@aria/shared';
+import { ToolError } from '../conductor/capability-host';
+
+export type BrowserProgress = ReturnType<typeof browserProgressSchema.parse>['progress'];
 
 export interface BrowserPort {
   start(): void;
@@ -22,7 +25,7 @@ export class BrowserPortClient {
     string,
     {
       request: BrowserRequest;
-      approval?: () => void;
+      progress?: (phase: BrowserProgress) => void;
       settle: (response?: BrowserResponse, error?: Error) => void;
     }
   >();
@@ -32,8 +35,12 @@ export class BrowserPortClient {
   }
 
   install(port: BrowserPort, generation: string) {
+    const previous = this.connection;
+    for (const pending of this.pending.values())
+      pending.settle(undefined, new ToolError('CAPABILITY_UNAVAILABLE', 'The browser connection was replaced.'));
     const connection = { port, generation };
     this.connection = connection;
+    if (previous?.port !== port) previous?.port.close();
     port.on('message', ({ data }) => {
       if (this.connection !== connection) return;
       const progress = browserProgressSchema.safeParse(data);
@@ -55,7 +62,7 @@ export class BrowserPortClient {
           entry.request.stepId === stepId &&
           entry.request.op === op
         )
-          entry.approval?.();
+          entry.progress?.(progress.data.progress);
         return;
       }
       const parsed = browserResponseSchema.safeParse(data);
@@ -87,7 +94,7 @@ export class BrowserPortClient {
   invoke(
     input: Omit<BrowserRequest, 'v' | 'generation' | 'operationId' | 'deadline'>,
     signal: AbortSignal,
-    approval?: () => void,
+    progress?: (phase: BrowserProgress) => void,
   ) {
     signal.throwIfAborted();
     const connection = this.connection;
@@ -113,9 +120,8 @@ export class BrowserPortClient {
         }
         settle(
           undefined,
-          new Error(
-            signal.aborted ? 'The browser operation stopped.' : 'The browser operation timed out.',
-          ),
+          signal.aborted ? signal.reason :
+            new ToolError('TIMEOUT', 'The browser did not return a result before the IPC deadline.', 'IPC_TIMEOUT', 'timed_out'),
         );
       };
       const settle = (response?: BrowserResponse, error?: Error) => {
@@ -126,7 +132,7 @@ export class BrowserPortClient {
         else reject(error);
       };
       const timer = setTimeout(cancel, 80_000);
-      this.pending.set(request.operationId, { request, settle, approval });
+      this.pending.set(request.operationId, { request, settle, progress });
       signal.addEventListener('abort', cancel, { once: true });
       try {
         connection.port.postMessage(request);

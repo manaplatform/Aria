@@ -26,6 +26,12 @@ import type { CapabilityStorage } from '../capability-storage';
 import { decodeSkillText } from '../skill-bundles';
 import type { SecretCipher } from '../provider-storage';
 import type { MediaStorage } from '../media-storage';
+import {
+  listFiles,
+  readFileLines,
+  repository,
+  searchFiles,
+} from '../project';
 import { downloadVerified } from './downloads';
 import { extractDocument } from './extraction';
 import { LocalEmbeddings, embeddingRevision } from './embeddings';
@@ -86,6 +92,7 @@ export class DesktopRuntime {
     private readonly providerIdentity: () => string | undefined,
     private readonly resolveRegistry: () => Promise<RuntimeRegistry>,
     private readonly programCipher: SecretCipher,
+    private readonly workspaces: () => { id: string; name: string; root: string; branch: string | null }[] = () => [],
   ) {
     this.store = skills.runtimeStore;
     this.knowledge = new Knowledge(this.store, extractDocument);
@@ -556,11 +563,144 @@ Skills: ${[...references, ...inline].join(', ') || 'none'}`,
           }
         });
       }
+      case 'workspace.list_projects': {
+        checked(runtimeOperations[request.operation].safeParse(request.input));
+        return {
+          data: {
+            projects: this.workspaces().map(({ id, name, branch }) => ({ id, name, branch })),
+          },
+        };
+      }
+      case 'workspace.repo_info': {
+        const { projectId } = checked(runtimeOperations[request.operation].safeParse(request.input));
+        const project = this.resolveWorkspace(projectId);
+        const [repo, entries] = await Promise.all([
+          repository(project.root),
+          listFiles(project.root, ''),
+        ]);
+        return {
+          data: {
+            project: { id: project.id, name: project.name },
+            repository: repo,
+            entries: entries.slice(0, 40),
+            truncated: entries.length > 40,
+          },
+        };
+      }
+      case 'workspace.list_files': {
+        const { projectId, path: relative } = checked(
+          runtimeOperations[request.operation].safeParse(request.input),
+        );
+        const project = this.resolveWorkspace(projectId);
+        const entries = await this.runWorkspaceIo(() => listFiles(project.root, relative ?? ''));
+        return {
+          data: {
+            projectId: project.id,
+            path: relative ?? '',
+            entries: entries.slice(0, 200),
+            truncated: entries.length > 200,
+          },
+        };
+      }
+      case 'workspace.search_files': {
+        const { projectId, query, path: relative, limit } = checked(
+          runtimeOperations[request.operation].safeParse(request.input),
+        );
+        const project = this.resolveWorkspace(projectId);
+        await this.allowWorkspaceContent(request, project, signal);
+        const result = await this.runWorkspaceIo(() =>
+          searchFiles(
+            project.root,
+            relative ?? '',
+            query,
+            limit ?? 20,
+            signal,
+          ),
+        );
+        return { data: { projectId: project.id, ...result }, privateContent: true };
+      }
+      case 'workspace.read_file': {
+        const { projectId, path: relative, startLine, maxLines } = checked(
+          runtimeOperations[request.operation].safeParse(request.input),
+        );
+        const project = this.resolveWorkspace(projectId);
+        await this.allowWorkspaceContent(request, project, signal);
+        const result = await this.runWorkspaceIo(() =>
+          readFileLines(
+            project.root,
+            relative,
+            startLine ?? 1,
+            maxLines ?? 200,
+          ),
+        );
+        return { data: { projectId: project.id, ...result }, privateContent: true };
+      }
     }
     throw new RuntimeError(
       'CAPABILITY_UNAVAILABLE',
       'The operation requires a different desktop runtime driver.',
     );
+  }
+
+  private resolveWorkspace(projectId: string) {
+    const project = this.workspaces().find((item) => item.id === projectId);
+    if (!project)
+      throw new RuntimeError('PERMISSION_DENIED', 'Choose a registered project folder.');
+    return project;
+  }
+
+  private async runWorkspaceIo<T>(task: () => Promise<T>): Promise<T> {
+    try {
+      return await task();
+    } catch (error) {
+      if (error instanceof RuntimeError) throw error;
+      const message = error instanceof Error ? error.message : 'Unable to access project path.';
+      if (message.includes('outside') || message.includes('relative')) {
+        throw new RuntimeError('PERMISSION_DENIED', message);
+      }
+      throw error;
+    }
+  }
+
+  private async allowWorkspaceContent(
+    request: RuntimeRequest,
+    project: { id: string; name: string },
+    signal: AbortSignal,
+  ) {
+    const scope = !request.programId
+      ? digest(JSON.stringify([request.primary, request.revision, 'workspace', project.id]))
+      : undefined;
+    const fingerprint = digest(
+      JSON.stringify([
+        request.primary,
+        request.revision,
+        'workspace',
+        project.id,
+        request.operation,
+        request.input,
+        request.programId ?? null,
+      ]),
+    );
+    const grants = this.grants.get(request.requestId) ?? new Set<string>();
+    if (scope || !grants.has(fingerprint)) {
+      if (
+        !(await this.approve(
+          'Share workspace files with the configured model?',
+          `Allow excerpts from project "${project.name}" to ${request.primary.model} at ${new URL(request.primary.endpoint).origin}.` +
+            (request.programId
+              ? `\n\nProgram operation: ${request.operation}\nArguments: ${JSON.stringify(request.input)}`
+              : ''),
+          signal,
+          scope,
+        ))
+      )
+        throw new RuntimeError(
+          'PERMISSION_DENIED',
+          'Sharing workspace files with the model was declined.',
+        );
+      signal.throwIfAborted();
+      if (!scope) this.grants.set(request.requestId, grants.add(fingerprint));
+    }
   }
 
   private async getScoped(conversation: string, id: string) {

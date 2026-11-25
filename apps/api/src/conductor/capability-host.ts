@@ -25,6 +25,9 @@ export class ToolError extends RunError {
   constructor(
     readonly code: ToolProblem['code'],
     message: string,
+    readonly category?: string,
+    readonly phase?: string,
+    readonly retryAfterMs?: number,
   ) {
     super(message);
   }

@@ -18,34 +18,32 @@ import {
   webUrlSchema,
   type BrowserCommand,
   type BrowserLayout,
+  type BrowserPhase,
   type BrowserRequest,
   type BrowserState,
   type BrowserTab,
   type ComputerAction,
   type ComputerObservation,
   type WebPolicy,
+  type WebSearchEngine,
 } from '@aria/shared';
 import { BrowserProxy } from './egress-proxy';
-import { inspectPage } from './page-inspector';
+import { inspectPage, inspectWhileLoading } from './page-inspector';
+import { BrowserError, fetchPublicPage } from './http-fetch';
 import { BrowserSessionPolicy } from './session-policy';
 import { BrowserStateStorage, type BrowserDiskState } from './state-storage';
 import { browserInputPoint, dispatchBrowserInput } from './computer-input';
 import { RuntimeError } from '../runtime/store';
 
-class BrowserError extends Error {
-  constructor(
-    readonly code: string,
-    message: string,
-  ) {
-    super(message);
-  }
-}
 type Tab = {
   state: BrowserTab;
   owner?: string;
   background: boolean;
   documentId: string;
   runId?: string;
+  httpStatus?: number;
+  domDocument?: string;
+  navigation?: { redirects: string[]; active: boolean };
   view: WebContentsView;
   profile: BrowserSessionPolicy;
   findId?: number;
@@ -66,7 +64,10 @@ function whenActive<T>(promise: Promise<T>, signal: AbortSignal) {
   return new Promise<T>((resolve, reject) => {
     const abort = () => reject(signal.reason);
     signal.addEventListener('abort', abort, { once: true });
-    void promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', abort));
+    void promise.then(
+      (value) => { signal.removeEventListener('abort', abort); resolve(value); },
+      (error) => { signal.removeEventListener('abort', abort); reject(error); },
+    );
   });
 }
 
@@ -492,7 +493,9 @@ export class BrowserController {
       if (isMainFrame) {
         this.stopPlayback(tab);
         tab.documentId = randomUUID();
+        tab.domDocument = undefined;
         tab.runId = undefined;
+        tab.httpStatus = undefined;
         tab.state.error = undefined;
       }
     });
@@ -521,13 +524,27 @@ export class BrowserController {
       this.changed();
     };
     wc.on('did-navigate', (_event, url, status) => {
+      tab.httpStatus = status >= 100 ? status : undefined;
+      completed(url);
       if (status >= 400) {
         tab.state.error = `The page returned HTTP ${status}.`;
         this.changed();
-      } else completed(url);
+      }
     });
     wc.on('did-navigate-in-page', (_event, url, main) => {
-      if (main) completed(url);
+      if (main) {
+        completed(url);
+        tab.domDocument = tab.documentId;
+      }
+    });
+    wc.on('dom-ready', () => {
+      if (!wc.isDestroyed() && wc.getURL() === tab.state.url &&
+          (!tab.navigation || tab.navigation.active)) tab.domDocument = tab.documentId;
+    });
+    wc.on('did-redirect-navigation', ({ url, isMainFrame }) => {
+      const navigation = tab.navigation;
+      if (isMainFrame && navigation?.active && navigation.redirects.length < 8 &&
+          webUrlSchema.safeParse(url).success) navigation.redirects.push(url);
     });
     wc.on('did-start-loading', () => {
       tab.state.loading = true;
@@ -713,7 +730,7 @@ export class BrowserController {
       !tab.privateAuth &&
       !contents.isDestroyed() &&
       tab.documentId === documentId &&
-      !contents.isLoadingMainFrame();
+      tab.domDocument === documentId;
     if (!ownsTab())
       throw new BrowserError(
         'TAB_UNAVAILABLE',
@@ -768,7 +785,7 @@ export class BrowserController {
         'SEARCH_DISABLED',
         'Enable address bar search in Settings → Web & Browser.',
       );
-    return browserSearchUrl(input);
+    return browserSearchUrl(input, this.policy().searchEngine === 'bing' ? 'bing' : 'brave');
   }
 
   private async navigate(tab: Tab, url: string, signal?: AbortSignal) {
@@ -793,6 +810,80 @@ export class BrowserController {
     } finally {
       signal?.removeEventListener('abort', stop);
     }
+  }
+
+  private async navigateResearch(
+    tab: Tab,
+    url: string,
+    parent: AbortSignal,
+    progress: (phase: BrowserPhase | 'network') => void,
+  ) {
+    const contents = tab.view.webContents;
+    const target = publicWebUrl(url).href;
+    const deadline = AbortSignal.any([parent, tab.lifetime.signal, AbortSignal.timeout(20_000)]);
+    deadline.throwIfAborted();
+    const navigation = { redirects: [] as string[], active: true };
+    tab.navigation = navigation;
+    tab.domDocument = undefined;
+    tab.httpStatus = undefined;
+    tab.state.error = undefined;
+    const stop = () => {
+      if (tab.navigation !== navigation) return;
+      navigation.active = false;
+      tab.domDocument = undefined;
+      if (!contents.isDestroyed()) contents.stop();
+    };
+    deadline.addEventListener('abort', stop, { once: true });
+    let ready!: () => void;
+    const dom = new Promise<void>((resolve) => { ready = resolve; });
+    const onDom = () => { if (tab.domDocument === tab.documentId) ready(); };
+    const inPage = (_event: Electron.Event, _url: string, main: boolean) => { if (main) onDom(); };
+    contents.on('dom-ready', onDom);
+    contents.on('did-navigate-in-page', inPage);
+    try {
+      progress('navigating');
+      progress('network');
+      const loading = contents.loadURL(target);
+      // A promised full load may settle after we return a usable DOM.
+      await whenActive(Promise.race([loading, dom]), deadline);
+      deadline.throwIfAborted();
+      if (tab.navigation !== navigation || !navigation.active || contents.isDestroyed())
+        throw new BrowserError('TAB_UNAVAILABLE', 'The browser tab changed during navigation.', 'unavailable');
+      if (tab.state.error)
+        throw new BrowserError('NAVIGATION_FAILED', tab.state.error, 'navigation_failed');
+      if (tab.domDocument !== tab.documentId && !contents.isLoading()) tab.domDocument = tab.documentId;
+      if (tab.domDocument !== tab.documentId)
+        throw new BrowserError('NAVIGATION_FAILED', 'Navigation finished without an inspectable document.', 'navigation_failed');
+      progress(contents.isLoading() ? 'dom_available' : 'ready');
+    } catch (error) {
+      stop();
+      if (parent.aborted) throw parent.reason;
+      if (tab.lifetime.signal.aborted)
+        throw new BrowserError('TAB_UNAVAILABLE', 'The browser tab is no longer available.', 'unavailable');
+      if (deadline.aborted)
+        throw new BrowserError('TIMEOUT', 'Navigation timed out before the main document was readable.', 'timed_out', 1000);
+      if (error instanceof BrowserError) throw error;
+      throw new BrowserError('NAVIGATION_FAILED', tab.state.error || 'The browser could not load the destination.', 'navigation_failed');
+    } finally {
+      deadline.removeEventListener('abort', stop);
+      contents.off('dom-ready', onDom);
+      contents.off('did-navigate-in-page', inPage);
+    }
+  }
+
+  private pageState(tab: Tab) {
+    const contents = tab.view.webContents;
+    const ready = tab.domDocument === tab.documentId && !contents.isDestroyed();
+    return {
+      tabId: tab.state.id,
+      url: tab.state.url,
+      title: tab.state.title,
+      phase: contents.isDestroyed() || tab.state.crashed ? 'unavailable' :
+        ready ? contents.isLoading() ? 'partial' : 'ready' :
+        tab.state.error ? 'navigation_failed' : 'navigating',
+      ...(tab.httpStatus !== undefined && { httpStatus: tab.httpStatus }),
+      ...(tab.navigation?.redirects.length && { redirects: [...tab.navigation.redirects] }),
+    };
   }
 
   async command(command: BrowserCommand): Promise<string | void> {
@@ -1354,10 +1445,100 @@ export class BrowserController {
     return { url: publicWebUrl(plan.action).href, field: plan.field };
   }
 
+  private async runSearch(
+    engine: Exclude<WebSearchEngine, 'auto'>,
+    query: string,
+    owner: string,
+    signal: AbortSignal,
+    progress: (phase: BrowserPhase | 'network') => void,
+  ) {
+    const url = browserSearchUrl(query, engine);
+    const tab = await this.create(owner, true);
+    const active = AbortSignal.any([signal, tab.lifetime.signal, AbortSignal.timeout(12_000)]);
+    try {
+      await this.navigateResearch(tab, url, active, progress);
+      active.throwIfAborted();
+      const contents = tab.view.webContents;
+      const documentId = tab.documentId;
+      const page = new URL(contents.getURL());
+      const validSearchPage =
+        engine === 'brave'
+          ? page.origin === 'https://search.brave.com' && page.pathname === '/search'
+          : page.protocol === 'https:' &&
+            (page.hostname === 'bing.com' || page.hostname.endsWith('.bing.com')) &&
+            page.pathname === '/search';
+      if (!validSearchPage)
+        throw new BrowserError(
+          'SEARCH_UNAVAILABLE',
+          'The search page was unavailable. Try the query in a Personal tab.',
+        );
+      const command = { op: 'search-results', documentId } as const;
+      progress('inspecting');
+      const read = () => contents.isLoading()
+        ? inspectWhileLoading(contents, command, active)
+        : whenActive(inspectPage(contents, command), active);
+      let evidence = await read();
+      for (let check = 0; check < 6 && !evidence.results?.length &&
+          !evidence.searchEmpty && !evidence.captchaDetected; check++) {
+        await sleep(150, undefined, { signal: active });
+        if (tab.documentId !== documentId) break;
+        evidence = await read();
+      }
+      if (tab.documentId !== documentId)
+        throw new BrowserError(
+          'STALE_PAGE',
+          'The page changed while Aria was reading it. Try again.',
+        );
+      if (evidence.captchaDetected && !evidence.results?.length)
+        throw new BrowserError(
+          'CAPTCHA_BLOCKED',
+          'The search site requested human verification and cannot be accessed automatically.',
+        );
+      if (!evidence.results?.length && !evidence.searchEmpty)
+        throw new BrowserError(
+          'SEARCH_UNAVAILABLE',
+          'Aria could not read the search results. Try the query in a Personal tab.',
+        );
+      const results = [];
+      let remaining = 9_000;
+      for (const result of evidence.results ?? []) {
+        if (!webUrlSchema.safeParse(result.url).success) continue;
+        const host = new URL(result.url).hostname;
+        if (
+          new URL(result.url).origin === page.origin ||
+          (engine === 'bing' && (host === 'bing.com' || host.endsWith('.bing.com')))
+        )
+          continue;
+        remaining -= JSON.stringify(result).length + 8;
+        if (remaining < 0) break;
+        results.push(result);
+      }
+      if (!results.length && evidence.results?.length)
+        throw new BrowserError(
+          'SEARCH_UNAVAILABLE',
+          'The search page did not expose usable public publisher links.',
+          'inspecting',
+        );
+      return results;
+    } catch (error) {
+      if (!signal.aborted && active.aborted && !tab.lifetime.signal.aborted)
+        throw new BrowserError('TIMEOUT', 'The search page did not become readable before its deadline.', 'timed_out', 1000);
+      if (tab.httpStatus === 429 && error instanceof BrowserError)
+        throw Object.assign(error, { rateLimited: true });
+      throw error;
+    } finally {
+      this.closeTab(tab);
+    }
+  }
+
   async execute(
     request: BrowserRequest,
     signal: AbortSignal,
-    lifecycle?: { approval(): void; reserve(fingerprint: string): Promise<boolean> },
+    lifecycle?: {
+      approval(): void;
+      progress?(phase: BrowserPhase | 'network'): void;
+      reserve(fingerprint: string): Promise<boolean>;
+    },
   ) {
     signal.throwIfAborted();
     if (!this.policy().enabled || !this.policy().aiBrowser)
@@ -1373,7 +1554,14 @@ export class BrowserController {
       selection?: boolean;
       value?: string;
       fields?: { elementId: string; value: string }[];
+      method?: 'GET' | 'HEAD';
+      view?: Parameters<typeof inspectPage>[1]['view'];
+      offset?: number;
+      condition?: 'dom_available' | 'ready' | 'visible_text' | 'url_changed';
+      text?: string;
+      timeoutMs?: number;
     };
+    const progress = (phase: BrowserPhase | 'network') => lifecycle?.progress?.(phase);
     const output = (data: Record<string, unknown>, tab?: Tab, screenshot?: Buffer) => {
       const text = JSON.stringify(data);
       if (text.length > 12_000)
@@ -1396,70 +1584,82 @@ export class BrowserController {
         'TAB_UNAVAILABLE',
         'The user currently controls the computer browser.',
       );
-    if (request.op === 'web_search' || request.op === 'web_fetch') {
-      const searching = request.op === 'web_search';
-      const url = searching ? browserSearchUrl(args.query!) : args.url!;
-      const tab = await this.create(owner, true);
-      try {
-        const active = AbortSignal.any([signal, tab.lifetime.signal, AbortSignal.timeout(20_000)]);
-        await this.navigate(tab, url, active);
-        active.throwIfAborted();
-        const contents = tab.view.webContents;
-        const documentId = tab.documentId;
-        const page = new URL(contents.getURL());
-        if (
-          searching &&
-          (page.origin !== 'https://search.brave.com' || page.pathname !== '/search')
-        )
-          throw new BrowserError(
-            'SEARCH_UNAVAILABLE',
-            'The search page was unavailable. Try the query in a Personal tab.',
-          );
-        const evidence = await whenActive(
-          inspectPage(contents, {
-            op: searching ? 'search-results' : 'extract',
-            documentId,
-          }),
-          active,
-        );
-        if (tab.documentId !== documentId)
-          throw new BrowserError(
-            'STALE_PAGE',
-            'The page changed while Aria was reading it. Try again.',
-          );
-        if (!searching) return output({ text: evidence.text ?? '' }, tab);
-        if (!evidence.results?.length && !evidence.searchEmpty)
-          throw new BrowserError(
-            'SEARCH_UNAVAILABLE',
-            'Aria could not read the search results. Try the query in a Personal tab.',
-          );
-        const results = [];
-        let remaining = 9_000;
-        for (const result of evidence.results ?? []) {
-          if (!webUrlSchema.safeParse(result.url).success) continue;
-          if (new URL(result.url).origin === page.origin) continue;
-          remaining -= JSON.stringify(result).length + 8;
-          if (remaining < 0) break;
-          results.push(result);
+    if (request.op === 'web_search') {
+      const mode = this.policy().searchEngine ?? 'auto';
+      const engines: Exclude<WebSearchEngine, 'auto'>[] =
+        mode === 'brave' ? ['brave'] : mode === 'bing' ? ['bing'] : ['brave', 'bing'];
+      const overall = AbortSignal.any([signal, AbortSignal.timeout(25_000)]);
+      let lastError: unknown;
+      let sawRateLimit = false;
+      for (const engine of engines) {
+        signal.throwIfAborted();
+        if (overall.aborted)
+          throw new BrowserError('TIMEOUT', 'Web search reached its deadline.', 'timed_out', 1000);
+        try {
+          progress('initializing');
+          const results = await this.runSearch(engine, args.query!, owner, overall, progress);
+          progress('ready');
+          return output({ results });
+        } catch (error) {
+          if (signal.aborted) throw error;
+          if (overall.aborted)
+            throw new BrowserError('TIMEOUT', 'Web search reached its deadline.', 'timed_out', 1000);
+          lastError = error;
+          if ((error as { rateLimited?: boolean }).rateLimited) sawRateLimit = true;
+          const retryable =
+            error instanceof BrowserError
+              ? ['NAVIGATION_FAILED', 'SEARCH_UNAVAILABLE', 'CAPTCHA_BLOCKED', 'STALE_PAGE', 'TIMEOUT'].includes(
+                  error.code,
+                )
+              : !overall.aborted;
+          if (!retryable) throw error;
         }
-        return output({ results });
-      } finally {
-        this.closeTab(tab);
       }
+      if (sawRateLimit)
+        throw new BrowserError(
+          'RATE_LIMITED',
+          'Web search was rate-limited (HTTP 429). Wait a moment before retrying, or search in a Personal tab.',
+          'navigation_failed', 2000,
+        );
+      throw lastError;
+    }
+    if (request.op === 'web_fetch') {
+      progress('initializing');
+      const page = await fetchPublicPage(args.url!, args.method ?? 'GET', signal, () => progress('network'));
+      const { text, metadata, links, ...summary } = page;
+      const reducedLinks: NonNullable<typeof links> = [];
+      const data: Record<string, unknown> = { ...summary, metadata, links: reducedLinks };
+      if (JSON.stringify(data).length > 10_000) {
+        delete data.metadata;
+        data.truncated = true;
+      }
+      let remaining = 11_800 - JSON.stringify(data).length;
+      for (const link of links ?? []) {
+        remaining -= JSON.stringify(link).length + 4;
+        if (remaining < 1000) { data.truncated = true; break; }
+        reducedLinks.push(link);
+      }
+      if (text !== undefined) {
+        let end = Math.max(0, Math.min(text.length, remaining - 128));
+        while (end > 0 && JSON.stringify(text.slice(0, end)).length > remaining - 64) end = Math.floor(end / 2);
+        data.text = text.slice(0, end);
+        if (end < text.length) data.truncated = true;
+      }
+      progress(data.truncated ? 'partial' : 'ready');
+      return { ...output(data), url: page.url, title: page.title };
     }
     if (request.op === 'browser_get_tabs')
       return output({
         tabs: [...this.tabs.values()]
           .filter((tab) => tab.owner === owner && !tab.background && !tab.privateAuth)
           .map((tab) => ({
-            tabId: tab.state.id,
-            url: tab.state.url,
-            title: tab.state.title,
+            ...this.pageState(tab),
             playingMedia: !!tab.state.playingMedia,
           })),
       });
     if (request.op === 'browser_open') {
       if (!args.url) throw new BrowserError('INVALID_URL', 'Use a validated public URL.');
+      progress('initializing');
       const tab = await this.create(owner);
       if (signal.aborted) {
         this.closeTab(tab);
@@ -1467,15 +1667,15 @@ export class BrowserController {
       }
       this.select(tab);
       try {
-        await this.navigate(tab, args.url, AbortSignal.any([signal, AbortSignal.timeout(20_000)]));
+        await this.navigateResearch(tab, args.url, signal, progress);
       } catch (error) {
         this.closeTab(tab);
         throw error;
       }
-      return output({ tabId: tab.state.id, url: tab.state.url }, tab);
+      return output(this.pageState(tab), tab);
     }
     const tab = args.tabId && this.tabs.get(args.tabId);
-    if (!tab || tab.background || tab.owner !== owner || tab.state.crashed)
+    if (!tab || tab.background || tab.owner !== owner || tab.state.crashed || tab.privateAuth)
       throw new BrowserError('TAB_UNAVAILABLE', 'The tab is unavailable in this conversation.');
     const active = AbortSignal.any([signal, tab.lifetime.signal]);
     const work = tab.queue.then(async () => {
@@ -1503,17 +1703,53 @@ export class BrowserController {
         this.select(tab);
         return output({ tabId: tab.state.id });
       }
+      if (request.op === 'browser_close') {
+        // Closing aborts the tab lifetime, so settle this result against the run signal below.
+        this.closeTab(tab);
+        progress('closed');
+        return output({ tabId: tab.state.id, phase: 'closed' });
+      }
       if (request.op === 'browser_navigate') {
         if (!args.url) throw new BrowserError('INVALID_URL', 'Use a validated public URL.');
-        await this.navigate(tab, args.url, AbortSignal.any([active, AbortSignal.timeout(20_000)]));
-        return output({ tabId: tab.state.id, url: tab.state.url }, tab);
+        await this.navigateResearch(tab, args.url, active, progress);
+        return output(this.pageState(tab), tab);
+      }
+      if (request.op === 'browser_wait') {
+        const start = tab.state.url;
+        const deadline = AbortSignal.any([active, AbortSignal.timeout(args.timeoutMs ?? 5000)]);
+        try {
+          for (;;) {
+            deadline.throwIfAborted();
+            const current = this.pageState(tab);
+            const readable = current.phase === 'ready' || current.phase === 'partial';
+            if (current.phase === 'navigation_failed')
+              throw new BrowserError('NAVIGATION_FAILED', tab.state.error || 'Navigation failed.', 'navigation_failed');
+            let matched = args.condition === 'ready' ? current.phase === 'ready'
+              : args.condition === 'dom_available' ? readable
+              : args.condition === 'url_changed' ? start !== current.url && readable : false;
+            if (args.condition === 'visible_text' && readable) {
+              const id = tab.documentId;
+              const command = { op: 'read-view', documentId: id } as const;
+              const result = contents.isLoading() ? await inspectWhileLoading(contents, command, deadline)
+                : await whenActive(inspectPage(contents, command), deadline);
+              matched = id === tab.documentId && Boolean(result.text?.includes(args.text!));
+            }
+            if (matched) return output({ ...current, condition: args.condition }, tab);
+            await sleep(150, undefined, { signal: deadline });
+          }
+        } catch (error) {
+          if (active.aborted) throw active.reason;
+          if (deadline.aborted)
+            throw new BrowserError('TIMEOUT', 'The page condition was not observed before the wait expired.', 'timed_out');
+          throw error;
+        }
       }
       const documentId = tab.documentId;
-      const snapshot = () => {
+      const snapshot = (readOnly = false) => {
         if (
           tab.documentId !== documentId ||
           contents.isDestroyed() ||
-          contents.isLoadingMainFrame()
+          (readOnly ? tab.domDocument !== documentId : contents.isLoadingMainFrame())
         )
           throw new BrowserError('STALE_PAGE', 'Inspect the current page again.');
       };
@@ -1532,8 +1768,27 @@ export class BrowserController {
         return result;
       };
       const timed = () => AbortSignal.any([active, AbortSignal.timeout(20_000)]);
+      const readView = async (view: Parameters<typeof inspectPage>[1]['view'], offset?: number) => {
+        const timeout = AbortSignal.any([active, AbortSignal.timeout(5000)]);
+        const command = { op: 'read-view', documentId, view, offset } as const;
+        snapshot(true);
+        progress('inspecting');
+        try {
+          const value = contents.isLoading() ? await inspectWhileLoading(contents, command, timeout)
+            : await whenActive(inspectPage(contents, command), timeout);
+          snapshot(true);
+          return value;
+        } catch (error) {
+          if (!active.aborted && timeout.aborted)
+            throw new BrowserError('TIMEOUT', 'Page inspection timed out.', 'timed_out', 1000);
+          throw error;
+        }
+      };
       if (request.op === 'browser_get_page') {
-        const value = await inspect({ op: 'inspect', documentId }, timed());
+        snapshot(true);
+        const value = contents.isLoading()
+          ? await readView('links')
+          : await inspect({ op: 'inspect', documentId }, timed());
         tab.runId = request.requestId;
         const elements = [];
         let capacity = 9000;
@@ -1546,13 +1801,17 @@ export class BrowserController {
           elements.push(candidate);
         }
         return output(
-          { tabId: tab.state.id, documentId, url: tab.state.url, title: tab.state.title, elements },
+          { ...this.pageState(tab), documentId, elements, links: value.links, nextOffset: value.nextOffset },
           tab,
         );
       }
       if (args.documentId !== documentId || tab.runId !== request.requestId)
         throw new BrowserError('STALE_PAGE', 'Inspect the current page again.');
       const action = { documentId, elementId: args.elementId };
+      if (request.op === 'browser_extract' && (args.view || (contents.isLoading() && !args.query && !args.selection))) {
+        const data = await readView(args.view ?? 'content', args.offset);
+        return output({ ...this.pageState(tab), documentId, ...data }, tab);
+      }
       if (request.op === 'browser_extract' || request.op === 'browser_scroll') {
         const data = await inspect(
           {
@@ -1663,8 +1922,8 @@ export class BrowserController {
       }
       const observed = await inspect({ ...action, op: 'describe' }, timed());
       if (request.op === 'browser_click' && observed.element?.href) {
-        await this.navigate(tab, observed.element.href, timed());
-        return output({ tabId: tab.state.id, url: tab.state.url }, tab);
+        await this.navigateResearch(tab, observed.element.href, active, progress);
+        return output(this.pageState(tab), tab);
       }
       if (request.op === 'browser_type' && !observed.element?.editable)
         throw new BrowserError(
@@ -1701,7 +1960,7 @@ export class BrowserController {
       return output({ tabId: tab.state.id, documentId, status: 'action_dispatched' }, tab);
     });
     tab.queue = work.catch(() => undefined);
-    return whenActive(work, active);
+    return whenActive(work, request.op === 'browser_close' ? signal : active);
   }
 
   private async approve(

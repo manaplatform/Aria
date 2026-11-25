@@ -28,6 +28,12 @@ export const memorySettingsSchema = z.strictObject({
   retentionDays: z.number().int().min(1).max(3650).nullable(),
   suggestions: z.boolean(),
   temporaryChats: z.boolean(),
+  recallConsent: z
+    .strictObject({
+      providerKey: z.string().regex(/^[a-f0-9]{64}$/),
+      grantedAt: time,
+    })
+    .optional(),
   embedding: z.discriminatedUnion('mode', [
     z.strictObject({ mode: z.literal('lexical') }),
     z.strictObject({ mode: z.literal('local') }),
@@ -196,10 +202,19 @@ export interface MemoryStatus {
   pending: number;
   failures: number;
 }
+export interface MemoryContextHint {
+  id: string;
+  scope: 'profile' | 'project' | 'conversation';
+  category: MemoryRecord['value']['category'];
+  content: string;
+  confirmation: MemoryRecord['confirmation'];
+  observedAt: number;
+}
 export interface MemoryTurnOptions {
   enabled: boolean;
   suggestions: boolean;
   temporary?: boolean;
   workingSummary?: string;
   privateHistory?: boolean;
+  contextHints?: MemoryContextHint[];
 }

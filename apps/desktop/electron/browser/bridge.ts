@@ -93,20 +93,13 @@ export function openBrowserBridge(
     const controller = new AbortController();
     active.set(request.operationId, controller);
     const signal = AbortSignal.any([controller.signal, parent, AbortSignal.timeout(remaining)]);
+    const phase = (progress: import('@aria/shared').BrowserPhase | 'approval' | 'network') => {
+      if (!closed && !signal.aborted)
+        port1.postMessage({ v, generation, operationId, requestId, conversationId, stepId, op, progress });
+    };
     const execute = () => browser.execute(request, signal, {
-        approval: () => {
-          if (!closed && !signal.aborted)
-            port1.postMessage({
-              v,
-              generation,
-              operationId,
-              requestId,
-              conversationId,
-              stepId,
-              op,
-              progress: 'approval',
-            });
-        },
+        approval: () => phase('approval'),
+        progress: phase,
         reserve: (fingerprint) => reserve?.(request, fingerprint, signal) ?? Promise.resolve(false),
       });
     void (scoped ? scoped(request, execute) : execute())
@@ -121,7 +114,8 @@ export function openBrowserBridge(
             controller.signal.aborted
           )
             return;
-          const code =
+          const expired = signal.aborted && signal.reason?.name === 'TimeoutError';
+          const code = expired ? 'TIMEOUT' :
             error &&
             typeof error === 'object' &&
             'code' in error &&
@@ -129,11 +123,14 @@ export function openBrowserBridge(
             /^[A-Z_]{1,40}$/.test(error.code)
               ? error.code
               : 'BROWSER_ERROR';
-          const message =
+          const message = expired ? 'The browser operation reached its deadline.' :
             code === 'BROWSER_ERROR' || !(error instanceof Error)
               ? 'The browser operation could not complete. Check the tab and try again if the action is safe.'
               : error.message;
-          send({ ok: false, code, message: message.slice(0, 400) });
+          const detail = error as { phase?: import('@aria/shared').BrowserPhase; retryAfterMs?: number } | undefined;
+          send({ ok: false, code, message: message.slice(0, 400),
+            phase: expired ? 'timed_out' : detail?.phase,
+            retryAfterMs: detail?.retryAfterMs });
         },
       )
       .finally(() => active.delete(request.operationId));

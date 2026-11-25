@@ -1,13 +1,18 @@
 import { useEffect, useState } from 'react';
-import { webPolicySchema, type WebSettings } from '@aria/shared';
+import {
+  webPolicyLimits,
+  webPolicySchema,
+  type WebSearchEngine,
+  type WebSettings,
+} from '@aria/shared';
 import { Button, Field } from '../ui';
 import { browserCommand, useBrowserStore } from '../../stores/browserStore';
 import { errorMessage } from '../../services/desktop';
 
 const toggles = [
   ['enabled', 'Web access'],
-  ['aiBrowser', 'Allow Aria to search and browse'],
-  ['addressSearch', 'Search Brave from the address bar'],
+  ['aiBrowser', 'Allow Aria to search, fetch, and browse'],
+  ['addressSearch', 'Search the web from the address bar'],
   ['persistentSiteData', 'Keep personal cookies and site data'],
   ['history', 'Save personal browsing history'],
   ['restoreTabs', 'Restore personal tabs at startup'],
@@ -65,15 +70,30 @@ export function WebBrowserSettings() {
         </label>
       ))}
       <p className="muted">
-        Aria searches through the Brave website in its browser. Search queries are sent to Brave and
-        no search API key is required.
+        Aria searches through Brave Search (with optional Bing fallback if rate-limited) in its
+        isolated browser. No search API key is required.
       </p>
       <div className="web-settings-grid">
+        <Field label="Web search engine">
+          <select
+            value={settings.searchEngine}
+            disabled={busy}
+            onChange={(event) =>
+              setSettings({ ...settings, searchEngine: event.target.value as WebSearchEngine })
+            }
+          >
+            <option value="auto">Brave Search (Bing fallback)</option>
+            <option value="brave">Brave Search only</option>
+            <option value="bing">Bing</option>
+          </select>
+        </Field>
         {(
           [
-            ['searches', 'Searches per turn', 2],
-            ['fetches', 'Pages fetched per turn', 4],
-            ['screenshots', 'Screenshots per turn', 2],
+            ['searches', 'Searches per turn', webPolicyLimits.searches.max],
+            ['fetches', 'Pages fetched per turn', webPolicyLimits.fetches.max],
+            ['navigations', 'Browser navigations per turn', webPolicyLimits.navigations.max],
+            ['inspections', 'Browser inspections per turn', webPolicyLimits.inspections.max],
+            ['screenshots', 'Screenshots per turn', webPolicyLimits.screenshots.max],
           ] as const
         ).map(([name, label, max]) => (
           <Field key={name} label={label}>

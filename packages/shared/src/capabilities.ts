@@ -7,6 +7,7 @@ import {
 import { identifier } from './model-registry.js';
 import { programSettingsSchema, type ProgramSettings } from './programmatic.js';
 import { loopCheckpointSchema, loopLimitsSchema } from './loop.js';
+import type { webBudgetKeySchema } from './web.js';
 
 export const capabilityId = z
   .string()
@@ -37,12 +38,34 @@ export const builtinSourceSkill = {
   enabled: true,
 } satisfies SkillSummary;
 
+export const toolAvailabilitySchema = z.enum([
+  'available',
+  'requires_approval',
+  'disabled',
+  'unconfigured',
+  'unavailable_turn',
+]);
+export const toolHealthSchema = z.enum(['ready', 'degraded', 'unavailable']);
+export const connectorSummarySchema = z.strictObject({
+  id: capabilityId,
+  name: z.string().max(120),
+  description: z.string().max(500),
+  availability: toolAvailabilitySchema,
+  health: toolHealthSchema,
+  reason: z.string().max(300).optional(),
+  settingsSection: z.string().max(120).optional(),
+});
+
 export const toolPolicySchema = z.strictObject({
   revision: identifier,
   disabled: z.array(capabilityId).max(1024),
   discovery: toolDiscoverySchema,
   nativeVerified: z.boolean().optional(),
   desktopRuntime: z.boolean().optional(),
+  dockerConfigured: z.boolean().optional(),
+  localEmbeddings: z.boolean().optional(),
+  workspacesCount: z.number().int().min(0).max(1000).optional(),
+  connectors: z.array(connectorSummarySchema).max(32).optional(),
   computerBrowser: z.boolean().optional(),
   computerVirtual: z.boolean().optional(),
   computerLocal: z.boolean().optional(),
@@ -59,11 +82,29 @@ export const defaultToolPolicy: ToolPolicy = {
   skills: [builtinSourceSkill],
 };
 
+export type ToolAvailability = z.infer<typeof toolAvailabilitySchema>;
+export type ToolHealth = z.infer<typeof toolHealthSchema>;
+export type ConnectorSummary = z.infer<typeof connectorSummarySchema>;
 export type ToolPolicy = z.infer<typeof toolPolicySchema>;
 export type SkillSummary = z.infer<typeof skillSummarySchema>;
 export type SkillRef = z.infer<typeof skillRefSchema>;
 export type ToolEffect = z.infer<typeof effectSchema>;
 export type ToolDiscovery = z.infer<typeof toolDiscoverySchema>;
+export interface ToolInputHint {
+  required: string[];
+  optional: string[];
+  summary: string;
+}
+export interface ToolConstraints {
+  timeoutMs?: number;
+  modes?: ('direct' | 'programmatic')[];
+  parallelRead?: boolean;
+  parallelDelegate?: boolean;
+  citations?: boolean;
+  artifacts?: boolean;
+  budget?: z.infer<typeof webBudgetKeySchema>;
+  requiredModelCapabilities?: string[];
+}
 export interface ToolSummary {
   id: string;
   namespace: string;
@@ -76,6 +117,13 @@ export interface ToolSummary {
   available: boolean;
   reason?: string;
   programmatic?: ('managed' | 'openai-responses')[];
+  output?: 'text' | 'image' | 'audio' | 'file' | 'sources' | 'data';
+  availability?: ToolAvailability;
+  health?: ToolHealth;
+  settingsSection?: string;
+  tags?: string[];
+  constraints?: ToolConstraints;
+  inputHint?: ToolInputHint;
 }
 
 export interface SkillPreview {
@@ -116,6 +164,7 @@ export const toolProblemSchema = z.strictObject({
     'INVALID_REFERENCE',
   ]),
   message: z.string().max(2000),
+  category: z.string().max(40).optional(),
 });
 export type ToolProblem = z.infer<typeof toolProblemSchema>;
 

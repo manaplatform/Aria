@@ -8,7 +8,11 @@ export async function scopedPath(root: string, relative: string): Promise<string
   if (path.isAbsolute(relative) || relative.includes('\0'))
     throw new Error('Use a relative project path.');
   const base = await fs.realpath(root);
-  const resolved = await fs.realpath(path.resolve(base, relative || '.'));
+  const candidate = path.resolve(base, relative || '.');
+  const lexical = path.relative(base, candidate);
+  if (lexical === '..' || lexical.startsWith(`..${path.sep}`) || path.isAbsolute(lexical))
+    throw new Error('Path is outside the selected project.');
+  const resolved = await fs.realpath(candidate);
   const within = path.relative(base, resolved);
   if (within === '..' || within.startsWith(`..${path.sep}`) || path.isAbsolute(within))
     throw new Error('Path is outside the selected project.');
@@ -89,6 +93,109 @@ export async function readFile(root: string, relative: string): Promise<FilePrev
   } finally {
     await handle.close();
   }
+}
+
+export async function readFileLines(
+  root: string,
+  relative: string,
+  startLine = 1,
+  maxLines = 200,
+) {
+  const preview = await readFile(root, relative);
+  if (preview.binary) {
+    return {
+      path: relative,
+      startLine: 1,
+      endLine: 0,
+      totalLines: 0,
+      truncated: false,
+      binary: true,
+      content: '',
+    };
+  }
+  const lines = preview.content.split(/\r?\n/);
+  const from = Math.max(1, Math.min(startLine, Math.max(1, lines.length)));
+  const end = Math.min(lines.length, from + maxLines - 1);
+  const slice = lines.slice(from - 1, end).join('\n');
+  const maxChars = 10_000;
+  const content = slice.length > maxChars ? slice.slice(0, maxChars) : slice;
+  return {
+    path: relative,
+    startLine: from,
+    endLine: end,
+    totalLines: lines.length,
+    truncated: preview.truncated || end < lines.length || slice.length > maxChars,
+    binary: false,
+    content,
+  };
+}
+
+const ignoredWorkspaceEntries = new Set(['.git', 'node_modules', 'dist', 'out', '.DS_Store']);
+
+export async function searchFiles(
+  root: string,
+  relative: string,
+  query: string,
+  limit = 20,
+  signal?: AbortSignal,
+) {
+  const startDir = await scopedPath(root, relative);
+  const base = await fs.realpath(root);
+  const needle = query.toLowerCase();
+  const matches: { path: string; line?: number; excerpt: string }[] = [];
+  const queue = [startDir];
+  let filesScanned = 0;
+  let truncated = false;
+  const maxFiles = 1500;
+  while (queue.length && matches.length < limit) {
+    signal?.throwIfAborted();
+    const current = queue.shift()!;
+    const entries = await fs.readdir(current, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      signal?.throwIfAborted();
+      if (ignoredWorkspaceEntries.has(entry.name) || entry.isSymbolicLink()) continue;
+      const candidate = path.join(current, entry.name);
+      let real: string;
+      try {
+        real = await fs.realpath(candidate);
+      } catch {
+        continue;
+      }
+      const rel = path.relative(base, real);
+      if (!rel || rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) continue;
+      if (entry.isDirectory()) {
+        queue.push(real);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      if (++filesScanned > maxFiles) {
+        truncated = true;
+        break;
+      }
+      if (rel.toLowerCase().includes(needle)) {
+        matches.push({ path: rel, excerpt: `Filename match: ${rel}` });
+        if (matches.length >= limit) break;
+      }
+      const stat = await fs.stat(real).catch(() => undefined);
+      if (!stat || !stat.isFile() || stat.size === 0 || stat.size > 524_288) continue;
+      const bytes = await fs.readFile(real).catch(() => undefined);
+      if (!bytes || bytes.includes(0)) continue;
+      const lines = bytes.toString('utf8').split(/\r?\n/);
+      for (let index = 0; index < lines.length; index++) {
+        if (lines[index].toLowerCase().includes(needle)) {
+          matches.push({
+            path: rel,
+            line: index + 1,
+            excerpt: lines[index].trim().slice(0, 240),
+          });
+          if (matches.length >= limit) break;
+        }
+      }
+      if (matches.length >= limit) break;
+    }
+    if (truncated) break;
+  }
+  return { matches, filesScanned, truncated: truncated || matches.length >= limit };
 }
 export function safeExternalUrl(value: string): string {
   const url = new URL(value);

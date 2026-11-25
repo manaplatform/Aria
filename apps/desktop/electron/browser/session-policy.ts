@@ -22,6 +22,17 @@ export class BrowserSessionPolicy {
   ) {}
 
   async install(proxy: BrowserProxy) {
+    if (
+      typeof this.session.getUserAgent === 'function' &&
+      typeof this.session.setUserAgent === 'function'
+    ) {
+      const cleanAgent = this.session
+        .getUserAgent()
+        .replace(/\s+(?:Aria|Electron)\/[^\s]+/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+      if (cleanAgent) this.session.setUserAgent(cleanAgent);
+    }
     const port = await proxy.start();
     await this.session.setProxy({
       mode: 'fixed_servers',

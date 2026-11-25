@@ -23,7 +23,13 @@ import {
   type ConductorSource,
   type ExecutionStep,
   type ResearchToolId,
+  type SkillSummary,
+  type ToolAvailability,
   type ToolEffect,
+  type ToolConstraints,
+  type LoopCheckpoint,
+  type ToolHealth,
+  type ToolInputHint,
   type ToolSummary,
 } from '@aria/shared';
 import { AiService } from '../ai/ai.service';
@@ -31,11 +37,13 @@ import { MediaService } from '../media/media.service';
 import { ModelRegistry, type ResolvedModel } from '../providers/model-registry.service';
 import { OpenAIRuntime, nativeFeatureName } from '../providers/openai-runtime';
 import type { ResearchRun } from '../web/web.service';
+import { evaluateCalculation } from './calc';
 import { CapabilityHost, ToolError } from './capability-host';
 import { RunError, type RunAttachment, type RunFile } from './run-assets';
 import { programRequestSchema, programStatus, type ProgramRequest } from '@aria/shared';
 import { ExecutionScheduler } from './scheduler';
 import type { TurnBudget } from './turn-budget';
+import type { BrowserProgress } from '../web/browser-port.client';
 
 type Registry = Awaited<ReturnType<ModelRegistry['resolve']>>;
 export type StepInputs = { text: string[]; files: RunFile[] };
@@ -44,6 +52,7 @@ export type StepValue = {
   text?: string;
   file?: RunFile;
   sources?: ConductorSource[];
+  references?: ConductorSource[];
   data?: Record<string, unknown>;
   managedArtifact?: z.infer<typeof desktopArtifactSchema>;
   evidence?: z.infer<typeof evidenceSchema>[];
@@ -69,6 +78,7 @@ const resultSchema = z.strictObject({
     })
     .optional(),
   sources: z.array(sourceSchema).max(8).optional(),
+  references: z.array(sourceSchema).max(24).optional(),
   data: z.record(z.string(), z.unknown()).optional(),
   managedArtifact: desktopArtifactSchema.optional(),
   evidence: z.array(evidenceSchema).max(executionLimits.searchResults).optional(),
@@ -111,6 +121,7 @@ export interface ToolContext {
     admit(): void;
     beforeEffect(id: string, operation: string): Promise<void>;
     recordBudget(): Promise<void>;
+    observeAttempt?(receipt: LoopCheckpoint['receipts'][number]): void;
     blocked: ReadonlySet<string>;
   };
   hostedProgramsBlocked?: boolean;
@@ -129,6 +140,7 @@ type Invocation = {
   inputs: StepInputs;
   signal: AbortSignal;
   approval: () => void;
+  browserProgress: (phase: BrowserProgress) => void;
   callId: string;
   programId?: string;
 };
@@ -162,11 +174,15 @@ export interface ToolDescriptor<Input = unknown, Output extends StepValue = Step
   };
   artifacts: boolean;
   citations: boolean;
+  tags?: string[];
+  settingsSection?: string;
   repeatable?: boolean;
   parallelRead?: boolean;
   parallelDelegate?: boolean;
-  budget?: 'searches' | 'fetches' | 'screenshots';
+  budget?: ToolConstraints['budget'];
+  preflight?: (step: ExecutionStep, context: ToolContext) => Record<string, unknown>;
   available?: (context: ToolContext) => boolean;
+  prepareInput?: (input: unknown) => unknown;
   normalize?: (input: Input) => Partial<ExecutionStep>;
   execute: (input: Input, invocation: Invocation) => Promise<Output> | Output;
 }
@@ -185,16 +201,19 @@ const base = {
 };
 
 const researchDescriptions: Record<ResearchToolId, string> = {
-  web_search: 'Find public webpages about a topic using a natural-language search query.',
+  web_search: 'Find public webpages about a topic using a natural-language search query (args: { query }).',
   web_fetch:
-    'Read a public publisher page by search result source ID or a URL supplied by the user.',
+    'Retrieve public HTTP status, headers, and static documents without opening a browser. Use a user-supplied URL or bare domain, or copy a tool result sourceId and its producerStepId into dependsOn. For an authorized site, this can also retrieve robots.txt and sitemap.xml. Use HEAD for metadata only.',
   web_read: 'Read the full bounded text of a fetched publisher document.',
   web_find: 'Find mentions of a term in a fetched publisher document.',
   browser_open:
-    'Open a public page in an isolated Aria browser tab using an authorized URL or source.',
-  browser_navigate: 'Navigate an existing AI browser tab to an authorized public source.',
+    'Open a user-supplied URL or bare domain directly in an isolated tab for rendered content. For an observed destination, copy sourceId and include producerStepId in dependsOn.',
+  browser_navigate:
+    'Navigate an owned AI tab using a user-supplied URL or bare domain, or an observed sourceId. Declare the completed producers of the tab and any source.',
   browser_get_tabs: 'List AI browser tabs that belong to this conversation.',
   browser_get_page: 'Inspect the current public page and its structured controls.',
+  browser_close: 'Close an owned AI tab returned by a completed dependency.',
+  browser_wait: 'Wait briefly for the current AI tab to reach readiness, display visible text, or change URL.',
   browser_media:
     'Start or stop audio or video playback in a public AI browser tab. For a request to play music or other audio, use a user-provided URL or a public Web Search result, open that source with browser_open, and play its media here. Reports whether the media advanced.',
   browser_click:
@@ -202,7 +221,7 @@ const researchDescriptions: Record<ResearchToolId, string> = {
   browser_type: 'Fill a referenced non-sensitive field after user approval.',
   browser_submit: 'Submit a validated public form after user approval.',
   browser_extract:
-    'Extract visible publisher content from an inspected page for evidence and citations.',
+    'Extract visible page text, links, metadata and dates, sanitized HTML, or measured performance from a current inspected document. Select a view and use nextOffset when returned.',
   browser_scroll: 'Scroll an AI tab to inspect more of the page.',
   browser_screenshot: 'Capture the current AI browser page as a PNG artifact.',
   browser_switch_tab: 'Select another AI browser tab in this conversation.',
@@ -309,11 +328,119 @@ const runtimeDescriptions: Record<RuntimeOperation, readonly [string, string, To
     'Validate and publish a file from the isolated workspace outputs as a downloadable conversation artifact.',
     'local',
   ],
+  'workspace.list_projects': [
+    'List registered projects',
+    'List registered local project folders and their Git branch metadata.',
+    'read',
+  ],
+  'workspace.repo_info': [
+    'Inspect repository info',
+    'Inspect Git branch, repository status, and top-level files for a registered project.',
+    'read',
+  ],
+  'workspace.list_files': [
+    'List project files',
+    'List files and subdirectories inside a registered project folder.',
+    'read',
+  ],
+  'workspace.search_files': [
+    'Search project files',
+    'Search filenames and text content inside a registered project folder.',
+    'read',
+  ],
+  'workspace.read_file': [
+    'Read project file',
+    'Read bounded line ranges from a file inside a registered project folder.',
+    'read',
+  ],
 };
 
 const localToolsForPrivateMemory = new Set([
-  'shell.inspect', 'shell.open', 'shell.run', 'files.read_document', 'artifacts.publish',
+  'calc.evaluate',
+  'shell.inspect', 'shell.open', 'shell.run',
+  'files.read_attachment', 'files.read_document', 'files.create_text_artifact',
+  'artifacts.publish',
+  'knowledge.list', 'knowledge.search',
+  'workspace.list_projects', 'workspace.repo_info', 'workspace.list_files',
+  'workspace.search_files', 'workspace.read_file',
 ]);
+
+const descriptorTags: Record<string, string[]> = {
+  'calc.evaluate': ['math', 'calculate', 'calculation', 'arithmetic', 'percentage', 'formula', 'verify', 'compute'],
+  'programs.run': ['program', 'code', 'javascript', 'script', 'batch', 'compute'],
+  'files.read_attachment': ['file', 'attachment', 'document', 'read', 'inspect'],
+  'files.create_text_artifact': ['document', 'report', 'markdown', 'csv', 'json', 'file', 'create', 'export'],
+  'web.web_search': ['search', 'web', 'internet', 'lookup', 'research', 'news', 'latest', 'unknown', 'product', 'company', 'project'],
+  'web.web_fetch': ['fetch', 'webpage', 'url', 'read', 'article', 'source', 'research'],
+  'browser.browser_open': ['browser', 'open', 'page', 'website', 'interact', 'navigate'],
+  'media.image': ['image', 'picture', 'draw', 'illustration', 'generate', 'art', 'photo'],
+  'media.image_edit': ['image', 'edit', 'modify', 'retouch'],
+  'workspace.list_projects': ['project', 'repository', 'repo', 'workspace', 'folder', 'code'],
+  'workspace.repo_info': ['git', 'branch', 'repository', 'repo', 'project', 'status'],
+  'workspace.list_files': ['files', 'directory', 'tree', 'project', 'repository', 'repo'],
+  'workspace.search_files': ['search', 'grep', 'find', 'code', 'repository', 'repo', 'project', 'files'],
+  'workspace.read_file': ['read', 'file', 'code', 'source', 'repository', 'repo', 'project'],
+  'memory.search': ['memory', 'remember', 'recall', 'history', 'past', 'preference', 'project', 'decision'],
+  'knowledge.search': ['knowledge', 'library', 'document', 'pdf', 'search', 'citations'],
+};
+
+function settingsSectionFor(id: string) {
+  if (id.startsWith('web.') || id.startsWith('browser.')) return 'Web & Browser';
+  if (id.startsWith('memory.')) return 'Memory';
+  if (id.startsWith('models.') || id.startsWith('media.')) return 'AI Models';
+  if (id.startsWith('workspace.')) return 'Projects';
+  return 'Tools';
+}
+
+function stripNullishRecord(value: Record<string, unknown>) {
+  return Object.fromEntries(
+    Object.entries(value).filter(([, item]) => item !== undefined && item !== null),
+  );
+}
+
+function normalizeResearchInput(raw: unknown): unknown {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return raw;
+  const record = stripNullishRecord(raw as Record<string, unknown>);
+  if (Object.hasOwn(record, 'args')) {
+    if (!record.args || typeof record.args !== 'object' || Array.isArray(record.args)) return record;
+    const args = stripNullishRecord(record.args as Record<string, unknown>);
+    if (Object.hasOwn(args, 'dependsOn') && !Object.hasOwn(record, 'dependsOn')) {
+      const { dependsOn: nestedDeps, ...rest } = args;
+      return { ...record, args: rest, ...(nestedDeps != null && { dependsOn: nestedDeps }) };
+    }
+    return { ...record, args };
+  }
+  const { dependsOn: deps, retryOf, ...args } = record;
+  return { args, ...(deps !== undefined && { dependsOn: deps }), ...(retryOf !== undefined && { retryOf }) };
+}
+
+function inputHintFromSchema(schema?: JSONSchema7): ToolInputHint | undefined {
+  if (!schema || typeof schema !== 'object' || !schema.properties) return undefined;
+  const required = (Array.isArray(schema.required) ? schema.required : []).slice(0, 16);
+  const optional = Object.keys(schema.properties)
+    .filter((key) => !required.includes(key))
+    .slice(0, 16);
+  const formatField = (key: string) => {
+    const prop = schema.properties?.[key];
+    if (
+      key === 'args' &&
+      prop &&
+      typeof prop === 'object' &&
+      !Array.isArray(prop) &&
+      prop.properties &&
+      Object.keys(prop.properties).length
+    ) {
+      return `args.{${Object.keys(prop.properties).slice(0, 8).join(', ')}}`;
+    }
+    return key;
+  };
+  const parts = [
+    required.length ? `required: ${required.map(formatField).join(', ')}` : '',
+    optional.length ? `optional: ${optional.map(formatField).join(', ')}` : '',
+  ].filter(Boolean);
+  if (!parts.length) return undefined;
+  return { required, optional, summary: parts.join(' | ').slice(0, 400) };
+}
 
 const modelDescriptions = {
   chat: [
@@ -327,7 +454,17 @@ const modelDescriptions = {
   transcription: ['Transcribe an authorized audio or video attachment to text.', 'text'],
 } as const;
 
-function summarize(descriptor: ToolDescriptor, available: boolean, reason?: string): ToolSummary {
+function summarize(
+  descriptor: ToolDescriptor,
+  available: boolean,
+  reason?: string,
+  extra?: {
+    availability?: ToolAvailability;
+    health?: ToolHealth;
+    settingsSection?: string;
+    inputHint?: ToolInputHint;
+  },
+): ToolSummary {
   return {
     id: descriptor.id,
     namespace: descriptor.id.split('.')[0],
@@ -340,6 +477,26 @@ function summarize(descriptor: ToolDescriptor, available: boolean, reason?: stri
     available,
     reason,
     ...(descriptor.program && { programmatic: [...descriptor.program.backends] }),
+    output: descriptor.output,
+    ...(extra?.availability && { availability: extra.availability }),
+    ...(extra?.health && { health: extra.health }),
+    ...(extra?.settingsSection && { settingsSection: extra.settingsSection }),
+    ...((descriptor.tags ?? descriptorTags[descriptor.id]) && {
+      tags: descriptor.tags ?? descriptorTags[descriptor.id],
+    }),
+    constraints: {
+      timeoutMs: descriptor.timeoutMs,
+      modes: [...descriptor.modes],
+      ...(descriptor.parallelRead && { parallelRead: true }),
+      ...(descriptor.parallelDelegate && { parallelDelegate: true }),
+      ...(descriptor.citations && { citations: true }),
+      ...(descriptor.artifacts && { artifacts: true }),
+      ...(descriptor.budget && { budget: descriptor.budget }),
+      ...(descriptor.requiredModelCapabilities.length && {
+        requiredModelCapabilities: [...descriptor.requiredModelCapabilities],
+      }),
+    },
+    ...(extra?.inputHint && { inputHint: extra.inputHint }),
   };
 }
 
@@ -482,6 +639,35 @@ export class ToolRegistry {
         };
       },
     });
+    this.register({
+      ...base,
+      id: 'calc.evaluate',
+      name: 'Evaluate mathematical expression',
+      description: 'Calculate and verify arithmetic, percentages, powers, roots, or math expressions deterministically without needing a shell.',
+      tags: descriptorTags['calc.evaluate'],
+      input: z.strictObject({
+        expression: z.string().trim().min(1).max(500),
+        precision: z.number().int().min(0).max(12).optional(),
+      }),
+      output: 'data',
+      capability: 'calc.evaluate',
+      effect: 'read',
+      parallelRead: true,
+      dependency: 'local',
+      permission: 'In-process deterministic mathematical calculation',
+      modes: ['direct', 'programmatic'],
+      programmaticEligible: true,
+      program: {
+        backends: ['managed', 'openai-responses'],
+        scope: 'public',
+        parallel: true,
+        retry: 'verified-read',
+      },
+      repeatable: true,
+      execute: ({ expression, precision }) => ({
+        data: evaluateCalculation(expression, precision),
+      }),
+    });
 
     for (const [operation, schema] of Object.entries(runtimeOperations) as [
       RuntimeOperation,
@@ -539,7 +725,10 @@ export class ToolRegistry {
         dependency: 'local',
         permission: operation.startsWith('memory.') ? 'Active memory scope and trusted desktop approval' : 'Authorized desktop conversation runtime',
         timeoutMs: executionLimits.operationMs + 1000,
+        parallelRead: operation.startsWith('workspace.') || (operation.startsWith('memory.') && effect === 'read') ||
+          operation === 'knowledge.list' || operation === 'knowledge.search' || operation === 'files.read_document',
         repeatable: operation === 'computer.observe' || operation === 'computer.act' ||
+          operation.startsWith('workspace.') ||
           (operation.startsWith('memory.') && effect === 'read'),
         ...(program && { program, programmaticEligible: true, modes: ['direct', 'programmatic'] }),
         artifacts: operation === 'artifacts.publish' || operation === 'computer.transfer',
@@ -548,6 +737,7 @@ export class ToolRegistry {
           Boolean(
             context.runtime &&
             this.host.current.desktopRuntime &&
+            (!operation.startsWith('workspace.') || this.host.current.workspacesCount !== 0) &&
             (!operation.startsWith('computer.') ||
               operation === 'computer.inspect' ||
               ((this.host.current.computerBrowser ||
@@ -684,6 +874,8 @@ export class ToolRegistry {
               'knowledge.search',
               'files.read_document',
               'skills.run_script',
+              'workspace.search_files',
+              'workspace.read_file',
             ].includes(operation)
           )
             approval();
@@ -823,7 +1015,9 @@ export class ToolRegistry {
         'browser_get_tabs',
         'browser_extract',
         'browser_scroll',
+        'browser_wait',
       ].includes(op);
+      const readOnly = snapshot && op !== 'browser_scroll';
       const program: ToolDescriptor['program'] =
         ['web_search', 'web_fetch', 'web_find', 'web_read'].includes(op)
           ? { backends: ['managed', 'openai-responses'], scope: 'public', parallel: true, retry: 'verified-read' }
@@ -835,10 +1029,13 @@ export class ToolRegistry {
         id: `${browser ? 'browser' : 'web'}.${op}`,
         name: op.replaceAll('_', ' '),
         description: researchDescriptions[op],
-        input: z.strictObject({ args: researchToolArgs[op], ...withDependencies }),
+        input: z.strictObject({
+          args: researchToolArgs[op], ...withDependencies,
+          retryOf: z.uuid().optional().describe('Execution ID of the prior failed attempt, only when it is marked retryable.'),
+        }),
         capability: op === 'web_search' ? 'web-search' : op,
         output: op === 'browser_screenshot' ? 'image' : op === 'web_read' ? 'text' : 'data',
-        effect: consequential ? 'consequential' : browser ? 'local' : 'read',
+        effect: consequential ? 'consequential' : browser && !readOnly ? 'local' : 'read',
         parallelRead: !browser,
         dependency: 'browser',
         permission: consequential
@@ -851,14 +1048,16 @@ export class ToolRegistry {
             ? 'searches'
             : op === 'web_fetch'
               ? 'fetches'
-              : op === 'browser_screenshot'
-                ? 'screenshots'
-                : undefined,
+              : op === 'browser_screenshot' ? 'screenshots'
+              : ['browser_open', 'browser_navigate'].includes(op) ? 'navigations'
+              : snapshot ? 'inspections' : undefined,
         artifacts: op === 'browser_screenshot',
-        citations: ['web_fetch', 'web_find', 'web_read', 'browser_extract'].includes(op),
+        citations: ['web_search', 'web_fetch', 'web_find', 'web_read', 'browser_get_page', 'browser_extract'].includes(op),
+        prepareInput: normalizeResearchInput,
         normalize: ({ args, dependsOn }) => ({ args, dependsOn: dependsOn ?? [] }),
-        execute: ({ args }, { context, step, signal, approval }) =>
-          context.research.invoke(op, args, step, signal, approval),
+        preflight: (step, context) => context.research.preflight(op, step.args ?? {}, step),
+        execute: ({ args }, { context, step, signal, browserProgress }) =>
+          context.research.invoke(op, args, step, signal, browserProgress),
       });
     }
 
@@ -965,13 +1164,35 @@ export class ToolRegistry {
   namespaceInfo(context: ToolContext) {
     const items: string[] = [];
     for (const [namespace, entries] of this.namespaces) {
-      const representative = [...entries.values()].find((descriptor) =>
+      const active = [...entries.values()].filter((descriptor) =>
         this.allowed(descriptor, context),
       );
-      if (representative) items.push(`${namespace} (${representative.name})`);
+      if (active.length) {
+        const preview = active
+          .slice(0, 4)
+          .map((item) => item.id.split('.')[1] ?? item.name)
+          .join(', ');
+        items.push(`${namespace} (${preview}${active.length > 4 ? ', …' : ''})`);
+      }
       if (items.length >= 12) break;
     }
     return items;
+  }
+
+  unavailableManifest(context: ToolContext, skills: readonly SkillSummary[]) {
+    const notes: string[] = [];
+    for (const [namespace, entries] of this.namespaces) {
+      const list = [...entries.values()];
+      if (list.some((descriptor) => this.allowed(descriptor, context))) continue;
+      const sample = list[0];
+      if (!sample) continue;
+      const reason = this.unavailable(sample, context.research.native, context);
+      if (reason) notes.push(`${namespace}: ${reason}`);
+    }
+    if (!context.temporary && !skills.some((skill) => skill.enabled)) {
+      notes.push('skills: No skills currently enabled');
+    }
+    return notes.slice(0, 8);
   }
 
   schema(descriptor: ToolDescriptor) {
@@ -998,11 +1219,15 @@ export class ToolRegistry {
     if (context?.temporary) return 'This tool is unavailable in a temporary conversation.';
     if (context?.memoryPrivate && !descriptor.id.startsWith('memory.') &&
       !localToolsForPrivateMemory.has(descriptor.id))
-      return 'This capability cannot receive private recalled memory.';
+      return 'Disabled after private memory entered this conversation. Start a new chat or run web research before recalling memory.';
     if (descriptor.id.startsWith('memory.') && context &&
       (!context.memoryEnabled || context.memoryBlocked || context.native || context.computer))
-      return 'Memory requires an enabled, compatible desktop conversation.';
+      return context.memoryEnabled
+        ? 'Memory is temporarily unavailable with the current active runtime mode.'
+        : 'Disabled in Settings → Memory.';
 
+    if (descriptor.id.startsWith('workspace.') && policy.workspacesCount === 0)
+      return 'No project folder registered. Add one in Projects or Home to inspect repositories.';
     if (Object.hasOwn(runtimeOperations, descriptor.id) &&
       (!policy.desktopRuntime || (context && !context.runtime)))
       return 'Open the managed Aria desktop application to use this tool.';
@@ -1019,16 +1244,67 @@ export class ToolRegistry {
       return 'Enable AI Browser, verify the virtual desktop, or select a scoped local display.';
     if (descriptor.dependency === 'browser' && (!browserAvailable || context?.privateContent))
       return context?.privateContent
-        ? 'Web tools cannot receive private skill or attachment contents.'
-        : 'Enable AI Browser in Web & Browser.';
+        ? 'Web tools cannot receive private skill, workspace, or attachment contents.'
+        : 'Enable AI Browser in Settings → Web & Browser.';
     if (descriptor.dependency === 'delegate' && (context
       ? !this.models.hasDelegateCandidates(context.registry.config)
       : ![...(settingsRegistry?.models.values() ?? [])].some((model) => model.delegate &&
         descriptor.requiredModelCapabilities.every((capability) =>
           model.capabilities.some((actual) => actual === capability)))))
-      return 'Configure an eligible delegated model in AI Models.';
+      return 'Configure an eligible delegated model in Settings → AI Models.';
     if (context && descriptor.available?.(context) === false)
       return 'This tool requires a compatible, authorized input or backend in this turn.';
+  }
+
+  private diagnose(
+    descriptor: ToolDescriptor,
+    browserAvailable: boolean,
+    context?: ToolContext,
+    settingsRegistry?: Registry,
+  ): {
+    available: boolean;
+    reason?: string;
+    availability: ToolAvailability;
+    health: ToolHealth;
+    settingsSection: string;
+  } {
+    const policy = this.host.current;
+    const reason = this.unavailable(descriptor, browserAvailable, context, settingsRegistry);
+    const settingsSection = descriptor.settingsSection ?? settingsSectionFor(descriptor.id);
+    if (reason) {
+      const availability: ToolAvailability = policy.disabled.includes(descriptor.id)
+        ? 'disabled'
+        : context?.temporary ||
+            Boolean(context?.memoryPrivate && !localToolsForPrivateMemory.has(descriptor.id) && !descriptor.id.startsWith('memory.')) ||
+            Boolean(context?.privateContent && descriptor.dependency === 'browser') ||
+            (context && descriptor.available?.(context) === false)
+          ? 'unavailable_turn'
+          : 'unconfigured';
+      return { available: false, reason, availability, health: 'unavailable', settingsSection };
+    }
+    const requiresApproval =
+      descriptor.effect === 'consequential' ||
+      [
+        'shell.fetch',
+        'knowledge.search',
+        'files.read_document',
+        'skills.run_script',
+        'workspace.search_files',
+        'workspace.read_file',
+        'memory.remember',
+        'memory.update',
+        'memory.forget',
+      ].includes(descriptor.id);
+    const shellUnconfigured =
+      (descriptor.id === 'shell.open' || descriptor.id === 'shell.run') &&
+      policy.dockerConfigured === false &&
+      !policy.nativeRuntime?.some((feature) => feature === 'hosted-shell' || feature === 'local-shell');
+    return {
+      available: true,
+      availability: requiresApproval ? 'requires_approval' : 'available',
+      health: shellUnconfigured ? 'unavailable' : 'ready',
+      settingsSection,
+    };
   }
 
   allowedForProgram(
@@ -1053,6 +1329,8 @@ export class ToolRegistry {
 
   discoveryProblem(ids: string[], context: ToolContext) {
     return ids.map((id) => {
+      const connector = this.host.current.connectors?.find((item) => item.id === id);
+      if (connector) return connector.reason ?? 'The requested connector is unavailable.';
       const descriptor = this.get(id);
       if (!descriptor) return 'The requested capability is not registered.';
       return this.unavailable(descriptor, context.research.native, context) ??
@@ -1062,16 +1340,50 @@ export class ToolRegistry {
     }).join(' ').slice(0, 400);
   }
 
-  cards(context: ToolContext) {
-    return [...this.entries.values()]
-      .filter((descriptor) => this.allowed(descriptor, context))
-      .map((descriptor) => summarize(descriptor, true));
+  cards(context: ToolContext, includeUnavailable = false): ToolSummary[] {
+    const tools = [...this.entries.values()]
+      .flatMap((descriptor) => {
+        const status = this.diagnose(descriptor, context.research.native, context);
+        if (!status.available && !includeUnavailable) return [];
+        return [
+          summarize(descriptor, status.available, status.reason, {
+            availability: status.availability,
+            health: status.health,
+            settingsSection: status.settingsSection,
+            inputHint: inputHintFromSchema(this.schemas.get(descriptor)),
+          }),
+        ];
+      });
+    if (!includeUnavailable) return tools;
+    const connectors: ToolSummary[] = (this.host.current.connectors ?? [])
+      .filter((connector) => !this.entries.has(connector.id)).map((connector) => ({
+      id: connector.id,
+      namespace: connector.id.split('.')[0],
+      name: connector.name,
+      description: connector.description,
+      version: '1',
+      provenance: 'connector',
+      effect: 'local',
+      permission: 'Registered external connector',
+      available: false,
+      reason: connector.reason ?? 'No executable tool is registered for this connector.',
+      availability: connector.availability === 'available' ? 'unconfigured' : connector.availability,
+      health: 'unavailable',
+      settingsSection: connector.settingsSection,
+      tags: ['connector', 'coding', 'external', connector.name.toLowerCase()],
+    }));
+    return [...tools, ...connectors];
   }
 
   settings(registry: Registry | undefined, browserAvailable: boolean) {
     return [...this.entries.values()].map((descriptor) => {
-      const reason = this.unavailable(descriptor, browserAvailable, undefined, registry);
-      return summarize(descriptor, !reason, reason);
+      const status = this.diagnose(descriptor, browserAvailable, undefined, registry);
+      return summarize(descriptor, status.available, status.reason, {
+        availability: status.availability,
+        health: status.health,
+        settingsSection: status.settingsSection,
+        inputHint: inputHintFromSchema(this.schemas.get(descriptor)),
+      });
     });
   }
 

@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { capabilityId, type ToolDiscovery } from '@aria/shared';
 import { nativeToolSearch } from './ai.service';
 
-const selection = z.strictObject({ ids: z.array(capabilityId).min(1).max(4) });
+const selection = z.strictObject({ ids: z.array(capabilityId).min(1).max(8) });
 
 interface Definition {
   id: string;

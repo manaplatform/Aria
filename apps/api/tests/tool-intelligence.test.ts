@@ -3,11 +3,13 @@ import { EventEmitter } from 'node:events';
 import { createRequire } from 'node:module';
 import type { INestApplication } from '@nestjs/common';
 import {
+  browserRequestSchema,
   defaultToolPolicy,
   defaultProgramSettings,
   defaultWebPolicy,
   capabilityHostRequest,
   type ChatEvent,
+  type ExecutionStep,
   type LoopCheckpoint,
 } from '@aria/shared';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
@@ -507,7 +509,8 @@ it('rejects an unavailable exact tool from discovery without loading it', async 
   expect(events.at(-1)).toMatchObject({
     type: 'failed', settingsHelp: true, problem: { code: 'CAPABILITY_UNAVAILABLE' },
   });
-  expect(fixture.received).toHaveLength(2);
+  expect(fixture.received).toHaveLength(3);
+  expect(fixture.received[2].body.messages[0].content).toContain('recoverable discovery');
 });
 
 it('rejects a spending-capped turn before sending an unpriced model request', async () => {
@@ -701,6 +704,180 @@ it('revokes outbound tools after an approved imported skill returns private inst
     problem: { code: 'CAPABILITY_UNAVAILABLE', message: expect.stringContaining('private') },
   });
   expect(browserDispatch).not.toHaveBeenCalled();
+});
+
+it('runs more than two web searches by default and refunds failed searches without overshooting the budget', async () => {
+  const checkpoints = executionPort();
+  const browserEvents = new EventEmitter();
+  const dispatchedQueries: string[] = [];
+  const browserDispatch = vi.fn((value: unknown) => {
+    const request = browserRequestSchema.parse(value);
+    const query = String((request.args as { query?: string }).query ?? '');
+    dispatchedQueries.push(query);
+    queueMicrotask(() => {
+      browserEvents.emit('message', {
+        data: {
+          v: request.v,
+          generation: request.generation,
+          operationId: request.operationId,
+          requestId: request.requestId,
+          conversationId: request.conversationId,
+          stepId: request.stepId,
+          op: request.op,
+          result:
+            query === 'transient'
+              ? { ok: false, code: 'SEARCH_UNAVAILABLE', message: 'Brave busy' }
+              : {
+                  ok: true,
+                  text: JSON.stringify({
+                    results: [{ url: `https://example.com/${encodeURIComponent(query)}`, title: query }],
+                  }),
+                },
+        },
+      });
+    });
+  });
+  app.get(BrowserPortClient).install(
+    {
+      start() {},
+      close() {},
+      on: browserEvents.on.bind(browserEvents),
+      postMessage: browserDispatch,
+    },
+    randomUUID(),
+  );
+  const searchStep = (id: string, query: string): ExecutionStep => ({
+    id,
+    target: { kind: 'tool', tool: 'web_search', model: null },
+    capability: 'web-search',
+    instructions: `Search ${query}`,
+    summary: `Search ${query}`,
+    args: { query },
+    inputs: [],
+    dependsOn: [],
+    output: 'data',
+  });
+
+  app.get(WebService).install({ ...defaultWebPolicy, aiBrowser: true });
+  const multiPrompt = 'Research three topics in parallel';
+  fixture.queueOperations(multiPrompt, {
+    steps: [searchStep('s1', 'one'), searchStep('s2', 'two'), searchStep('s3', 'three')],
+  });
+  const multiEvents = await chat(multiPrompt);
+  expect(multiEvents.at(-1)).toMatchObject({ type: 'completed', partial: false });
+  expect(
+    multiEvents.filter(
+      (event) =>
+        event.type === 'activity' &&
+        event.activity.target === 'web.web_search' &&
+        event.activity.status === 'completed',
+    ),
+  ).toHaveLength(3);
+  expect(dispatchedQueries).toEqual(['one', 'two', 'three']);
+
+  dispatchedQueries.length = 0;
+  app.get(WebService).install({ ...defaultWebPolicy, aiBrowser: true, searches: 2 });
+  const cappedPrompt = 'Search with a two-search cap after a transient failure';
+  fixture.queueOperations(cappedPrompt, { steps: [searchStep('f1', 'transient')] });
+  fixture.onToolResult(cappedPrompt, (result) => {
+    const first = Array.isArray(result) ? result[0] : undefined;
+    if (first?.id === 'f1')
+      return {
+        name: 'fixture_operations',
+        input: { steps: [searchStep('ok1', 'first'), searchStep('ok2', 'second')] },
+      };
+    if (first?.id === 'ok1')
+      return { name: 'fixture_operations', input: { steps: [searchStep('over', 'third')] } };
+  });
+  const execution = await managedExecution(cappedPrompt);
+  try {
+    await execution.completed;
+    expect(execution.events.at(-1)).toMatchObject({ type: 'completed', partial: true });
+    expect(dispatchedQueries).toEqual(['transient', 'first', 'second']);
+    const failedActivities = execution.events.filter(
+      (event) =>
+        event.type === 'activity' &&
+        event.activity.target === 'web.web_search' &&
+        event.activity.status === 'failed',
+    );
+    expect(failedActivities).toHaveLength(2);
+    expect(failedActivities[0]).toMatchObject({
+      activity: { error: 'Brave busy' },
+    });
+    expect(failedActivities[1]).toMatchObject({
+      activity: { error: 'The turn reached its searches limit (2).' },
+    });
+    expect(checkpoints.at(-1)?.budget.searches).toBe(2);
+  } finally {
+    execution.controller.abort();
+  }
+});
+
+it('rolls back search budget and read attempts when a queued search is cancelled before launch', async () => {
+  const checkpoints = executionPort();
+  const browserEvents = new EventEmitter();
+  const dispatchedQueries: string[] = [];
+  let steerQueuedSearch: (() => Promise<void>) | undefined;
+  app.get(BrowserPortClient).install(
+    {
+      start() {},
+      close() {},
+      on: browserEvents.on.bind(browserEvents),
+      postMessage: (value: unknown) => {
+        const request = browserRequestSchema.parse(value);
+        const query = String((request.args as { query?: string }).query ?? '');
+        dispatchedQueries.push(query);
+        void (async () => {
+          if (query === 'first' && steerQueuedSearch) {
+            const steer = steerQueuedSearch;
+            steerQueuedSearch = undefined;
+            await steer();
+          }
+          browserEvents.emit('message', {
+            data: {
+              v: request.v,
+              generation: request.generation,
+              operationId: request.operationId,
+              requestId: request.requestId,
+              conversationId: request.conversationId,
+              stepId: request.stepId,
+              op: request.op,
+              result: {
+                ok: true,
+                text: JSON.stringify({
+                  results: [{ url: `https://example.com/${encodeURIComponent(query)}`, title: query }],
+                }),
+              },
+            },
+          });
+        })();
+      },
+    },
+    randomUUID(),
+  );
+  app.get(WebService).install({ ...defaultWebPolicy, aiBrowser: true, searches: 2 });
+  const prompt = 'Search in order and steer before the second search dispatches';
+  fixture.queueTool(prompt, 'find_capabilities', { query: '', ids: ['web.web_search'] });
+  fixture.queueTool(prompt, 'load_capabilities', { ids: ['web.web_search'] });
+  fixture.queueTool(prompt, 'aria_execute_batch', {
+    operations: [
+      { id: 'first', after: [], tool: 'web_web_search', args: { args: { query: 'first' } } },
+      { id: 'second', after: ['first'], tool: 'web_web_search', args: { args: { query: 'second' } } },
+    ],
+  });
+  fixture.queueTool('Continue with second search', 'web_web_search', { args: { query: 'second' } });
+  const execution = await managedExecution(prompt);
+  steerQueuedSearch = async () => {
+    expect((await execution.command({ action: 'steer', text: 'Continue with second search' })).status).toBe(201);
+  };
+  try {
+    await execution.completed;
+    expect(execution.events.at(-1)).toMatchObject({ type: 'completed', partial: false });
+    expect(dispatchedQueries).toEqual(['first', 'second']);
+    expect(checkpoints.at(-1)?.budget.searches).toBe(2);
+  } finally {
+    execution.controller.abort();
+  }
 });
 
 const liveEnabled = process.env.ARIA_RUN_MODEL_EVALS === '1';

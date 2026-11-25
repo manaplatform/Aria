@@ -7,6 +7,7 @@ import {
   type ChatMessage,
   type ChatEvent,
   type CapabilityHostRequest,
+  type MemoryContextHint,
   type MemoryInput,
   type MemoryRecord,
   type MemorySearch,
@@ -112,6 +113,7 @@ export class DesktopMemory {
     private readonly projectTasks: (project: string) => unknown[],
     private readonly clearContext: () => void,
     private readonly purgeOutbox: () => Promise<void>,
+    private readonly providerIdentity: () => string | undefined = () => undefined,
   ) {
     this.client = new MemoryClient(directory);
     this.timer = setInterval(() => void this.tick(), 4000);
@@ -142,6 +144,75 @@ export class DesktopMemory {
     this.completed.clear();
     for (const [request, turn] of this.turns)
       if (request !== except && turn.recalled) this.cancel(request);
+  }
+
+  hasStandingRecallConsent() {
+    const key = this.providerIdentity();
+    return Boolean(
+      this.settings.enabled &&
+      key &&
+      this.settings.recallConsent?.providerKey === key,
+    );
+  }
+
+  async selectiveContext(
+    conversation: ChatConversation,
+    query: string,
+    assistantId: string,
+    requestId: string,
+    signal?: AbortSignal,
+  ): Promise<MemoryContextHint[]> {
+    if (
+      !this.ready ||
+      !this.settings.enabled ||
+      conversation.temporary ||
+      !this.hasStandingRecallConsent() ||
+      !query.trim() ||
+      containsSecret(query)
+    )
+      return [];
+    try {
+      const deadline = signal
+        ? AbortSignal.any([signal, this.revocations.signal, AbortSignal.timeout(150)])
+        : AbortSignal.any([this.revocations.signal, AbortSignal.timeout(150)]);
+      const access: MemoryAccess = {
+        conversationId: conversation.id,
+        projectId: conversation.projectId,
+      };
+      const result = await Promise.race([
+        this.client.call('search', access, { query: query.slice(0, 300), limit: 4 }),
+        new Promise<never>((_, reject) => {
+          const abort = () => reject(deadline.reason);
+          if (deadline.aborted) abort();
+          else deadline.addEventListener('abort', abort, { once: true });
+        }),
+      ]);
+      const hints: MemoryContextHint[] = [];
+      let total = 0;
+      const turn = this.turns.get(requestId);
+      for (const record of result.records) {
+        if (containsSecret(record.value.content)) continue;
+        const content = record.value.content.slice(0, 240);
+        if (total + content.length > 1000) break;
+        total += content.length;
+        hints.push({
+          id: record.id,
+          scope: record.scope.kind,
+          category: record.value.category,
+          content,
+          confirmation: record.confirmation,
+          observedAt: record.observedAt,
+        });
+        if (turn && turn.assistantId === assistantId) {
+          turn.references ??= new Set();
+          if (turn.references.size < 24) turn.references.add(record.id);
+        }
+      }
+      if (hints.length && turn && turn.assistantId === assistantId) turn.recalled = true;
+      return hints;
+    } catch {
+      return [];
+    }
   }
 
   admit(conversation: ChatConversation, user: ChatMessage, assistant: ChatMessage) {
@@ -364,16 +435,19 @@ export class DesktopMemory {
     if (this.configuring) throw new Error('Wait for Memory settings to finish saving.');
     this.configuring = true;
     try {
+      const normalized: MemorySettings = settings.enabled
+        ? settings
+        : { ...settings, recallConsent: undefined };
       if (
-        settings.embedding.mode === 'remote' &&
-        JSON.stringify(settings.embedding) !== JSON.stringify(this.settings.embedding)
+        normalized.embedding.mode === 'remote' &&
+        JSON.stringify(normalized.embedding) !== JSON.stringify(this.settings.embedding)
       ) {
-        const remote = RemoteEmbeddings.resolve(await this.registry(), settings.embedding);
+        const remote = RemoteEmbeddings.resolve(await this.registry(), normalized.embedding);
         await this.verifyRemote(remote, AbortSignal.timeout(6000));
       }
       this.invalidate();
       this.embeddingHealth = undefined;
-      const saved = await this.client.call('saveSettings', settings);
+      const saved = await this.client.call('saveSettings', normalized);
       this.settings = saved.settings;
       this.epoch = saved.epoch;
       this.cutoff = saved.cutoff;
@@ -631,6 +705,10 @@ export class DesktopMemory {
       }
       default: {
         turn.recalled = true;
+        if (this.hasStandingRecallConsent()) {
+          this.available(turn, generation, signal);
+          break;
+        }
         turn.consent ??= this.approve(
           'recall',
           'Use saved memories in this reply?',
@@ -699,6 +777,8 @@ export class DesktopMemory {
     }
     this.available(turn, generation, signal);
     const records = (data.records ?? (data.record ? [data.record] : [])) as MemoryRecord[];
+    const hasEntities = Array.isArray(data.matches) && data.matches.length > 0;
+    const hasTasks = Array.isArray(data.projectTasks) && data.projectTasks.length > 0;
     turn.references ??= new Set();
     for (const record of records) if (turn.references.size < 24) turn.references.add(record.id);
     if (data.records)
@@ -715,7 +795,7 @@ export class DesktopMemory {
         confidence: record.confidence,
         sources: record.sources.slice(-3),
       }));
-    return { data, privateContent: true };
+    return { data, privateContent: records.length > 0 || hasEntities || hasTasks };
   }
 
   private async confirmWrite(
