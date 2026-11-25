@@ -107,9 +107,14 @@ test('browses from ordinary chat through the managed private port and keeps priv
   const provider = await createProviderFixture();
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'aria-browser-electron-'));
   const traffic: string[] = [];
+  const computerUrl = `http://${host}/computer`;
+  let computerImage: http.ServerResponse | undefined;
   const site = http.createServer((request, response) => {
     traffic.push(request.url || '');
-    if (request.url === '/music') {
+    if (request.url === '/computer-image.svg') {
+      // Hold an ancillary asset open until the provider receives the partial page.
+      computerImage = response;
+    } else if (request.url === '/music') {
       response
         .writeHead(200, { 'Content-Type': 'text/html' })
         .end(
@@ -140,7 +145,8 @@ test('browses from ordinary chat through the managed private port and keeps priv
             '<p>The sample contains 42 measurements.</p><p hidden>secret-hidden-value</p>' +
             '<a href="/next">Next page</a><button style="appearance:none;background:#1e82c8;position:absolute;left:100px;top:180px;width:180px;height:40px">Ready for input</button></main>' +
             '<script>document.querySelector("button").onclick=()=>{document.querySelector("button").textContent="Fixture received input";fetch("/unexpected-action").catch(()=>{})}</script>' +
-            `<img src="http://127.0.0.1:${port}/private-canary" alt="">`,
+            `<img src="http://127.0.0.1:${port}/private-canary" alt="">` +
+            (request.url === '/computer' ? '<img src="/computer-image.svg" alt="">' : ''),
         );
     }
   });
@@ -246,7 +252,7 @@ test('browses from ordinary chat through the managed private port and keeps priv
     const prompt = `Open and read ${url}`;
     const step = (
       id: string,
-      op: 'browser_open' | 'browser_get_page' | 'browser_extract',
+      op: 'browser_open' | 'browser_get_page' | 'browser_extract' | 'browser_wait',
       args: Record<string, unknown>,
       dependsOn: string[] = [],
     ): ExecutionStep => ({
@@ -449,7 +455,7 @@ test('browses from ordinary chat through the managed private port and keeps priv
       .toBe(0);
 
     await expect(page.getByRole('button', { name: 'Send message', exact: true })).toBeVisible();
-    const computerPrompt = `Use the computer to interact with ${url}`;
+    const computerPrompt = `Use the computer to interact with ${computerUrl}`;
     expect(
       await page.evaluate(() => window.aria!.setNativeRuntime('computer-image', true)),
     ).toContain('computer-image');
@@ -475,6 +481,7 @@ test('browses from ordinary chat through the managed private port and keeps priv
     let viewport: { width: number; height: number } | undefined;
     const computerTools = [
       'browser.browser_open',
+      'browser.browser_wait',
       'computer.open',
       'computer.observe',
       'computer.act',
@@ -485,7 +492,9 @@ test('browses from ordinary chat through the managed private port and keeps priv
       query: '',
     });
     provider.queueTool(computerPrompt, 'load_capabilities', { ids: computerTools });
-    provider.queueOperations(computerPrompt, { steps: [step('open', 'browser_open', { url })] });
+    provider.queueOperations(computerPrompt, {
+      steps: [step('open', 'browser_open', { url: computerUrl })],
+    });
     provider.onToolResult(computerPrompt, (result) => {
       if (!Array.isArray(result) || !result[0]) return;
       const { id, data, status, error } = result[0];
@@ -494,7 +503,19 @@ test('browses from ordinary chat through the managed private port and keeps priv
         computerResults.failure = error ?? status;
         return;
       }
-      if (id === 'open')
+      if (id === 'open') {
+        computerResults.openPhase = data.phase;
+        return {
+          name: 'fixture_operations',
+          input: {
+            steps: [
+              step('ready', 'browser_wait', { tabId: data.tabId, condition: 'ready' }, [id]),
+            ],
+          },
+        };
+      }
+      if (id === 'ready') {
+        computerResults.readyPhase = data.phase;
         return {
           name: 'fixture_operations',
           input: {
@@ -507,6 +528,7 @@ test('browses from ordinary chat through the managed private port and keeps priv
             ],
           },
         };
+      }
       if (id === 'start')
         return {
           name: 'fixture_operations',
@@ -550,9 +572,17 @@ test('browses from ordinary chat through the managed private port and keeps priv
     await page.getByRole('textbox', { name: 'Message Aria' }).fill(computerPrompt);
     await page.getByRole('button', { name: 'Send message', exact: true }).click();
     await expect
+      .poll(() => computerResults.openPhase ?? computerResults.failure, { timeout: 20_000 })
+      .toBe('partial');
+    await expect.poll(() => Boolean(computerImage)).toBe(true);
+    computerImage!
+      .writeHead(200, { 'Content-Type': 'image/svg+xml' })
+      .end('<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"/>');
+    await expect
       .poll(() => computerResults.failure ?? computerResults.outcomes, { timeout: 20_000 })
       .toBeDefined();
     expect(computerResults).toMatchObject({
+      readyPhase: 'ready',
       outcomes: [{ index: 0, action: 'click', status: 'submitted' }],
       elements: expect.arrayContaining([
         expect.objectContaining({ label: 'Fixture received input' }),
