@@ -66,7 +66,7 @@ test('connects GitHub through Settings and discovers a scoped read in normal cha
     env: {
       ...launchEnvironment(), ARIA_TEST_DATA_DIR: directory,
       OPENAI_API_KEY: 'test-only-key', OPENAI_MODEL: 'fixture-model', OPENAI_BASE_URL: fixture.baseUrl,
-      ...(!providers.github && {
+      ...(providers.github ? {} : {
         ARIA_DEV_GITHUB_CLIENT_ID: identity.clientId, ARIA_DEV_GITHUB_APP_SLUG: identity.slug,
       }),
     },
