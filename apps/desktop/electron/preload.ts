@@ -5,11 +5,18 @@ import type {
   ChatServiceStatus,
   DesktopBridge,
   LiveEvent,
+  ProactiveEvent,
   UpdateState,
 } from '@aria/shared';
 
 const bridge: DesktopBridge = {
   platform: process.platform,
+  proactive: (input) => ipcRenderer.invoke('aria:proactive', input),
+  onProactiveEvent: (callback) => {
+    const listener = (_event: Electron.IpcRendererEvent, value: ProactiveEvent) => callback(value);
+    ipcRenderer.on('aria:proactive-event', listener);
+    return () => ipcRenderer.removeListener('aria:proactive-event', listener);
+  },
   updateState: () => ipcRenderer.invoke('aria:update-state'),
   updateCommand: (command) => ipcRenderer.invoke('aria:update-command', command),
   onUpdateState: (callback) => {

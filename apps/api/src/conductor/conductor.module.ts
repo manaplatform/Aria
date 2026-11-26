@@ -7,10 +7,12 @@ import { Conductor } from './conductor.service';
 import { ConductorLoopExecutor } from './loop-executor';
 import { RunAssets } from './run-assets';
 import { CapabilityHost } from './capability-host';
+import { ProactiveController } from './proactive.controller';
 import { ToolRegistry } from './tool-registry';
 
 @Module({
   imports: [AiModule, ProvidersModule, WebModule],
+  controllers: [ProactiveController],
   providers: [Conductor, ConductorLoopExecutor, RunAssets, MediaService, ToolRegistry, CapabilityHost],
   exports: [Conductor, RunAssets, ToolRegistry, CapabilityHost],
 })

@@ -13,6 +13,7 @@ import {
   setBrowserMode,
   useBrowserStore,
 } from '../../stores/browserStore';
+import { targetRoute } from '../proactive/runtime';
 import { Button, ErrorState, IconButton, Modal, Toast } from '../ui';
 
 export default function ChatLayout() {
@@ -26,6 +27,9 @@ export default function ChatLayout() {
   const [drawer, setDrawer] = useState(false);
   const location = useLocation();
   const navigate = useNavigate();
+  useEffect(() => window.aria?.onProactiveEvent?.(({ target }) => {
+    if (target) navigate(targetRoute(target));
+  }), [navigate]);
   const browserMode = useBrowserStore((state) => state.mode);
   const playing = useBrowserStore((state) => state.state.tabs.find((tab) => tab.playingMedia));
   const conversation = chat.conversations.find((item) => item.id === chat.selectedId);

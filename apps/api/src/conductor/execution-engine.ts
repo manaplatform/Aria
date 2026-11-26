@@ -545,6 +545,7 @@ export class ExecutionEngine {
             : [];
         lease = await this.tools.scheduler.acquire({
           turn: this.request.requestId,
+          background: Boolean(this.context.proactive),
           provider: model?.connection.id,
           tool: descriptor.id,
           toolLimit: descriptor.program?.parallel ? 3 : 4,
@@ -571,7 +572,8 @@ export class ExecutionEngine {
         authorize();
       }
       if (descriptor.artifacts) settleArtifact = this.context.budget.artifact();
-      if (descriptor.effect === 'billable' || this.context.execution && descriptor.effect === 'consequential' && !descriptor.repeatable) {
+      if (descriptor.effect === 'billable' || this.context.execution && descriptor.effect === 'consequential' && !descriptor.repeatable &&
+        !(this.context.proactive && descriptor.dependency === 'browser')) {
         const revision = this.tools.host.current.revision;
         await this.tools.host.request(
           {

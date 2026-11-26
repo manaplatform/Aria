@@ -8,6 +8,7 @@ export const settingsCategoryIds = [
   'providers',
   'models',
   'conductor',
+  'proactive',
   'memory',
   'integrations',
   'browser',

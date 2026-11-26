@@ -1,6 +1,7 @@
 type Ticket = {
   turn: string;
   provider?: string;
+  background?: boolean;
   tool: string;
   toolLimit: number;
   locks: readonly string[];
@@ -41,14 +42,14 @@ export class ExecutionScheduler {
 
   private schedule() {
     const waitingLocks = new Set<string>();
-    for (const ticket of [...this.queue]) {
+    for (const ticket of [...this.queue].sort((a, b) => Number(!!a.background) - Number(!!b.background))) {
       const active = [...this.active];
       if (
         this.fenced.size >= 48 ||
-        active.length >= 12 ||
+        active.length >= (ticket.background ? 10 : 12) ||
         active.filter((current) => current.turn === ticket.turn).length >= ticket.limit ||
         (ticket.provider &&
-          active.filter((current) => current.provider === ticket.provider).length >= 3) ||
+          active.filter((current) => current.provider === ticket.provider).length >= (ticket.background ? 2 : 3)) ||
         active.filter((current) => current.tool === ticket.tool).length >= ticket.toolLimit ||
         ticket.locks.some(
           (key) => waitingLocks.has(key) || active.some((current) => current.locks.includes(key)) ||

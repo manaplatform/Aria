@@ -97,3 +97,6 @@ Desktop text chat extends the Part 1 capability bridge with conversation-scoped 
 ## Persistent memory
 
 Electron owns the per-profile memory worker, scope checks, trusted confirmations, and chat outbox. Conductor offers optional retrieval to the configured primary. The renderer receives typed settings, scoped source references, and optional suggestion chips through the preload bridge. See [Memory architecture](memory-engine.md).
+
+
+Agenda, Automations, and Notifications are profile-scoped routes in the chat shell. Settings includes Proactive Assistant. Electron main owns the durable runtime and exposes committed snapshots and change events through preload. See [Proactive Assistant Runtime](proactive-assistant-runtime.md).

@@ -6,6 +6,10 @@ import { flushPersistence, initializeWorkspace, useWorkspaceStore } from './stor
 import { bindChatBridge } from './stores/chatStore';
 const ChatView = lazy(() => import('./components/chat/ChatView'));
 const SettingsView = lazy(() => import('./components/settings/SettingsView'));
+const Agenda = lazy(() => import('./components/proactive/AgendaPage'));
+const AgendaDetail = lazy(() => import('./components/proactive/AgendaDetail'));
+const Automations = lazy(() => import('./components/proactive/AutomationsPage'));
+const Notifications = lazy(() => import('./components/proactive/NotificationCenter'));
 const LegacyWorkspace = lazy(() => import('./pages/LegacyWorkspace'));
 class ErrorBoundary extends Component<{ children: ReactNode }, { error: string | null }> {
   state = { error: null as string | null };
@@ -79,6 +83,12 @@ function Application() {
         <Routes>
           <Route element={<ChatLayout />}>
             <Route path="/chat" element={<ChatView />} />
+            <Route path="/agenda" element={<Agenda />} />
+            <Route path="/agenda/tasks/:id" element={<AgendaDetail />} />
+            <Route path="/agenda/objectives/:id" element={<AgendaDetail />} />
+            <Route path="/agenda/jobs/:id" element={<AgendaDetail />} />
+            <Route path="/automations/:id?" element={<Automations />} />
+            <Route path="/notifications" element={<Notifications />} />
             <Route path="/settings" element={<SettingsView />} />
             <Route path="/settings/:category" element={<SettingsView />} />
           </Route>

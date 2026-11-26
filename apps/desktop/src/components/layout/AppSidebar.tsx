@@ -1,5 +1,5 @@
 import { useRef, useState } from 'react';
-import { PanelLeftClose, Plus, Search, Settings, UserRound } from 'lucide-react';
+import { Bell, ClipboardList, Clock3, PanelLeftClose, Plus, Search, Settings, UserRound } from 'lucide-react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { formatShortcutChord, resolveShortcuts } from '@aria/shared';
 import { useWorkspaceStore } from '../../stores/workspaceStore';
@@ -73,6 +73,13 @@ export function AppSidebar({
             />
           </label>
         )}
+        {[{ path: '/agenda', label: 'Agenda', Icon: ClipboardList },
+          { path: '/automations', label: 'Automations', Icon: Clock3 },
+          { path: '/notifications', label: 'Notifications', Icon: Bell }].map(({ path, label, Icon }) => (
+          <button key={path} className={'sidebar-settings ' + (location.pathname.startsWith(path) ? 'active' : '')}
+            aria-label={label} aria-current={location.pathname.startsWith(path) ? 'page' : undefined}
+            onClick={() => { navigate(path); onSelect(); }}><Icon size={18} /><span>{label}</span></button>
+        ))}
       </nav>
       {!compact && (
         <ConversationList

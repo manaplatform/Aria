@@ -126,7 +126,7 @@ it('fences pending approvals during takeover and rejects stale and cross-convers
     await runtime.supervise('owner', { sessionId, action: 'return-control' });
     await expect(call('computer.act', actions)).rejects.toThrow('latest observation');
     expect(inputCount).toBe(0);
-    expect(storage.db.prepare('PRAGMA user_version').get()?.user_version).toBe(8);
+    expect(storage.db.prepare('PRAGMA user_version').get()?.user_version).toBe(9);
   } finally {
     await runtime.shutdown();
     storage.close();

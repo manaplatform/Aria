@@ -19,6 +19,10 @@ export function openBrowserBridge(
   authorize: (request: BrowserRequest) => AbortSignal | undefined,
   reserve?: (request: BrowserRequest, fingerprint: string, signal: AbortSignal) => Promise<boolean>,
   scoped?: <T>(request: BrowserRequest, work: () => T) => T,
+  proactive?: {
+    approve(request: BrowserRequest, fingerprint: string, message: string, signal: AbortSignal): Promise<boolean>;
+    result(request: BrowserRequest, result: BrowserResponse['result'], fingerprint?: string): void;
+  },
 ): BrowserBridgeSession {
   const { port1, port2 } = new MessageChannelMain();
   const generation = randomUUID();
@@ -97,15 +101,24 @@ export function openBrowserBridge(
       if (!closed && !signal.aborted)
         port1.postMessage({ v, generation, operationId, requestId, conversationId, stepId, op, progress });
     };
+    let reservedFingerprint: string | undefined;
     const execute = () => browser.execute(request, signal, {
         approval: () => phase('approval'),
         progress: phase,
-        reserve: (fingerprint) => reserve?.(request, fingerprint, signal) ?? Promise.resolve(false),
+        reserve: async (fingerprint) => {
+          const ok = await reserve?.(request, fingerprint, signal);
+          if (ok) reservedFingerprint = fingerprint;
+          return Boolean(ok);
+        },
+        approve: (fingerprint, message, signal) => proactive?.approve(request, fingerprint, message, signal) ?? Promise.resolve(false),
       });
     void (scoped ? scoped(request, execute) : execute())
       .then(
         (result) => {
-          if (!signal.aborted && active.get(request.operationId) === controller) send(result);
+          if (!signal.aborted && active.get(request.operationId) === controller) {
+            proactive?.result(request, result, reservedFingerprint);
+            send(result);
+          }
         },
         (error: unknown) => {
           if (

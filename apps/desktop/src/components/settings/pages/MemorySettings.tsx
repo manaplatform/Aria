@@ -155,6 +155,8 @@ export default function MemorySettings() {
 
   const selectedSource = (record: MemoryRecord): ReactNode => {
     const source = record.sources.at(-1);
+    if (source && 'kind' in source)
+      return <Button variant="ghost" size="sm" onClick={() => navigate('/agenda/jobs/' + source.jobId)}>Open job</Button>;
     const conversation = source && conversations.find(({ id }) => id === source.conversationId);
     return conversation ? (
       <Button

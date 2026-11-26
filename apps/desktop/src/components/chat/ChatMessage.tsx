@@ -328,7 +328,11 @@ export function ChatMessage({
             ? `${memorySource.confirmation} · ${new Date(memorySource.observedAt).toLocaleDateString()}`
             : 'This memory is unavailable.'}>
           {memorySource && <p>{memorySource.value.content}</p>}
-          {memorySource?.sources.slice(-3).map((source) => (
+          {memorySource?.sources.slice(-3).map((source) => 'kind' in source ? (
+            <Button key={source.attemptId} variant="ghost" size="sm" onClick={() => navigate('/agenda/jobs/' + source.jobId)}>
+              View job
+            </Button>
+          ) : (
             <Button key={source.messageId} variant="ghost" size="sm" onClick={() => {
               selectChat(source.conversationId);
               navigate('/chat', { state: { messageId: source.messageId } });

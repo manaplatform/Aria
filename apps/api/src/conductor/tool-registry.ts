@@ -26,6 +26,10 @@ import {
   type SkillSummary,
   type ToolAvailability,
   type ToolEffect,
+  proactiveOperations,
+  proactiveReadOperations,
+  type ProactiveOperation,
+  type ProactiveRequest,
   type ToolConstraints,
   type LoopCheckpoint,
   type ToolHealth,
@@ -106,6 +110,7 @@ const delegateSchema = z.strictObject({
 
 export interface ToolContext {
   registry: Registry;
+  proactive?: ProactiveRequest;
   research: ResearchRun;
   attachments: Map<string, RunAttachment>;
   privateContent: boolean;
@@ -353,6 +358,29 @@ const runtimeDescriptions: Record<RuntimeOperation, readonly [string, string, To
     'Read bounded line ranges from a file inside a registered project folder.',
     'read',
   ],
+};
+
+const proactiveDescriptions: Record<ProactiveOperation, string> = {
+  'agenda.list_tasks': 'List owned Agenda tasks. Filter by status and paginate.',
+  'agenda.get_task': 'Inspect an Agenda task and its prerequisites.',
+  'agenda.create_task': 'Create a passive task to track a user responsibility.',
+  'agenda.update_task': 'Update task fields and dependencies using the current revision.',
+  'agenda.complete_task': 'Propose completion of an authorized task with runtime-verified progress.',
+  'agenda.cancel_task': 'Propose cancellation of an owned Agenda task.',
+  'agenda.list_objectives': 'List objectives and their lifecycle states.',
+  'agenda.create_objective': 'Create a passive objective to organize a responsibility.',
+  'agenda.get_job': 'Inspect job state and verified execution outcome.',
+  'automation.list': 'List reviewed automation definitions and schedules.',
+  'automation.create': 'Propose a new automation for explicit user review. Use the exact original user instruction and a separate bounded execution action.',
+  'automation.update': 'Propose an edit to the specified automation revision for explicit user review.',
+  'automation.pause': 'Request pausing an owned automation.',
+  'automation.resume': 'Request resuming an owned automation.',
+  'automation.delete': 'Propose deleting an automation for user review.',
+  'automation.run_now': 'Request a manual run of an owned automation.',
+  'automation.report_condition': 'Record met, not_met, or unknown against a verified target observation from this run.',
+  'pulse.get_status': 'Read the Pulse configuration and recent evaluations.',
+  'pulse.submit_actions': 'Submit one or more compatible Pulse decisions. A no_action decision stands alone.',
+  'notification.propose': 'Propose a concise, meaningful notification for the current responsibility.',
 };
 
 const localToolsForPrivateMemory = new Set([
@@ -1007,6 +1035,30 @@ export class ToolRegistry {
       });
     }
 
+    for (const [id, input] of Object.entries(proactiveOperations)) {
+      const operation = id as ProactiveOperation;
+      this.register({
+        ...base, id, input: input as z.ZodType<Record<string, unknown>>, name: id.replace(/[._]/g, ' '),
+        description: proactiveDescriptions[operation],
+        capability: operation, output: 'data', dependency: 'local',
+        permission: 'Current profile, validated responsibility scope, and desktop review for persistent execution',
+        effect: proactiveReadOperations.has(operation) ? 'read' : 'local',
+        timeoutMs: 10_000,
+        available: (context) => Boolean(context.runtime) &&
+          (operation !== 'pulse.submit_actions' || context.proactive?.kind === 'pulse') &&
+          (operation !== 'automation.report_condition' || context.proactive?.kind === 'automation'),
+        normalize: (args) => ({ args }),
+        execute: async (args, { context, step, callId, signal }) => {
+          if (!context.runtime) throw new ToolError('PERMISSION_DENIED', 'Use an authorized desktop session.');
+          const { primary } = context.registry;
+          return this.host.runtime({
+            ...context.runtime, type: 'runtime', revision: this.host.current.revision, operation, stepId: step.id, callId,
+            input: args, primary: { connectionId: primary.connection.id, model: primary.id, endpoint: primary.connection.baseUrl },
+          }, signal);
+        },
+      });
+    }
+
     for (const op of Object.keys(researchToolArgs) as ResearchToolId[]) {
       const browser = op.startsWith('browser_');
       const consequential = ['browser_click', 'browser_type', 'browser_submit'].includes(op);
@@ -1217,7 +1269,21 @@ export class ToolRegistry {
       return 'This tool definition changed. Discover the current version.';
     if (policy.disabled.includes(descriptor.id)) return 'Disabled in Tools settings.';
     if (context?.temporary) return 'This tool is unavailable in a temporary conversation.';
-    if (context?.memoryPrivate && !descriptor.id.startsWith('memory.') &&
+    const proactiveOperation = Object.hasOwn(proactiveOperations, descriptor.id);
+    if (proactiveOperation && (!policy.desktopRuntime || context && !context.runtime))
+      return 'Available through the managed desktop runtime.';
+    if (context?.proactive) {
+      const scope = context.proactive.scope;
+      const operations = descriptor.id.startsWith('web.') || descriptor.id.startsWith('browser.');
+      const publicRead = operations && (scope.publicOrigins.length > 0 || scope.publicSearch) &&
+        (descriptor.id !== 'web.web_search' || scope.publicSearch) &&
+        !['browser.browser_media', 'browser.browser_screenshot', 'browser.browser_switch_tab'].includes(descriptor.id);
+      const memoryRead = scope.memory && ['memory.search', 'memory.read'].includes(descriptor.id);
+      if (!publicRead && !memoryRead && !proactiveOperation &&
+        !['calc.evaluate', 'files.create_text_artifact'].includes(descriptor.id))
+        return 'Outside the authorized background capability scope.';
+    }
+    if (context?.memoryPrivate && !proactiveOperation && !descriptor.id.startsWith('memory.') &&
       !localToolsForPrivateMemory.has(descriptor.id))
       return 'Disabled after private memory entered this conversation. Start a new chat or run web research before recalling memory.';
     if (descriptor.id.startsWith('memory.') && context &&

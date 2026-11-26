@@ -103,6 +103,7 @@ export class AiService {
         : {}),
       system,
       messages,
+      allowSystemInMessages: messages[0]?.role === 'system',
       ...(tools
         ? {
             tools,

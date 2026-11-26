@@ -44,3 +44,6 @@ Built browser fixtures run with the normal Electron suite. `ARIA_RUN_PUBLIC_BROW
 For example, set **Maximum model requests** to `8` and **Maximum active time** to `120` seconds to bound short research tasks. Save runtime settings to apply the limits to new work. An explicit resume applies the stricter of the saved and current values.
 
 Run `pnpm typecheck`, `pnpm lint`, `pnpm test`, `pnpm build`, `pnpm licenses:check`, and the built Electron suite on macOS and Windows. `node tests/conductor-benchmark.mts` measures direct chat, discovery, and independent tool calls against a local provider fixture. Live providers, OS permissions, optional isolated backends, and packaged builds each need their own validation. Mana-Agent has no registered connector in this checkout. Exact configured model delegation uses the shared registry.
+
+
+Managed proactive jobs use the same executor, scheduler, registry, and receipt fencing with a job-owned scope and durable lease. Their starting message is a system event. See [Proactive Assistant Runtime](proactive-assistant-runtime.md).

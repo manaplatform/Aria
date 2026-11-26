@@ -13,6 +13,7 @@ const pages = {
   notifications: lazy(() => import('./pages/NotificationSettings')),
   providers: lazy(() => import('./pages/ProviderSettings')),
   models: lazy(() => import('./pages/ModelSettings')),
+  proactive: lazy(() => import('./pages/ProactiveAssistantSettings')),
   conductor: lazy(() => import('./pages/ConductorSettings')),
   memory: lazy(() => import('./pages/MemorySettings')),
   integrations: lazy(() => import('./pages/IntegrationSettings')),

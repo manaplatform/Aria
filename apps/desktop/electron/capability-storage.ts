@@ -400,6 +400,7 @@ export class CapabilityStorage {
     fingerprint: string,
     signal: AbortSignal,
     metadata?: { id: string; stepId: string; callId: string; revision: string },
+    stillAuthorized?: () => boolean,
   ) {
     signal.throwIfAborted();
     const directory = path.join(this.journal, hash(conversationId), hash(turn));
@@ -414,6 +415,7 @@ export class CapabilityStorage {
       fingerprints: (await fs.readdir(directory)).filter((key) => /^[a-f0-9]{64}$/.test(key)),
     };
     signal.throwIfAborted();
+    if (stillAuthorized && !stillAuthorized()) return false;
     return this.runtimeStore.reserveDispatch(conversationId, turn, attempt, fingerprint, legacy, metadata);
   }
 }

@@ -81,6 +81,21 @@ export class BrowserController {
   private selected: string | null = null;
   private conversationId: string | null = null;
   private window?: BrowserWindow;
+  private readonly jobScopes = new Map<string, (url: string) => boolean>();
+  private jobWindow?: BaseWindow;
+
+  openJob(owner: string, allowed: (url: string) => boolean) {
+    this.jobScopes.set(owner, allowed);
+  }
+
+  closeJob(owner: string) {
+    for (const tab of this.tabs.values()) if (tab.owner === owner) this.closeTab(tab);
+    this.jobScopes.delete(owner);
+    if (!this.jobScopes.size) {
+      this.jobWindow?.destroy();
+      this.jobWindow = undefined;
+    }
+  }
   private visible?: Tab;
   private computerHost?: { window: BaseWindow; tab: Tab };
   private playback?: { tab: Tab };
@@ -157,7 +172,7 @@ export class BrowserController {
     this.layoutRevision = -1;
     this.layout = undefined;
     this.place();
-    for (const tab of [...this.tabs.values()]) this.closeTab(tab);
+    for (const tab of [...this.tabs.values()]) if (!tab.owner || !this.jobScopes.has(tab.owner)) this.closeTab(tab);
     this.conversationId = null;
     this.selected = null;
     this.personalSelected = null;
@@ -191,12 +206,12 @@ export class BrowserController {
 
   pruneConversations(conversations: { id: string }[]) {
     const ids = new Set(conversations.map(({ id }) => id));
-    for (const tab of this.tabs.values()) if (tab.owner && !ids.has(tab.owner)) this.closeTab(tab);
+    for (const tab of this.tabs.values()) if (tab.owner && !ids.has(tab.owner) && !this.jobScopes.has(tab.owner)) this.closeTab(tab);
   }
 
   state(): BrowserState {
     const tabs = [...this.tabs.values()].filter(
-      (tab) => !tab.background && (!tab.owner || tab.owner === this.conversationId),
+      (tab) => !tab.background && (!tab.owner || tab.owner === this.conversationId) && (!tab.owner || !this.jobScopes.has(tab.owner)),
     );
     return {
       tabs: tabs.map((tab) =>
@@ -375,7 +390,9 @@ export class BrowserController {
   }
 
   private async create(owner?: string, background = false) {
-    const window = this.window;
+    const job = owner && this.jobScopes.get(owner);
+    if (job && !this.jobWindow) this.jobWindow = new BaseWindow({ show: false, width: 900, height: 700 });
+    const window = job ? this.jobWindow : this.window;
     const epoch = this.privacyEpoch;
     if (
       !window ||
@@ -407,7 +424,7 @@ export class BrowserController {
       else this.pending--;
     }
     if (
-      window !== this.window ||
+      window !== (job ? this.jobWindow : this.window) ||
       window.isDestroyed() ||
       epoch !== this.privacyEpoch ||
       !this.policy().enabled ||
@@ -452,7 +469,7 @@ export class BrowserController {
     wc.setWebRTCIPHandlingPolicy('disable_non_proxied_udp');
     wc.setWindowOpenHandler(() => ({ action: 'deny' }));
     const check = (event: { url: string; isMainFrame?: boolean; preventDefault: () => void }) => {
-      if (webUrlSchema.safeParse(event.url).success) return;
+      if (webUrlSchema.safeParse(event.url).success && (!job || event.isMainFrame === false || job(event.url))) return;
       event.preventDefault();
       if (event.isMainFrame !== false) {
         tab.state.error = 'This destination is blocked by the browser settings.';
@@ -638,6 +655,10 @@ export class BrowserController {
         .catch(() => undefined);
     });
     this.tabs.set(id, tab);
+    if (job) {
+      window.contentView.addChildView(view);
+      view.setBounds({ x: 0, y: 0, width: 900, height: 700 });
+    }
     this.changed();
     return tab;
   }
@@ -820,6 +841,8 @@ export class BrowserController {
   ) {
     const contents = tab.view.webContents;
     const target = publicWebUrl(url).href;
+    const allowed = tab.owner && this.jobScopes.get(tab.owner);
+    if (allowed && !allowed(target)) throw new BrowserError('DESTINATION_BLOCKED', 'This site is outside the approved job scope.');
     const deadline = AbortSignal.any([parent, tab.lifetime.signal, AbortSignal.timeout(20_000)]);
     deadline.throwIfAborted();
     const navigation = { redirects: [] as string[], active: true };
@@ -1538,6 +1561,7 @@ export class BrowserController {
       approval(): void;
       progress?(phase: BrowserPhase | 'network'): void;
       reserve(fingerprint: string): Promise<boolean>;
+      approve?(fingerprint: string, message: string, signal: AbortSignal): Promise<boolean>;
     },
   ) {
     signal.throwIfAborted();
@@ -1625,7 +1649,7 @@ export class BrowserController {
     }
     if (request.op === 'web_fetch') {
       progress('initializing');
-      const page = await fetchPublicPage(args.url!, args.method ?? 'GET', signal, () => progress('network'));
+      const page = await fetchPublicPage(args.url!, args.method ?? 'GET', signal, () => progress('network'), this.jobScopes.get(owner));
       const { text, metadata, links, ...summary } = page;
       const reducedLinks: NonNullable<typeof links> = [];
       const data: Record<string, unknown> = { ...summary, metadata, links: reducedLinks };
@@ -1665,7 +1689,7 @@ export class BrowserController {
         this.closeTab(tab);
         signal.throwIfAborted();
       }
-      this.select(tab);
+      if (!this.jobScopes.has(owner)) this.select(tab);
       try {
         await this.navigateResearch(tab, args.url, signal, progress);
       } catch (error) {
@@ -1865,7 +1889,13 @@ export class BrowserController {
             'ALREADY_SUBMITTED',
             'The form was already dispatched. Check the website for its outcome.',
           );
-        await this.approve(
+        if (this.jobScopes.has(owner)) {
+          if (!this.jobScopes.get(owner)?.(plan.action))
+            throw new BrowserError('DESTINATION_BLOCKED', 'The form destination is outside this job’s scope.');
+          lifecycle?.approval();
+          if (!await lifecycle?.approve?.(digest, ['Submit form', plan.action, ...fields].join('\n'), active))
+            throw new BrowserError('APPROVAL_DENIED', 'Review the exact form submission in Agenda.');
+        } else await this.approve(
           tab,
           'Submit form',
           plan.action,
@@ -1930,7 +1960,12 @@ export class BrowserController {
           'MANUAL_ACTION_REQUIRED',
           'Complete this field yourself in a Personal tab.',
         );
-      await this.approve(
+      const exact = createHash('sha256').update(JSON.stringify([request.op, tab.state.url, observed.fingerprint, args.value])).digest('hex');
+      if (this.jobScopes.has(owner)) {
+        lifecycle?.approval();
+        if (!await lifecycle?.approve?.(exact, [request.op, tab.state.url, observed.element?.label, args.value].join('\n'), active))
+          throw new BrowserError('APPROVAL_DENIED', 'Review the exact browser operation in Agenda.');
+      } else await this.approve(
         tab,
         request.op === 'browser_type' ? 'Fill field' : 'Click control',
         tab.state.url,
@@ -1938,11 +1973,8 @@ export class BrowserController {
         active,
         lifecycle?.approval,
       );
-      const digest = createHash('sha256')
-        .update(JSON.stringify([request.op, tab.state.url, observed.fingerprint, args.value]))
-        .digest('hex');
       snapshot();
-      if (!(await lifecycle?.reserve(digest)))
+      if (!(await lifecycle?.reserve(exact)))
         throw new BrowserError(
           'DUPLICATE_DISPATCH',
           'An earlier dispatch may already have taken effect. Check the website.',

@@ -301,6 +301,7 @@ export async function fetchPublicPage(
   method: 'GET' | 'HEAD',
   parent: AbortSignal,
   onNetwork: () => void,
+  allowed?: (url: string) => boolean,
 ): Promise<WebFetchResult> {
   const signal = AbortSignal.any([parent, AbortSignal.timeout(12_000)]);
   const redirects: WebFetchResult['redirects'] = [];
@@ -308,6 +309,8 @@ export async function fetchPublicPage(
   url.hash = '';
   try {
     for (;;) {
+      if (allowed && !allowed(url.href))
+        throw new BrowserError('DESTINATION_BLOCKED', 'The destination is outside the approved job scope.');
       const response = await getResponse(url, method, signal, onNetwork);
       const status = response.statusCode ?? 502;
       const location = response.headers.location;

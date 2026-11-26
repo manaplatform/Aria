@@ -2,6 +2,9 @@ import { createHash, randomUUID } from 'node:crypto';
 import type { UtilityProcess } from 'electron';
 import {
   conductorLimits,
+  proactiveRequestSchema,
+  proactiveRunEnvelope,
+  type ProactiveRequest,
   emptyRegistryPolicy,
   type ArtifactReference,
   type BrowserRequest,
@@ -50,6 +53,7 @@ interface CapabilityIntegration {
 
 interface ActiveRequest {
   request: ChatRequest;
+  proactive?: ProactiveRequest;
   controller: AbortController;
   stopped: boolean;
   sequence: number;
@@ -95,8 +99,8 @@ export class ChatService {
       throw new Error('Aria is handling too many turns. Stop a response or try again shortly.');
     this.assertConversationIdle(conversationId);
   }
-  assertIdle(): void {
-    if (this.requests.size)
+  assertIdle(foregroundOnly = false): void {
+    if ([...this.requests.values()].some((request) => !foregroundOnly || !request.proactive))
       throw new Error('Stop active responses before changing the connection.');
   }
   async start(): Promise<void> {
@@ -310,17 +314,21 @@ export class ChatService {
       handshakeTimeout: 15000,
     });
   }
-  private begin(input: ChatRequest, emit = this.emitEvent): ActiveRequest {
-    const request = managedChatRequestSchema.parse(input);
+  private begin(input: ChatRequest, emit = this.emitEvent, proactive?: ProactiveRequest, signal?: AbortSignal): ActiveRequest {
+    const request = proactive ? input : managedChatRequestSchema.parse(input);
+    signal?.throwIfAborted();
     if (this.status.state !== 'ready' || !this.status.configured || !this.url)
       throw new Error('Configure your provider in Settings before sending a message.');
     if (request.expectedRevision && this.status.revision !== request.expectedRevision)
       throw new Error('The AI Models configuration changed. Send again to use current settings.');
     this.assertExecutionCapacity(request.conversationId);
+    if (proactive && this.requests.size >= conductorLimits.turns - 1)
+      throw new Error('The foreground turn reservation is in use.');
     if (this.requests.has(request.requestId))
       throw new Error('This conversation already has a response in progress.');
     const active: ActiveRequest = {
       request,
+      proactive,
       controller: new AbortController(),
       stopped: false,
       sequence: 0,
@@ -329,7 +337,9 @@ export class ChatService {
       emit,
     };
     this.requests.set(request.requestId, active);
-    active.done = this.consume(active);
+    const abort = () => active.controller.abort();
+    signal?.addEventListener('abort', abort, { once: true });
+    active.done = this.consume(active).finally(() => signal?.removeEventListener('abort', abort));
     return active;
   }
   activeTurn(request: { requestId: string; conversationId: string; assistantMessageId?: string }) {
@@ -369,6 +379,13 @@ export class ChatService {
     const turn = this.requests.get(requestId);
     return turn?.stopped ? undefined : turn?.request.execution;
   }
+  proactiveForTurn(id: string) { return this.requests.get(id)?.proactive; }
+
+  async runProactive(input: ProactiveRequest, signal: AbortSignal, emit: (event: ChatEvent) => void) {
+    const run = proactiveRequestSchema.parse(input);
+    await this.begin(proactiveRunEnvelope(run), emit, run, signal).done;
+  }
+
   async control(command: LoopCommand) {
     const turn = this.requests.get(command.requestId);
     if (!turn || !this.activeTurn(command) || command.executionId !== turn.request.execution?.executionId ||
@@ -397,10 +414,10 @@ export class ChatService {
     const artifacts = new Map<string, string>();
     try {
       if (request.attachmentIds?.length) await this.stage(request, controller.signal);
-      const response = await this.http('chat/stream', {
+      const response = await this.http(active.proactive ? 'internal/proactive/stream' : 'chat/stream', {
         method: 'POST',
         headers: this.headers(),
-        body: JSON.stringify({
+        body: JSON.stringify(active.proactive ?? {
           ...request,
           availableAssets: this.capabilities
             ?.availableAssets?.(request.conversationId)
@@ -462,12 +479,14 @@ export class ChatService {
               controller.signal,
             );
           if (active.stopped) break;
-          this.recentlyPublished(asset.id);
-          if (this.newlyPublished.size >= 128) {
-            const oldest = this.newlyPublished.keys().next().value;
-            if (oldest) this.newlyPublished.delete(oldest);
+          if (!active.proactive) {
+            this.recentlyPublished(asset.id);
+            if (this.newlyPublished.size >= 128) {
+              const oldest = this.newlyPublished.keys().next().value;
+              if (oldest) this.newlyPublished.delete(oldest);
+            }
+            this.newlyPublished.set(asset.id, Date.now() + 30_000);
           }
-          this.newlyPublished.set(asset.id, Date.now() + 30_000);
           artifacts.set(event.artifact.id, asset.id);
           active.emit({
             type: 'asset',
@@ -533,11 +552,17 @@ export class ChatService {
   async cancelAll(): Promise<void> {
     await Promise.all([...this.requests.keys()].map((id) => this.cancel(id)));
   }
-  async interruptAll(): Promise<void> {
-    const active = [...this.requests.values()];
+  async interruptAll(foregroundOnly = false): Promise<void> {
+    const active = [...this.requests.values()].filter((request) => !foregroundOnly || !request.proactive);
     active.forEach(({ controller }) => controller.abort());
     await Promise.all(active.map(({ done }) => done));
   }
+  async interruptProactive(): Promise<void> {
+    const active = [...this.requests.values()].filter((request) => request.proactive);
+    active.forEach(({ controller }) => controller.abort());
+    await Promise.all(active.map(({ done }) => done));
+  }
+
   private async stage(request: ChatRequest, signal: AbortSignal) {
     if (!this.assets) throw new Error('Local attachments are unavailable.');
     const form = new FormData();

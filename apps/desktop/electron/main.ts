@@ -26,6 +26,8 @@ import { mkdirSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { defaultPreferences, LocalStorage, localDataSchema } from './storage';
+import { ProactiveService } from './proactive/service';
+import { ProactiveStore } from './proactive/store';
 import { BrowserController } from './browser/controller';
 import { openBrowserBridge } from './browser/bridge';
 import { CapabilityStorage, openCapabilityBridge } from './capability-storage';
@@ -33,6 +35,8 @@ import { WebSettingsStorage } from './web-settings-storage';
 import { ProviderStorage } from './provider-storage';
 import {
   browserCommandSchema,
+  proactiveOperations,
+  type ProactiveEvent,
   capabilityId,
   defaultWebPolicy,
   effectSchema,
@@ -118,6 +122,9 @@ if (process.env.ARIA_TEST_DATA_DIR) {
   mkdirSync(process.env.ARIA_TEST_DATA_DIR, { recursive: true });
   app.setPath('userData', path.resolve(process.env.ARIA_TEST_DATA_DIR));
 }
+const ownsProfile = app.requestSingleInstanceLock();
+if (!ownsProfile) app.quit();
+let proactive: ProactiveService | undefined;
 let mainWindow: BrowserWindow | null = null;
 let appTray: Tray | null = null;
 let appIcon: NativeImage | undefined;
@@ -294,6 +301,11 @@ function purgeMemoryOutbox() {
   return saving;
 }
 
+function proactiveArtifactIds() {
+  if (!executionRuntime.store.exists()) return [];
+  return executionRuntime.store.db.prepare('SELECT id FROM proactive_artifacts').all().map(({ id }) => String(id));
+}
+
 function savedConversation(id: string): ChatConversation | undefined {
   return initial.data.chat.conversations.find((item) => item.id === id);
 }
@@ -370,27 +382,31 @@ async function loadModels(connection: { provider: 'openai'; baseUrl: string; api
 }
 async function changeRegistry<T>(save: () => Promise<T>) {
   if (configuring) throw new Error('AI Models settings are already being saved.');
-  chat.assertIdle();
+  chat.assertIdle(true);
   media.assertIdle();
   configuring = true;
   try {
+    await chat.interruptProactive();
     const saved = await save();
     await chat.restart();
     return saved;
   } finally {
     configuring = false;
+    proactive?.wake();
   }
 }
 
 async function changeRuntimeSettings<T>(save: () => Promise<T>) {
   if (configuring) throw new Error('Wait for settings to finish saving.');
-  chat.assertIdle();
+  chat.assertIdle(true);
   media.assertIdle();
   configuring = true;
   try {
+    await chat.interruptProactive();
     return await save();
   } finally {
     configuring = false;
+    proactive?.wake();
   }
 }
 
@@ -504,6 +520,11 @@ function registerIpc(): void {
       validateSender(event);
       return fn(...args);
     });
+  handle('aria:proactive', async (input) => {
+    const result = await proactive?.handle(input);
+    if (result?.kind === 'accepted') syncTray(Boolean(initial.data.preferences.minimizeToTray) || Boolean(proactive?.background()));
+    return result ?? { kind: 'error', code: 'unavailable', message: 'The proactive runtime is unavailable.' };
+  });
   handle('aria:update-state', () => updates.snapshot);
   handle('aria:update-command', (input) => {
     const command = z.union([
@@ -529,6 +550,7 @@ function registerIpc(): void {
     quitting = false;
     installUpdate = undefined;
     updates.installCancelled();
+    proactive?.show();
     dialog.showErrorBox('Local changes could not be saved', string.parse(error));
   });
   handle('aria:load', () => ({
@@ -694,7 +716,7 @@ function registerIpc(): void {
         const outbox = memory.outbox(storage.memoryOutbox, mergedData.chat.messages, mergedData.chat.conversations);
         await storage.save(mergedData, outbox);
         initial = { data: mergedData };
-        syncTray(Boolean(mergedData.preferences.minimizeToTray));
+        syncTray(Boolean(mergedData.preferences.minimizeToTray) || Boolean(proactive?.background()));
         for (const message of parsed.chat.messages) {
           const projection = activeMessages.get(message.id);
           if (projection?.requestId === message.requestId && message.sequence >= projection.sequence &&
@@ -714,6 +736,7 @@ function registerIpc(): void {
               void chat.cancel(message.requestId);
             }
             executionRuntime.store.deletePrograms(id);
+            proactive?.removeConversation(id);
             void memory.removeConversation(id).catch(() => undefined);
           }
         await assets.prune(previous, parsed).catch(() => undefined);
@@ -1335,7 +1358,7 @@ function registerIpc(): void {
   });
   handle('aria:start-live', async (input) => {
     if (configuring) throw new Error('Wait for settings to finish saving.');
-    chat.assertIdle();
+    chat.assertIdle(true);
     const request = liveRequestSchema.parse(input);
     if (temporaryConversations.has(request.conversationId))
       throw new Error('Live voice is unavailable in temporary chat.');
@@ -1393,7 +1416,7 @@ function registerIpc(): void {
         };
         await storage.save(next);
         initial = { data: next };
-        syncTray(Boolean(patch.minimizeToTray));
+        syncTray(Boolean(patch.minimizeToTray) || Boolean(proactive?.background()));
       });
       try {
         await saving;
@@ -1541,7 +1564,7 @@ function registerIpc(): void {
     const before = await pathBytes(assets.directory);
     const names = await fs.readdir(assets.directory).catch(() => [] as string[]);
     const beforeCount = names.filter((name) => !name.endsWith('.json') && !name.endsWith('.tmp')).length;
-    await assets.pruneUnreferenced(initial.data);
+    await assets.pruneUnreferenced(initial.data, proactiveArtifactIds());
     const after = await pathBytes(assets.directory);
     const afterNames = await fs.readdir(assets.directory).catch(() => [] as string[]);
     const afterCount = afterNames.filter((name) => !name.endsWith('.json') && !name.endsWith('.tmp')).length;
@@ -1599,9 +1622,10 @@ function registerIpc(): void {
           pendingChatProjects.delete(id);
           workingContext.clear(id);
           executionRuntime.store.deletePrograms(id);
+          proactive?.removeConversation(id);
         }
         browser.pruneConversations([]);
-        await assets.pruneUnreferenced(next);
+        await assets.pruneUnreferenced(next, proactiveArtifactIds());
       });
       await saving;
       return true;
@@ -1773,7 +1797,29 @@ function registerIpc(): void {
     mainWindow?.webContents.openDevTools({ mode: 'detach' });
   });
 }
-function createWindow(icon: NativeImage | undefined): void {
+function showAria(target?: NonNullable<ProactiveEvent['target']>) {
+  proactive?.show();
+  const route = target ? (target.kind === 'automation' ? '/automations/' : target.kind === 'job' ? '/agenda/jobs/' : '/agenda/tasks/') + target.id : undefined;
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    createWindow(appIcon, route);
+    return;
+  }
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+  if (target) proactive?.changed(target);
+}
+
+function notifyProactive(target: NonNullable<ProactiveEvent['target']>) {
+  if (!Notification.isSupported()) return false;
+  const preferences = initial.data.preferences.notifications;
+  const note = new Notification({ title: 'Aria', body: 'Open Aria to view a proactive update.', silent: preferences?.sound === false });
+  note.on('click', () => showAria(target));
+  note.show();
+  return true;
+}
+
+function createWindow(icon: NativeImage | undefined, route?: string): void {
   closeFlushEnabled = false;
   closePending = false;
   mainWindow = new BrowserWindow({
@@ -1830,8 +1876,9 @@ function createWindow(icon: NativeImage | undefined): void {
   mainWindow.on('closed', () => {
     void browser.detach();
     void media.close();
-    void chat.interruptAll();
+    void chat.interruptAll(true);
     mainWindow = null;
+    if (!proactive?.background()) proactive?.suspend();
   });
   mainWindow.on('close', (event) => {
     if (!quitting && initial?.data?.preferences.minimizeToTray && appTray) {
@@ -1846,12 +1893,13 @@ function createWindow(icon: NativeImage | undefined): void {
       mainWindow?.webContents.send('aria:before-close');
     }
   });
-  if (devServerUrl) void mainWindow.loadURL(devServerUrl);
-  else void mainWindow.loadFile(path.join(__dirname, '../dist/index.html'));
+  if (devServerUrl) void mainWindow.loadURL(route ? new URL('#' + route, devServerUrl).href : devServerUrl);
+  else void mainWindow.loadFile(path.join(__dirname, '../dist/index.html'), route ? { hash: route } : undefined);
 }
 app
   .whenReady()
   .then(async () => {
+    if (!ownsProfile) return;
     const iconDirectory = devServerUrl ? '../public' : '../dist';
     const image = nativeImage.createFromPath(path.join(__dirname, iconDirectory, 'aria-icon.png'));
     const icon = image.isEmpty() ? undefined : image;
@@ -1974,7 +2022,7 @@ app
         .map(({ id, title, status, dependencies, revision }) => ({
           id, title, status, dependencies: dependencies.slice(0, 8), revision,
         })),
-      () => workingContext.clear(), purgeMemoryOutbox, () => chat.executionIdentity());
+      () => { workingContext.clear(); proactive?.invalidateMemory(); }, purgeMemoryOutbox, () => chat.executionIdentity());
     void memory.start().then(drainMemoryOutbox);
     const memoryDrainTimer = setInterval(() => void drainMemoryOutbox(), 4000);
     memoryDrainTimer.unref();
@@ -1988,7 +2036,7 @@ app
           await storage.save(recovered);
           initial = { data: recovered };
         }
-        await assets.pruneUnreferenced(initial.data);
+        await assets.pruneUnreferenced(initial.data, proactiveArtifactIds());
       } catch {
         // Keep files for reconciliation on the next successful load.
       }
@@ -2069,14 +2117,21 @@ app
     powerMonitor.on('unlock-screen', () => {
       locked = false;
       updateDesktopAvailability();
+      proactive?.event('desktop.unlocked');
     });
     powerMonitor.on('suspend', () => {
       sleeping = true;
       updateDesktopAvailability();
+      proactive?.suspend();
+    });
+    powerMonitor.on('shutdown', () => {
+      proactive?.suspend();
+      app.quit();
     });
     powerMonitor.on('resume', () => {
       sleeping = false;
       updateDesktopAvailability();
+      proactive?.resume();
     });
     chat = new ChatService(
       provider,
@@ -2115,6 +2170,8 @@ app
         }
       },
       (status) => {
+        proactive?.wake();
+        proactive?.changed();
         recordDiagnostic(status.state === 'failed' ? 'error' : 'info', 'service', `Chat service ${status.state}`);
         if (mainWindow && !mainWindow.webContents.isDestroyed())
           mainWindow.webContents.send('aria:chat-status-update', status);
@@ -2129,6 +2186,7 @@ app
             (request) => {
               const signal = authorize(request);
               if (!signal) return;
+              if (chat.proactiveForTurn(request.requestId)) return proactive?.authorizeBrowser(request);
               const turn = initial.data.chat.messages.find(
                 (message) =>
                   message.id === chat.assistantForTurn(request.requestId) &&
@@ -2148,6 +2206,8 @@ app
                     signal,
                     { id: `browser.${request.op}`, stepId: request.stepId,
                       callId: request.operationId, revision: webSettings.revision },
+                    () => !chat.proactiveForTurn(request.requestId) ||
+                      Boolean(proactive?.supervisor.live(request.requestId, request.conversationId)),
                   )
                 : Promise.resolve(false);
             },
@@ -2155,6 +2215,17 @@ app
               conversation: request.conversationId, request: request.requestId, step: request.stepId,
               operation: request.op, binding: [webSettings.revision, request.args],
             }, work),
+            {
+              approve: (request, fingerprint, message, signal) =>
+                proactive?.approveBrowser(request, fingerprint, message, signal) ?? Promise.resolve(false),
+              result: (request, result, fingerprint) => {
+                if (!chat.proactiveForTurn(request.requestId)) return;
+                proactive?.observations(request, result);
+                if (fingerprint && proactive?.supervisor.live(request.requestId, request.conversationId))
+                  executionRuntime.store.settleDispatch(request.conversationId, request.conversationId,
+                    request.requestId, fingerprint, result.ok ? 'completed' : 'uncertain');
+              },
+            },
           ),
       },
       {
@@ -2202,13 +2273,36 @@ app
           openCapabilityBridge(
             capabilities,
             revision,
-            (request) =>
-              request.type === 'runtime'
+            (request) => {
+              if (chat.proactiveForTurn(request.requestId) &&
+                  !proactive?.supervisor.live(request.requestId, request.conversationId)) return;
+              return request.type === 'runtime'
                 ? authorize(request) && chat.authorizeRuntime(request)
                 : request.voiceSessionId
                   ? media.authorizeCapability(request)
-                  : authorize(request),
+                  : authorize(request);
+            },
             (request, signal) => {
+              const job = chat.proactiveForTurn(request.requestId);
+              const live = job && proactive?.supervisor.live(request.requestId, job.jobId);
+              if (job && !live) throw new Error('The background execution is no longer active.');
+              if (Object.hasOwn(proactiveOperations, request.operation)) {
+                const conversation = !job && savedConversation(request.conversationId);
+                const instruction = conversation && initial.data.chat.messages.filter((message) =>
+                  message.conversationId === conversation.id && message.role === 'user' &&
+                  message.id === chat.executionForTurn(request.requestId)?.userMessageId).at(-1)?.content;
+                if (!proactive || !job && (!conversation || conversation.temporary))
+                  throw new Error('Use a saved chat or Agenda to manage proactive responsibilities.');
+                return proactive.dispatch(request, signal, live || undefined, instruction || undefined);
+              }
+              if (job) {
+                if (live?.prepared.scope.memory && (request.operation === 'memory.search' || request.operation === 'memory.read'))
+                  return memory.proactiveRecall(request.operation, request.input, signal).then((result) => {
+                    if (result.privateContent) proactive?.markPrivate(job.jobId);
+                    return result;
+                  });
+                throw new Error('This operation is outside the background grant.');
+              }
               if (request.programId)
                 executionRuntime.store.assertProgramChild(request, chat.executionIdentity());
               return approvals.within({
@@ -2222,6 +2316,7 @@ app
               });
             },
             (request, signal) => {
+              if (chat.proactiveForTurn(request.requestId)) return proactive?.checkpoint(request, signal) ?? Promise.resolve(false);
               const active = chat.executionForTurn(request.requestId);
               const conversation = savedConversation(request.conversationId);
               if (!active || request.checkpoint.executionId !== active.executionId ||
@@ -2237,17 +2332,49 @@ app
     media = new MediaService(chat, assets, (event) =>
       mainWindow?.webContents.send('aria:live-event', event),
     );
+    proactive = new ProactiveService(new ProactiveStore(executionRuntime.store, cipher), {
+      identity: () => {
+        const status = chat.getStatus();
+        const key = chat.executionIdentity();
+        return !configuring && status.state === 'ready' && status.configured && status.revision && key
+          ? { provider: key, revision: status.revision } : undefined;
+      },
+      run: (request, signal, event) => {
+        browser.openJob(request.jobId, (url) => {
+          const live = proactive?.supervisor.live(request.attemptId, request.jobId);
+          return !!live && !!proactive?.canVisit(live, url);
+        });
+        return chat.runProactive(request, signal, event);
+      },
+      changed: (event) => {
+        if (mainWindow && !mainWindow.webContents.isDestroyed()) mainWindow.webContents.send('aria:proactive-event', event);
+      },
+      notify: (_category, target) => notifyProactive(target),
+      saveMemory: (source, content, observedAt, authorize) => memory.rememberJob(source, content, observedAt, authorize),
+      exportArtifact: async (id) => {
+        const { asset, bytes } = await assets.get(id);
+        if (!mainWindow || mainWindow.isDestroyed()) return false;
+        const result = await dialog.showSaveDialog(mainWindow, { title: 'Save job artifact', defaultPath: asset.name });
+        if (result.canceled || !result.filePath) return false;
+        await fs.writeFile(result.filePath, bytes);
+        return true;
+      },
+      closeJob: (id) => browser.closeJob(id),
+      removeArtifact: (id) => assets.remove(id),
+    });
+    proactive.start();
+    app.on('second-instance', () => showAria());
     registerIpc();
     if (devLauncher && !process.connected) {
       app.quit();
       return;
     }
-    syncTray(Boolean(initial.data.preferences.minimizeToTray));
+    syncTray(Boolean(initial.data.preferences.minimizeToTray) || Boolean(proactive?.background()));
     createWindow(icon);
     updates.startAutomaticChecks();
     void chat.start().then(() => executionRuntime.cleanHostedResources());
     app.on('activate', () => {
-      if (BrowserWindow.getAllWindows().length === 0) createWindow(icon);
+      if (!mainWindow) showAria();
     });
   })
   .catch((error) => {
@@ -2255,17 +2382,19 @@ app
     app.quit();
   });
 app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') app.quit();
+  if (process.platform !== 'darwin' && !proactive?.background() && !BrowserWindow.getAllWindows().length) app.quit();
+  else if (process.platform === 'darwin' && !proactive?.background()) proactive?.suspend();
 });
 app.on('before-quit', (event) => {
   quitting = true;
+  proactive?.suspend();
   appTray?.destroy();
   appTray = null;
   // The window close handshake flushes renderer state before this final shutdown.
   if (!mainWindow && chat && !shutdownComplete) {
     event.preventDefault();
-    shutdown ??= media
-      .close()
+    shutdown ??= Promise.resolve(proactive?.close())
+      .then(() => media.close())
       .then(() => chat.close())
       .then(() => computerRuntime.shutdown())
       .then(() => localComputer.reset())

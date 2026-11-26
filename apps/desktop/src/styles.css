@@ -3,6 +3,7 @@
 @import './styles/chat.css';
 @import './styles/reply.css';
 @import './styles/settings.css';
+@import "./styles/proactive.css";
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);

@@ -25,7 +25,7 @@ describe('durable runtime', () => {
         PRAGMA user_version = 4;
       `);
       store.close();
-      expect(store.db.prepare('PRAGMA user_version').get()?.user_version).toBe(8);
+      expect(store.db.prepare('PRAGMA user_version').get()?.user_version).toBe(9);
       expect(store.db.prepare("SELECT name FROM documents WHERE id = 'document'").get())
         .toMatchObject({ name: 'notes.txt' });
       const approval = store.beginApproval({

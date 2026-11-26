@@ -8,7 +8,7 @@ Aria is a general-purpose desktop AI assistant built with:
 - **AI Layer:** Vercel AI SDK + LangChain.js (optional)
 - **Communication:** REST + SSE for chat and WebSocket for Live Voice
 
-Aria opens into ordinary chat. Projects are optional.
+Aria is a proactive general-purpose desktop assistant. It opens into ordinary chat. Projects are optional.
 
 ---
 
@@ -188,3 +188,12 @@ When implementing AI features:
 
 - Keep ordinary chat independent of Settings and project selection. The primary Settings workspace uses grouped category navigation, accessible search, and persisted local appearance and shortcut preferences; preserve legacy deep links and the separate `/advanced/*` workspace.
 - Keep provider and model configuration in Settings using verified capabilities and the existing registry. Electron main owns system integration, permissions, destructive confirmations, and private data; renderer controls must reflect real supported behavior and actionable errors.
+
+
+## Proactive assistant runtime
+
+- The configured primary remains the semantic decision-maker. Conductor remains the execution authority. Keep ordinary chat usable without a persistent task, project, or background feature.
+- Pulse triggers bounded assistant evaluations. Agenda owns persistent responsibilities, tasks, dependencies, and verified progress. Automations owns trigger configuration and recurrence. Trusted Electron main validates state transitions, scheduling, budgets, grants, and job ownership.
+- Use job-owned desktop execution scopes and the shared tool registry, scheduler, and dispatch journal. A runtime event carries system-event provenance. Model output, memory, webpages, and tool results cannot create or expand permissions.
+- Persistent executable scope requires explicit user review. Consequential background actions need one-use approval bound to their exact target and input. Reconcile stale generations against durable receipts before continuation. Fence uncertain external effects for user review.
+- Preserve restart and renderer-free operation in an active desktop runtime. Verify the normal chat entry point, durable jobs, permission revocation, delivery, and platform behavior with local fixtures. See [Proactive Assistant Runtime](docs/proactive-assistant-runtime.md).

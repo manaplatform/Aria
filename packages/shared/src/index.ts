@@ -1,3 +1,5 @@
+export * from './proactive.js';
+import type { ProactiveCommand, ProactiveEvent, ProactiveResult } from './proactive.js';
 import type { MemoryDiagnostics, MemoryRecord, MemorySearch, MemorySearchResult, MemorySettings, MemoryStatus, MemoryTurnOptions } from './memory.js';
 export * from './memory.js';
 import type {
@@ -440,6 +442,8 @@ export interface UpdateState {
   error?: string;
 }
 export interface DesktopBridge {
+  proactive(command: ProactiveCommand): Promise<ProactiveResult>;
+  onProactiveEvent(callback: (event: ProactiveEvent) => void): () => void;
   platform: string;
   updateState(): Promise<UpdateState>;
   updateCommand(command: UpdateCommand): Promise<void>;

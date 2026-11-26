@@ -13,6 +13,7 @@ import {
   type MemorySearchResult,
   type MemorySettings,
   type MemorySource,
+  type MemoryProvenance,
 } from '@aria/shared';
 
 export interface MemoryAccess {
@@ -67,6 +68,10 @@ function searchable(query: string, exact: boolean, operator = 'OR') {
   const terms = [...new Set(query.match(/[\p{L}\p{N}\p{M}_]+/gu) ?? [])].slice(0, 18);
   if (!terms.length) return undefined;
   return exact ? `"${terms.join(' ')}"` : terms.map((term) => `"${term}"`).join(` ${operator} `);
+}
+
+function sourceKey(source: MemoryProvenance): [string, string] {
+  return 'kind' in source ? ['job:' + source.jobId, source.attemptId] : [source.conversationId, source.messageId];
 }
 
 export class MemoryStore {
@@ -374,7 +379,7 @@ export class MemoryStore {
     for (const source of record.sources)
       this.db
         .prepare('INSERT OR IGNORE INTO sources VALUES (?,?,?)')
-        .run(record.id, source.conversationId, source.messageId);
+        .run(record.id, ...sourceKey(source));
   }
 
   private associate(record: MemoryRecord) {
@@ -456,7 +461,7 @@ export class MemoryStore {
   private write(
     value: MemoryInput,
     scope: MemoryScope,
-    source: MemorySource | undefined,
+    source: MemoryProvenance | undefined,
     origin: MemoryRecord['origin'],
     observedAt: number,
     previous?: MemoryRecord,
@@ -471,7 +476,7 @@ export class MemoryStore {
       ((source &&
         this.db
           .prepare('SELECT 1 FROM blocked_sources WHERE conversation=? AND message=?')
-          .get(source.conversationId, source.messageId)) ||
+          .get(...sourceKey(source))) ||
         (fact &&
           this.db
             .prepare('SELECT 1 FROM blocked_facts WHERE scope=? AND category=? AND fact_key=?')
@@ -493,7 +498,11 @@ export class MemoryStore {
       const matched = rowPayload(duplicate);
       const promote = origin === 'user' && matched.confirmation !== 'confirmed';
       const alreadyLinked =
-        source && matched.sources.some((item) => item.messageId === source.messageId);
+        source && matched.sources.some((item) => {
+          const [owner, event] = sourceKey(source);
+          const [priorOwner, priorEvent] = sourceKey(item);
+          return owner === priorOwner && event === priorEvent;
+        });
       if (!promote && (!source || alreadyLinked)) return matched;
       const record: MemoryRecord = {
         ...matched,
@@ -551,7 +560,7 @@ export class MemoryStore {
   remember(
     scope: MemoryScope,
     value: MemoryInput,
-    source: MemorySource | undefined,
+    source: MemoryProvenance | undefined,
     epoch: number,
     observedAt = Date.now(),
   ) {

@@ -96,6 +96,10 @@ export const settingsCategories: SettingsCategoryMeta[] = [
     icon: Workflow,
   },
   {
+    id: 'proactive', group: 'ai', label: 'Proactive Assistant',
+    description: 'Configure Pulse, automations, and background responsibilities.', icon: Sparkles,
+  },
+  {
     id: 'memory',
     group: 'ai',
     label: 'Memory',
@@ -176,6 +180,7 @@ export const settingsSearchIndex: SettingsSearchItem[] = [
   { id: 'per-style', category: 'personalization', title: 'Assistant response preferences', description: 'Prefer balanced, concise, or detailed replies.', keywords: ['tone', 'concise', 'detailed', 'style'], settingId: 'personalization-style' },
   { id: 'per-language', category: 'personalization', title: 'Preferred communication language', description: 'Language Aria uses when responding.', keywords: ['reply language', 'locale'], settingId: 'personalization-language' },
   { id: 'not-desktop', category: 'notifications', title: 'Desktop notifications', description: 'Enable OS notifications when Aria is in the background.', keywords: ['alerts', 'banner', 'os'], settingId: 'notifications-enabled' },
+  { id: 'proactive-pulse', category: 'proactive', title: 'Pulse and background work', description: 'Set heartbeat frequency, quiet hours, notifications, and job limits.', keywords: ['agenda', 'automation', 'heartbeat', 'emergency pause'] },
   { id: 'not-task', category: 'notifications', title: 'Task completion notifications', description: 'Notify when a response completes while Aria is unfocused.', keywords: ['done', 'finished'], settingId: 'notifications-task' },
   { id: 'not-bg', category: 'notifications', title: 'Background execution notifications', description: 'Notify on approval requests or background errors.', keywords: ['approval', 'error', 'background'], settingId: 'notifications-background' },
   { id: 'not-sound', category: 'notifications', title: 'Notification sounds', description: 'Play a system notification sound.', keywords: ['audio', 'chime', 'mute'], settingId: 'notifications-sound' },

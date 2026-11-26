@@ -148,8 +148,9 @@ export class MediaStorage {
       fs.rm(this.filename(id, '.tmp'), { force: true }),
     ]);
   }
-  async pruneUnreferenced(data: LocalData) {
+  async pruneUnreferenced(data: LocalData, additional: readonly string[] = []) {
     const retained = referencedAssets(data);
+    for (const id of additional) retained.add(id);
     const names = await fs.readdir(this.directory).catch((error: NodeJS.ErrnoException) => {
       if (error.code === 'ENOENT') return [];
       throw error;

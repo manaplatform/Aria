@@ -65,3 +65,6 @@ At 100,000 records the cached working snapshot timed below the 0.001 ms reportin
 ## Extension points
 
 Add managed memory actions to the shared schemas and Tool Registry, then wire them through the existing active-turn runtime bridge. Add a store migration for new authoritative data. Add embedding transports through verified registry capabilities and the desktop embedding adapters. Keep raw text, prompts, and tokens out of diagnostics. Store counters and worker timings separately from user-facing activity.
+
+
+A reviewed background job can perform bounded profile recall with current standing consent. Job-owned verified findings have explicit job and attempt provenance when the user saves them through the existing Memory confirmation. See [Proactive Assistant Runtime](proactive-assistant-runtime.md).

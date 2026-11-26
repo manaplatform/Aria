@@ -14,6 +14,7 @@ import {
   type MemorySettings,
   type MemoryScope,
   type MemorySource,
+  type MemoryJobSource,
   type MemoryStatus,
   type RuntimeRegistry,
   type RuntimeResult,
@@ -616,6 +617,26 @@ export class DesktopMemory {
       throw blocked();
   }
 
+  async proactiveRecall(operation: 'memory.search' | 'memory.read', input: unknown, signal: AbortSignal): Promise<RuntimeResult> {
+    const generation = this.generation;
+    signal = AbortSignal.any([signal, this.revocations.signal]);
+    if (!this.hasStandingRecallConsent() || !this.ready) throw blocked();
+    let records: MemoryRecord[];
+    if (operation === 'memory.search') {
+      const query = memoryOperations[operation].parse(input);
+      records = (await this.search({ ...query, match: 'terms', scope: 'profile', historical: false }, {}, signal)).records.slice(0, 5);
+    } else {
+      const { id } = memoryOperations[operation].parse(input);
+      const record = await this.client.call('read', id, {}, false);
+      records = record ? [record] : [];
+    }
+    signal.throwIfAborted();
+    if (generation !== this.generation || !this.hasStandingRecallConsent()) throw blocked();
+    return { data: { records: records.map(({ id, revision, value, observedAt, confirmation }) => ({
+      id, revision, content: value.content.slice(0, 520), category: value.category, observedAt, confirmation,
+    })) }, privateContent: records.length > 0 };
+  }
+
   async dispatch(request: Request, signal: AbortSignal): Promise<RuntimeResult> {
     const turn = this.turns.get(request.requestId);
     signal = AbortSignal.any([signal, this.revocations.signal]);
@@ -809,6 +830,19 @@ export class DesktopMemory {
       throw new RuntimeError('INVALID_ARGUMENT', 'Memory cannot contain authentication secrets.');
     if (!(await this.approve('write', title, value, signal))) throw blocked();
     this.available(turn, generation, signal);
+  }
+
+  async rememberJob(source: MemoryJobSource, text: string, observedAt: number, authorize: () => boolean) {
+    const content = text.trim();
+    if (!this.ready || !this.settings.enabled) throw new Error('Enable persistent memory to save a verified finding.');
+    if (!content || content.length > 1400 || containsSecret(content))
+      throw new Error('Choose a finding of up to 1,400 characters without authentication secrets.');
+    const signal = AbortSignal.any([this.revocations.signal, AbortSignal.timeout(65_000)]);
+    const epoch = this.epoch;
+    if (!await this.approve('write', 'Save this verified finding?', content, signal) || !authorize())
+      throw new Error('The memory save was declined or its source changed.');
+    signal.throwIfAborted();
+    return this.client.call('remember', { kind: 'profile' }, { content, category: 'episode' }, source, epoch, observedAt);
   }
 
   async rememberSource(
