@@ -41,6 +41,7 @@ import {
   connectorCommand,
   githubAccountId,
   githubOperation,
+  githubPublicSearchOperation,
   githubResult,
   type ProactiveEvent,
   capabilityId,
@@ -2314,6 +2315,13 @@ app
               const job = chat.proactiveForTurn(request.requestId);
               const live = job && proactive?.supervisor.live(request.requestId, job.jobId);
               if (job && !live) throw new Error('The background execution is no longer active.');
+              if (request.operation === githubPublicSearchOperation) {
+                if (job || savedConversation(request.conversationId)?.temporary)
+                  throw new Error('Use a saved foreground chat to search public GitHub repositories.');
+                return connectors.searchPublic(request, signal, {
+                  live: () => Boolean(chat.authorizeRuntime(request)), network: () => progress('dispatch'),
+                });
+              }
               if (githubOperation.safeParse(request.operation).success) {
                 const grant = live && live.prepared.scope.connector;
                 if (job && !grant || !job && savedConversation(request.conversationId)?.temporary)

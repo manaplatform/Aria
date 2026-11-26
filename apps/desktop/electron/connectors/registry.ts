@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import {
-  githubOperation, githubOperations, githubResult,
+  githubOperation, githubOperations, githubPublicSearchInput, githubPublicSearchOperation, githubResult,
   type CapabilityHostRequest, type ConnectorCommand, type ConnectorInventory, type ConnectorJobGrant,
   type ConnectorSnapshot, type GithubAccount, type GithubRepository, type RuntimeResult,
 } from '@aria/shared';
@@ -34,6 +34,8 @@ const unavailable = () => new RuntimeError('CAPABILITY_UNAVAILABLE', 'GitHub is 
 const bracket = (text: string) => sanitizeGithubText(text).replace(/[\p{Cc}\p{Cf}]/gu, ' ');
 const connectionChanged = (first: GithubAccount, second: GithubAccount | undefined) =>
   !second || first.generation !== second.generation;
+const canSearchPublic = (account: GithubAccount | undefined) =>
+  account?.state === 'connected' || account?.state === 'needs_repositories';
 
 export class ConnectorRegistry {
   private readonly github?: GithubAdapter;
@@ -96,11 +98,12 @@ export class ConnectorRegistry {
 
   inventory(): ConnectorInventory {
     const active = this.store?.active() ?? null;
-    const account = active && this.store?.account(active);
+    const account = active ? this.store?.account(active) : undefined;
     const primary = this.host.identity()?.key;
     const readable = Boolean(account && primary && account.state === 'connected' && account.selected.length &&
       this.store?.approvedPrimary(account.id) === primary);
-    return { active, readable, writable: Boolean(readable && account && account.policy !== 'read_only') };
+    return { active, readable, writable: Boolean(readable && account && account.policy !== 'read_only'),
+      publicSearch: canSearchPublic(account) };
   }
 
   subscribe(listener: (inventory: ConnectorInventory) => void) {
@@ -386,6 +389,47 @@ export class ConnectorRegistry {
 
   release(request: string) { this.turns.delete(request); }
   private readonly turns = new Map<string, { connection: string; repository?: number; privateInventory?: boolean }>();
+
+  async searchPublic(scope: Scope, parent: AbortSignal, host: Pick<OperationHost, 'live' | 'network'>): Promise<RuntimeResult> {
+    const input = githubPublicSearchInput.safeParse(scope.input);
+    if (scope.operation !== githubPublicSearchOperation || !input.success || scope.programId || scope.voiceSessionId)
+      throw new RuntimeError('INVALID_ARGUMENT', 'GitHub public search requires a valid direct query.');
+    const { github, store } = this.enabled;
+    const account = this.account();
+    if (!canSearchPublic(account))
+      throw new RuntimeError('PERMISSION_DENIED', 'Sign in or reconnect GitHub in Settings → Connectors.');
+    const primary = this.host.identity()?.key;
+    const signal = AbortSignal.any([parent, this.epoch(account.id)]);
+    const assertLive = () => {
+      signal.throwIfAborted();
+      const previous = this.turns.get(scope.requestId);
+      if (!primary || this.host.identity()?.key !== primary || !host.live() || store.active() !== account.id ||
+          connectionChanged(account, store.account(account.id)) ||
+          previous && (previous.connection !== account.id || previous.repository || previous.privateInventory))
+        throw changed();
+    };
+    assertLive();
+    this.turns.set(scope.requestId, { connection: account.id });
+    const search = async (forceRefresh = false) => {
+      assertLive();
+      const credentials = await this.credentials(account, signal, forceRefresh);
+      return github.client(account.id).searchPublicRepositories(credentials.accessToken, input.data, signal, () => {
+        assertLive();
+        host.network();
+      });
+    };
+    try {
+      const data = await search().catch((error: unknown) => {
+        if (!(error instanceof GithubError) || error.category !== 'AUTH_REJECTED') throw error;
+        return search(true);
+      });
+      assertLive();
+      return { data };
+    } catch (error) {
+      if (error instanceof GithubError && error.category === 'AUTH_REJECTED') this.revokeLocal(account);
+      throw error;
+    }
+  }
 
   async dispatch(scope: Scope, parent: AbortSignal, host: OperationHost): Promise<RuntimeResult> {
     const operation = githubOperation.parse(scope.operation);

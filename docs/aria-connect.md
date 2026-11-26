@@ -12,6 +12,8 @@ Aria Connect is the desktop integration platform for external apps. GitHub is th
 
 Use **Add account** to authorize a second identity and the account picker to select which identity foreground chat uses. Reconnect requests verify the original GitHub user. A primary change requires renewed repository approval. **Disconnect this device** deletes Aria’s local credentials. **Revoke on GitHub** disconnects this device and opens GitHub’s **Authorized GitHub Apps** settings. Sign in as the named account and revoke Aria Connect there to revoke its GitHub authorization across devices. [GitHub revocation instructions](https://docs.github.com/en/apps/using-github-apps/reviewing-and-revoking-authorization-of-github-apps)
 
+After signing in, ask ordinary chat to find a public GitHub repository by name or `owner/name`. Aria searches through GitHub’s API using the active account’s stored token, even before an App installation or repository review. Results contain public links and repository metadata. To read repository contents, search within a repository, or use write tools, install the App and review repository access first. [GitHub repository search API](https://docs.github.com/en/rest/search/search#search-repositories)
+
 GitHub content enters the selected primary’s context as evidence. Private GitHub-derived replies stay visible in local chat history. Later turns retrieve private evidence through the current authorization. The assistant’s activity and Settings history show repository targets, verified results, and GitHub source links.
 
 ## Maintain the official GitHub App

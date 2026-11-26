@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { githubAccount, type CapabilityHostRequest, type GithubOperation } from '@aria/shared';
+import { githubAccount, githubPublicSearchOperation, type CapabilityHostRequest, type GithubOperation } from '@aria/shared';
 import { ConnectorRegistry } from '../electron/connectors/registry';
 import { ConnectorStore } from '../electron/connectors/store';
 import { GithubAuthorization } from '../electron/connectors/github/authorization';
@@ -41,7 +41,7 @@ const repo = { id: 20, installation: 30, name: 'owner/repo', private: true, desc
 const registered = githubAccount.parse({ id: randomUUID(), userId: 1, login: 'user', avatar: null, connectedAt: 1, verifiedAt: 1,
   state: 'connected', generation: 1, selected: [repo.id], repositories: [repo], policy: 'read_only', grants: [] });
 const signal = () => new AbortController().signal;
-const request = (operation: GithubOperation, input: Record<string, unknown>, requestId = randomUUID()) =>
+const request = (operation: GithubOperation | typeof githubPublicSearchOperation, input: Record<string, unknown>, requestId = randomUUID()) =>
   ({ type: 'runtime', id: randomUUID(), requestId, conversationId: scopeOwner, assistantMessageId: randomUUID(),
     callId: randomUUID(), stepId: randomUUID(), revision: 'initial', operation, input, primary }) satisfies CapabilityHostRequest;
 
@@ -109,6 +109,50 @@ afterEach(() => {
 });
 
 describe('Aria Connect GitHub boundaries', () => {
+  it('uses the signed-in account token for public API search before any repository is approved', async () => {
+    const { registry, store, fetcher } = await fixture({ expired: true });
+    store.update({ ...registered, state: 'needs_repositories', repositories: [], selected: [] });
+    expect(registry.inventory()).toMatchObject({ publicSearch: true, readable: false, writable: false });
+    const original = fetcher.getMockImplementation()!;
+    const search = vi.fn(() => Response.json({ incomplete_results: false, total_count: 2, items: [
+      { full_name: 'manaplatform/mana-agent', private: false, description: 'Example ' + credential,
+        language: 'Python', stargazers_count: 12, html_url: 'https://untrusted.example' },
+      { full_name: 'owner/private-match', private: true, description: 'private match', language: null, stargazers_count: 0 },
+    ] }, { headers: { link: '<https://api.github.com/search/repositories?page=2>; rel="next"' } }));
+    fetcher.mockImplementation(async (url, options) => {
+      const target = new URL(String(url));
+      if (target.pathname !== '/search/repositories') return original(url, options);
+      expect(target.origin).toBe('https://api.github.com');
+      expect(target.searchParams.get('q')).toBe('repo:manaplatform/mana-agent is:public');
+      expect(options?.method).toBe('GET');
+      expect(options?.redirect).toBe('manual');
+      expect(new Headers(options?.headers).get('authorization')).toBe('Bearer ghu_fixture_rotated_token');
+      return search();
+    });
+    const call = request(githubPublicSearchOperation, { query: 'manaplatform/mana-agent' });
+    await expect(registry.searchPublic(call, signal(), operations)).resolves.toEqual({ data: { partial: false,
+      nextPage: undefined, results: [{ name: 'manaplatform/mana-agent', description: 'Example [redacted GitHub credential]',
+        language: 'Python', stars: 12 }] } });
+    await expect(registry.searchPublic({ ...call, input: { query: 'mana-agent is:private' } }, signal(), operations))
+      .rejects.toThrow(/valid direct query/);
+    await expect(registry.dispatch(request('github.read_file', { repository: repo.name, path: 'README.md' }), signal(), operations))
+      .rejects.toThrow(/scope changed/);
+    await registry.command({ action: 'disconnect', id: registered.id });
+    expect(registry.inventory().publicSearch).toBe(false);
+    await expect(registry.searchPublic(call, signal(), operations)).rejects.toThrow(/unavailable/);
+    expect(search).toHaveBeenCalledTimes(1);
+    expect(fetcher.mock.calls.some(([url]) => String(url).includes('/user/installations'))).toBe(false);
+  });
+
+  it('keeps private GitHub evidence out of public repository queries in the same turn', async () => {
+    const { registry, fetcher } = await fixture();
+    const turn = randomUUID();
+    await registry.dispatch(request('github.read_file', { repository: repo.name, path: 'README.md' }, turn), signal(), operations);
+    await expect(registry.searchPublic(request(githubPublicSearchOperation, { query: 'repo' }, turn), signal(), operations))
+      .rejects.toThrow(/scope changed/);
+    expect(fetcher.mock.calls.some(([url]) => String(url).includes('/search/repositories'))).toBe(false);
+  });
+
   it('projects only authorized repositories and cleans credential text from tool results', async () => {
     const { registry, fetcher } = await fixture();
     const result = await registry.dispatch(request('github.read_file', { repository: repo.name, path: 'README.md' }), signal(), operations);

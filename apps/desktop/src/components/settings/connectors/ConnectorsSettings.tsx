@@ -40,6 +40,7 @@ function GithubAccountPanel({ account, busy, submit }: {
           {account.avatar && <img src={account.avatar} alt="" width={44} height={44} referrerPolicy="no-referrer" />}
           <div>
             <strong>{stateLabels[account.state]}</strong>
+            {account.state === 'needs_repositories' && <p>Public repository search is available now. Review repository access to enable repository tools.</p>}
             {account.reconnectReason === 'device_flow' && <p>Reconnect this account using GitHub’s device verification code, then review your repository access.</p>}
             <p>Connected {date(account.connectedAt)} · Verified {date(account.verifiedAt)}</p>
           </div>

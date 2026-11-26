@@ -6,7 +6,7 @@ import path from 'node:path';
 import { createProviderFixture } from '../../../tests/provider-fixture';
 import providers from '../electron/connectors/providers.json';
 import {
-  connectGithubFixture, fixtureGithub, githubFixtureSecrets, installGithubFixture, openConnectors,
+  connectGithubFixture, fixtureGithub, githubFixturePublicSearchCount, githubFixtureSecrets, installGithubFixture, openConnectors,
   verifyGithubFixtureAfterRestart,
 } from './github-connector-fixture';
 
@@ -93,6 +93,63 @@ test('connects GitHub through Settings and discovers a scoped read in normal cha
     app = await launch();
     await installGithubFixture(app, identity, { mockStorage: true, restart: true });
     await verifyGithubFixtureAfterRestart(app, await app.firstWindow());
+  } finally {
+    await app.close();
+    await fixture.close();
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('discovers signed-in GitHub API search in chat without app installations or browser access', async () => {
+  const executablePath = process.env.ARIA_TEST_PACKAGED_APP;
+  test.skip(Boolean(executablePath) && !providers.github, 'Packaged authorization requires the bundled GitHub identity.');
+  const identity = providers.github ?? fixtureGithub;
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'aria-github-public-search-'));
+  const fixture = await createProviderFixture();
+  const prompt = 'Check GitHub for mana-agent';
+  const id = 'github.search_public_repositories';
+  fixture.queueTool(prompt, 'find_capabilities', { query: 'GitHub repository search', namespace: 'github', includeUnavailable: true });
+  fixture.onToolResult(prompt, (result) => {
+    const payload = result as { items?: { id: string; available: boolean }[]; loaded?: unknown;
+      data?: { results?: { name: string }[] }; sources?: { url: string; evidenceStatus: string }[] };
+    if (payload.items?.some((item) => item.id === id && item.available) &&
+        !payload.items.some((item) => item.id !== id && item.available))
+      return { name: 'load_capabilities', input: { ids: [id] } };
+    if (payload.loaded) return { name: 'github_search_public_repositories', input: { query: 'mana-agent' } };
+    if (payload.data?.results?.[0]?.name === 'manaplatform/mana-agent' &&
+        payload.sources?.some((source) => source.url === 'https://github.com/manaplatform/mana-agent' && source.evidenceStatus === 'metadata'))
+      fixture.finalReply(prompt, 'Found [manaplatform/mana-agent](https://github.com/manaplatform/mana-agent) through the GitHub API.');
+    return undefined;
+  });
+  const app = await electron.launch({
+    ...(executablePath && { executablePath }),
+    args: executablePath ? [] : [path.resolve(__dirname, '..')],
+    env: {
+      ...launchEnvironment(), ARIA_TEST_DATA_DIR: directory,
+      OPENAI_API_KEY: 'test-only-key', OPENAI_MODEL: 'fixture-model', OPENAI_BASE_URL: fixture.baseUrl,
+      ...(providers.github ? {} : { ARIA_DEV_GITHUB_CLIENT_ID: identity.clientId, ARIA_DEV_GITHUB_APP_SLUG: identity.slug }),
+    },
+  });
+  try {
+    await installGithubFixture(app, identity, { mockStorage: true, hasInstallation: false });
+    const page = await app.firstWindow();
+    await expect.poll(() => page.evaluate(() => window.aria!.chatStatus()), { timeout: 20000 }).toMatchObject({ state: 'ready' });
+    if (!(await page.evaluate(() => window.aria!.chatStatus())).configured)
+      await page.evaluate(() => window.aria!.importRegistryEnvironment());
+    await page.evaluate(async () => {
+      const policy = await window.aria!.webSettings();
+      delete policy.warning;
+      await window.aria!.saveWebSettings({ ...policy, aiBrowser: false });
+    });
+    await connectGithubFixture(app, page, { reviewRepositories: false });
+    expect(await page.evaluate(() => window.aria!.connectors({ action: 'status' })))
+      .toMatchObject({ accounts: [{ state: 'needs_repositories', repositories: [], selected: [] }] });
+    await page.evaluate(() => { location.hash = '/chat'; });
+    await page.getByRole('textbox', { name: 'Message Aria' }).fill(prompt);
+    await page.getByRole('button', { name: 'Send message' }).click();
+    await expect(page.locator('.from-assistant .markdown').last()).toContainText('through the GitHub API.');
+    expect(await githubFixturePublicSearchCount(app)).toBe(1);
+    for (const secret of githubFixtureSecrets) expect(JSON.stringify(fixture.received)).not.toContain(secret);
   } finally {
     await app.close();
     await fixture.close();

@@ -120,6 +120,28 @@ export type GithubOperation = keyof typeof githubOperations;
 export const githubOperation = z.enum(Object.keys(githubOperations) as [GithubOperation, ...GithubOperation[]]);
 export type GithubArguments<Operation extends GithubOperation> = z.infer<(typeof githubOperations)[Operation]['input']>;
 
+export const githubPublicSearchOperation = 'github.search_public_repositories';
+const publicRepositoryName = githubRepositoryName.refine((name) =>
+  name.split('/').every((part) => part !== '.' && part !== '..'));
+export const githubPublicSearchInput = z.strictObject({
+  query: z.string().trim().min(1).max(160).refine((query) =>
+    publicRepositoryName.safeParse(query).success ||
+    /^[\p{L}\p{M}\p{N}_. -]+$/u.test(query) && /[\p{L}\p{N}]/u.test(query),
+  'Use a repository name, owner/name, or keywords.'),
+  ...page,
+});
+export const githubPublicSearchLimit = 8;
+export const githubPublicSearchResult = z.strictObject({
+  results: z.array(z.strictObject({
+    name: publicRepositoryName,
+    description: z.string().max(500).nullable(),
+    stars: z.number().int().nonnegative().safe(),
+    language: z.string().max(80).nullable(),
+  })).max(githubPublicSearchLimit),
+  nextPage: page.page,
+  partial: z.boolean(),
+});
+
 export const connectorPolicy = z.enum(['read_only', 'ask', 'scoped']);
 export type ConnectorPolicy = z.infer<typeof connectorPolicy>;
 export const githubRepository = z.strictObject({
@@ -173,6 +195,7 @@ export type ConnectorJobGrant = z.infer<typeof connectorJobGrant>;
 
 export const connectorInventory = z.strictObject({
   active: githubAccountId.nullable(), readable: z.boolean(), writable: z.boolean(),
+  publicSearch: z.boolean().optional(),
 });
 export type ConnectorInventory = z.infer<typeof connectorInventory>;
 export const githubResult = z.strictObject({

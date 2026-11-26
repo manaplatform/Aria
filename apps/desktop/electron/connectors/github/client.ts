@@ -1,5 +1,6 @@
 import { setTimeout as delay } from 'node:timers/promises';
-import { githubPermissions, githubRepository, type GithubRepository } from '@aria/shared';
+import { githubPermissions, githubPublicSearchInput, githubPublicSearchLimit, githubPublicSearchResult,
+  githubRepository, type GithubRepository } from '@aria/shared';
 import { z } from 'zod';
 import { downloadPublicBytes } from '../../browser/http-fetch';
 import { RuntimeError } from '../../runtime/store';
@@ -52,6 +53,12 @@ const repoSchema = z.object({
   default_branch: z.string().max(220), permissions: z.object({ push: z.boolean(), admin: z.boolean().optional(), maintain: z.boolean().optional() }).optional(),
 });
 const repositoriesSchema = z.object({ repositories: z.array(repoSchema) });
+const searchPage = z.object({ items: z.array(z.unknown()), incomplete_results: z.boolean() });
+const searchItem = z.object({
+  full_name: githubPublicSearchResult.shape.results.element.shape.name,
+  private: z.literal(false), visibility: z.literal('public').optional(),
+  description: z.string().nullable(), stargazers_count: z.number().int().nonnegative().safe(), language: z.string().nullable(),
+});
 
 function retryAfter(response: Response) {
   const retry = response.headers.get('retry-after');
@@ -205,6 +212,32 @@ export class GithubClient {
       if (url.origin === 'https://avatars.githubusercontent.com' && !url.username && !url.password) avatar = url.origin + url.pathname;
     }
     return { id: parsed.data.id, login: parsed.data.login, avatar };
+  }
+
+  async searchPublicRepositories(token: string, input: z.infer<typeof githubPublicSearchInput>, signal: AbortSignal,
+    onDispatch: () => void) {
+    if (sanitizeGithubText(input.query) !== input.query)
+      throw new GithubError('INVALID_ARGUMENT', 'Search with a repository name or keywords.', 'INVALID_QUERY');
+    const page = input.page ?? 1;
+    const terms = input.query.includes('/') ? 'repo:' + input.query : `"${input.query}" in:name,description`;
+    const query = new URLSearchParams({ q: `${terms} is:public`, page: String(page), per_page: String(githubPublicSearchLimit) });
+    const response = await this.json(token, '/search/repositories?' + query, signal, { onDispatch });
+    const parsed = searchPage.safeParse(response.value);
+    if (!parsed.success)
+      throw new GithubError('INVALID_TOOL_OUTPUT', 'GitHub did not return repository search results.', 'INVALID_PROVIDER_OUTPUT');
+    const results = parsed.data.items.slice(0, githubPublicSearchLimit).flatMap((entry) => {
+      const item = searchItem.safeParse(entry);
+      if (!item.success || sanitizeGithubText(item.data.full_name) !== item.data.full_name) return [];
+      const { full_name, description, stargazers_count, language } = item.data;
+      return [{ name: full_name, description: description && sanitizeGithubText(description).slice(0, 500),
+        stars: stargazers_count, language: language && sanitizeGithubText(language).slice(0, 80) }];
+    });
+    const match = input.query.toLowerCase();
+    const exact = (name: string) => Number(name.toLowerCase().split('/')[1] === match);
+    results.sort((a, b) => exact(b.name) - exact(a.name));
+    const hasNext = results.length === githubPublicSearchLimit && response.next;
+    return githubPublicSearchResult.parse({ results, nextPage: hasNext && page < 100 ? page + 1 : undefined,
+      partial: parsed.data.incomplete_results || hasNext && page === 100 });
   }
 
   async repositories(token: string, slug: string, signal: AbortSignal) {

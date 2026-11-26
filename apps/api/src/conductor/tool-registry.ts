@@ -167,6 +167,7 @@ export interface ToolDescriptor<Input = unknown, Output extends StepValue = Step
   dependency: 'local' | 'browser' | 'delegate';
   hostJournal?: boolean;
   connector?: string;
+  connectorScope?: 'account';
   requiredModelCapabilities: readonly string[];
   timeoutMs: number;
   deferred: boolean;
@@ -1327,9 +1328,16 @@ export class ToolRegistry {
         descriptor.requiredModelCapabilities.every((capability) =>
           model.capabilities.some((actual) => actual === capability)))))
       return 'Configure an eligible delegated model in Settings → AI Models.';
-    if (connector && !context?.proactive && (!this.host.connectors?.readable ||
-        descriptor.effect === 'consequential' && !this.host.connectors.writable))
-      return 'Connect GitHub and review this operation in Settings → Connectors.';
+    if (connector && !context?.proactive) {
+      const state = this.host.connectors;
+      if (descriptor.connectorScope === 'account') {
+        if (!state?.publicSearch) return 'Sign in or reconnect GitHub in Settings → Connectors to use API search.';
+      } else if (!state?.readable || descriptor.effect === 'consequential' && !state.writable) {
+        return state?.publicSearch
+          ? 'GitHub is signed in. Review repository access and operation permissions in Settings → Connectors.'
+          : 'Connect GitHub and review repository access in Settings → Connectors.';
+      }
+    }
     if (context && descriptor.available?.(context) === false)
       return 'This tool requires a compatible, authorized input or backend in this turn.';
   }

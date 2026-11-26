@@ -11,14 +11,14 @@ const rotatedAccess = 'ghu_fake_desktop_rotated_access';
 const rotatedRefresh = 'ghr_fake_desktop_rotated_refresh';
 export const githubFixtureSecrets = [userCode, deviceCode, access, refresh, rotatedAccess, rotatedRefresh];
 
-type FixtureState = { opened: number; refreshes: number; authorized: boolean; allowVerification: boolean };
+type FixtureState = { opened: number; refreshes: number; publicSearches: number; authorized: boolean; allowVerification: boolean };
 type FixtureGlobal = typeof globalThis & { ariaGithubFixture: FixtureState };
 
 export async function installGithubFixture(app: ElectronApplication, identity: GithubConfig,
-  { mockStorage = false, restart = false } = {}) {
+  { mockStorage = false, restart = false, hasInstallation = true } = {}) {
   await app.evaluate(({ dialog, safeStorage, shell }, fixture) => {
     const actualFetch = globalThis.fetch;
-    const state = { opened: 0, refreshes: 0, authorized: false, allowVerification: fixture.restart };
+    const state = { opened: 0, refreshes: 0, publicSearches: 0, authorized: false, allowVerification: fixture.restart };
     (globalThis as FixtureGlobal).ariaGithubFixture = state;
     let validAccess = fixture.restart ? undefined : fixture.access;
     if (fixture.mockStorage) {
@@ -74,9 +74,17 @@ export async function installGithubFixture(app: ElectronApplication, identity: G
           }
           return Response.json({ id: 1, login: 'fixture-user' });
         }
-        if (url.pathname === '/user/installations') return Response.json({ installations: [
+        if (url.pathname === '/user/installations') return Response.json({ installations: fixture.hasInstallation ? [
           { id: 10, app_slug: fixture.identity.slug, permissions: { metadata: 'read', contents: 'write' } },
-        ] });
+        ] : [] });
+        if (url.pathname === '/search/repositories') {
+          if (url.searchParams.get('q') !== '"mana-agent" in:name,description is:public') throw new Error('Unexpected search scope');
+          state.publicSearches++;
+          return Response.json({ incomplete_results: false, items: [{
+            full_name: 'manaplatform/mana-agent', private: false, description: 'Public search fixture.',
+            language: 'Python', stargazers_count: 12,
+          }] });
+        }
         if (url.pathname === '/user/installations/10/repositories') return Response.json({ repositories: [
           { id: 20, full_name: 'example/connector-fixture', private: true, default_branch: 'main', permissions: { push: true } },
         ] });
@@ -88,7 +96,11 @@ export async function installGithubFixture(app: ElectronApplication, identity: G
       }
       return actualFetch(value, options);
     };
-  }, { identity, mockStorage, restart, deviceCode, userCode, access, refresh, rotatedAccess, rotatedRefresh });
+  }, { identity, mockStorage, restart, hasInstallation, deviceCode, userCode, access, refresh, rotatedAccess, rotatedRefresh });
+}
+
+export async function githubFixturePublicSearchCount(app: ElectronApplication) {
+  return app.evaluate(() => (globalThis as FixtureGlobal).ariaGithubFixture.publicSearches);
 }
 
 export async function openConnectors(page: Page) {
@@ -98,7 +110,7 @@ export async function openConnectors(page: Page) {
   await expect(page.getByRole('heading', { name: 'Connectors', exact: true })).toBeVisible();
 }
 
-export async function connectGithubFixture(app: ElectronApplication, page: Page) {
+export async function connectGithubFixture(app: ElectronApplication, page: Page, { reviewRepositories = true } = {}) {
   await openConnectors(page);
   await page.getByRole('button', { name: 'Connect', exact: true }).click();
   const verification = page.getByRole('region', { name: 'GitHub device verification' });
@@ -114,11 +126,12 @@ export async function connectGithubFixture(app: ElectronApplication, page: Page)
   expect(verifying.attempt).toEqual({ id: pending.attempt?.id, phase: 'verifying' });
   await app.evaluate(() => { (globalThis as FixtureGlobal).ariaGithubFixture.allowVerification = true; });
   await expect(page.getByRole('heading', { name: 'fixture-user', exact: true })).toBeVisible({ timeout: 10000 });
+  expect(await app.evaluate(() => (globalThis as FixtureGlobal).ariaGithubFixture.opened)).toBe(1);
+  if (!reviewRepositories) return;
   await page.getByRole('checkbox', { name: /example\/connector-fixture/ }).check();
   await page.getByRole('button', { name: 'Review repository access' }).click();
   await expect.poll(() => page.evaluate(() => window.aria!.connectors({ action: 'status' })))
     .toMatchObject({ accounts: [{ state: 'connected', policy: 'read_only', selected: [20] }] });
-  expect(await app.evaluate(() => (globalThis as FixtureGlobal).ariaGithubFixture.opened)).toBe(1);
 }
 
 export async function verifyGithubFixtureAfterRestart(app: ElectronApplication, page: Page) {
