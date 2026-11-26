@@ -4,10 +4,15 @@ import type {
   ChatEvent,
   ChatServiceStatus,
   DesktopBridge,
+  DiagnosticEvent,
   LiveEvent,
   ProactiveEvent,
   UpdateState,
 } from '@aria/shared';
+
+window.addEventListener('unhandledrejection', () => {
+  void ipcRenderer.invoke('aria:diagnostic-renderer-error').catch(() => undefined);
+});
 
 const bridge: DesktopBridge = {
   platform: process.platform,
@@ -180,6 +185,19 @@ const bridge: DesktopBridge = {
   clearChatHistory: () => ipcRenderer.invoke('aria:clear-chat-history'),
   clearLegacyData: () => ipcRenderer.invoke('aria:clear-legacy-data'),
   exportDiagnostics: () => ipcRenderer.invoke('aria:export-diagnostics'),
+  diagnosticStatus: () => ipcRenderer.invoke('aria:diagnostic-status'),
+  diagnosticConfigure: (config) => ipcRenderer.invoke('aria:diagnostic-configure', config),
+  diagnosticQuery: (filter) => ipcRenderer.invoke('aria:diagnostic-query', filter),
+  diagnosticClear: () => ipcRenderer.invoke('aria:diagnostic-clear'),
+  diagnosticOpenDirectory: () => ipcRenderer.invoke('aria:diagnostic-open'),
+  diagnosticExport: (filter) => ipcRenderer.invoke('aria:diagnostic-export', filter),
+  diagnosticRendererError: () => ipcRenderer.invoke('aria:diagnostic-renderer-error'),
+  onDiagnosticEvents: (callback) => {
+    const listener = (_event: Electron.IpcRendererEvent, events: DiagnosticEvent[]) => callback(events);
+    ipcRenderer.on('aria:diagnostic-events', listener);
+    void ipcRenderer.invoke('aria:diagnostic-subscribe', true);
+    return () => { ipcRenderer.removeListener('aria:diagnostic-events', listener); void ipcRenderer.invoke('aria:diagnostic-subscribe', false); };
+  },
   resetConfiguration: (scope) => ipcRenderer.invoke('aria:reset-configuration', scope),
   aboutInfo: () => ipcRenderer.invoke('aria:about-info'),
   openDevTools: () => ipcRenderer.invoke('aria:open-devtools'),

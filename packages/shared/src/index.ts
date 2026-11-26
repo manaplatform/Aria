@@ -64,6 +64,8 @@ import type {
   UserPersonalization,
 } from './settings.js';
 export * from './settings.js';
+export * from './diagnostics.js';
+import type { DiagnosticConfig, DiagnosticEvent, DiagnosticFilter, DiagnosticPage, DiagnosticStatus } from './diagnostics.js';
 
 export interface HealthResponse {
   status: 'ok';
@@ -562,6 +564,14 @@ export interface DesktopBridge {
   clearChatHistory(): Promise<boolean>;
   clearLegacyData(): Promise<boolean>;
   exportDiagnostics(): Promise<boolean>;
+  diagnosticStatus(): Promise<DiagnosticStatus>;
+  diagnosticConfigure(config: DiagnosticConfig): Promise<DiagnosticStatus>;
+  diagnosticQuery(filter: DiagnosticFilter): Promise<DiagnosticPage>;
+  diagnosticClear(): Promise<void>;
+  diagnosticOpenDirectory(): Promise<void>;
+  diagnosticExport(filter: DiagnosticFilter): Promise<boolean>;
+  diagnosticRendererError(): Promise<void>;
+  onDiagnosticEvents(callback: (events: DiagnosticEvent[]) => void): () => void;
   resetConfiguration(scope: ResetConfigurationScope): Promise<boolean>;
   aboutInfo(): Promise<AboutInfo>;
   openDevTools(): Promise<void>;

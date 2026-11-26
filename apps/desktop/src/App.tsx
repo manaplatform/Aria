@@ -1,4 +1,4 @@
-import { Component, lazy, Suspense, useEffect, type ErrorInfo, type ReactNode } from 'react';
+import { Component, lazy, Suspense, useEffect, type ReactNode } from 'react';
 import { HashRouter, Navigate, Route, Routes } from 'react-router-dom';
 import ChatLayout from './components/layout/ChatLayout';
 import { Button, ErrorState, Skeleton, TooltipProvider } from './components/ui';
@@ -16,8 +16,8 @@ class ErrorBoundary extends Component<{ children: ReactNode }, { error: string |
   static getDerivedStateFromError(error: Error) {
     return { error: error.message };
   }
-  componentDidCatch(error: Error, info: ErrorInfo) {
-    console.error('Aria renderer error', error, info.componentStack);
+  componentDidCatch() {
+    void window.aria?.diagnosticRendererError().catch(() => undefined);
   }
   render() {
     return this.state.error ? (

@@ -98,6 +98,8 @@ export class ConnectorRegistry {
   }
 
   inventory(): ConnectorInventory {
+    // A profile without a runtime database cannot contain connector accounts.
+    if (!this.runtime.exists()) return { active: null, readable: false, writable: false, publicAccess: false };
     const active = this.store?.active() ?? null;
     const account = active ? this.store?.account(active) : undefined;
     const primary = this.host.identity()?.key;

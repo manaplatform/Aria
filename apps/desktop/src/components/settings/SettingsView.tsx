@@ -24,6 +24,7 @@ const pages = {
   privacy: lazy(() => import('./pages/PrivacySettings')),
   shortcuts: lazy(() => import('./pages/ShortcutSettings')),
   advanced: lazy(() => import('./pages/AdvancedSettings')),
+  diagnostics: lazy(() => import('./pages/DiagnosticsSettings')),
   about: lazy(() => import('./pages/AboutSettings')),
 };
 

@@ -9,6 +9,7 @@ import { WebService } from './web/web.service';
 import { AppModule } from './app.module';
 import { CapabilityHost } from './conductor/capability-host';
 import { ModelRegistry } from './providers/model-registry.service';
+import { configureDiagnostics } from './diagnostics/logger';
 
 if (process.env.ARIA_MANAGED !== '1')
   config({ path: process.env.DOTENV_CONFIG_PATH || path.resolve(__dirname, '../../..', '.env') });
@@ -76,6 +77,8 @@ if (require.main === module) {
     parentPort?.postMessage({ type: 'ready', port });
     parentPort?.on('message', (event) => {
       if (event.data === 'shutdown') void app.close().then(() => process.exit(0));
+      else if (event.data && typeof event.data === 'object' && 'type' in event.data &&
+        event.data.type === 'diagnostic-config' && 'config' in event.data) configureDiagnostics(event.data.config);
     });
   })().catch(() => {
     console.error('Aria API could not start.');

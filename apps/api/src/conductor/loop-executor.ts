@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { diagnostic } from '../diagnostics/logger';
 import { z } from 'zod';
 import { Inject, Injectable } from '@nestjs/common';
 import { tool, type ModelMessage, type ToolResultPart } from 'ai';
@@ -107,6 +108,8 @@ export class ConductorLoopExecutor {
     proactive?: ProactiveRequest,
   ) {
     const { requestId } = request;
+    const diagnosticContext = { requestId, conversationId: request.conversationId,
+      correlationId: requestId, operationId: requestId, executionId: request.execution?.executionId, generation: request.execution?.generation };
     for (const [id, expires] of this.recent) if (expires < Date.now()) this.recent.delete(id);
     if (
       this.active.size >= (proactive ? conductorLimits.turns - 1 : conductorLimits.turns) ||
@@ -136,7 +139,13 @@ export class ConductorLoopExecutor {
     if (session) this.sessions.set(requestId, { request, session });
     const signal = session?.signal ?? AbortSignal.any([parent, AbortSignal.timeout(limits.activeMs)]);
     const emit = (event: ConductorEvent) => {
-      if (event.type === 'activity') session?.activity(event.activity);
+      if (event.type === 'activity') {
+        const activity = event.activity;
+        diagnostic(activity.status === 'failed' ? 'error' : 'info', 'conductor', 'tool', `tool.${activity.status}`,
+          { ...diagnosticContext, operationId: activity.stepId, parentOperationId: activity.parentStepId ?? requestId },
+          { capability: activity.capability, status: activity.status, durationMs: activity.durationMs });
+        session?.activity(activity);
+      }
       forward(event);
     };
     let engine: ExecutionEngine | undefined;
@@ -196,6 +205,8 @@ export class ConductorLoopExecutor {
       revision = registry.config.revision;
       primary = registry.primary.ref;
       primaryName = `${registry.primary.connection.name} / ${registry.primary.id}`;
+      diagnostic('info', 'api', 'model', 'model.selected', diagnosticContext,
+        { provider: registry.primary.connection.id, model: registry.primary.id });
       const cap = proactive ? Math.min(proactive.spendingLimit, snapshot.spendingLimitUsdMicros ?? Infinity)
         : snapshot.spendingLimitUsdMicros;
       const spendingLimit = prior?.spendingLimit === undefined ? cap
@@ -425,10 +436,13 @@ export class ConductorLoopExecutor {
       let researchGap = false;
       let reconsidered = false;
       for (let round = 0; round < limits.iterations && budget.remainingRequests > 0; round++) {
+        diagnostic('debug', 'conductor', 'loop', 'loop.iteration', diagnosticContext, { iteration: round });
         await boundary();
         signal.throwIfAborted();
         const progress = () => turn.progress + engine!.progress + nativeEvidence.size + (hosted?.completed ?? 0);
         const before = progress();
+        if (stagnant >= limits.stagnantRounds)
+          diagnostic('warn', 'conductor', 'loop', 'loop.no_progress', diagnosticContext, { iteration: round, count: stagnant });
         const synthesis = stagnant >= limits.stagnantRounds || budget.remainingRequests === 1 ||
           (budget.remainingSteps === 0 && !hosted?.pending);
         native = context.native;
@@ -515,6 +529,10 @@ export class ConductorLoopExecutor {
           toolLimit: 12, limit: 3, locks: [], signal, background: Boolean(proactive),
         });
         const calls: ModelCall[] = [];
+        const modelStarted = Date.now();
+        const modelContext = { ...diagnosticContext, operationId: randomUUID(), parentOperationId: requestId };
+        let firstTokenMs: number | undefined;
+        diagnostic('info', 'api', 'model', 'model.started', modelContext, { iteration: round });
         let response: ReturnType<AiService['generate']>;
         try {
           response = this.ai.generate(
@@ -539,6 +557,10 @@ export class ConductorLoopExecutor {
             signal.throwIfAborted();
             if (part.type === 'error') throw part.error;
             if (part.type === 'text-delta') {
+              if (firstTokenMs === undefined) {
+                firstTokenMs = Date.now() - modelStarted;
+                diagnostic('debug', 'api', 'model', 'model.first_token', modelContext, { firstTokenMs });
+              }
               text += part.text;
               if (text.length > 100_000)
                 throw new RunError('The response exceeded the local text limit.');
@@ -610,8 +632,16 @@ export class ConductorLoopExecutor {
             if (calls.length > conductorLimits.steps)
               throw new ToolError('BUDGET_EXCEEDED', 'The primary returned too many tool calls.');
           }
-          prepared.settle(await response.usage);
+          const usage = await response.usage;
+          prepared.settle(usage);
+          const finish = await response.finishReason;
+          diagnostic('info', 'api', 'model', 'model.completed', modelContext, {
+            durationMs: Date.now() - modelStarted, firstTokenMs,
+            inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, reason: finish,
+          });
         } catch (error) {
+          diagnostic(signal.aborted ? 'info' : 'error', 'api', 'model', signal.aborted ? 'model.cancelled' : 'model.failed',
+            modelContext, { durationMs: Date.now() - modelStarted });
           if (nativeReceipt) await nativeReceipt('uncertain').catch(() => undefined);
           if (!discoveryProblem && protocol.rejected(error))
             throw new ToolError(

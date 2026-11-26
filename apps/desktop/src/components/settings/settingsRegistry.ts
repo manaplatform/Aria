@@ -156,6 +156,7 @@ export const settingsCategories: SettingsCategoryMeta[] = [
     description: 'View and customize keyboard shortcuts and detect conflicting bindings.',
     icon: Keyboard,
   },
+  { id: 'diagnostics', group: 'system', label: 'Developer & Diagnostics', description: 'Logging, live events, and diagnostic exports.', icon: Terminal },
   {
     id: 'advanced',
     group: 'system',
@@ -173,6 +174,7 @@ export const settingsCategories: SettingsCategoryMeta[] = [
 ];
 
 export const settingsSearchIndex: SettingsSearchItem[] = [
+  { id: 'diagnostic-logs', category: 'diagnostics', title: 'Developer and Diagnostics', description: 'View and export local logs.', keywords: ['logs', 'debug', 'trace', 'export'], settingId: 'diagnostics-logs' },
   { id: 'connector-github', category: 'connectors', title: 'GitHub', description: 'Connect a GitHub account and manage repository access and write permissions.', keywords: ['OAuth', 'app', 'sign in', 'disconnect', 'repository'], settingId: 'connector-github' },
   { id: 'gen-name', category: 'general', title: 'Display name', description: 'Your local name shown in the sidebar and conversations.', keywords: ['profile', 'name', 'user'], settingId: 'general-display-name' },
   { id: 'gen-lang', category: 'general', title: 'Application language', description: 'Interface display language.', keywords: ['locale', 'english', 'language'], settingId: 'general-language' },

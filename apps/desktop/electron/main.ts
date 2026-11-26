@@ -20,6 +20,7 @@ import {
   type NativeImage,
 } from 'electron';
 import path from 'node:path';
+import os from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { promises as fs } from 'node:fs';
 import { mkdirSync } from 'node:fs';
@@ -59,7 +60,6 @@ import {
   toolHealthSchema,
   type ChatConversation,
   type ChatMessage,
-  type LogLevel,
   type StorageAreaUsage,
   type UserPersonalization,
   loopCommandSchema,
@@ -82,6 +82,8 @@ import {
   programSettingsSchema,
 } from '@aria/shared';
 import { ChatService } from './chat-service';
+import { Diagnostics } from './diagnostics/service';
+import { diagnosticConfigSchema, diagnosticFilterSchema } from '@aria/shared';
 import { DesktopMemory } from './memory/service';
 import { WorkingContext } from './memory/working-context';
 import { LoopRecovery } from './loop-recovery';
@@ -106,6 +108,9 @@ import {
 } from './project';
 
 app.setName('Aria');
+process.on('uncaughtExceptionMonitor', () => {
+  diagnostics?.log('fatal', 'desktop', 'lifecycle', 'process.uncaught_exception');
+});
 if (process.platform === 'win32' && app.isPackaged)
   app.setAppUserModelId('io.github.manaplatform.aria');
 app.commandLine.appendSwitch('disable-quic');
@@ -158,20 +163,8 @@ const workingContext = new WorkingContext();
 const temporaryConversations = new Set<string>();
 const pendingChatProjects = new Map<string, string | null>();
 let drainingMemory = false;
-const diagnosticEvents: { at: string; level: LogLevel; area: string; message: string }[] = [];
-const logPriority: Record<LogLevel, number> = { error: 0, warn: 1, info: 2 };
-
-function recordDiagnostic(level: LogLevel, area: string, message: string) {
-  const configured = initial?.data?.preferences.logLevel ?? 'info';
-  if (logPriority[level] > logPriority[configured]) return;
-  diagnosticEvents.push({
-    at: new Date().toISOString(),
-    level,
-    area: area.slice(0, 40),
-    message: message.slice(0, 240),
-  });
-  if (diagnosticEvents.length > 200) diagnosticEvents.shift();
-}
+let diagnostics: Diagnostics | undefined;
+let diagnosticSubscribed = false;
 
 function syncTray(enabled: boolean): boolean {
   if (!enabled || !appIcon) {
@@ -216,7 +209,7 @@ function syncTray(enabled: boolean): boolean {
       }
     });
   } catch {
-    recordDiagnostic('warn', 'tray', 'Tray unavailable');
+    diagnostics?.log('warn', 'desktop', 'tray', 'tray.unavailable');
     appTray = null;
     return false;
   }
@@ -522,12 +515,102 @@ async function changeCapabilities(
   }
 }
 
+async function exportDiagnosticReport(filter: import('@aria/shared').DiagnosticFilter): Promise<boolean> {
+  if (!diagnostics || !mainWindow || mainWindow.isDestroyed()) return false;
+  const destination = await dialog.showSaveDialog(mainWindow, {
+    title: 'Export sanitized diagnostics',
+    defaultPath: `aria-diagnostics-${new Date().toISOString().slice(0, 10)}.json`,
+    filters: [{ name: 'JSON', extensions: ['json'] }],
+  });
+  if (destination.canceled || !destination.filePath) return false;
+  const events: import('@aria/shared').DiagnosticEvent[] = [];
+  let cursor = 0;
+  do {
+    const page = await diagnostics.query({ ...filter, cursor, limit: 500 }, false);
+    events.push(...page.events);
+    cursor = page.nextCursor ?? -1;
+  } while (cursor >= 0 && events.length < 20_000);
+  const ids = new Map<string, string>();
+  const pseudonym = (value: string) => {
+    if (!ids.has(value)) ids.set(value, `id-${ids.size + 1}`);
+    return ids.get(value)!;
+  };
+  const config = diagnostics.status().config;
+  const errorSummary: Record<string, number> = {};
+  for (const event of events) if (event.level === 'error' || event.level === 'fatal')
+    errorSummary[event.event] = (errorSummary[event.event] ?? 0) + 1;
+  const [toolSnapshot, memoryStatus] = await Promise.all([
+    toolSettings().catch(() => undefined), memory?.status().catch(() => undefined),
+  ]);
+  const exportedEvents = events.map((entry) => ({ ...entry, context: Object.fromEntries(Object.entries(entry.context)
+    .map(([key, value]) => [key, typeof value === 'string' ? pseudonym(value) : value])) }));
+  const timelines: Record<string, string[]> = {};
+  for (const event of [...exportedEvents].reverse()) {
+    const correlation = event.context.correlationId;
+    if (typeof correlation === 'string') (timelines[correlation] ??= []).push(event.id);
+  }
+  const report = {
+    version: 1, exportedAt: new Date().toISOString(),
+    app: { version: app.getVersion(), electron: process.versions.electron, node: process.versions.node,
+      platform: process.platform, osRelease: os.release(), arch: process.arch, packaged: app.isPackaged },
+    diagnostics: { dropped: diagnostics.status().dropped, truncated: cursor >= 0,
+      config: { level: config.level, debug: config.debug, trace: config.trace,
+        retentionDays: config.retentionDays, maxBytes: config.maxBytes } },
+    errorSummary, timelines,
+    memory: memoryStatus && { state: memoryStatus.state, embedding: memoryStatus.embedding, records: memoryStatus.records, pending: memoryStatus.pending, failures: memoryStatus.failures },
+    tools: toolSnapshot && { available: toolSnapshot.tools.filter((tool) => tool.available).length,
+      total: toolSnapshot.tools.length, enabledSkills: toolSnapshot.skills.filter((skill) => skill.enabled).length },
+    executionHistory: executionRuntime?.history().slice(0, 25).map(({ state, elapsed, exitCode }) => ({ state, elapsed, exitCode })),
+    chatService: chat ? { state: chat.getStatus().state, configured: chat.getStatus().configured } : undefined,
+    events: exportedEvents,
+  };
+  const temporary = `${destination.filePath}.${randomUUID()}.tmp`;
+  try {
+    await fs.writeFile(temporary, JSON.stringify(report, null, 2), { mode: 0o600, flag: 'wx' });
+    await fs.rename(temporary, destination.filePath);
+  } finally { await fs.rm(temporary, { force: true }).catch(() => undefined); }
+  return true;
+}
+
 function registerIpc(): void {
   const handle = (channel: string, fn: (...args: unknown[]) => unknown) =>
-    ipcMain.handle(channel, (event, ...args: unknown[]) => {
+    ipcMain.handle(channel, async (event, ...args: unknown[]) => {
       validateSender(event);
-      return fn(...args);
+      try { return await fn(...args); }
+      catch (error) {
+        if (!channel.startsWith('aria:diagnostic')) diagnostics?.log('warn', 'desktop', 'ipc', 'ipc.failed', {}, { capability: channel }, false, error);
+        throw error;
+      }
     });
+  handle('aria:diagnostic-status', () => {
+    if (!diagnostics) throw new Error('Diagnostics are unavailable.');
+    return diagnostics.status();
+  });
+  handle('aria:diagnostic-configure', async (value) => {
+    if (!diagnostics) throw new Error('Diagnostics are unavailable.');
+    const status = await diagnostics.configure(diagnosticConfigSchema.parse(value));
+    chat?.configureDiagnostics(status.config);
+    return status;
+  });
+  handle('aria:diagnostic-query', (value) => {
+    if (!diagnostics) throw new Error('Diagnostics are unavailable.');
+    return diagnostics.query(diagnosticFilterSchema.parse(value));
+  });
+  handle('aria:diagnostic-subscribe', (value) => { diagnosticSubscribed = z.boolean().parse(value); });
+  handle('aria:diagnostic-renderer-error', () => diagnostics?.log('error', 'renderer', 'application', 'renderer.error'));
+  handle('aria:diagnostic-clear', async () => {
+    if (!diagnostics || !mainWindow || mainWindow.isDestroyed()) throw new Error('Diagnostics are unavailable.');
+    const result = await dialog.showMessageBox(mainWindow, { type: 'warning', message: 'Clear all diagnostic logs?',
+      detail: 'Local diagnostic events will be permanently removed.', buttons: ['Cancel', 'Clear logs'],
+      defaultId: 0, cancelId: 0, noLink: true });
+    if (result.response === 1) await diagnostics.clear();
+  });
+  handle('aria:diagnostic-open', async () => {
+    if (!diagnostics) throw new Error('Diagnostics are unavailable.');
+    const error = await shell.openPath(diagnostics.directory);
+    if (error) throw new Error('The logs directory could not be opened.');
+  });
+  handle('aria:diagnostic-export', (value) => exportDiagnosticReport(diagnosticFilterSchema.parse(value)));
   handle('aria:connectors', (input) => connectors.command(connectorCommand.parse(input)));
   handle('aria:connector-activity', (id) => connectors.history(githubAccountId.parse(id)));
   handle('aria:proactive', async (input) => {
@@ -739,6 +822,7 @@ function registerIpc(): void {
         for (const { id } of previous.chat.conversations)
           if (!retained.has(id)) {
             temporaryConversations.delete(id);
+            diagnostics?.discardTemporary(id);
             pendingChatProjects.delete(id);
             workingContext.clear(id);
             for (const [messageId, message] of activeMessages) if (message.conversationId === id) {
@@ -1629,6 +1713,7 @@ function registerIpc(): void {
         initial = { data: next };
         for (const { id } of previous.chat.conversations) {
           temporaryConversations.delete(id);
+          diagnostics?.discardTemporary(id);
           pendingChatProjects.delete(id);
           workingContext.clear(id);
           executionRuntime.store.deletePrograms(id);
@@ -1669,55 +1754,7 @@ function registerIpc(): void {
       configuring = false;
     }
   });
-  handle('aria:export-diagnostics', async () => {
-    if (!mainWindow || mainWindow.isDestroyed()) return false;
-    const destination = await dialog.showSaveDialog(mainWindow, {
-      title: 'Export redacted diagnostics',
-      defaultPath: `aria-diagnostics-${new Date().toISOString().slice(0, 10)}.json`,
-      filters: [{ name: 'JSON', extensions: ['json'] }],
-    });
-    if (destination.canceled || !destination.filePath) return false;
-    const [memDiag, memStatus, tools] = await Promise.all([
-      memory.diagnosticSnapshot().catch(() => null),
-      Promise.resolve().then(() => memory.status()).catch(() => null),
-      toolSettings().catch(() => null),
-    ]);
-    const report = {
-      exportedAt: new Date().toISOString(),
-      app: {
-        version: app.getVersion(),
-        electron: process.versions.electron,
-        node: process.versions.node,
-        platform: process.platform,
-        arch: process.arch,
-        packaged: app.isPackaged,
-      },
-      chatService: { state: chat.getStatus().state, configured: chat.getStatus().configured },
-      runtimeSettings: {
-        ...executionRuntime.settings(),
-        engineSocketConfigured: Boolean(executionRuntime.settings().engineSocket.trim()),
-        engineSocket: undefined,
-      },
-      tools: tools
-        ? {
-            discovery: tools.discovery,
-            nativeVerified: tools.nativeVerified,
-            availableCount: tools.tools.filter((t) => t.available).length,
-            totalCount: tools.tools.length,
-            enabledSkills: tools.skills.filter((s) => s.enabled).length,
-          }
-        : null,
-      memory: memStatus
-        ? { state: memStatus.state, embedding: memStatus.embedding, records: memStatus.records, diagnostics: memDiag }
-        : null,
-      executionHistory: executionRuntime.history().slice(0, 25).map(({ state, elapsed, exitCode }) => ({ state, elapsed, exitCode })),
-      events: diagnosticEvents,
-    };
-    const temporary = `${destination.filePath}.${randomUUID()}.tmp`;
-    await fs.writeFile(temporary, JSON.stringify(report, null, 2), { mode: 0o600 });
-    await fs.rename(temporary, destination.filePath);
-    return true;
-  });
+  handle('aria:export-diagnostics', () => exportDiagnosticReport({}));
   handle('aria:reset-configuration', async (rawScope) => {
     const scope = resetConfigurationScopeSchema.parse(rawScope);
     chat.assertIdle();
@@ -1848,6 +1885,8 @@ function createWindow(icon: NativeImage | undefined, route?: string): void {
   });
   browser.attach(mainWindow);
   mainWindow.webContents.on('render-process-gone', () => {
+    diagnosticSubscribed = false;
+    diagnostics?.log('error', 'renderer', 'lifecycle', 'renderer.process_gone');
     closeFlushEnabled = false;
     closePending = false;
     browser.resetRenderer();
@@ -1925,6 +1964,12 @@ app
     }
     const directory = process.env.ARIA_TEST_DATA_DIR || app.getPath('userData');
     dataDirectory = directory;
+    diagnostics = new Diagnostics(directory, app.getVersion(), (events) => {
+      if (diagnosticSubscribed && mainWindow && !mainWindow.webContents.isDestroyed())
+        mainWindow.webContents.send('aria:diagnostic-events', events);
+    }, () => diagnosticSubscribed);
+    await diagnostics.initialize();
+    diagnostics.log('info', 'desktop', 'lifecycle', 'startup.started');
     updates = new DesktopUpdates(directory, (state) => {
       if (mainWindow && !mainWindow.webContents.isDestroyed())
         mainWindow.webContents.send('aria:update-state-changed', state);
@@ -1932,6 +1977,7 @@ app
     await updates.load();
     storage = new LocalStorage(directory);
     initial = await storage.load();
+    await diagnostics.initialize(initial.data.preferences.logLevel);
     assets = new MediaStorage(directory);
     protocol.handle('aria-media', async (request) => {
       try {
@@ -1996,6 +2042,15 @@ app
     }, {
       begin: (scope, fingerprint) => capabilities.runtimeStore.beginApproval(scope, fingerprint),
       finish: (id, decision) => capabilities.runtimeStore.finishApproval(id, decision),
+    }, (scope, decision) => {
+      const execution = chat?.executionForTurn(scope.request);
+      if (!execution) return;
+      const temporary = chat.temporaryForTurn(scope.request);
+      if (temporary && !temporaryConversations.has(scope.conversation)) return;
+      diagnostics?.log('info', 'permissions', 'approval', 'permission.decision', {
+        conversationId: scope.conversation, requestId: scope.request, correlationId: scope.request,
+        executionId: execution.executionId, generation: execution.generation, operationId: scope.step,
+      }, { capability: scope.operation, status: decision }, temporary);
     });
     const approve = approvals.approve.bind(approvals);
     loopRecovery = new LoopRecovery(capabilities.runtimeStore, cipher, () => chat.executionIdentity(),
@@ -2050,7 +2105,10 @@ app
         .map(({ id, title, status, dependencies, revision }) => ({
           id, title, status, dependencies: dependencies.slice(0, 8), revision,
         })),
-      () => { workingContext.clear(); proactive?.invalidateMemory(); }, purgeMemoryOutbox, () => chat.executionIdentity());
+      () => { workingContext.clear(); proactive?.invalidateMemory(); }, purgeMemoryOutbox, () => chat.executionIdentity(),
+      (event, detail) => diagnostics?.log(event.includes('failed') || event.includes('timed_out') || event.includes('exited') ? 'error'
+        : event.startsWith('worker.') ? 'info' : 'debug', 'memory', 'worker', `memory.${event}`,
+        {}, { capability: detail?.method, durationMs: detail?.durationMs }));
     void memory.start().then(drainMemoryOutbox);
     const memoryDrainTimer = setInterval(() => void drainMemoryOutbox(), 4000);
     memoryDrainTimer.unref();
@@ -2071,7 +2129,7 @@ app
     }
     webSettings = new WebSettingsStorage(directory);
     await webSettings.load();
-    browser = new BrowserController(directory, () => webSettings.get(), approve);
+    browser = new BrowserController(directory, () => webSettings.get(), approve, () => diagnostics?.log('error', 'browser', 'lifecycle', 'browser.renderer_gone'));
     await browser.load();
     virtualComputer = new VirtualComputer(() => executionRuntime.settings(), directory);
     localComputer = new LocalComputer(executionRuntime.store, () => chat.executionIdentity());
@@ -2172,6 +2230,14 @@ app
           serviceName: 'Aria Chat API',
         }),
       (event) => {
+        const temporary = chat.temporaryForTurn(event.requestId);
+        const retainDiagnostic = !temporary || temporaryConversations.has(event.conversationId);
+        const context = { conversationId: event.conversationId, requestId: event.requestId,
+          correlationId: event.requestId, operationId: event.requestId, executionId: event.executionId, generation: event.generation };
+        if (retainDiagnostic && ['started', 'completed', 'failed', 'stopped'].includes(event.type)) {
+          diagnostics?.log(event.type === 'failed' ? 'error' : 'info', 'chat', 'execution',
+            `chat.${event.type}`, context, {}, temporary);
+        }
         const references = memory.event(event);
         const visible = event.type === 'completed' && 'run' in event ? {
           type: event.type, requestId: event.requestId, conversationId: event.conversationId,
@@ -2191,7 +2257,6 @@ app
         if (visible.type === 'completed') {
           notifyBackground('task', 'Aria finished your response', 'Return to Aria to view the result.');
         } else if (visible.type === 'failed') {
-          recordDiagnostic('error', 'chat', 'Chat response failed');
           notifyBackground('background', 'Aria response failed', 'Return to Aria for details.');
         } else if (visible.type === 'activity' && visible.activity.status === 'approval') {
           notifyBackground('background', 'Aria needs your approval', 'Return to Aria to review the request.');
@@ -2200,7 +2265,7 @@ app
       (status) => {
         proactive?.wake();
         proactive?.changed();
-        recordDiagnostic(status.state === 'failed' ? 'error' : 'info', 'service', `Chat service ${status.state}`);
+        diagnostics?.log(status.state === 'failed' ? 'error' : 'info', 'desktop', 'service', 'service.state_changed', {}, { status: status.state });
         if (mainWindow && !mainWindow.webContents.isDestroyed())
           mainWindow.webContents.send('aria:chat-status-update', status);
       },
@@ -2388,6 +2453,11 @@ app
           ),
       },
     );
+    if (diagnostics) chat.configureDiagnostics(diagnostics.status().config);
+    chat.onDiagnostic = (entry, temporary) => {
+      if (!temporary || entry.context.conversationId && temporaryConversations.has(entry.context.conversationId))
+        diagnostics?.acceptRemote(entry, temporary);
+    };
     media = new MediaService(chat, assets, (event) =>
       mainWindow?.webContents.send('aria:live-event', event),
     );
@@ -2439,6 +2509,8 @@ app
     });
   })
   .catch((error) => {
+    diagnostics?.log('fatal', 'desktop', 'lifecycle', 'startup.failed', {}, {}, false, error);
+    void diagnostics?.flush();
     dialog.showErrorBox('Aria could not start', String(error));
     app.quit();
   });
@@ -2462,6 +2534,12 @@ app.on('before-quit', (event) => {
       .then(() => localComputer.reset())
       .then(() => memory.close())
       .then(() => executionRuntime.close())
+      .then(async () => {
+        diagnostics?.log('info', 'desktop', 'lifecycle', 'shutdown.completed');
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try { await Promise.race([diagnostics?.close(), new Promise<void>((resolve) => { timer = setTimeout(resolve, 2000); })]); }
+        finally { if (timer) clearTimeout(timer); }
+      })
       .then(() => {
         browser.close();
         shutdownComplete = true;

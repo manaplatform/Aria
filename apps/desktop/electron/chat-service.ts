@@ -2,6 +2,9 @@ import { createHash, randomUUID } from 'node:crypto';
 import type { UtilityProcess } from 'electron';
 import {
   conductorLimits,
+  diagnosticEventSchema,
+  type DiagnosticEvent,
+  type DiagnosticConfig,
   proactiveRequestSchema,
   proactiveRunEnvelope,
   type ProactiveRequest,
@@ -62,6 +65,12 @@ interface ActiveRequest {
   emit: (event: ChatEvent) => void;
 }
 export class ChatService {
+  onDiagnostic?: (event: DiagnosticEvent, temporary: boolean) => void;
+  private diagnosticConfig?: DiagnosticConfig;
+  configureDiagnostics(config: DiagnosticConfig) {
+    this.diagnosticConfig = config;
+    try { this.child?.postMessage({ type: 'diagnostic-config', config }); } catch { /* Service may be restarting. */ }
+  }
   private child?: UtilityProcess;
   private browserSession?: BrowserBridgeSession;
   private capabilitySession?: Pick<BrowserBridgeSession, 'port' | 'close'>;
@@ -157,6 +166,18 @@ export class ChatService {
         delete env[key];
       const child = this.launch({ ...env, ARIA_MANAGED: '1', ARIA_INTERNAL_TOKEN: this.token });
       this.child = child;
+      child.on('message', (message: unknown) => {
+        if (generation !== this.generation || !message || typeof message !== 'object' ||
+            !('type' in message) || message.type !== 'diagnostic' || !('entry' in message)) return;
+        const parsed = diagnosticEventSchema.safeParse(message.entry);
+        if (!parsed.success) return;
+        const context = parsed.data.context;
+        const turn = context.requestId && this.requests.get(context.requestId);
+        if (!turn || turn.request.conversationId !== context.conversationId ||
+            turn.request.execution?.executionId !== context.executionId ||
+            turn.request.execution?.generation !== context.generation) return;
+        this.onDiagnostic?.(parsed.data, turn.request.memory?.temporary === true);
+      });
       const native = this.browser?.open((request) => {
         const turn = this.requests.get(request.requestId);
         if (
@@ -228,6 +249,7 @@ export class ChatService {
         return;
       }
       this.url = `http://127.0.0.1:${port}`;
+      if (this.diagnosticConfig) this.configureDiagnostics(this.diagnosticConfig);
       child.once('exit', () => {
         native?.close();
         capabilityPort?.close();
@@ -380,6 +402,7 @@ export class ChatService {
     return turn?.stopped ? undefined : turn?.request.execution;
   }
   proactiveForTurn(id: string) { return this.requests.get(id)?.proactive; }
+  temporaryForTurn(id: string) { return this.requests.get(id)?.request.memory?.temporary === true; }
 
   async runProactive(input: ProactiveRequest, signal: AbortSignal, emit: (event: ChatEvent) => void) {
     const run = proactiveRequestSchema.parse(input);

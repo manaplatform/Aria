@@ -123,6 +123,7 @@ export class BrowserController {
       detail: string,
       signal: AbortSignal,
     ) => Promise<boolean>,
+    private readonly diagnostic: () => void = () => {},
   ) {
     this.storage = new BrowserStateStorage(directory);
   }
@@ -624,6 +625,7 @@ export class BrowserController {
       }
     });
     wc.on('render-process-gone', () => {
+      try { this.diagnostic(); } catch { /* Diagnostics cannot affect browser recovery. */ }
       this.stopPlayback(tab);
       tab.lifetime.abort();
       tab.state.crashed = true;

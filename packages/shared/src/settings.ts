@@ -18,6 +18,7 @@ export const settingsCategoryIds = [
   'privacy',
   'shortcuts',
   'advanced',
+  'diagnostics',
   'about',
 ] as const;
 export const settingsCategorySchema = z.enum(settingsCategoryIds);

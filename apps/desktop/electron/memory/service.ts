@@ -115,8 +115,9 @@ export class DesktopMemory {
     private readonly clearContext: () => void,
     private readonly purgeOutbox: () => Promise<void>,
     private readonly providerIdentity: () => string | undefined = () => undefined,
+    diagnostic?: (event: string, detail?: { method?: string; durationMs?: number }) => void,
   ) {
-    this.client = new MemoryClient(directory);
+    this.client = new MemoryClient(directory, diagnostic);
     this.timer = setInterval(() => void this.tick(), 4000);
     this.timer.unref();
   }
