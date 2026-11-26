@@ -96,7 +96,7 @@ export function occurrence(
     const at = once(trigger);
     return (backwards ? at <= now : at > now) ? { at, key: String(at) } : null;
   }
-  if (trigger.kind === 'interval' || trigger.kind === 'condition') {
+  if (trigger.kind === 'interval' || trigger.kind === 'condition' || trigger.kind === 'github_watch') {
     const interval = trigger.minutes * minute;
     const count = Math.floor((now - trigger.anchor) / interval) + (backwards ? 0 : 1);
     if (backwards && count < 0) return null;

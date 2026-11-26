@@ -10,6 +10,7 @@ import {
   Keyboard,
   Monitor,
   Palette,
+  Plug,
   SlidersHorizontal,
   Sparkles,
   Terminal,
@@ -107,6 +108,13 @@ export const settingsCategories: SettingsCategoryMeta[] = [
     icon: Brain,
   },
   {
+    id: 'connectors',
+    group: 'capabilities',
+    label: 'Connectors',
+    description: 'Connect GitHub and manage accounts, repositories, and permissions.',
+    icon: Plug,
+  },
+  {
     id: 'integrations',
     group: 'capabilities',
     label: 'Tools & Integrations',
@@ -165,6 +173,7 @@ export const settingsCategories: SettingsCategoryMeta[] = [
 ];
 
 export const settingsSearchIndex: SettingsSearchItem[] = [
+  { id: 'connector-github', category: 'connectors', title: 'GitHub', description: 'Connect a GitHub account and manage repository access and write permissions.', keywords: ['OAuth', 'app', 'sign in', 'disconnect', 'repository'], settingId: 'connector-github' },
   { id: 'gen-name', category: 'general', title: 'Display name', description: 'Your local name shown in the sidebar and conversations.', keywords: ['profile', 'name', 'user'], settingId: 'general-display-name' },
   { id: 'gen-lang', category: 'general', title: 'Application language', description: 'Interface display language.', keywords: ['locale', 'english', 'language'], settingId: 'general-language' },
   { id: 'gen-startup', category: 'general', title: 'Startup behavior', description: 'Restore last conversation or open a fresh chat on launch.', keywords: ['launch', 'boot', 'home', 'welcome'], settingId: 'general-startup' },

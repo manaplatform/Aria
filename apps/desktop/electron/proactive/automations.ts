@@ -90,6 +90,12 @@ export class Automations {
       !this.store.one('SELECT 1 FROM agenda_tasks WHERE id=?', draft.trigger.taskId)
     )
       throw new ProactiveError('validation', 'Select an existing Agenda task for this trigger.');
+    if (draft.trigger.kind === 'github_watch') {
+      const operation = draft.trigger.watch === 'release' ? 'github.list_releases' : 'github.list_workflow_runs';
+      if (!draft.scope.connector?.repositories.includes(draft.trigger.repository) ||
+          !draft.scope.connector.operations.includes(operation))
+        throw new ProactiveError('validation', 'Authorize the watched repository and matching GitHub list operation.');
+    }
     const times = preview(draft.trigger, now);
     if (draft.trigger.kind === 'once' && !times.length)
       throw new ProactiveError('validation', 'Choose a future time for the one-time automation.');
@@ -230,6 +236,7 @@ export class Automations {
     if (state === 'deleted') {
       this.store.run("UPDATE automation_definitions SET payload=X'' WHERE id=?", id);
       this.store.run('DELETE FROM automation_triggers WHERE automation=?', id);
+      this.store.run('DELETE FROM connector_watch_baseline WHERE automation=?', id);
     }
     return id;
   }

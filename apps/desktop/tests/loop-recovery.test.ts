@@ -73,7 +73,7 @@ it('reconciles a dispatch across restart, fences old generations and retains bud
     store.db.exec('DROP TABLE loop_checkpoints; PRAGMA user_version = 7');
     store.close();
     expect(await recovery.save(request, signal)).toBe(true);
-    expect(store.db.prepare('PRAGMA user_version').get()?.user_version).toBe(9);
+    expect(store.db.prepare('PRAGMA user_version').get()?.user_version).toBe(10);
     const effect = 'f'.repeat(64);
     expect(
       store.reserveDispatch('conv', 'assistant', 'first', effect, undefined, {

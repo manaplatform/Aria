@@ -8,6 +8,7 @@ import {
   type ProactiveCommand,
   type ProactivePending,
 } from '@aria/shared';
+import { ConnectorScopeSummary } from './ConnectorScopeFields';
 import { Badge, Button, Modal } from '../ui';
 import {
   commandId,
@@ -196,6 +197,10 @@ export function RequestCard({ request, act }: { request: ProactivePending; act: 
           </dd>
           <dt>Memory</dt>
           <dd>{automation.scope.memory ? 'Profile recall with standing consent' : 'Off'}</dd>
+          {automation.scope.connector && <>
+            <dt>GitHub scope</dt>
+            <dd><ConnectorScopeSummary value={automation.scope.connector} /></dd>
+          </>}
           <dt>Run limit</dt>
           <dd>
             ${(automation.maxMicros / 1_000_000).toFixed(3)} · {automation.maxAttempts} attempts ·{' '}

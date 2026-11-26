@@ -11,6 +11,7 @@ export const settingsCategoryIds = [
   'proactive',
   'memory',
   'integrations',
+  'connectors',
   'browser',
   'desktop',
   'storage',

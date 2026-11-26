@@ -408,3 +408,26 @@ export async function fetchPublicPage(
     );
   }
 }
+
+// Follow a single provider-issued download through the same DNS-pinned public transport.
+export async function downloadPublicBytes(destination: string, limit: number, signal: AbortSignal) {
+  const url = publicWebUrl(destination);
+  if (url.protocol !== 'https:') throw new BrowserError('DESTINATION_BLOCKED', 'HTTPS is required.');
+  const response = await getResponse(url, 'GET', signal, () => {});
+  try {
+    if (response.statusCode !== 200 || Number(response.headers['content-length'] ?? 0) > limit)
+      throw new BrowserError('DOWNLOAD_FAILED', 'The remote file is unavailable or exceeds the limit.');
+    let length = 0;
+    const chunks: Buffer[] = [];
+    for await (const chunk of response) {
+      signal.throwIfAborted();
+      const bytes = Buffer.from(chunk as Uint8Array);
+      length += bytes.length;
+      if (length > limit) throw new BrowserError('DOWNLOAD_FAILED', 'The remote file exceeds the limit.');
+      chunks.push(bytes);
+    }
+    return Buffer.concat(chunks, length);
+  } finally {
+    response.destroy();
+  }
+}

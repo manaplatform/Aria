@@ -1,3 +1,4 @@
+import type { ConnectorCommand, ConnectorSnapshot, ConnectorActivity } from './connectors/index.js';
 export * from './proactive.js';
 import type { ProactiveCommand, ProactiveEvent, ProactiveResult } from './proactive.js';
 import type { MemoryDiagnostics, MemoryRecord, MemorySearch, MemorySearchResult, MemorySettings, MemoryStatus, MemoryTurnOptions } from './memory.js';
@@ -442,6 +443,9 @@ export interface UpdateState {
   error?: string;
 }
 export interface DesktopBridge {
+  connectors(input: ConnectorCommand): Promise<ConnectorSnapshot>;
+  connectorActivity(id: string): Promise<ConnectorActivity[]>;
+  onConnectorsChanged(callback: (state: ConnectorSnapshot) => void): () => void;
   proactive(command: ProactiveCommand): Promise<ProactiveResult>;
   onProactiveEvent(callback: (event: ProactiveEvent) => void): () => void;
   platform: string;
@@ -565,3 +569,4 @@ export interface DesktopBridge {
 
 export * from './execution-runtime.js';
 export * from './reply-visual.js';
+export * from './connectors/index.js';

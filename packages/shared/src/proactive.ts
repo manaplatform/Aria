@@ -1,3 +1,4 @@
+import { connectorJobGrant, githubRepositoryId } from './connectors/index.js';
 import { z } from 'zod';
 import { publicWebUrl } from './web.js';
 import type { ConductorActivity } from './conductor.js';
@@ -60,6 +61,7 @@ export const proactiveRequestSchema = z.strictObject({
     publicSearch: z.boolean(),
     publicOrigins: z.array(webOrigin).max(16),
     memory: z.boolean(),
+    connector: connectorJobGrant.optional(),
   }),
   context: z.string().min(1).max(16_000),
   answer: z.string().trim().min(1).max(2000).optional(),
@@ -104,6 +106,10 @@ export const proactiveTriggerSchema = z.discriminatedUnion('kind', [
     anchor: time,
     origin: webOrigin,
     cooldownMinutes: minutes.default(30),
+  }),
+  z.strictObject({
+    kind: z.literal('github_watch'), minutes: minutes.min(5), anchor: time,
+    repository: githubRepositoryId, watch: z.enum(['workflow_failure', 'release']),
   }),
   z.strictObject({
     kind: z.literal('event'),

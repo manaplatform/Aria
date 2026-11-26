@@ -533,7 +533,7 @@ export class ProactiveStore {
     return !!this.one(
       `SELECT 1 FROM dispatch_receipts WHERE conversation = ? AND turn = ?
       AND state IN ('reserved','uncertain') AND (operation IN ('browser.browser_click','browser.browser_type','browser.browser_submit')
-      OR operation IS NULL) LIMIT 1`,
+      OR operation LIKE 'github.%' OR operation IS NULL) LIMIT 1`,
       digest(row.id),
       digest(row.id),
     );
@@ -542,7 +542,7 @@ export class ProactiveStore {
   hasDispatchedAction(row: JobRow) {
     return !!this.one(
       `SELECT 1 FROM dispatch_receipts WHERE conversation=? AND turn=? AND
-       operation IN ('browser.browser_click','browser.browser_type','browser.browser_submit') LIMIT 1`,
+       (operation IN ('browser.browser_click','browser.browser_type','browser.browser_submit') OR operation LIKE 'github.%') LIMIT 1`,
       digest(row.id),
       digest(row.id),
     );

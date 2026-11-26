@@ -149,6 +149,21 @@ async function packageDesktop() {
       resource('virtual-desktop', 'aria-runtime-recipes/virtual-desktop'),
       { from: buildConfig, to: 'aria-update-trust.json' },
     ];
+    const connector = {
+      origin: env.ARIA_CONNECT_ORIGIN,
+      clientId: env.ARIA_CONNECT_GITHUB_CLIENT_ID,
+      slug: env.ARIA_CONNECT_GITHUB_APP_SLUG,
+    };
+    if (Object.values(connector).some(Boolean)) {
+      if (!connector.origin || new URL(connector.origin).origin !== connector.origin ||
+          new URL(connector.origin).protocol !== 'https:' ||
+          !/^[A-Za-z0-9_]{8,120}$/.test(connector.clientId ?? '') ||
+          !/^[a-z0-9-]{1,100}$/.test(connector.slug ?? ''))
+        throw new Error('Aria Connect requires a valid HTTPS broker origin, GitHub client ID, and App slug.');
+      const connectorConfig = path.join(configDirectory, 'aria-connect.json');
+      await writeFile(connectorConfig, JSON.stringify(connector));
+      extraResources.push({ from: connectorConfig, to: 'aria-connect.json' });
+    }
     if (platform !== 'linux') extraResources.push(resource('dist-electron/computer-helpers', 'aria-computer',
       platform === 'windows' ? ['Aria.Computer.exe', 'licenses/**/*'] : ['aria-macos-computer']));
     const config = {

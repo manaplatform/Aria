@@ -47,3 +47,5 @@ Run `pnpm typecheck`, `pnpm lint`, `pnpm test`, `pnpm build`, `pnpm licenses:che
 
 
 Managed proactive jobs use the same executor, scheduler, registry, and receipt fencing with a job-owned scope and durable lease. Their starting message is a system event. See [Proactive Assistant Runtime](proactive-assistant-runtime.md).
+
+Aria Connect registers deferred GitHub tools over the same capability host. Electron main checks the selected connection, provider permissions, approved repository, primary identity, and active scope at dispatch. See [Aria Connect](aria-connect.md).

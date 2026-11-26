@@ -27,6 +27,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { defaultPreferences, LocalStorage, localDataSchema } from './storage';
 import { ProactiveService } from './proactive/service';
+import { ConnectorRegistry } from './connectors/registry';
 import { ProactiveStore } from './proactive/store';
 import { BrowserController } from './browser/controller';
 import { openBrowserBridge } from './browser/bridge';
@@ -36,6 +37,10 @@ import { ProviderStorage } from './provider-storage';
 import {
   browserCommandSchema,
   proactiveOperations,
+  connectorCommand,
+  githubAccountId,
+  githubOperation,
+  githubResult,
   type ProactiveEvent,
   capabilityId,
   defaultWebPolicy,
@@ -145,6 +150,7 @@ let media: MediaService;
 let memory: DesktopMemory;
 let loopRecovery: LoopRecovery;
 let approvals: OperationApproval;
+let connectors: ConnectorRegistry;
 const activeMessages = new Map<string, ChatMessage>();
 const workingContext = new WorkingContext();
 const temporaryConversations = new Set<string>();
@@ -520,6 +526,8 @@ function registerIpc(): void {
       validateSender(event);
       return fn(...args);
     });
+  handle('aria:connectors', (input) => connectors.command(connectorCommand.parse(input)));
+  handle('aria:connector-activity', (id) => connectors.history(githubAccountId.parse(id)));
   handle('aria:proactive', async (input) => {
     const result = await proactive?.handle(input);
     if (result?.kind === 'accepted') syncTray(Boolean(initial.data.preferences.minimizeToTray) || Boolean(proactive?.background()));
@@ -2008,6 +2016,30 @@ app
       cipher,
       () => initial.data.workspaces,
     );
+    const connectorConfig: unknown = app.isPackaged
+      ? await fs.readFile(path.join(process.resourcesPath, 'aria-connect.json'), 'utf8')
+          .then((value) => JSON.parse(value) as unknown).catch(() => undefined)
+      : {
+          origin: process.env.ARIA_CONNECT_ORIGIN,
+          clientId: process.env.ARIA_CONNECT_GITHUB_CLIENT_ID,
+          slug: process.env.ARIA_CONNECT_GITHUB_APP_SLUG,
+        };
+    connectors = new ConnectorRegistry(connectorConfig, executionRuntime.store, cipher, {
+      open: (url) => shell.openExternal(url),
+      identity: () => chat?.runtimeIdentity(),
+      approve: async (message, detail, signal) => Boolean(await approve(message, detail, signal)),
+      changed: () => {
+        if (mainWindow && !mainWindow.webContents.isDestroyed())
+          mainWindow.webContents.send('aria:connectors-changed', connectors.snapshot());
+        proactive?.connectorChanged();
+      },
+      artifact: async (request, bytes, name, signal) => {
+        signal.throwIfAborted();
+        const asset = await assets.put(bytes, path.basename(name), 'application/octet-stream');
+        await executionRuntime.adoptArtifact(asset, request.conversationId, request.requestId, { stepId: request.stepId }, signal);
+        return { id: asset.id, name: asset.name, mimeType: asset.mimeType, size: asset.size, storage: 'desktop' };
+      },
+    });
     memory = new DesktopMemory(directory, executionRuntime.embeddings, () => provider.resolve(),
       (_kind, title, detail, signal) => approve(title, detail, signal),
       (request) => { void chat.cancel(request); }, (id) => {
@@ -2255,6 +2287,7 @@ app
         adoptArtifact: (asset, conversation, request, execution, signal) =>
           executionRuntime.adoptArtifact(asset, conversation, request, execution, signal),
         release: (request) => {
+          connectors.release(request);
           approvals.release(request);
           executionRuntime.release(request);
           computerRuntime.release(request);
@@ -2282,10 +2315,32 @@ app
                   ? media.authorizeCapability(request)
                   : authorize(request);
             },
-            (request, signal) => {
+            (request, signal, progress) => {
               const job = chat.proactiveForTurn(request.requestId);
               const live = job && proactive?.supervisor.live(request.requestId, job.jobId);
               if (job && !live) throw new Error('The background execution is no longer active.');
+              if (githubOperation.safeParse(request.operation).success) {
+                const grant = live && live.prepared.scope.connector;
+                if (job && !grant || !job && savedConversation(request.conversationId)?.temporary)
+                  throw new Error('GitHub is outside the authorized execution scope.');
+                return approvals.within({
+                  conversation: request.conversationId, request: request.requestId, step: request.stepId,
+                  operation: request.operation, binding: [request.revision, request.primary, request.input, grant],
+                }, () => connectors.dispatch(request, signal, {
+                  job: grant || undefined,
+                  approval: () => progress('approval'), network: () => progress('dispatch'),
+                  ...(grant && { approve: (fingerprint: string, message: string) =>
+                    proactive?.approveAction(request, fingerprint, message, signal) ?? Promise.resolve(false) }),
+                  live: () => Boolean(chat.authorizeRuntime(request) &&
+                    (!job || proactive?.supervisor.live(request.requestId, request.conversationId))),
+                })).then(async (result) => {
+                  if (job && result.privateContent) proactive?.markPrivate(job.jobId);
+                  const evidence = githubResult.safeParse(result.data);
+                  if (job && evidence.success && evidence.data.verified)
+                    await proactive?.observeGithub(request, evidence.data);
+                  return result;
+                });
+              }
               if (Object.hasOwn(proactiveOperations, request.operation)) {
                 const conversation = !job && savedConversation(request.conversationId);
                 const instruction = conversation && initial.data.chat.messages.filter((message) =>
@@ -2326,6 +2381,7 @@ app
                 return Promise.resolve(false);
               return loopRecovery.save(request, signal);
             },
+            (listener) => connectors.subscribe(listener),
           ),
       },
     );
@@ -2350,6 +2406,8 @@ app
         if (mainWindow && !mainWindow.webContents.isDestroyed()) mainWindow.webContents.send('aria:proactive-event', event);
       },
       notify: (_category, target) => notifyProactive(target),
+      verifyConnector: (grant, provider) => connectors.verifyJob(grant, provider),
+      connectorValid: (grant, provider) => connectors.jobValid(grant, provider),
       saveMemory: (source, content, observedAt, authorize) => memory.rememberJob(source, content, observedAt, authorize),
       exportArtifact: async (id) => {
         const { asset, bytes } = await assets.get(id);

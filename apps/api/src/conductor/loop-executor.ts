@@ -163,6 +163,7 @@ export class ConductorLoopExecutor {
             billableChildStarted: engine?.billableChildStarted ?? false,
             ...(toolContext?.privateContent && { privateContent: true }),
             ...(toolContext?.memoryPrivate && { memoryContent: true }),
+            ...(toolContext?.connectorPrivate && { connectorContent: true }),
             ...(storedResponses && { storedResponses: true }),
             usage: {
               ...engine?.snapshot(),
@@ -432,7 +433,7 @@ export class ConductorLoopExecutor {
         native = context.native;
         const active = native?.active;
         const nativeComputerActive = context.computer?.mode === 'openai-responses';
-        const nativeTools = synthesis || prior?.pendingProviderWork || context.memoryPrivate || context.temporary ? {} : (native?.tools() ?? {});
+        const nativeTools = synthesis || prior?.pendingProviderWork || context.memoryPrivate || context.connectorPrivate || context.temporary ? {} : (native?.tools() ?? {});
         const computerTools = nativeComputerActive && !synthesis ? nativeComputerTools : {};
         context.hostedProgramsBlocked = nativeComputerActive || Object.keys(nativeTools).length > 0;
         const hostedBindings = turn.programTools('openai-responses');
@@ -722,7 +723,7 @@ export class ConductorLoopExecutor {
             await finish(isPartial ? 'partial' : 'completed');
             emit({
               type: 'completed',
-              ...(!isPartial && context.memoryEnabled && metadata?.candidates?.length && { memoryCandidates: metadata.candidates }),
+              ...(!isPartial && context.memoryEnabled && !context.connectorPrivate && metadata?.candidates?.length && { memoryCandidates: metadata.candidates }),
               ...(memory?.suggestions && metadata?.suggestions?.length && {
                 suggestions: [...new Set(metadata.suggestions)].slice(0, 3),
               }),

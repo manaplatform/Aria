@@ -16,6 +16,7 @@ const pages = {
   proactive: lazy(() => import('./pages/ProactiveAssistantSettings')),
   conductor: lazy(() => import('./pages/ConductorSettings')),
   memory: lazy(() => import('./pages/MemorySettings')),
+  connectors: lazy(() => import('./connectors/ConnectorsSettings')),
   integrations: lazy(() => import('./pages/IntegrationSettings')),
   browser: lazy(() => import('./pages/BrowserSettings')),
   desktop: lazy(() => import('./pages/DesktopSettings')),

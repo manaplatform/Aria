@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { connectorInventory } from './connectors/index.js';
 import {
   openAIRuntimeFeatureSchema,
   runtimeCallSchema,
@@ -226,6 +227,11 @@ export const capabilityHostRequest = z.discriminatedUnion('type', [
     offset: z.number().int().min(0).max(1_048_576),
   }),
 ]);
+export const capabilityHostEvent = z.discriminatedUnion('event', [
+  z.strictObject({ event: z.literal('connectors'), inventory: connectorInventory }),
+  z.strictObject({ event: z.literal('approval'), id: z.uuid() }),
+  z.strictObject({ event: z.literal('dispatch'), id: z.uuid() }),
+]);
 export const capabilityHostReply = z.discriminatedUnion('ok', [
   z.strictObject({
     id: z.string().uuid(),
@@ -253,6 +259,8 @@ export const capabilityHostReply = z.discriminatedUnion('ok', [
     ok: z.literal(false),
     code: toolProblemSchema.shape.code,
     message: z.string().max(400).optional(),
+    category: z.string().max(40).optional(),
+    retryAfterMs: z.number().nonnegative().optional(),
   }),
 ]);
 export type CapabilityHostRequest = z.infer<typeof capabilityHostRequest>;

@@ -10,6 +10,7 @@ export const assetSchema = z
     name: z.string().min(1).max(255),
     mimeType: z.enum([
       'text/plain',
+      'application/octet-stream',
       ...documentMimeTypes,
       'image/png',
       'image/jpeg',
@@ -66,7 +67,7 @@ export class MediaStorage {
     const mimeType =
       expected === 'text/plain'
         ? this.textType(bytes)
-        : (documentMime(name, bytes) ?? identifyMedia(bytes));
+        : expected === 'application/octet-stream' ? expected : (documentMime(name, bytes) ?? identifyMedia(bytes));
     if (expected && expected !== mimeType)
       throw new Error('The provider returned an unexpected media format.');
     const asset = assetSchema.parse({

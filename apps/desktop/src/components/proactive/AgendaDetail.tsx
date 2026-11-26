@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import type { ProactiveJobState } from '@aria/shared';
 import { Badge, Button, Modal, ProgressBar } from '../ui';
+import { ConnectorScopeFields, connectorScopeFromForm } from './ConnectorScopeFields';
 import { ObjectiveForm, RequestCard, TaskForm } from './AgendaPage';
 import {
   commandId,
@@ -30,6 +31,7 @@ export default function AgendaDetail() {
   const { id = '' } = useParams();
   const view = useProactive({ action: 'detail', id });
   const snapshot = useProactive({ action: 'snapshot' });
+  const [scopeError, setScopeError] = useState('');
   const [editing, setEditing] = useState<'record' | 'run' | null>(null);
   const { task, objective, job, history, attempts, activity, artifacts } = view.result ?? {};
   const data = snapshot.result?.value;
@@ -329,6 +331,10 @@ export default function AgendaDetail() {
             onSubmit={(event) => {
               event.preventDefault();
               const fields = new FormData(event.currentTarget);
+              setScopeError('');
+              let connector;
+              try { connector = connectorScopeFromForm(fields); }
+              catch { setScopeError('Select GitHub repositories and operations for this task.'); return; }
               const origins = String(fields.get('origins') || '')
                 .split(/\s+/)
                 .filter(Boolean);
@@ -342,6 +348,7 @@ export default function AgendaDetail() {
                     publicSearch: fields.has('search'),
                     publicOrigins: origins,
                     memory: fields.has('memory'),
+                    connector,
                   },
                 })
                 .then((response) => response && setEditing(null));
@@ -358,7 +365,8 @@ export default function AgendaDetail() {
               <input name="memory" type="checkbox" /> Allow profile memory recall with standing
               consent
             </label>
-            {error && <p role="alert">{error}</p>}
+            <ConnectorScopeFields />
+            {(error || scopeError) && <p role="alert">{error || scopeError}</p>}
             <Button type="submit" variant="primary">
               Authorize and queue
             </Button>

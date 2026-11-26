@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import {
   defaultProactiveLimits,
+  type ConnectorJobGrant,
   type MediaAsset,
   type ConductorActivity,
   type ChatEvent,
@@ -17,9 +18,10 @@ type Live = {
   claim: Claim;
   controller: AbortController;
   prepared: Prepared;
-  stop?: 'paused' | 'cancelled' | 'interrupted' | 'waiting_user' | 'waiting_approval';
+  stop?: 'blocked' | 'paused' | 'cancelled' | 'interrupted' | 'waiting_user' | 'waiting_approval';
   activities: Map<string, Extract<ChatEvent, { type: 'activity' }>['activity']>;
   observations: Map<string, string>;
+  githubWatch?: string;
   privateContent?: boolean;
 };
 type Outcome = {
@@ -30,6 +32,7 @@ type Outcome = {
   due?: number;
   artifacts: MediaAsset[];
   activity: ConductorActivity[];
+  githubWatch?: string;
 };
 
 export class ProactiveSupervisor {
@@ -235,6 +238,13 @@ export class ProactiveSupervisor {
     live.controller.abort();
   }
 
+  fenceConnectors(invalid: (job: JobRow, grant: ConnectorJobGrant) => boolean) {
+    for (const live of this.active.values()) {
+      const grant = live.prepared.scope.connector;
+      if (grant && invalid(live.claim.job, grant)) this.stop(live.claim.job.id, 'blocked');
+    }
+  }
+
   suspend() {
     this.suspended = true;
     clearTimeout(this.timer);
@@ -339,7 +349,8 @@ export class ProactiveSupervisor {
       reason = 'The browser accepted an action before the run could verify its outcome.';
     } else if (live.stop) {
       state = live.stop;
-      reason = state === 'interrupted' ? 'Execution stopped at a recoverable boundary.' : undefined;
+      reason = state === 'interrupted' ? 'Execution stopped at a recoverable boundary.' :
+        state === 'blocked' ? 'GitHub access changed. Reconnect and review the repository scope.' : undefined;
     } else if (terminal?.type === 'completed') {
       state = 'partial' in terminal && terminal.partial ? 'blocked' : 'completed';
       if ('partial' in terminal && terminal.partial)
@@ -393,6 +404,7 @@ export class ProactiveSupervisor {
         due,
         artifacts: [...artifacts.values()],
         activity: [...live.activities.values()],
+        githubWatch: live.githubWatch,
       });
     } catch {
       this.store.atomic(() =>

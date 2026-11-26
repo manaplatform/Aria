@@ -128,6 +128,13 @@ const bridge: DesktopBridge = {
     ipcRenderer.on('aria:live-event', listener);
     return () => ipcRenderer.removeListener('aria:live-event', listener);
   },
+  connectors: (input) => ipcRenderer.invoke('aria:connectors', input),
+  connectorActivity: (id) => ipcRenderer.invoke('aria:connector-activity', id),
+  onConnectorsChanged: (callback) => {
+    const listener: Parameters<typeof ipcRenderer.on>[1] = (_event, state) => callback(state);
+    ipcRenderer.on('aria:connectors-changed', listener);
+    return () => ipcRenderer.removeListener('aria:connectors-changed', listener);
+  },
   memoryStatus: () => ipcRenderer.invoke('aria:memory-status'),
   memoryDiagnostics: () => ipcRenderer.invoke('aria:memory-diagnostics'),
   saveMemorySettings: (settings, allowAutoRecall) =>

@@ -10,6 +10,7 @@ import {
   type AutomationDraft,
   type BrowserRequest,
   type CapabilityHostRequest,
+  type githubResult,
   type ProactiveCommand,
   type ProactiveEvent,
   type ProactiveOperation,
@@ -43,6 +44,7 @@ type PendingRow = {
 };
 type PendingPayload = {
   message: string;
+  review?: string;
   automation?: AutomationDraft;
   fingerprint?: string;
   receipt?: string;
@@ -178,6 +180,16 @@ export class ProactiveService {
         .map(async (row) => (await this.store.open<PendingPayload>(row.payload)).message),
     );
     if (!scope) throw new ProactiveError('permission', 'Renew this responsibility’s permissions.');
+    if (scope.connector) {
+      try {
+        if (!this.host.connectorValid?.(scope.connector, provider))
+          throw new ProactiveError('permission', 'GitHub access changed. Reconnect and review the repository scope.');
+        await this.host.verifyConnector?.(scope.connector, provider);
+      } catch (error) {
+        if (!this.host.connectorValid?.(scope.connector, provider)) this.blockConnectorJob(job);
+        throw error;
+      }
+    }
     let context: unknown;
     let limits = defaultProactiveLimits;
     let spendingLimit = 150_000;
@@ -194,6 +206,12 @@ export class ProactiveService {
       const draft = await this.automations.draft(row);
       context = {
         action: draft.action,
+        githubWatch: draft.trigger.kind === 'github_watch' ? {
+          repository: draft.trigger.repository,
+          operation: draft.trigger.watch === 'release' ? 'github.list_releases' : 'github.list_workflow_runs',
+          arguments: draft.trigger.watch === 'release' ? { page: 1 } : { page: 1, status: 'failure' },
+          instruction: 'Call the designated GitHub read for the exact monitored repository to establish a verified observation.',
+        } : undefined,
         instruction: draft.instruction,
         condition:
           draft.trigger.kind === 'condition'
@@ -354,8 +372,12 @@ export class ProactiveService {
     this.supervisor.stop(active.claim.job.id, 'waiting_user');
   }
 
-  async approveBrowser(
-    request: BrowserRequest,
+  approveBrowser(request: BrowserRequest, fingerprint: string, message: string, signal: AbortSignal) {
+    return this.approveAction({ ...request, operation: request.op }, fingerprint, message, signal);
+  }
+
+  async approveAction(
+    request: { requestId: string; conversationId: string; stepId: string; operation: string },
     fingerprint: string,
     message: string,
     signal: AbortSignal,
@@ -389,12 +411,13 @@ export class ProactiveService {
         conversation: job.id,
         request: request.requestId,
         step: request.stepId,
-        operation: request.op,
+        operation: request.operation,
       },
       fingerprint,
     );
     const payload = await this.store.seal({
-      message: message.slice(0, 8200),
+      message: message.slice(0, 3000),
+      review: request.operation.startsWith('github.') ? message : message.slice(0, 8200),
       fingerprint,
       receipt,
     });
@@ -407,6 +430,29 @@ export class ProactiveService {
     );
     this.supervisor.stop(job.id, 'waiting_approval');
     return false;
+  }
+
+  private blockConnectorJob(job: JobRow) {
+    if (job.kind === 'automation' && job.owner) {
+      this.store.run("UPDATE automation_definitions SET state='paused',updated=? WHERE id=? AND state='enabled'",
+        this.store.now(), job.owner);
+      this.store.run('UPDATE automation_triggers SET next_due=NULL WHERE automation=?', job.owner);
+    }
+    if (job.kind === 'agenda' && job.owner)
+      this.store.run("UPDATE agenda_tasks SET state='blocked',revision=revision+1,updated=? WHERE id=? AND state IN ('ready','in_progress')",
+        this.store.now(), job.owner);
+    this.notifications.add('GitHub connection needs review', job, job.id + ':github-review');
+  }
+
+  connectorChanged() {
+    const provider = this.host.identity()?.provider;
+    if (!provider) return;
+    this.supervisor.fenceConnectors((job, grant) => {
+      if (this.host.connectorValid?.(grant, provider)) return false;
+      this.blockConnectorJob(job);
+      return true;
+    });
+    this.wake();
   }
 
   authorizeBrowser(request: BrowserRequest) {
@@ -508,6 +554,10 @@ export class ProactiveService {
         outcome.state = 'blocked';
         outcome.reason = 'The task has unresolved subtasks or dependencies.';
       }
+      if (outcome.state === 'completed' && draft?.trigger.kind === 'github_watch' && outcome.githubWatch === undefined) {
+        outcome.state = 'blocked';
+        outcome.reason = 'The run produced no verified GitHub observation for the watched repository.';
+      }
       if (outcome.state === 'completed' && draft?.trigger.kind === 'condition' && !row.condition) {
         outcome.state = 'blocked';
         outcome.reason = 'The run produced no verified condition for the authorized target.';
@@ -557,6 +607,16 @@ export class ProactiveService {
           );
           if (notify) this.notifications.add('Condition changed', row, row.id + ':condition');
         }
+      } else if (outcome.state === 'completed' && draft?.trigger.kind === 'github_watch' && row.owner && automation &&
+          outcome.githubWatch !== undefined) {
+        const current = this.store.one<{ evidence: string }>(
+          'SELECT evidence FROM connector_watch_baseline WHERE automation=? AND revision=?',
+          row.owner, automation.revision);
+        if (current && current.evidence !== outcome.githubWatch && outcome.githubWatch !== 'none' && draft.notifications !== 'none')
+          this.notifications.add(draft.trigger.watch === 'release' ? 'New GitHub release' : 'GitHub workflow failed',
+            row, row.owner + ':github:' + automation.revision + ':' + outcome.githubWatch);
+        this.store.run('INSERT OR REPLACE INTO connector_watch_baseline VALUES (?,?,?)',
+          row.owner, automation.revision, outcome.githubWatch);
       } else if (
         outcome.state === 'completed' &&
         row.kind !== 'pulse' &&
@@ -654,7 +714,7 @@ export class ProactiveService {
               revision: row.revision,
               created: row.created,
               updated: row.updated,
-              message: data.message,
+              message: data.review ?? data.message,
               automation: data.automation,
             };
           }),
@@ -833,6 +893,8 @@ export class ProactiveService {
         return () => this.agenda.completeOrCancel(command.id, command.revision, command.state);
       case 'task_run': {
         const provider = this.identity().provider;
+        if (command.scope.connector && !this.host.connectorValid?.(command.scope.connector, provider))
+          throw new ProactiveError('permission', 'Review an available GitHub connection and repositories.');
         const payload = await this.store.seal(command.scope);
         return () => {
           const task = this.agenda.taskRow(command.id);
@@ -889,10 +951,11 @@ export class ProactiveService {
         return () => this.agenda.finishObjective(command.id, command.revision, command.state);
       case 'automation_create':
       case 'automation_update': {
-        const prepared = await this.automations.prepare(
-          command.automation,
-          this.identity().provider,
-        );
+        const provider = this.identity().provider;
+        const grant = command.automation.scope.connector;
+        if (grant && !this.host.connectorValid?.(grant, provider))
+          throw new ProactiveError('permission', 'Review an available GitHub connection and repositories.');
+        const prepared = await this.automations.prepare(command.automation, provider);
         return () =>
           this.automations.save(
             command.automation,
@@ -1014,6 +1077,9 @@ export class ProactiveService {
         'permission',
         'The configured primary changed. Request a new review.',
       );
+    const connector = data.automation?.scope.connector;
+    if (connector && command.decision === 'approve' && !this.host.connectorValid?.(connector, this.identity().provider))
+      throw new ProactiveError('permission', 'Review an available GitHub connection and repositories.');
     const config =
       data.automation && command.decision === 'approve'
         ? await this.automations.prepare(data.automation, this.identity().provider)
@@ -1522,6 +1588,22 @@ export class ProactiveService {
         waiting.action === 'request_clarification' ? 'waiting_user' : 'waiting_approval',
       );
     return result;
+  }
+
+  async observeGithub(request: RuntimeCall, result: ReturnType<typeof githubResult.parse>) {
+    const live = this.supervisor.live(request.requestId, request.conversationId);
+    const job = live?.claim.job;
+    const owner = job?.kind === 'automation' && job.owner ? this.automations.row(job.owner) : undefined;
+    if (!result.verified || !live || !job || !owner || owner.revision !== job.owner_revision ||
+        request.input.page !== undefined && request.input.page !== 1 || !result.observation) return;
+    const { trigger } = await this.automations.draft(owner);
+    if (this.supervisor.live(request.requestId, request.conversationId) !== live ||
+        trigger.kind !== 'github_watch' || trigger.repository !== result.repositoryId ||
+        live.prepared.scope.connector?.connection !== result.connection) return;
+    const release = trigger.watch === 'release';
+    if (request.operation !== (release ? 'github.list_releases' : 'github.list_workflow_runs') ||
+        !release && (request.input.status !== 'failure' || request.input.workflowId !== undefined)) return;
+    live.githubWatch = result.observation;
   }
 
   observations(request: BrowserRequest, result: { url?: string; ok: boolean }) {

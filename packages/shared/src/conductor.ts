@@ -27,6 +27,8 @@ export function selectChatContext(
     const privateContent = Boolean(
       assistant.run?.privateContent || assistant.activity?.some((step) => step.privateContent),
     );
+    if (assistant.run?.connectorContent ||
+        assistant.activity?.some((step) => step.privateContent && step.capability.startsWith('github.'))) continue;
     if (privateContent && revision !== undefined && assistant.run?.revision !== revision) continue;
     pairs.push({ user, assistant, privateContent });
   }
@@ -154,7 +156,7 @@ export const sourceSchema = z
     publishedAt: z.iso.datetime().optional(),
     retrievedAt: z.iso.datetime().optional(),
     contentType: z.string().max(100).optional(),
-    provenance: z.enum(['hosted', 'publisher', 'browser', 'search']).optional(),
+    provenance: z.enum(['hosted', 'publisher', 'browser', 'search', 'connector']).optional(),
     producerStepId: stepId.optional(),
     evidenceStatus: z.enum(['discovered', 'inspected', 'partial', 'metadata']).optional(),
     excerpt: z.string().max(500).optional(),
@@ -219,6 +221,7 @@ export const runInfoSchema = z
     billableChildStarted: z.boolean(),
     privateContent: z.boolean().optional(),
     memoryContent: z.boolean().optional(),
+    connectorContent: z.boolean().optional(),
     storedResponses: z.boolean().optional(),
     usage: z.strictObject({
       providerRequests: z.number().int().nonnegative(),

@@ -128,6 +128,10 @@ function check(release) {
     path.join(root, 'THIRD_PARTY_NOTICES.md'),
     path.join(destination, 'THIRD_PARTY_NOTICES.md'),
   );
+  fs.copyFileSync(
+    path.join(root, 'third-party/octicons-LICENSE'),
+    path.join(destination, 'LICENSE.octicons'),
+  );
   fs.writeFileSync(
     path.join(destination, 'packages.txt'),
     packages
@@ -158,6 +162,7 @@ function check(release) {
     'package.json',
     'apps/desktop/package.json',
     'apps/api/package.json',
+    'apps/connector-auth-broker/package.json',
     'packages/shared/package.json',
   ];
   const hasLicense = fs.existsSync(path.join(root, 'LICENSE'));

@@ -1,4 +1,4 @@
-import type { MemoryJobSource, ChatEvent, ProactiveEvent, ProactiveRequest } from '@aria/shared';
+import type { ConnectorJobGrant, MemoryJobSource, ChatEvent, ProactiveEvent, ProactiveRequest } from '@aria/shared';
 
 export interface ProactiveHost {
   identity(): { provider: string; revision: string } | undefined;
@@ -17,5 +17,7 @@ export interface ProactiveHost {
   ): Promise<unknown>;
   removeArtifact?(id: string): Promise<void>;
   exportArtifact?(id: string): Promise<boolean>;
+  verifyConnector?(grant: ConnectorJobGrant, provider: string): Promise<void>;
+  connectorValid?(grant: ConnectorJobGrant, provider: string): boolean;
   closeJob?(id: string): void;
 }

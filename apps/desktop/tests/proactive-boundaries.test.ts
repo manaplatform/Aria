@@ -17,7 +17,7 @@ const origin = 'https://example.com';
 const scope = { publicSearch: false, publicOrigins: [origin], memory: false };
 const primary = { connectionId: 'fixture', model: 'fixture', endpoint: 'https://provider.example' };
 
-async function setup(run: ProactiveHost['run']) {
+async function setup(run: ProactiveHost['run'], connectorValid?: ProactiveHost['connectorValid']) {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'aria-proactive-boundary-'));
   const runtime = new RuntimeStore(directory);
   const store = new ProactiveStore(runtime, {
@@ -28,6 +28,7 @@ async function setup(run: ProactiveHost['run']) {
   const service = new ProactiveService(store, {
     identity: () => ({ provider: 'primary', revision: 'policy' }),
     run,
+    connectorValid,
     changed: () => undefined,
     notify: () => true,
   });
@@ -218,4 +219,58 @@ it('fences a suspended worker and resumes safe work under the next generation', 
     expect(store.job(id)).toMatchObject({ state: 'completed', generation: 2 }),
   );
   expect(store.attempts(id).map(({ state }) => state)).toEqual(['completed', 'interrupted']);
+});
+
+it('establishes a verified GitHub watch baseline and parks a revoked connection', async () => {
+  const grant = { connection: randomUUID(), generation: 1, repositories: [21],
+    operations: ['github.list_workflow_runs' as const] };
+  const observations = ['none', '501/1', '501/1'];
+  let valid = true;
+  let dispatched = 0;
+  const fixture = await setup(async (run, _signal, emit) => {
+    expect(run.scope.connector).toEqual(grant);
+    const call = {
+      type: 'runtime', operation: 'github.list_workflow_runs', revision: 'policy', id: randomUUID(),
+      requestId: run.attemptId, conversationId: run.jobId, assistantMessageId: run.jobId,
+      stepId: randomUUID(), callId: randomUUID(), primary, input: { repository: 21, page: 1, status: 'failure' },
+    } as const;
+    const result = {
+      connection: grant.connection, account: 'fixture', repositoryId: 21,
+      observation: observations[dispatched++], verified: true,
+    };
+    await fixture.service.observeGithub(call, { ...result, repositoryId: 99 });
+    await fixture.service.observeGithub(call, result);
+    emit({ ...call, sequence: 1, type: 'completed' });
+  }, (scope) => valid && scope.connection === grant.connection);
+  const { service, store } = fixture;
+  expect((await service.handle({
+    action: 'settings', commandId: randomUUID(), revision: 1,
+    value: { ...defaultProactiveSettings, dailyOutputTokens: 65536 },
+  })).kind).toBe('accepted');
+  const automation = automationDraftSchema.parse({
+    title: 'Watch GitHub CI', instruction: 'Check failed GitHub runs.', action: 'Check the authorized repository.',
+    trigger: { kind: 'github_watch', watch: 'workflow_failure', repository: 21, anchor: Date.now(), minutes: 10 },
+    scope: { ...scope, connector: grant },
+  });
+  const stored = await service.handle({ action: 'automation_create', commandId: randomUUID(), automation });
+  expect(stored.kind).toBe('accepted');
+  const id = stored.kind === 'accepted' ? stored.id! : '';
+  const run = async (expected: 'completed' | 'blocked') => {
+    const queued = await service.handle({
+      action: 'automation_control', commandId: randomUUID(), id, revision: 1, control: 'run_now',
+    });
+    expect(queued.kind).toBe('accepted');
+    const job = queued.kind === 'accepted' ? queued.id! : '';
+    await vi.waitFor(() => expect(store.job(job)?.state).toBe(expected));
+  };
+  service.start();
+  for (const observation of observations) {
+    await run('completed');
+    expect(store.one('SELECT evidence FROM connector_watch_baseline WHERE automation=?', id)?.evidence).toBe(observation);
+  }
+  expect((await service.notifications.list(0)).filter((row) => row.category === 'GitHub workflow failed')).toHaveLength(1);
+  valid = false;
+  await run('blocked');
+  expect(service.automations.row(id)?.state).toBe('paused');
+  expect(dispatched).toBe(3);
 });

@@ -331,6 +331,8 @@ export class ExecutionEngine {
                 ? 'Artifact created'
                 : this.unverified.has(id)
                   ? 'Action sent. Outcome awaits verification.'
+                : descriptor.connector === 'github' && outcome.data?.verified === true
+                  ? 'GitHub result verified'
                 : outcome.sources?.length
                   ? `${outcome.sources.length} verified source references`
                   : 'Result received'
@@ -573,7 +575,7 @@ export class ExecutionEngine {
       }
       if (descriptor.artifacts) settleArtifact = this.context.budget.artifact();
       if (descriptor.effect === 'billable' || this.context.execution && descriptor.effect === 'consequential' && !descriptor.repeatable &&
-        !(this.context.proactive && descriptor.dependency === 'browser')) {
+        !descriptor.hostJournal && !(this.context.proactive && descriptor.dependency === 'browser')) {
         const revision = this.tools.host.current.revision;
         await this.tools.host.request(
           {
@@ -620,7 +622,7 @@ export class ExecutionEngine {
       } catch (error) {
         if (timeout.aborted)
           throw new ToolError(
-            reserved || descriptor.effect === 'consequential' ? 'OUTCOME_UNCERTAIN' : 'TIMEOUT',
+            reserved || descriptor.effect === 'consequential' && (!descriptor.hostJournal || networkStarted) ? 'OUTCOME_UNCERTAIN' : 'TIMEOUT',
             reserved
               ? 'The provider timed out after dispatch. The outcome is uncertain.'
               : 'The tool timed out.',
@@ -701,6 +703,8 @@ export class ExecutionEngine {
       }
       const target = result.data?.tabId ?? result.data?.sessionId ?? step.args?.sessionId;
       if (typeof result.data?.phase === 'string') phase = result.data.phase.slice(0, 40);
+      if (descriptor.connector === 'github' && typeof result.data?.repository === 'string')
+        operationTarget = result.data.repository.slice(0, 253);
       if (!operationTarget && typeof result.data?.url === 'string') {
         try { operationTarget = new URL(result.data.url).hostname.slice(0, 253); } catch { /* No public target. */ }
       }
@@ -734,7 +738,7 @@ export class ExecutionEngine {
     } catch (error) {
       const stopped = parent.aborted;
       const code = stopped
-        ? launched && (reserved || descriptor.effect === 'consequential' ||
+        ? launched && (reserved || descriptor.effect === 'consequential' && (!descriptor.hostJournal || networkStarted) ||
           descriptor.program?.retry === 'never') ? 'OUTCOME_UNCERTAIN' : 'CANCELLED'
         : error instanceof ToolError
           ? error.code

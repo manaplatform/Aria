@@ -51,3 +51,5 @@ IPC exposes validated commands and sequenced change events through the existing 
 
 Run `pnpm typecheck`, `pnpm lint`, `pnpm test`, `pnpm build`, `pnpm test:electron`, and `pnpm licenses:check`. Desktop tests use isolated SQLite profiles, controlled clocks, and a local deterministic HTTPS provider for priced background execution. Run the built suite on Apple Silicon and Windows before packaging. Verify native notifications, login, shutdown, suspend, and resume on each supported OS. Standalone API and Live Voice continue to use their existing execution entry points.
 
+
+Aria Connect can add reviewed GitHub account, repository, and operation scopes to Agenda runs and Automations. Connector writes wait for a one-use action approval and remain subject to the shared dispatch journal. Use GitHub watches for new published releases or failed workflow runs. See [Aria Connect](aria-connect.md).

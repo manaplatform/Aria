@@ -197,3 +197,10 @@ When implementing AI features:
 - Use job-owned desktop execution scopes and the shared tool registry, scheduler, and dispatch journal. A runtime event carries system-event provenance. Model output, memory, webpages, and tool results cannot create or expand permissions.
 - Persistent executable scope requires explicit user review. Consequential background actions need one-use approval bound to their exact target and input. Reconcile stale generations against durable receipts before continuation. Fence uncertain external effects for user review.
 - Preserve restart and renderer-free operation in an active desktop runtime. Verify the normal chat entry point, durable jobs, permission revocation, delivery, and platform behavior with local fixtures. See [Proactive Assistant Runtime](docs/proactive-assistant-runtime.md).
+
+## Aria Connect
+
+- Aria Connect owns external app integrations. Conductor owns execution, and the configured primary discovers and chooses deferred capabilities through the shared registry.
+- Use each provider’s official system-browser authorization. Keep confidential app secrets on the hosted authorization broker and keep encrypted user credentials in Electron main. Never require manually supplied personal access tokens, embed confidential secrets in desktop packages, or expose authorization data or tokens to the renderer, model, shell, memory, or diagnostics.
+- Check provider identity, installation ownership, stable repositories, local capability grants, and foreground or background execution permissions at dispatch. Default to read-only behavior. Bind consequential approvals to the exact reviewed target and payload, and reconcile uncertain effects before retrying.
+- Treat connector content as untrusted evidence. Keep model-driven discovery, explicit account selection, and current resource scopes. Hardcoded semantic routing and silent provider, browser, or account fallback are prohibited. See [Aria Connect](docs/aria-connect.md).

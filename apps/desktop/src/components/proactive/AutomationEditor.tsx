@@ -4,9 +4,11 @@ import {
   automationDraftSchema,
   proactiveTriggerSchema,
   type AutomationDraft,
+  type ConnectorJobGrant,
   type ProactiveTrigger,
 } from '@aria/shared';
 import { Button } from '../ui';
+import { ConnectorScopeFields, ConnectorScopeSummary, connectorScopeFromForm } from './ConnectorScopeFields';
 import { dateLabel, localZone } from './runtime';
 
 const kinds = [
@@ -17,6 +19,7 @@ const kinds = [
   'monthly',
   'cron',
   'condition',
+  'github_watch',
   'event',
   'task_event',
   'manual',
@@ -55,9 +58,10 @@ export default function AutomationEditor({
     const origin = get('origin').trim();
     const trigger: Record<string, unknown> = { kind };
     if (kind === 'once') Object.assign(trigger, { at, zone });
-    if (kind === 'interval' || kind === 'condition') Object.assign(trigger, { anchor, minutes });
+    if (kind === 'interval' || kind === 'condition' || kind === 'github_watch') Object.assign(trigger, { anchor, minutes });
     if (kind === 'condition')
       Object.assign(trigger, { origin, cooldownMinutes: Number(get('cooldown')) });
+    if (kind === 'github_watch') Object.assign(trigger, { repository: Number(get('watchRepository')), watch: get('githubWatch') });
     if (calendar) {
       Object.assign(trigger, { zone, followSystem });
       if (kind === 'cron') trigger.expression = get('cron');
@@ -70,6 +74,9 @@ export default function AutomationEditor({
     const parsedTrigger = proactiveTriggerSchema.safeParse(trigger);
     const origins = get('origins').split(/\s+/).filter(Boolean);
     const expiration = get('expiration');
+    let connector: ConnectorJobGrant | undefined;
+    try { connector = connectorScopeFromForm(form); }
+    catch { setError('Select GitHub repositories and operations for this automation.'); return; }
     const parsed =
       parsedTrigger.success &&
       automationDraftSchema.safeParse({
@@ -80,6 +87,7 @@ export default function AutomationEditor({
         scope: {
           publicSearch: form.has('search'),
           memory: form.has('memory'),
+          connector,
           publicOrigins: [
             ...new Set(origin && kind === 'condition' ? [...origins, origin] : origins),
           ],
@@ -137,6 +145,7 @@ export default function AutomationEditor({
             ))}
           </ul>
         )}
+        {checked.scope.connector && <ConnectorScopeSummary value={checked.scope.connector} />}
         <div className="proactive-controls">
           <Button onClick={() => setChecked(undefined)}>Back</Button>
           <Button variant="primary" onClick={() => void save(checked)}>
@@ -250,13 +259,13 @@ export default function AutomationEditor({
           />
         </label>
       )}
-      {(kind === 'interval' || kind === 'condition') && (
+      {(kind === 'interval' || kind === 'condition' || kind === 'github_watch') && (
         <label>
           Interval in minutes
           <input
             type="number"
             name="minutes"
-            min={1}
+            min={kind === 'github_watch' ? 5 : 1}
             defaultValue={previous && 'minutes' in previous ? previous.minutes : 30}
             required
           />
@@ -446,6 +455,18 @@ export default function AutomationEditor({
         <input name="memory" type="checkbox" defaultChecked={draft?.scope.memory} /> Allow profile
         memory recall with standing consent
       </label>
+      {kind === 'github_watch' && (
+        <>
+          <label>GitHub event
+            <select name="githubWatch" defaultValue={previous?.kind === 'github_watch' ? previous.watch : 'workflow_failure'}>
+              <option value="workflow_failure">Workflow failure</option>
+              <option value="release">Published release</option>
+            </select>
+          </label>
+        </>
+      )}
+      <ConnectorScopeFields value={draft?.scope.connector}
+        watchedRepository={kind === 'github_watch' ? previous?.kind === 'github_watch' ? previous.repository : null : undefined} />
       {error && <p role="alert">{error}</p>}
       <Button type="submit" variant="primary">
         Preview and review

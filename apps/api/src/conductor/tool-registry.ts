@@ -41,6 +41,7 @@ import { MediaService } from '../media/media.service';
 import { ModelRegistry, type ResolvedModel } from '../providers/model-registry.service';
 import { OpenAIRuntime, nativeFeatureName } from '../providers/openai-runtime';
 import type { ResearchRun } from '../web/web.service';
+import { registerConnectorTools } from './connectors/github';
 import { evaluateCalculation } from './calc';
 import { CapabilityHost, ToolError } from './capability-host';
 import { RunError, type RunAttachment, type RunFile } from './run-assets';
@@ -116,6 +117,7 @@ export interface ToolContext {
   privateContent: boolean;
   memoryEnabled?: boolean;
   memoryPrivate?: boolean;
+  connectorPrivate?: boolean;
   memoryBlocked?: boolean;
   temporary?: boolean;
   budget: TurnBudget;
@@ -163,6 +165,8 @@ export interface ToolDescriptor<Input = unknown, Output extends StepValue = Step
   effect: ToolEffect;
   permission: string;
   dependency: 'local' | 'browser' | 'delegate';
+  hostJournal?: boolean;
+  connector?: string;
   requiredModelCapabilities: readonly string[];
   timeoutMs: number;
   deferred: boolean;
@@ -543,6 +547,7 @@ export class ToolRegistry {
     @Inject(ModelRegistry) private readonly models: ModelRegistry,
     @Inject(CapabilityHost) readonly host: CapabilityHost,
   ) {
+    registerConnectorTools(this);
     this.register({
       ...base,
       id: 'programs.run',
@@ -1272,6 +1277,10 @@ export class ToolRegistry {
     const proactiveOperation = Object.hasOwn(proactiveOperations, descriptor.id);
     if (proactiveOperation && (!policy.desktopRuntime || context && !context.runtime))
       return 'Available through the managed desktop runtime.';
+    const connector = descriptor.connector;
+    if (context?.connectorPrivate && !connector &&
+        !['calc.evaluate', 'files.create_text_artifact', 'automation.report_condition'].includes(descriptor.id))
+      return 'Private GitHub evidence is scoped to the approved primary and repository.';
     if (context?.proactive) {
       const scope = context.proactive.scope;
       const operations = descriptor.id.startsWith('web.') || descriptor.id.startsWith('browser.');
@@ -1279,7 +1288,7 @@ export class ToolRegistry {
         (descriptor.id !== 'web.web_search' || scope.publicSearch) &&
         !['browser.browser_media', 'browser.browser_screenshot', 'browser.browser_switch_tab'].includes(descriptor.id);
       const memoryRead = scope.memory && ['memory.search', 'memory.read'].includes(descriptor.id);
-      if (!publicRead && !memoryRead && !proactiveOperation &&
+      if (!publicRead && !memoryRead && !proactiveOperation && !connector &&
         !['calc.evaluate', 'files.create_text_artifact'].includes(descriptor.id))
         return 'Outside the authorized background capability scope.';
     }
@@ -1318,6 +1327,9 @@ export class ToolRegistry {
         descriptor.requiredModelCapabilities.every((capability) =>
           model.capabilities.some((actual) => actual === capability)))))
       return 'Configure an eligible delegated model in Settings → AI Models.';
+    if (connector && !context?.proactive && (!this.host.connectors?.readable ||
+        descriptor.effect === 'consequential' && !this.host.connectors.writable))
+      return 'Connect GitHub and review this operation in Settings → Connectors.';
     if (context && descriptor.available?.(context) === false)
       return 'This tool requires a compatible, authorized input or backend in this turn.';
   }
