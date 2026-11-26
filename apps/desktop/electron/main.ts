@@ -28,6 +28,7 @@ import { z } from 'zod';
 import { defaultPreferences, LocalStorage, localDataSchema } from './storage';
 import { ProactiveService } from './proactive/service';
 import { ConnectorRegistry } from './connectors/registry';
+import { githubProviderConfig } from './connectors/provider-config';
 import { ProactiveStore } from './proactive/store';
 import { BrowserController } from './browser/controller';
 import { openBrowserBridge } from './browser/bridge';
@@ -1913,6 +1914,7 @@ app
     const icon = image.isEmpty() ? undefined : image;
     appIcon = icon;
     if (icon) app.dock?.setIcon(icon);
+    const connectorConfig = githubProviderConfig(app.isPackaged, process.env);
     if (!app.isPackaged) {
       try {
         process.loadEnvFile(path.resolve(__dirname, '../../..', '.env'));
@@ -2016,13 +2018,6 @@ app
       cipher,
       () => initial.data.workspaces,
     );
-    const connectorConfig: unknown = app.isPackaged
-      ? await fs.readFile(path.join(process.resourcesPath, 'aria-connect.json'), 'utf8')
-          .then((value) => JSON.parse(value) as unknown).catch(() => undefined)
-      : {
-          clientId: process.env.ARIA_CONNECT_GITHUB_CLIENT_ID,
-          slug: process.env.ARIA_CONNECT_GITHUB_APP_SLUG,
-        };
     connectors = new ConnectorRegistry(connectorConfig, executionRuntime.store, cipher, {
       open: (url) => shell.openExternal(url),
       copy: (code) => clipboard.writeText(code),

@@ -1,6 +1,6 @@
 # Aria Connect
 
-Aria Connect is the desktop integration platform for external apps. GitHub is the first provider. The configured primary discovers GitHub tools through Conductor in ordinary saved chats and reviewed Agenda and Automation runs. Connecting requires the system browser and an available OS-backed credential store.
+Aria Connect is the desktop integration platform for external apps. GitHub is the first provider. The configured primary discovers GitHub tools through Conductor in ordinary saved chats and reviewed Agenda and Automation runs. Select **Connect** to sign in through your system browser. Aria uses the OS credential store to keep you connected between launches. On Linux, use a supported desktop keyring.
 
 ## Connecting GitHub
 
@@ -14,13 +14,13 @@ Use **Add account** to authorize a second identity and the account picker to sel
 
 GitHub content enters the selected primary’s context as evidence. Private GitHub-derived replies stay visible in local chat history. Later turns retrieve private evidence through the current authorization. The assistant’s activity and Settings history show repository targets, verified results, and GitHub source links.
 
-## Register a GitHub App
+## Maintain the official GitHub App
 
-Create an App owned by the Aria maintainer organization. Use **Aria Connect** as the production name if available and [the Aria repository](https://github.com/manaplatform/Aria) as its homepage. Use a separate development App and a disposable repository for live tests.
+Confirm the official registration in the `manaplatform` organization before creating another App. If registration is needed, use **Aria Connect** as the production name if available and [the Aria repository](https://github.com/manaplatform/Aria) as its homepage. Use a separate development App and a disposable repository for maintainer experiments.
 
 | GitHub App setting | Value |
 | --- | --- |
-| Installations | Personal and organization accounts on GitHub.com |
+| Installations | Public, so users can install it on personal and organization accounts on GitHub.com |
 | Repository selection | Choose specific repositories in GitHub’s installer |
 | User-to-server token expiration | Enabled |
 | Request user authorization during installation | Disabled. Aria starts Device Flow separately. |
@@ -30,20 +30,13 @@ Create an App owned by the Aria maintainer organization. Use **Aria Connect** as
 | Optional repository permissions | Workflows write for explicitly approved workflow-file changes |
 | Account, organization, or enterprise permissions | Leave unset |
 
-Record the App’s **client ID** and **slug**. These public settings are the complete desktop configuration for Device Flow. The user access token acts within the intersection of the authenticated GitHub user and installed App permissions. Organization owners govern installation scope, SSO, and branch rules. The application uses GitHub.com APIs and does not need an App private key. [Register a GitHub App](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/registering-a-github-app) · [Choosing permissions](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/choosing-permissions-for-a-github-app) · [GitHub App user access tokens](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-user-access-token-for-a-github-app)
+Record the App’s public **client ID** and **slug** as `github.clientId` and `github.slug` in the [connector manifest](../apps/desktop/electron/connectors/providers.json). This manifest is bundled into Electron main for both development and packaged Aria. The user access token acts within the permissions of the authenticated GitHub user and the installed App. Organization owners govern installation scope, SSO, and branch rules. [Register a GitHub App](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/registering-a-github-app) · [Choosing permissions](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/choosing-permissions-for-a-github-app)
 
-## Configure Aria
+If the official registration cannot be confirmed, leave the manifest entry `null`. Aria reports a build configuration issue in Settings, and publication fails. Production release preparation checks the public identity and owner at the selected commit and verifies that GitHub accepts Device Flow. Native builds must also pass connector smoke tests before they qualify for publication. Publish from a commit that contains the verified registration and the passing checks.
 
-Set these public GitHub Actions variables for packaging or provide them in the local desktop launch environment.
+Users need no `.env`, App registration, personal access token, client secret, or authorization broker. For a separate App, maintainers can set `ARIA_DEV_GITHUB_CLIENT_ID` and `ARIA_DEV_GITHUB_APP_SLUG` together in the launch environment of `pnpm dev:desktop`. An incomplete or invalid pair disables GitHub for that launch. Packaged builds ignore these overrides. Device Flow uses GitHub’s own endpoints. [Enable Device Flow](https://docs.github.com/en/apps/maintaining-github-apps/modifying-a-github-app-registration#enabling-or-disabling-the-device-flow)
 
-| Public configuration | Value |
-| --- | --- |
-| `ARIA_CONNECT_GITHUB_CLIENT_ID` | GitHub App client ID |
-| `ARIA_CONNECT_GITHUB_APP_SLUG` | Slug from the App’s GitHub URL |
-
-Packaged Aria reads these values from its bundled resource. Local development reads the same variables from the launch environment. Builds without both values show GitHub as unavailable. Device Flow uses GitHub’s own endpoints and requires no hosted service, callback URL, client secret, or private key. [Enable Device Flow](https://docs.github.com/en/apps/maintaining-github-apps/modifying-a-github-app-registration#enabling-or-disabling-the-device-flow)
-
-### Authorization and recovery
+## Authorization and recovery
 
 Electron main requests a device code and displays the short user verification code in trusted Settings. It opens GitHub’s fixed verification URL and polls at GitHub’s interval until the user authorizes, declines, cancels locally, or the code expires. Closing Aria discards an unfinished attempt. Existing connections persist across restart. Aria refreshes expiring device-issued tokens directly with GitHub and saves the replacement pair atomically. If GitHub rotated a token but the replacement could not be saved, a later definitive rejection asks the user to reconnect. [GitHub device authorization](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-user-access-token-for-a-github-app#using-the-device-flow-to-generate-a-user-access-token) · [GitHub token refresh](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/refreshing-user-access-tokens)
 
@@ -59,12 +52,14 @@ Runtime SQLite v11 discards legacy browser-code credentials and keeps account re
 
 ## Verification
 
-Run the repository’s `pnpm typecheck`, `pnpm lint`, `pnpm test`, `pnpm build`, `pnpm test:electron`, and `pnpm licenses:check`. The desktop suite uses deterministic GitHub fixtures. The built Electron connector test exercises Settings, the browser handoff, repository review, ordinary chat discovery, and token redaction.
+Run the repository’s `pnpm typecheck`, `pnpm lint`, `pnpm test`, `pnpm build`, `pnpm test:electron`, `pnpm release:test`, and `pnpm licenses:check`. The Electron fixture covers Settings, the browser handoff, repository review, ordinary chat discovery, token redaction, and refresh after restart. The release matrix exercises the bundled identity and OS credential store with deterministic GitHub responses on macOS, Windows, and Linux.
 
-For live verification, install the development App on a disposable repository and set `ARIA_TEST_GITHUB_REPOSITORY=owner/repository`. Launch the explicit opt-in test with the two public configuration values and `ARIA_RUN_LIVE_GITHUB_CONNECT=1`. When verifying an installed desktop package, set `ARIA_TEST_PACKAGED_APP` to that executable. Enter the temporary code from Aria Settings in the default browser when it opens.
+For live release acceptance, install the official App on a disposable repository. Use a checkout without a local `.env` and leave both development override variables unset. Test with `pnpm dev:desktop` and with the installed macOS DMG, Windows EXE, and Linux packages. Authorize in the browser, approve the disposable repository for your configured primary model, ask ordinary chat to read its README, then restart and repeat the read. Record the real GitHub results separately from fixture results.
+
+For an interactive browser verification through the Playwright harness, set `ARIA_RUN_LIVE_GITHUB_CONNECT=1` and `ARIA_TEST_GITHUB_REPOSITORY=owner/repository`. Set `ARIA_TEST_PACKAGED_APP` to the installed executable to use it instead of the local build. Enter the temporary code from Aria Settings in the default browser when it opens.
 
 ```sh
-pnpm --filter @aria/desktop exec playwright test connectors.electron.ts --grep 'live development GitHub App'
+pnpm --filter @aria/desktop exec playwright test connectors.electron.ts --grep 'live GitHub App'
 ```
 
-Repeat on the supported macOS, Windows, and Linux targets with their normal credential stores. Reopen Aria with the same profile to verify credential reuse. Verify GitHub organization approval, selected repository enforcement, and one disposable mutation in staging before production enablement.
+Verify GitHub organization approval, selected repository enforcement, and one disposable mutation in staging before production enablement.

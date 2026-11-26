@@ -10,8 +10,13 @@ import { SettingsSection } from '../components';
 import { SettingsPage } from '../SettingsPage';
 
 const stateLabels = {
-  connected: 'Connected', needs_repositories: 'Repository access needed',
+  connected: 'Connected', needs_repositories: 'Select repositories',
   reconnect: 'Reconnect required', offline: 'Temporarily unavailable',
+};
+const attemptLabels = {
+  starting: 'Starting GitHub authorization',
+  waiting: 'Waiting for GitHub authorization',
+  verifying: 'Verifying GitHub account',
 };
 const policyLabels = { read_only: 'Read only', ask: 'Ask before writing', scoped: 'Scoped authorization' };
 const writeGrants = (Object.entries(githubOperations) as [GithubOperation, typeof githubOperations[GithubOperation]][])
@@ -140,7 +145,7 @@ export default function ConnectorsSettings() {
     setBusy(true);
     void desktop().connectors(command).then((value) => {
       setState(value);
-      if (command.action === 'connect' || command.action === 'switch') setManage(true);
+      if (command.action === 'connect' || command.action === 'reconnect' || command.action === 'switch') setManage(true);
     }, (failure: unknown) => setError(errorMessage(failure))).finally(() => setBusy(false));
   };
   const account = state?.accounts.find((account) => account.id === state.active);
@@ -154,7 +159,7 @@ export default function ConnectorsSettings() {
             <h3>{githubConnector.name}</h3>
             <p>{githubConnector.description}</p>
             <span role="status">
-              {attempt ? attempt.verification ? 'Waiting for GitHub authorization' : 'Preparing or verifying GitHub authorization' :
+              {attempt ? attemptLabels[attempt.phase] :
                 account ? stateLabels[account.state] : state?.available ? 'Available to connect' :
                   !state && window.aria?.connectors ? 'Loading GitHub status' : 'Unavailable in this build'}
             </span>
@@ -164,12 +169,14 @@ export default function ConnectorsSettings() {
               <>
                 <Button variant="primary" onClick={() => submit({ action: 'connect' })}
                   disabled={busy || !state?.available}>{state?.accounts.length ? 'Add account' : 'Connect'}</Button>
-                {!!state?.accounts.length && <Button onClick={() => setManage(!manage)} aria-expanded={manage}>Manage</Button>}
+                {!!state?.accounts.length && <Button onClick={() => setManage(!manage)} aria-expanded={manage}>
+                  {account?.state === 'needs_repositories' && !manage ? 'Select repositories' : 'Manage'}
+                </Button>}
               </>
             )}
           </div>
         </div>
-        {attempt?.verification && (
+        {attempt?.phase === 'waiting' && (
           <div className="aria-connector-device" role="region" aria-label="GitHub device verification">
             <p>Enter this code at github.com/login/device in your browser. Use only the code shown here. Never authorize a code someone else sent you.</p>
             <div className="aria-connector-actions">
@@ -180,7 +187,9 @@ export default function ConnectorsSettings() {
             <small>Code expires at {new Intl.DateTimeFormat(undefined, { timeStyle: 'short' }).format(attempt.verification.expiresAt)}.</small>
           </div>
         )}
-        {(error || state?.error) && <p role="alert">{error || state?.error}</p>}
+        {(error || state?.error || state?.available === false) && <p role="alert">
+          {error || state?.error || 'This build is missing a valid GitHub App registration. Contact Aria support.'}
+        </p>}
         {manage && !!state?.accounts.length && (
           <SettingsSection title="Connected accounts">
             <label className="aria-connector-select">

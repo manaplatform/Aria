@@ -7,6 +7,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
 import { applicationVersion, inspectFile, platformAssets, readJson, windowsCertificateName } from './generate-metadata.mjs';
+import { githubIdentityDigest, githubManifestPath, readGithubIdentity } from './github-connector.mjs';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const desktop = path.join(root, 'apps', 'desktop');
@@ -14,12 +15,15 @@ const require = createRequire(path.join(desktop, 'package.json'));
 const { _electron } = require('playwright');
 const { expect } = require('@playwright/test');
 const { createProviderFixture } = await import('../../tests/provider-fixture.ts');
+const { connectGithubFixture, installGithubFixture, openConnectors, verifyGithubFixtureAfterRestart } =
+  await import('../../apps/desktop/tests/github-connector-fixture.ts');
 const platform = { win32: 'windows', darwin: 'macos', linux: 'linux' }[process.platform];
 const arch = process.arch;
 const version = applicationVersion(await readJson(path.join(root, 'package.json')));
 const [input, destination, mode] = process.argv.slice(2);
 const artifacts = path.resolve(input);
 const production = mode === 'publish';
+const githubConnector = await readGithubIdentity(path.join(root, githubManifestPath), production);
 const target = platformAssets(version, platform, arch);
 const asset = (format) => path.join(artifacts, target.find((item) => item.format === format).filename);
 
@@ -38,6 +42,7 @@ async function smoke(executable, userData, fixture, verifyPersistence = false, e
     cwd: path.dirname(executable),
     env: {
       ...process.env, ELECTRON_RUN_AS_NODE: undefined, VITE_DEV_SERVER_URL: undefined,
+      ARIA_DEV_GITHUB_CLIENT_ID: undefined, ARIA_DEV_GITHUB_APP_SLUG: undefined,
       ARIA_TEST_DATA_DIR: userData, OPENAI_API_KEY: verifyPersistence ? undefined : 'release-smoke-test',
       OPENAI_MODEL: verifyPersistence ? undefined : 'fixture-model',
       OPENAI_BASE_URL: verifyPersistence ? undefined : fixture.baseUrl,
@@ -46,6 +51,7 @@ async function smoke(executable, userData, fixture, verifyPersistence = false, e
     },
   });
   try {
+    if (githubConnector) await installGithubFixture(session, githubConnector, { restart: verifyPersistence });
     const info = await session.evaluate(({ app }) => ({
       packaged: app.isPackaged, version: app.getVersion(), arch: process.arch,
     }));
@@ -82,6 +88,14 @@ async function smoke(executable, userData, fixture, verifyPersistence = false, e
       const profile = page.getByRole('textbox', { name: 'Display name' });
       await profile.fill('Package smoke profile');
       await profile.press('Enter');
+    }
+    if (githubConnector) {
+      if (verifyPersistence) await verifyGithubFixtureAfterRestart(session, page);
+      else await connectGithubFixture(session, page);
+    } else {
+      await openConnectors(page);
+      await expect(page.getByRole('button', { name: 'Connect', exact: true })).toBeDisabled();
+      await expect(page.getByText('This build is missing a valid GitHub App registration.', { exact: false })).toBeVisible();
     }
   } finally {
     await session.close();
@@ -264,6 +278,7 @@ try {
     }
     await writeFile(path.join(destination, 'receipt.json'), JSON.stringify({
       version, platform, arch, production, files,
+      githubConnector: githubIdentityDigest(githubConnector),
       ...(platform === 'macos' ? { signing: 'ad-hoc', notarized: false } : {}),
       timestamp: new Date().toISOString(), commit: run('git', ['rev-parse', 'HEAD'], root, true).trim(),
       components: await inventory(),

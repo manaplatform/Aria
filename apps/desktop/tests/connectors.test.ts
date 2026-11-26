@@ -280,11 +280,11 @@ describe('Aria Connect GitHub boundaries', () => {
       return originalRequest(url, options);
     });
     await registry.command({ action: 'connect' });
-    await vi.waitFor(() => expect(registry.snapshot().attempt?.verification?.userCode).toBe('ABCD-EFGH'));
+    await vi.waitFor(() => expect(registry.snapshot().attempt).toMatchObject({ phase: 'waiting', verification: { userCode: 'ABCD-EFGH' } }));
     const old = registry.snapshot().attempt!.id;
     await vi.waitFor(() => expect(complete).toBeDefined(), { timeout: 3000 });
     await registry.command({ action: 'connect' });
-    await vi.waitFor(() => expect(registry.snapshot().attempt?.verification?.userCode).toBe('ABCD-EFGH'));
+    await vi.waitFor(() => expect(registry.snapshot().attempt).toMatchObject({ phase: 'waiting', verification: { userCode: 'ABCD-EFGH' } }));
     const live = registry.snapshot().attempt!.id;
     expect(live).not.toBe(old);
     host.open.mockClear();

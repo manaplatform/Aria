@@ -42,7 +42,7 @@ export function migrateGithubDeviceFlow(db: DatabaseSync) {
       WHERE id=?
     `);
     for (const row of rows) {
-      const parts = /^https:\/\/[^|]+\|([A-Za-z0-9_]{8,120})\|([a-z0-9-]{1,100})$/.exec(String(row.registration));
+      const parts = /^https:\/\/[^|]+\|([A-Za-z0-9_.]{8,120})\|([a-z0-9-]{1,100})$/.exec(String(row.registration));
       if (!parts) continue;
       const registration = githubRegistration({ clientId: parts[1], slug: parts[2] });
       fence.run(row.id);

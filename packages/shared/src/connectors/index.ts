@@ -35,7 +35,7 @@ export interface ConnectorDescriptor {
   description: string;
   icon: string;
   provider: string;
-  authorization: { method: string; configuration: readonly string[]; credentials: string };
+  authorization: { method: string; credentials: string };
   contexts: readonly ('chat' | 'job')[];
   resourceOwnership: string;
   rateLimits: string;
@@ -107,7 +107,6 @@ export const githubConnector = {
   provider: 'https://github.com',
   authorization: {
     method: 'github_app_device_flow',
-    configuration: ['clientId', 'slug'],
     credentials: 'Expiring user access token and rotating refresh token, encrypted in the desktop profile.',
   },
   contexts: ['chat', 'job'],
@@ -144,9 +143,14 @@ const deviceCode = z.strictObject({
   expiresAt: z.number().int().positive(),
 });
 export type DeviceCode = z.infer<typeof deviceCode>;
+const connectorAttempt = z.discriminatedUnion('phase', [
+  z.strictObject({ id: z.uuid(), phase: z.literal('starting') }),
+  z.strictObject({ id: z.uuid(), phase: z.literal('waiting'), verification: deviceCode }),
+  z.strictObject({ id: z.uuid(), phase: z.literal('verifying') }),
+]);
 export const connectorSnapshot = z.strictObject({
   available: z.boolean(), active: githubAccountId.nullable(), accounts: z.array(githubAccount).max(12),
-  attempt: z.strictObject({ id: z.uuid(), verification: deviceCode.optional() }).nullable(), error: z.string().max(400).nullable(),
+  attempt: connectorAttempt.nullable(), error: z.string().max(400).nullable(),
 });
 export type ConnectorSnapshot = z.infer<typeof connectorSnapshot>;
 const grant = githubAccount.shape.grants;

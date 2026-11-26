@@ -74,8 +74,6 @@ jobs:
       - name: Build native installers
         shell: bash
         env:
-          ARIA_CONNECT_GITHUB_CLIENT_ID: ${{ vars.ARIA_CONNECT_GITHUB_CLIENT_ID }}
-          ARIA_CONNECT_GITHUB_APP_SLUG: ${{ vars.ARIA_CONNECT_GITHUB_APP_SLUG }}
           ARIA_UPDATE_PUBLIC_KEYS: ${{ inputs.mode == 'publish' && vars.ARIA_UPDATE_PUBLIC_KEYS || '' }}
           ARIA_WINDOWS_SIGNER_SHA256: ${{ vars.ARIA_WINDOWS_SIGNER_SHA256 }}
           ARIA_WINDOWS_ADDITIONAL_SIGNERS_SHA256: ${{ vars.ARIA_WINDOWS_ADDITIONAL_SIGNERS_SHA256 }}

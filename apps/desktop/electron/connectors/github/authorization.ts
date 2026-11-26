@@ -106,7 +106,7 @@ export class GithubAuthorization {
     if (code === 'access_denied')
       return new GithubError('PERMISSION_DENIED', 'GitHub authorization was declined.', 'AUTH_DENIED');
     if (code === 'device_flow_disabled' || code === 'incorrect_client_credentials' || code === 'unsupported_grant_type')
-      return new GithubError('CAPABILITY_UNAVAILABLE', 'GitHub Device Flow is unavailable. Check the GitHub App registration and client ID.', 'AUTH_CONFIGURATION');
+      return new GithubError('CAPABILITY_UNAVAILABLE', 'GitHub could not authorize this build’s GitHub App. Contact Aria support.', 'AUTH_CONFIGURATION');
     return invalid();
   }
 

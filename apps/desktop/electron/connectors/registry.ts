@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import {
   githubOperation, githubOperations, githubResult,
   type CapabilityHostRequest, type ConnectorCommand, type ConnectorInventory, type ConnectorJobGrant,
-  type ConnectorSnapshot, type DeviceCode, type GithubAccount, type GithubRepository, type RuntimeResult,
+  type ConnectorSnapshot, type GithubAccount, type GithubRepository, type RuntimeResult,
 } from '@aria/shared';
 import type { SecretCipher } from '../provider-storage';
 import { digest, RuntimeError, type RuntimeStore } from '../runtime/store';
@@ -43,7 +43,7 @@ export class ConnectorRegistry {
   private readonly verified = new Map<string, number>();
   private readonly writes = new Set<string>();
   private readonly listeners = new Set<(inventory: ConnectorInventory) => void>();
-  private attempt?: { id: string; controller: AbortController; verification?: DeviceCode };
+  private attempt?: { view: NonNullable<ConnectorSnapshot['attempt']>; controller: AbortController };
   private lastError: string | null = null;
 
   constructor(
@@ -90,9 +90,8 @@ export class ConnectorRegistry {
   snapshot(): ConnectorSnapshot {
     const accounts = this.store?.accounts() ?? [];
     const active = this.store?.active() ?? null;
-    const attempt = this.attempt;
     return { available: Boolean(this.store), active, accounts, error: this.lastError,
-      attempt: attempt ? { id: attempt.id, verification: attempt.verification } : null };
+      attempt: this.attempt?.view ?? null };
   }
 
   inventory(): ConnectorInventory {
@@ -126,10 +125,10 @@ export class ConnectorRegistry {
     try {
       const { github, store } = this.enabled;
       if ('attemptId' in command) {
-        const attempt = this.attempt;
+        const attempt = this.attempt?.view;
         if (!attempt || attempt.id !== command.attemptId) return this.snapshot();
         if (command.action === 'cancel') this.cancelAuthorization();
-        else if (attempt.verification && attempt.verification.expiresAt > Date.now()) {
+        else if (attempt.phase === 'waiting' && attempt.verification.expiresAt > Date.now()) {
           if (command.action === 'copy_code') this.host.copy(attempt.verification.userCode);
           else await this.host.open(githubVerificationUrl);
         }
@@ -230,7 +229,8 @@ export class ConnectorRegistry {
     const { github, store } = this.enabled;
     this.cancelAuthorization();
     const controller = new AbortController();
-    const attempt: NonNullable<ConnectorRegistry['attempt']> = { id: randomUUID(), controller };
+    const attemptId = randomUUID();
+    const attempt: NonNullable<ConnectorRegistry['attempt']> = { view: { id: attemptId, phase: 'starting' }, controller };
     const signal = controller.signal;
     this.attempt = attempt;
     void (async () => {
@@ -239,7 +239,7 @@ export class ConnectorRegistry {
       signal.throwIfAborted();
       const pair = await github.startAuthorization(async (code) => {
         signal.throwIfAborted();
-        attempt.verification = code;
+        attempt.view = { id: attemptId, phase: 'waiting', verification: code };
         this.emit();
         await this.host.open(githubVerificationUrl).catch(() => {
           if (this.attempt !== attempt || signal.aborted) return;
@@ -248,7 +248,7 @@ export class ConnectorRegistry {
         });
       }, signal);
       signal.throwIfAborted();
-      attempt.verification = undefined;
+      attempt.view = { id: attemptId, phase: 'verifying' };
       this.lastError = null;
       this.emit();
       const verification = AbortSignal.any([signal, AbortSignal.timeout(30_000)]);
