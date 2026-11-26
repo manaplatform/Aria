@@ -45,7 +45,7 @@ export class ConnectorStore {
 
   async seal(tokens: SavedTokens) {
     if (!await this.available()) throw new RuntimeError('PERMISSION_DENIED', 'GitHub requires an available OS-backed credential store.');
-    return this.cipher.encrypt(JSON.stringify(tokens));
+    return this.cipher.encrypt(JSON.stringify(savedTokens.parse(tokens)));
   }
 
   put(account: GithubAccount, sealed: Buffer) {

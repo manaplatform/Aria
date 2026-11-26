@@ -1,8 +1,9 @@
 import {
-  githubConnector, type GithubArguments, type GithubOperation, type GithubRepository,
+  githubConnector, type DeviceCode, type GithubArguments, type GithubOperation, type GithubRepository,
 } from '@aria/shared';
 import type { ConnectorAdapter } from '../adapter';
-import { GithubAuthorization, type GithubConfig, type SavedTokens } from './authorization';
+import { GithubAuthorization, type SavedTokens } from './authorization';
+import type { GithubConfig } from './config';
 import { GithubClient } from './client';
 import { operateGithub } from './operations';
 
@@ -23,8 +24,8 @@ export class GithubAdapter implements ConnectorAdapter<SavedTokens, Account, Git
   get installUrl() { return this.auth.installUrl; }
 
   discoverCapabilities() { return this.descriptor.capabilities; }
-  startAuthorization(open: (url: string) => Promise<void>, signal: AbortSignal) {
-    return this.auth.authorize(open, signal);
+  startAuthorization(present: (code: DeviceCode) => Promise<void>, signal: AbortSignal) {
+    return this.auth.authorize(present, signal);
   }
 
   completeAuthorization(credentials: SavedTokens, signal: AbortSignal) {
@@ -36,7 +37,7 @@ export class GithubAdapter implements ConnectorAdapter<SavedTokens, Account, Git
   }
 
   refreshAuthorization(credentials: SavedTokens, signal: AbortSignal) {
-    return this.auth.refresh(credentials.refreshToken, signal);
+    return this.auth.refresh(credentials, signal);
   }
 
   getAccount(connection: string, credentials: SavedTokens, signal: AbortSignal) {
@@ -50,10 +51,6 @@ export class GithubAdapter implements ConnectorAdapter<SavedTokens, Account, Git
   invokeCapability(connection: string, credentials: SavedTokens, repository: GithubRepository,
     operation: GithubOperation, args: GithubArguments<GithubOperation>, signal: AbortSignal, onWrite?: { dispatch(): void; accepted(): void }) {
     return operateGithub(this.client(connection), credentials.accessToken, repository, operation, args, signal, onWrite);
-  }
-
-  revokeAuthorization(credentials: SavedTokens, signal: AbortSignal) {
-    return this.auth.revoke(credentials.accessToken, signal);
   }
 
   disconnect(connection: string) {

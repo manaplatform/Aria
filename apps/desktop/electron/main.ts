@@ -2020,12 +2020,12 @@ app
       ? await fs.readFile(path.join(process.resourcesPath, 'aria-connect.json'), 'utf8')
           .then((value) => JSON.parse(value) as unknown).catch(() => undefined)
       : {
-          origin: process.env.ARIA_CONNECT_ORIGIN,
           clientId: process.env.ARIA_CONNECT_GITHUB_CLIENT_ID,
           slug: process.env.ARIA_CONNECT_GITHUB_APP_SLUG,
         };
     connectors = new ConnectorRegistry(connectorConfig, executionRuntime.store, cipher, {
       open: (url) => shell.openExternal(url),
+      copy: (code) => clipboard.writeText(code),
       identity: () => chat?.runtimeIdentity(),
       approve: async (message, detail, signal) => Boolean(await approve(message, detail, signal)),
       changed: () => {
@@ -2445,6 +2445,7 @@ app.on('window-all-closed', () => {
 });
 app.on('before-quit', (event) => {
   quitting = true;
+  connectors?.cancelAuthorization();
   proactive?.suspend();
   appTray?.destroy();
   appTray = null;

@@ -1,4 +1,5 @@
 import type { DatabaseSync } from 'node:sqlite';
+import { githubRegistration } from './github/config';
 
 export function migrateConnectors(db: DatabaseSync) {
   db.exec(`
@@ -21,4 +22,38 @@ export function migrateConnectors(db: DatabaseSync) {
     PRAGMA user_version = 10;
     COMMIT;
   `);
+}
+
+export function migrateGithubDeviceFlow(db: DatabaseSync) {
+  db.exec('PRAGMA secure_delete = ON; BEGIN IMMEDIATE;');
+  try {
+    const rows = db.prepare(`
+      SELECT a.id, a.registration, s.active = a.id AS is_active
+      FROM connector_accounts a LEFT JOIN connector_settings s ON s.registration = a.registration
+      ORDER BY is_active DESC, a.registration, a.id
+    `).all();
+    const move = db.prepare('UPDATE OR IGNORE connector_accounts SET registration=? WHERE id=?');
+    const select = db.prepare('INSERT OR IGNORE INTO connector_settings (registration, active) VALUES (?, ?)');
+    const fence = db.prepare(`
+      UPDATE connector_accounts SET credentials=NULL, approved_primary=NULL, grants_primary=NULL,
+        metadata=json_set(metadata, '$.state', 'reconnect', '$.reconnectReason', 'device_flow',
+          '$.generation', json_extract(metadata, '$.generation') + 1, '$.policy', 'read_only',
+          '$.grants', json('[]'), '$.repositories', json('[]'))
+      WHERE id=?
+    `);
+    for (const row of rows) {
+      const parts = /^https:\/\/[^|]+\|([A-Za-z0-9_]{8,120})\|([a-z0-9-]{1,100})$/.exec(String(row.registration));
+      if (!parts) continue;
+      const registration = githubRegistration({ clientId: parts[1], slug: parts[2] });
+      fence.run(row.id);
+      // Multiple legacy broker origins can refer to the same App and account. Keep
+      // the selected row first and leave duplicates fenced with their history intact.
+      if (move.run(registration, row.id).changes && row.is_active) select.run(registration, row.id);
+    }
+    db.exec('PRAGMA user_version = 11; COMMIT;');
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
+  }
+  db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
 }

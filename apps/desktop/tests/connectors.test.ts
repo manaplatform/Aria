@@ -11,13 +11,13 @@ import { operateGithub } from '../electron/connectors/github/operations';
 import { GithubClient } from '../electron/connectors/github/client';
 import { RuntimeStore } from '../electron/runtime/store';
 
-const config = { origin: 'https://broker.aria.example', slug: 'aria-connect', clientId: 'Iv1_fixture' };
+const config = { slug: 'aria-connect', clientId: 'Iv1_fixture' };
 const scopeOwner = randomUUID();
 const primary = { endpoint: 'https://llm.example/v1', model: 'primary', connectionId: randomUUID() };
 const credential = 'ghu_fixture_access_secret';
 const refresh = 'ghr_fixture_refresh_secret';
 const hosts = {
-  open: vi.fn(async () => {}), identity: () => ({ ...primary, key: 'primary-identity' }),
+  open: vi.fn(async () => {}), copy: vi.fn(), identity: () => ({ ...primary, key: 'primary-identity' }),
   approve: vi.fn(async () => true), artifact: async () => { throw new Error('unexpected artifact'); },
   changed: () => {},
 };
@@ -52,24 +52,36 @@ const operations = {
 };
 
 const profiles: { directory: string; runtime: RuntimeStore }[] = [];
-const fixture = async (params: { expired?: boolean; available?: boolean; denied?: boolean; revoked?: boolean } = {}) => {
+const fixture = async (params: { expired?: boolean; available?: boolean; denied?: boolean; revoked?: boolean; userId?: number } = {}) => {
   const directory = mkdtempSync(path.join(os.tmpdir(), 'aria-connectors-'));
   const runtime = new RuntimeStore(directory);
   profiles.push({ directory, runtime });
   const store = new ConnectorStore(runtime, cipher, new GithubAuthorization(config).registration);
-  store.put(registered, await store.seal({ accessToken: credential, refreshToken: refresh,
+  store.put(registered, await store.seal({ flow: 'device', accessToken: credential, refreshToken: refresh,
     expiresAt: params.expired ? Date.now() - 1000 : Date.now() + 3_600_000, refreshExpiresAt: Date.now() + 86_400_000 }));
   store.setApprovedPrimary(registered.id, 'primary-identity');
   const fetcher = vi.fn<typeof fetch>(async (value, options) => {
     const url = new URL(String(value));
-    if (url.pathname === '/v1/github/refresh') {
-      expect(JSON.parse(String(options?.body))).toEqual({ refreshToken: refresh });
-      if (params.revoked) return Response.json({ error: 'authorization_expired' }, { status: 410 });
-      return Response.json({ accessToken: 'ghu_fixture_rotated_token', refreshToken: 'ghr_fixture_rotated_token',
-        expiresIn: 30_000, refreshExpiresIn: 1_000_000 });
+    if (url.href === 'https://github.com/login/device/code') {
+      return Response.json({ device_code: 'a'.repeat(40), user_code: 'ABCD-EFGH',
+        verification_uri: 'https://github.com/login/device', interval: 1, expires_in: 900 });
+    }
+    if (url.href === 'https://github.com/login/oauth/access_token') {
+      const form = new URLSearchParams(String(options?.body));
+      expect(form.get('client_id')).toBe(config.clientId);
+      expect(form.has('client_secret')).toBe(false);
+      if (form.get('grant_type') === 'refresh_token') {
+        expect(form.get('refresh_token')).toBe(refresh);
+        if (params.revoked) return Response.json({ error: 'bad_refresh_token' });
+      } else {
+        expect(form.get('grant_type')).toBe('urn:ietf:params:oauth:grant-type:device_code');
+        expect(form.get('device_code')).toBe('a'.repeat(40));
+      }
+      return Response.json({ access_token: 'ghu_fixture_rotated_token', refresh_token: 'ghr_fixture_rotated_token',
+        expires_in: 30_000, refresh_token_expires_in: 1_000_000, token_type: 'bearer' });
     }
     expect(url.hostname).toBe('api.github.com');
-    if (url.pathname === '/user') return Response.json({ id: 1, login: 'user' });
+    if (url.pathname === '/user') return Response.json({ id: params.userId ?? 1, login: 'user' });
     if (url.pathname === '/user/installations') return Response.json({ installations: [{
       id: repo.installation, app_slug: config.slug, permissions: repo.permissions,
     }] });
@@ -130,7 +142,8 @@ describe('Aria Connect GitHub boundaries', () => {
     await Promise.all([0, 1].map(() => registry.dispatch(request('github.read_file', {
       repository: repo.name, path: 'README.md',
     }), signal(), operations)));
-    expect(fetcher.mock.calls.filter(([url]) => String(url).includes('/refresh'))).toHaveLength(1);
+    expect(fetcher.mock.calls.filter(([, options]) =>
+      new URLSearchParams(String(options?.body)).get('grant_type') === 'refresh_token')).toHaveLength(1);
     expect((await store.tokens(registered.id))?.accessToken).toBe('ghu_fixture_rotated_token');
     runtime.close();
     const reopened = new RuntimeStore(directory);
@@ -152,8 +165,8 @@ describe('Aria Connect GitHub boundaries', () => {
     expect(revoked.registry.jobValid(grant, 'primary-identity')).toBe(false);
     expect(await revoked.store.tokens(registered.id)).toBeUndefined();
     const locked = await fixture({ available: false });
-    const state = await locked.registry.command({ action: 'connect' });
-    expect(state.error).toMatch(/OS-backed credential store/);
+    await locked.registry.command({ action: 'connect' });
+    await vi.waitFor(() => expect(locked.registry.snapshot().error).toMatch(/OS-backed credential store/));
     expect(locked.fetcher).not.toHaveBeenCalled();
   });
 
@@ -163,7 +176,7 @@ describe('Aria Connect GitHub boundaries', () => {
     const read = () => request('github.read_file', { repository: repo.name, path: 'README.md' }, turn);
     await registry.dispatch(read(), signal(), operations);
     const second = { ...registered, id: randomUUID(), userId: 2, login: 'second' };
-    store.put(second, await store.seal({ accessToken: credential, refreshToken: refresh,
+    store.put(second, await store.seal({ flow: 'device', accessToken: credential, refreshToken: refresh,
       expiresAt: Date.now() + 3_600_000, refreshExpiresAt: Date.now() + 86_400_000 }));
     store.setApprovedPrimary(second.id, 'primary-identity');
     expect((await registry.command({ action: 'switch', id: second.id })).active).toBe(second.id);
@@ -195,6 +208,113 @@ describe('Aria Connect GitHub boundaries', () => {
       args, signal(), hooks)).value).toEqual({ sha: expected });
     expect(hooks.dispatch).toHaveBeenCalledOnce();
     expect(hooks.accepted).toHaveBeenCalledOnce();
+  });
+
+  it('migrates legacy credentials across restart and requires fresh repository approval', async () => {
+    const { directory, runtime, fetcher, host } = await fixture();
+    const registration = 'https://legacy-auth.example|' + config.clientId + '|' + config.slug;
+    const previous = { ...registered, generation: 7, policy: 'ask' as const };
+    runtime.db.prepare('DELETE FROM connector_accounts').run();
+    runtime.db.prepare('DELETE FROM connector_settings').run();
+    const legacy = new ConnectorStore(runtime, cipher, registration);
+    const oldCiphertext = await cipher.encrypt(JSON.stringify({
+      accessToken: credential, refreshToken: refresh, expiresAt: Date.now() + 100_000,
+      refreshExpiresAt: Date.now() + 3_600_000,
+    }));
+    legacy.put(previous, oldCiphertext);
+    legacy.setApprovedPrimary(previous.id, 'primary-identity');
+    legacy.setGrantsPrimary(previous.id, 'primary-identity');
+    legacy.activity(previous.id, repo.id, 'github.read_file', 'completed');
+    runtime.db.exec('PRAGMA user_version = 10');
+    runtime.close();
+
+    const reopened = new RuntimeStore(directory);
+    const store = new ConnectorStore(reopened, cipher, new GithubAuthorization(config).registration);
+    const registry = new ConnectorRegistry(config, reopened, cipher, host, fetcher);
+    try {
+      expect(registry.snapshot()).toMatchObject({
+        active: previous.id, attempt: null,
+        accounts: [{ id: previous.id, state: 'reconnect', generation: 8, reconnectReason: 'device_flow',
+          selected: [repo.id], repositories: [], policy: 'read_only' }],
+      });
+      expect(await store.tokens(previous.id)).toBeUndefined();
+      expect(store.approvedPrimary(previous.id)).toBeNull();
+      expect(store.grantsPrimary(previous.id)).toBeNull();
+      expect(registry.history(previous.id)).toHaveLength(1);
+      const job = { connection: previous.id, generation: 7, repositories: [repo.id], operations: ['github.read_file' as const] };
+      expect(registry.jobValid(job, 'primary-identity')).toBe(false);
+      const verify = await registry.command({ action: 'verify', id: previous.id });
+      expect(verify.error).toContain('Reconnect');
+      expect(fetcher).not.toHaveBeenCalled();
+      await registry.command({ action: 'reconnect', id: previous.id });
+      await vi.waitFor(() => expect(registry.snapshot()).toMatchObject({
+        active: previous.id, attempt: null, error: null,
+        accounts: [{ id: previous.id, state: 'needs_repositories', selected: [repo.id], generation: 9 }],
+      }), { timeout: 3000 });
+      expect(registry.inventory().readable).toBe(false);
+      expect((await store.tokens(previous.id))?.flow).toBe('device');
+      await registry.command({ action: 'repositories', id: previous.id, repositories: [repo.id] });
+      expect(registry.inventory()).toMatchObject({ readable: true, writable: false });
+      expect(registry.jobValid(job, 'primary-identity')).toBe(false);
+      expect(fetcher.mock.calls.some(([, options]) => new URLSearchParams(String(options?.body)).has('refresh_token'))).toBe(false);
+    } finally { reopened.close(); }
+  });
+
+  it('rejects a different GitHub user on reconnect', async () => {
+    const { registry, store } = await fixture({ userId: 2 });
+    await registry.command({ action: 'reconnect', id: registered.id });
+    await vi.waitFor(() => expect(registry.snapshot().error).toMatch(/different account/), { timeout: 3000 });
+    expect(registry.snapshot().accounts).toEqual([registered]);
+    expect((await store.tokens(registered.id))?.accessToken).toBe(credential);
+  });
+
+  it('binds cancel, clipboard, and browser commands to the initiating attempt', async () => {
+    const { registry, store, host, fetcher } = await fixture();
+    let requested = 0;
+    const originalRequest = fetcher.getMockImplementation()!;
+    let complete: ((value: Response) => void) | undefined;
+    fetcher.mockImplementation(async (url, options) => {
+      if (String(url).endsWith('/login/device/code')) requested++;
+      if (String(url).endsWith('/login/oauth/access_token'))
+        return new Promise<Response>((resolve) => { complete = resolve; });
+      return originalRequest(url, options);
+    });
+    await registry.command({ action: 'connect' });
+    await vi.waitFor(() => expect(registry.snapshot().attempt?.verification?.userCode).toBe('ABCD-EFGH'));
+    const old = registry.snapshot().attempt!.id;
+    await vi.waitFor(() => expect(complete).toBeDefined(), { timeout: 3000 });
+    await registry.command({ action: 'connect' });
+    await vi.waitFor(() => expect(registry.snapshot().attempt?.verification?.userCode).toBe('ABCD-EFGH'));
+    const live = registry.snapshot().attempt!.id;
+    expect(live).not.toBe(old);
+    host.open.mockClear();
+    host.copy.mockClear();
+    await registry.command({ action: 'copy_code', attemptId: old });
+    await registry.command({ action: 'open_device', attemptId: old });
+    await registry.command({ action: 'cancel', attemptId: old });
+    expect(registry.snapshot().attempt?.id).toBe(live);
+    expect(host.open).not.toHaveBeenCalled();
+    expect(host.copy).not.toHaveBeenCalled();
+    await registry.command({ action: 'copy_code', attemptId: live });
+    expect(host.copy).toHaveBeenCalledExactlyOnceWith('ABCD-EFGH');
+    await registry.command({ action: 'cancel', attemptId: live });
+    complete!(Response.json({ access_token: 'ghu_fixture_late_token', refresh_token: 'ghr_fixture_late_token',
+      expires_in: 28_800, refresh_token_expires_in: 15_897_600, token_type: 'bearer' }));
+    expect(registry.snapshot().attempt).toBeNull();
+    expect(registry.snapshot().accounts).toEqual([registered]);
+    expect((await store.tokens(registered.id))?.accessToken).toBe(credential);
+    expect(requested).toBe(2);
+    expect(fetcher.mock.calls.some(([url]) => String(url) === 'https://api.github.com/user')).toBe(false);
+  });
+
+  it('disconnects locally and opens GitHub settings for grant revocation', async () => {
+    const { registry, fetcher, host, store } = await fixture();
+    host.open.mockClear();
+    await registry.command({ action: 'revoke', id: registered.id });
+    expect(host.open).toHaveBeenCalledExactlyOnceWith('https://github.com/settings/apps/authorizations');
+    expect(await store.tokens(registered.id)).toBeUndefined();
+    expect(registry.inventory().readable).toBe(false);
+    expect(fetcher).not.toHaveBeenCalled();
   });
 
   it('reports rate limits without repeating the request and distinguishes organization SSO', async () => {

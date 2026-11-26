@@ -162,7 +162,6 @@ function check(release) {
     'package.json',
     'apps/desktop/package.json',
     'apps/api/package.json',
-    'apps/connector-auth-broker/package.json',
     'packages/shared/package.json',
   ];
   const hasLicense = fs.existsSync(path.join(root, 'LICENSE'));

@@ -8,7 +8,7 @@ import { createProviderFixture } from '../../../tests/provider-fixture';
 test('connects GitHub through Settings and discovers a scoped read in normal chat', async () => {
   const packaged = process.env.ARIA_TEST_PACKAGED_APP;
   test.skip(Boolean(packaged) && process.env.ARIA_TEST_PACKAGED_CONNECTOR !== '1',
-    'The packaged fixture needs a package configured with the test-only broker origin.');
+    'The packaged fixture needs a package configured with the test-only GitHub App client ID and slug.');
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'aria-connect-electron-'));
   const fixture = await createProviderFixture();
   const prompt = 'Read the README for example/connector-fixture';
@@ -34,16 +34,15 @@ test('connects GitHub through Settings and discovers a scoped read in normal cha
     env: {
       ...env, ARIA_TEST_DATA_DIR: directory,
       OPENAI_API_KEY: 'test-only-key', OPENAI_MODEL: 'fixture-model', OPENAI_BASE_URL: fixture.baseUrl,
-      ARIA_CONNECT_ORIGIN: 'https://broker.aria.example', ARIA_CONNECT_GITHUB_CLIENT_ID: 'Iv1_fixture',
+      ARIA_CONNECT_GITHUB_CLIENT_ID: 'Iv1_fixture',
       ARIA_CONNECT_GITHUB_APP_SLUG: 'fixture-app',
     },
   });
   try {
     await app.evaluate(({ dialog, safeStorage, shell }) => {
       const actualFetch = globalThis.fetch;
-      let opened = false;
-      let state = '';
-      let secret = '';
+      let opened = 0;
+      const deviceSecret = 'd'.repeat(40);
       const access = 'ghu_fake_desktop_access_secret';
       safeStorage.isAsyncEncryptionAvailable = async () => true;
       safeStorage.encryptStringAsync = async (value) => Buffer.from(Buffer.from(value).toString('base64'));
@@ -51,27 +50,27 @@ test('connects GitHub through Settings and discovers a scoped read in normal cha
       safeStorage.getSelectedStorageBackend = () => 'gnome_libsecret';
       dialog.showMessageBox = async () => ({ response: 1, checkboxChecked: false });
       shell.openExternal = async (destination) => {
-        const url = new URL(destination);
-        if (url.origin !== 'https://github.com' || url.pathname !== '/login/oauth/authorize' ||
-            url.searchParams.get('state') !== state || url.searchParams.get('code_challenge_method') !== 'S256' ||
-            url.searchParams.has('secret') || !url.searchParams.has('code_challenge')) throw new Error('Unexpected sign-in URL');
-        opened = true;
+        if (destination !== 'https://github.com/login/device') throw new Error('Unexpected sign-in URL');
+        opened++;
       };
       globalThis.fetch = async (value, options) => {
         const url = new URL(String(value));
-        if (url.origin === 'https://broker.aria.example') {
-          const input = JSON.parse(String(options?.body)) as { state: string; secret: string; verifier?: string };
-          if (url.pathname.endsWith('/start')) {
-            state = input.state;
-            secret = input.secret;
-            return Response.json({ callback: url.origin + '/v1/github/callback', expiresIn: 600 });
+        if (url.origin === 'https://github.com') {
+          const form = new URLSearchParams(String(options?.body));
+          if (options?.method !== 'POST' || options?.redirect !== 'error' ||
+              form.get('client_id') !== 'Iv1_fixture' || form.has('client_secret'))
+            throw new Error('Invalid Device Flow request');
+          if (url.pathname === '/login/device/code') {
+            if (form.get('scope') !== 'offline_access') throw new Error('Missing offline access');
+            return Response.json({ device_code: deviceSecret, user_code: 'AR1A-2026',
+              verification_uri: 'https://github.com/login/device', interval: 1, expires_in: 900 });
           }
-          if (input.state !== state || input.secret !== secret) return Response.json({}, { status: 400 });
-          if (url.pathname.endsWith('/status')) return Response.json({ status: opened ? 'ready' : 'pending' });
-          if (url.pathname.endsWith('/complete') && input.verifier?.length === 43)
-            return Response.json({ accessToken: access, refreshToken: 'ghr_fake_desktop_refresh_secret',
-              expiresIn: 28800, refreshExpiresIn: 1500000 });
-          if (url.pathname.endsWith('/cancel')) return Response.json({ status: 'cancelled' });
+          if (url.pathname !== '/login/oauth/access_token' || form.get('device_code') !== deviceSecret ||
+              form.get('grant_type') !== 'urn:ietf:params:oauth:grant-type:device_code')
+            throw new Error('Invalid device poll');
+          if (opened < 2) return Response.json({ error: 'authorization_pending' });
+          return Response.json({ access_token: access, refresh_token: 'ghr_fake_desktop_refresh_secret',
+            expires_in: 28800, refresh_token_expires_in: 1500000, token_type: 'bearer' });
         }
         if (url.origin === 'https://api.github.com') {
           if (new Headers(options?.headers).get('authorization') !== 'Bearer ' + access)
@@ -100,6 +99,13 @@ test('connects GitHub through Settings and discovers a scoped read in normal cha
     await page.evaluate(() => { location.hash = '/settings/connectors'; });
     await expect(page.getByRole('heading', { name: 'Connectors', exact: true })).toBeVisible();
     await page.getByRole('button', { name: 'Connect', exact: true }).click();
+    const verification = page.getByRole('region', { name: 'GitHub device verification' });
+    await expect(verification.getByText('AR1A-2026', { exact: true })).toBeVisible();
+    await expect(verification).toContainText('Never authorize a code someone else sent you.');
+    const pending = await page.evaluate(() => window.aria!.connectors({ action: 'status' }));
+    expect(Object.keys(pending.attempt?.verification ?? {}).sort()).toEqual(['expiresAt', 'userCode']);
+    await verification.getByRole('button', { name: 'Open GitHub' }).click();
+    await expect(verification).toHaveCount(0);
     await expect(page.getByRole('heading', { name: 'fixture-user', exact: true })).toBeVisible({ timeout: 10000 });
     await page.getByRole('checkbox', { name: /example\/connector-fixture/ }).check();
     await page.getByRole('button', { name: 'Review repository access' }).click();
@@ -109,7 +115,9 @@ test('connects GitHub through Settings and discovers a scoped read in normal cha
     await page.getByRole('textbox', { name: 'Message Aria' }).fill(prompt);
     await page.getByRole('button', { name: 'Send message' }).click();
     await expect(page.locator('.from-assistant .markdown').last()).toContainText('Verified GitHub README.');
-    expect(JSON.stringify(fixture.received)).not.toContain('ghu_fake_desktop_access_secret');
+    const requests = JSON.stringify(fixture.received);
+    for (const secret of ['ghu_fake_desktop_access_secret', 'ghr_fake_desktop_refresh_secret', 'd'.repeat(40), 'AR1A-2026'])
+      expect(requests).not.toContain(secret);
     await expect(page.getByText('ghu_fake_desktop_access_secret', { exact: false })).toHaveCount(0);
   } finally {
     await app.close();
@@ -120,7 +128,7 @@ test('connects GitHub through Settings and discovers a scoped read in normal cha
 
 test('authorizes the live development GitHub App through the system browser', async () => {
   test.skip(process.env.ARIA_RUN_LIVE_GITHUB_CONNECT !== '1', 'Opt in with an installed development GitHub App.');
-  test.setTimeout(610_000);
+  test.setTimeout(940_000);
   const filename = process.env.ARIA_TEST_PACKAGED_APP;
   const repository = process.env.ARIA_TEST_GITHUB_REPOSITORY;
   if (!repository) throw new Error('Set ARIA_TEST_GITHUB_REPOSITORY to an authorized development repository.');
@@ -142,7 +150,7 @@ test('authorizes the live development GitHub App through the system browser', as
     await expect.poll(async () => {
       const state = await page.evaluate(() => window.aria!.connectors({ action: 'status' }));
       return state.accounts.some((account) => account.repositories.some((item) => item.name === repository));
-    }, { timeout: 590_000 }).toBe(true);
+    }, { timeout: 920_000 }).toBe(true);
     await page.getByRole('button', { name: 'Test connection' }).click();
     await expect.poll(async () => {
       const state = await page.evaluate(() => window.aria!.connectors({ action: 'status' }));

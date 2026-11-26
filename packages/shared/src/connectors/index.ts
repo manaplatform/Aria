@@ -106,8 +106,8 @@ export const githubConnector = {
   icon: 'github-mark.svg',
   provider: 'https://github.com',
   authorization: {
-    method: 'github_app_oauth_code_pkce',
-    configuration: ['origin', 'clientId', 'slug'],
+    method: 'github_app_device_flow',
+    configuration: ['clientId', 'slug'],
     credentials: 'Expiring user access token and rotating refresh token, encrypted in the desktop profile.',
   },
   contexts: ['chat', 'job'],
@@ -134,20 +134,26 @@ export const githubAccount = z.strictObject({
   id: githubAccountId, userId: number, login: z.string().max(100), avatar: z.string().url().nullable(),
   connectedAt: z.number(), verifiedAt: z.number(), state: connectionState, generation: z.number().int().positive(),
   selected: z.array(githubRepositoryId).max(1000), repositories: z.array(githubRepository).max(1000),
+  reconnectReason: z.literal('device_flow').optional(),
   policy: connectorPolicy,
   grants: z.array(z.strictObject({ repository: githubRepositoryId, operation: githubOperation })).max(100),
 });
 export type GithubAccount = z.infer<typeof githubAccount>;
+const deviceCode = z.strictObject({
+  userCode: z.string().regex(/^[A-Z0-9]{4}-[A-Z0-9]{4}$/),
+  expiresAt: z.number().int().positive(),
+});
+export type DeviceCode = z.infer<typeof deviceCode>;
 export const connectorSnapshot = z.strictObject({
   available: z.boolean(), active: githubAccountId.nullable(), accounts: z.array(githubAccount).max(12),
-  attempt: z.enum(['idle', 'pending']).default('idle'), error: z.string().max(400).nullable(),
+  attempt: z.strictObject({ id: z.uuid(), verification: deviceCode.optional() }).nullable(), error: z.string().max(400).nullable(),
 });
 export type ConnectorSnapshot = z.infer<typeof connectorSnapshot>;
 const grant = githubAccount.shape.grants;
 export const connectorCommand = z.discriminatedUnion('action', [
   z.strictObject({ action: z.literal('status') }),
   z.strictObject({ action: z.literal('connect') }),
-  z.strictObject({ action: z.literal('cancel') }),
+  z.strictObject({ action: z.enum(['cancel', 'copy_code', 'open_device']), attemptId: z.uuid() }),
   z.strictObject({ action: z.enum(['reconnect', 'disconnect', 'revoke', 'switch', 'verify', 'manage']), id: githubAccountId }),
   z.strictObject({ action: z.literal('repositories'), id: githubAccountId, repositories: githubAccount.shape.selected }),
   z.strictObject({ action: z.literal('policy'), id: githubAccountId, policy: connectorPolicy, grants: grant }),

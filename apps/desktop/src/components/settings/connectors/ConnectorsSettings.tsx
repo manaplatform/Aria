@@ -11,7 +11,7 @@ import { SettingsPage } from '../SettingsPage';
 
 const stateLabels = {
   connected: 'Connected', needs_repositories: 'Repository access needed',
-  reconnect: 'Reconnection needed', offline: 'Temporarily unavailable',
+  reconnect: 'Reconnect required', offline: 'Temporarily unavailable',
 };
 const policyLabels = { read_only: 'Read only', ask: 'Ask before writing', scoped: 'Scoped authorization' };
 const writeGrants = (Object.entries(githubOperations) as [GithubOperation, typeof githubOperations[GithubOperation]][])
@@ -35,11 +35,12 @@ function GithubAccountPanel({ account, busy, submit }: {
           {account.avatar && <img src={account.avatar} alt="" width={44} height={44} referrerPolicy="no-referrer" />}
           <div>
             <strong>{stateLabels[account.state]}</strong>
+            {account.reconnectReason === 'device_flow' && <p>Reconnect this account using GitHub’s device verification code, then review your repository access.</p>}
             <p>Connected {date(account.connectedAt)} · Verified {date(account.verifiedAt)}</p>
           </div>
         </div>
         <div className="aria-connector-actions">
-          <Button size="sm" disabled={busy} onClick={() => submit({ action: 'verify', id: account.id })}>Test connection</Button>
+          <Button size="sm" disabled={busy || account.state === 'reconnect'} onClick={() => submit({ action: 'verify', id: account.id })}>Test connection</Button>
           <Button size="sm" disabled={busy} onClick={() => submit({ action: 'reconnect', id: account.id })}>Reconnect</Button>
           <Button size="sm" disabled={busy} onClick={() => submit({ action: 'manage', id: account.id })}>Manage repositories on GitHub</Button>
         </div>
@@ -51,7 +52,7 @@ function GithubAccountPanel({ account, busy, submit }: {
         <div className="aria-connector-options">
           {account.repositories.map((repo) => (
             <label key={repo.id}>
-              <input type="checkbox" checked={selected.includes(repo.id)} disabled={busy}
+              <input type="checkbox" checked={selected.includes(repo.id)} disabled={busy || account.state === 'reconnect'}
                 onChange={(event) => setSelected(event.target.checked ?
                   [...selected, repo.id] : selected.filter((item) => item !== repo.id))} />
               <span><strong>{repo.name}</strong> · {repo.private ? 'Private' : 'Public'}
@@ -143,7 +144,7 @@ export default function ConnectorsSettings() {
     }, (failure: unknown) => setError(errorMessage(failure))).finally(() => setBusy(false));
   };
   const account = state?.accounts.find((account) => account.id === state.active);
-  const pending = state?.attempt === 'pending';
+  const attempt = state?.attempt;
   return (
     <SettingsPage title="Connectors" description="Give Aria access to the apps you choose.">
       <SettingsSection id="connector-github" title="Available apps">
@@ -153,13 +154,13 @@ export default function ConnectorsSettings() {
             <h3>{githubConnector.name}</h3>
             <p>{githubConnector.description}</p>
             <span role="status">
-              {pending ? 'Waiting for GitHub authorization in your browser' :
+              {attempt ? attempt.verification ? 'Waiting for GitHub authorization' : 'Preparing or verifying GitHub authorization' :
                 account ? stateLabels[account.state] : state?.available ? 'Available to connect' :
                   !state && window.aria?.connectors ? 'Loading GitHub status' : 'Unavailable in this build'}
             </span>
           </div>
           <div className="aria-connector-actions">
-            {pending ? <Button onClick={() => submit({ action: 'cancel' })} disabled={busy}>Cancel</Button> : (
+            {attempt ? <Button onClick={() => submit({ action: 'cancel', attemptId: attempt.id })}>Cancel</Button> : (
               <>
                 <Button variant="primary" onClick={() => submit({ action: 'connect' })}
                   disabled={busy || !state?.available}>{state?.accounts.length ? 'Add account' : 'Connect'}</Button>
@@ -168,6 +169,17 @@ export default function ConnectorsSettings() {
             )}
           </div>
         </div>
+        {attempt?.verification && (
+          <div className="aria-connector-device" role="region" aria-label="GitHub device verification">
+            <p>Enter this code at github.com/login/device in your browser. Use only the code shown here. Never authorize a code someone else sent you.</p>
+            <div className="aria-connector-actions">
+              <code>{attempt.verification.userCode}</code>
+              <Button size="sm" onClick={() => submit({ action: 'copy_code', attemptId: attempt.id })}>Copy code</Button>
+              <Button size="sm" onClick={() => submit({ action: 'open_device', attemptId: attempt.id })}>Open GitHub</Button>
+            </div>
+            <small>Code expires at {new Intl.DateTimeFormat(undefined, { timeStyle: 'short' }).format(attempt.verification.expiresAt)}.</small>
+          </div>
+        )}
         {(error || state?.error) && <p role="alert">{error || state?.error}</p>}
         {manage && !!state?.accounts.length && (
           <SettingsSection title="Connected accounts">
@@ -180,7 +192,7 @@ export default function ConnectorsSettings() {
             </label>
           </SettingsSection>
         )}
-        {manage && account && <GithubAccountPanel key={account.id + '/' + account.generation} account={account} busy={busy || pending} submit={submit} />}
+        {manage && account && <GithubAccountPanel key={account.id + '/' + account.generation} account={account} busy={busy || Boolean(attempt)} submit={submit} />}
       </SettingsSection>
     </SettingsPage>
   );

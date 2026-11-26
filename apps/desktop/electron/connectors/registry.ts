@@ -2,12 +2,13 @@ import { randomUUID } from 'node:crypto';
 import {
   githubOperation, githubOperations, githubResult,
   type CapabilityHostRequest, type ConnectorCommand, type ConnectorInventory, type ConnectorJobGrant,
-  type ConnectorSnapshot, type GithubAccount, type GithubRepository, type RuntimeResult,
+  type ConnectorSnapshot, type DeviceCode, type GithubAccount, type GithubRepository, type RuntimeResult,
 } from '@aria/shared';
 import type { SecretCipher } from '../provider-storage';
 import { digest, RuntimeError, type RuntimeStore } from '../runtime/store';
 import { GithubAdapter } from './github/adapter';
-import { githubConfig, type SavedTokens } from './github/authorization';
+import { githubVerificationUrl, type SavedTokens } from './github/authorization';
+import { githubConfig } from './github/config';
 import { GithubError, sanitizeGithubText, segment } from './github/client';
 import { ConnectorStore } from './store';
 
@@ -15,6 +16,7 @@ type Scope = Extract<CapabilityHostRequest, { type: 'runtime' }>;
 type Artifact = NonNullable<RuntimeResult['artifact']>;
 type RegistryHost = {
   open(url: string): Promise<void>;
+  copy(code: string): void;
   identity(): { key: string; model: string; endpoint: string } | undefined;
   approve(message: string, detail: string, signal: AbortSignal): Promise<boolean>;
   artifact(scope: Scope, bytes: Buffer, name: string, signal: AbortSignal): Promise<Artifact>;
@@ -41,7 +43,7 @@ export class ConnectorRegistry {
   private readonly verified = new Map<string, number>();
   private readonly writes = new Set<string>();
   private readonly listeners = new Set<(inventory: ConnectorInventory) => void>();
-  private attempt?: AbortController;
+  private attempt?: { id: string; controller: AbortController; verification?: DeviceCode };
   private lastError: string | null = null;
 
   constructor(
@@ -88,7 +90,9 @@ export class ConnectorRegistry {
   snapshot(): ConnectorSnapshot {
     const accounts = this.store?.accounts() ?? [];
     const active = this.store?.active() ?? null;
-    return { available: Boolean(this.store), active, accounts, attempt: this.attempt ? 'pending' : 'idle', error: this.lastError };
+    const attempt = this.attempt;
+    return { available: Boolean(this.store), active, accounts, error: this.lastError,
+      attempt: attempt ? { id: attempt.id, verification: attempt.verification } : null };
   }
 
   inventory(): ConnectorInventory {
@@ -121,12 +125,16 @@ export class ConnectorRegistry {
     this.lastError = null;
     try {
       const { github, store } = this.enabled;
-      if (command.action === 'cancel') {
-        this.attempt?.abort();
-        this.attempt = undefined;
+      if ('attemptId' in command) {
+        const attempt = this.attempt;
+        if (!attempt || attempt.id !== command.attemptId) return this.snapshot();
+        if (command.action === 'cancel') this.cancelAuthorization();
+        else if (attempt.verification && attempt.verification.expiresAt > Date.now()) {
+          if (command.action === 'copy_code') this.host.copy(attempt.verification.userCode);
+          else await this.host.open(githubVerificationUrl);
+        }
       } else if (command.action === 'connect' || command.action === 'reconnect') {
-        if (!await store.available()) throw new RuntimeError('PERMISSION_DENIED', 'Unlock the OS-backed credential store before connecting GitHub.');
-        this.start(command.action === 'reconnect' ? command.id : undefined);
+        this.start(command.action === 'reconnect' ? this.account(command.id) : undefined);
       } else if ('id' in command) {
         const account = this.account(command.id);
         if (command.action === 'switch') {
@@ -135,30 +143,21 @@ export class ConnectorRegistry {
           store.select(account.id);
         } else if (command.action === 'disconnect' || command.action === 'revoke') {
           if (command.action === 'revoke') {
-            if (!await this.host.approve('Revoke Aria Connect on GitHub?', 'GitHub will revoke this account’s Aria authorization across devices. Account: ' +
-                account.login, AbortSignal.timeout(120_000))) return this.snapshot();
+            const approved = await this.host.approve('Disconnect and open GitHub settings?',
+              'Aria will disconnect ' + account.login +
+              ' on this device. In GitHub, sign in as this account and revoke Aria Connect to remove access across devices.',
+              AbortSignal.timeout(120_000));
+            if (!approved) return this.snapshot();
+            if (connectionChanged(account, store.account(account.id))) throw changed();
           }
-          if (this.attempt) { this.attempt.abort(); this.attempt = undefined; }
+          this.cancelAuthorization();
           this.fence(account.id);
-          if (command.action === 'disconnect') store.remove(account.id);
-          else {
-            const epoch = this.epoch(account.id);
-            // Fence local operations before asking the provider to invalidate the full grant.
-            const blocked = { ...account, state: 'reconnect' as const, generation: account.generation + 1 };
-            store.update(blocked);
+          store.remove(account.id);
+          if (command.action === 'revoke') {
             this.emit();
-            try {
-              const signal = AbortSignal.any([epoch, AbortSignal.timeout(20_000)]);
-              const pair = await store.tokens(account.id);
-              if (!pair) throw unavailable();
-              const valid = pair.expiresAt > Date.now() ? pair : await github.refreshAuthorization(pair, signal);
-              await github.revokeAuthorization(valid, signal);
-            } catch {
-              this.lastError = 'The local connection was removed. Revoke Aria Connect in GitHub Settings → Applications to finish.';
-              await this.host.open('https://github.com/settings/apps/authorizations').catch(() => {});
-            } finally {
-              if (!connectionChanged(blocked, store.account(account.id))) store.remove(account.id);
-            }
+            await this.host.open('https://github.com/settings/apps/authorizations').catch(() => {
+              this.lastError = 'Aria disconnected this device. Open GitHub Settings → Applications → Authorized GitHub Apps to revoke access.';
+            });
           }
         } else if (command.action === 'manage') {
           await this.host.open(account.repositories.length ? 'https://github.com/settings/installations' : github.installUrl);
@@ -222,34 +221,62 @@ export class ConnectorRegistry {
 
   history(id: string) { return this.store?.history(id) ?? []; }
 
-  private start(expected?: string) {
+  cancelAuthorization() {
+    this.attempt?.controller.abort();
+    this.attempt = undefined;
+  }
+
+  private start(expected?: GithubAccount) {
     const { github, store } = this.enabled;
-    this.attempt?.abort();
-    const attempt = new AbortController();
+    this.cancelAuthorization();
+    const controller = new AbortController();
+    const attempt: NonNullable<ConnectorRegistry['attempt']> = { id: randomUUID(), controller };
+    const signal = controller.signal;
     this.attempt = attempt;
     void (async () => {
-      const pair = await github.startAuthorization(this.host.open, attempt.signal);
-      const user = await github.completeAuthorization(pair, attempt.signal);
+      if (!await store.available())
+        throw new RuntimeError('PERMISSION_DENIED', 'Unlock the OS-backed credential store before connecting GitHub.');
+      signal.throwIfAborted();
+      const pair = await github.startAuthorization(async (code) => {
+        signal.throwIfAborted();
+        attempt.verification = code;
+        this.emit();
+        await this.host.open(githubVerificationUrl).catch(() => {
+          if (this.attempt !== attempt || signal.aborted) return;
+          this.lastError = 'Aria could not open your browser. Open GitHub from this panel or visit github.com/login/device.';
+          this.emit();
+        });
+      }, signal);
+      signal.throwIfAborted();
+      attempt.verification = undefined;
+      this.lastError = null;
+      this.emit();
+      const verification = AbortSignal.any([signal, AbortSignal.timeout(30_000)]);
+      const user = await github.completeAuthorization(pair, verification);
       const existing = store.accounts().find((item) => item.userId === user.id);
-      if (expected && existing?.id !== expected)
+      if (expected && (user.id !== expected.userId || existing?.id !== expected.id))
         throw new RuntimeError('PERMISSION_DENIED', 'GitHub selected a different account. Reconnect using the original account, or choose Connect to add another.');
+      if (expected && connectionChanged(expected, existing)) throw changed();
       if (!existing && store.accounts().length >= 12)
         throw new RuntimeError('BUDGET_EXCEEDED', 'Disconnect an existing GitHub account before adding another.');
       const id = existing?.id ?? randomUUID();
-      const repositories = await github.listPermissions(id, pair, attempt.signal);
+      github.client(id).invalidate();
+      const repositories = await github.listPermissions(id, pair, verification);
       const sealed = await store.seal(pair);
-      if (this.attempt !== attempt || attempt.signal.aborted) throw changed();
+      if (this.attempt !== attempt || verification.aborted ||
+          (existing && connectionChanged(existing, store.account(existing.id)))) throw changed();
       const previous = store.active();
       if (previous) this.fence(previous);
       if (existing && existing.id !== previous) this.fence(existing.id);
       store.put({
         id, userId: user.id, login: user.login, avatar: user.avatar,
         connectedAt: existing?.connectedAt ?? Date.now(), verifiedAt: Date.now(),
-        generation: (existing?.generation ?? 0) + 1, state: 'needs_repositories', selected: [],
+        generation: (existing?.generation ?? 0) + 1, state: 'needs_repositories',
+        selected: existing?.selected.filter((id) => repositories.some((repo) => repo.id === id)) ?? [],
         repositories, policy: 'read_only', grants: [],
       }, sealed);
     })().catch((error: unknown) => {
-      if (this.attempt === attempt && !attempt.signal.aborted) this.lastError = this.message(error);
+      if (this.attempt === attempt && !signal.aborted) this.lastError = this.message(error);
     }).finally(() => {
       if (this.attempt === attempt) {
         this.attempt = undefined;
@@ -330,7 +357,7 @@ export class ConnectorRegistry {
         JSON.stringify(previous.permissions) !== JSON.stringify(next.permissions);
     });
     const updated = { ...current, login: user.login, avatar: user.avatar, verifiedAt: Date.now(), repositories, selected,
-      state: selected.length ? 'connected' as const : 'needs_repositories' as const,
+      state: selected.length && current.state === 'connected' ? 'connected' as const : 'needs_repositories' as const,
       ...(changedPermissions && { generation: current.generation + 1,
         grants: current.grants.filter((grant) => selected.includes(grant.repository)) }),
     };
@@ -369,7 +396,7 @@ export class ConnectorRegistry {
     const account = this.account(host.job?.connection);
     const primary = this.host.identity()?.key;
     const previous = this.turns.get(scope.requestId);
-    if (previous && previous.connection !== account.id || !primary || store.approvedPrimary(account.id) !== primary) throw changed();
+    if (account.state !== 'connected' || previous && previous.connection !== account.id || !primary || store.approvedPrimary(account.id) !== primary) throw changed();
     const signal = AbortSignal.any([parent, this.epoch(account.id)]);
     const assertLive = () => {
       signal.throwIfAborted();

@@ -85,15 +85,6 @@ importers:
         specifier: 3.2.7
         version: 3.2.7(@types/debug@4.1.13)(@types/node@22.20.5)(jsdom@31.0.0(@napi-rs/canvas@1.2.0)(@noble/hashes@1.8.0))(lightningcss@1.33.0)
 
-  apps/connector-auth-broker:
-    devDependencies:
-      '@types/node':
-        specifier: ^22.10.2
-        version: 22.20.5
-      typescript:
-        specifier: ^5.7.2
-        version: 5.9.3
-
   apps/desktop:
     dependencies:
       '@aria/shared':

@@ -1,99 +1,178 @@
-import { createHash, randomBytes } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { z } from 'zod';
+import type { DeviceCode } from '@aria/shared';
 import { boundedBytes, GithubError } from './client';
+import { githubRegistration, type GithubConfig } from './config';
 
-export const githubConfig = z.strictObject({
-  origin: z.string().url().refine((value) => new URL(value).protocol === 'https:' && new URL(value).origin === value),
-  clientId: z.string().regex(/^[A-Za-z0-9_]{8,120}$/),
-  slug: z.string().regex(/^[a-z0-9-]{1,100}$/),
+const deviceEndpoint = 'https://github.com/login/device/code';
+const tokenEndpoint = 'https://github.com/login/oauth/access_token';
+export const githubVerificationUrl = 'https://github.com/login/device';
+const deviceGrant = 'urn:ietf:params:oauth:grant-type:device_code';
+const session = z.object({
+  device_code: z.string().regex(/^[a-zA-Z0-9_-]{40}$/),
+  user_code: z.string().regex(/^[A-Z0-9]{4}-[A-Z0-9]{4}$/),
+  verification_uri: z.literal(githubVerificationUrl),
+  expires_in: z.number().int().min(1).max(900),
+  interval: z.number().int().min(1).max(900),
 });
-export type GithubConfig = z.infer<typeof githubConfig>;
-export const githubTokens = z.strictObject({
-  accessToken: z.string().regex(/^ghu_[a-zA-Z0-9_]{12,251}$/),
-  refreshToken: z.string().regex(/^ghr_[a-zA-Z0-9_]{12,251}$/),
-  expiresIn: z.number().int().min(1).max(86_400),
-  refreshExpiresIn: z.number().int().min(1).max(32_000_000),
+const responseTokens = z.object({
+  access_token: z.string().regex(/^ghu_[a-zA-Z0-9_]{12,251}$/),
+  refresh_token: z.string().regex(/^ghr_[a-zA-Z0-9_]{12,251}$/),
+  expires_in: z.number().int().min(1).max(86_400),
+  refresh_token_expires_in: z.number().int().min(1).max(32_000_000),
+  token_type: z.literal('bearer'),
 });
-export const savedTokens = githubTokens.pick({ accessToken: true, refreshToken: true }).extend({
-  expiresAt: z.number().int().positive(), refreshExpiresAt: z.number().int().positive(),
+export const savedTokens = z.strictObject({
+  flow: z.literal('device'),
+  accessToken: responseTokens.shape.access_token,
+  refreshToken: responseTokens.shape.refresh_token,
+  expiresAt: z.number().int().positive(),
+  refreshExpiresAt: z.number().int().positive(),
 });
 export type SavedTokens = z.infer<typeof savedTokens>;
 
-const randomProof = () => randomBytes(32).toString('base64url');
-const status = z.strictObject({ status: z.enum(['pending', 'ready', 'denied']) });
+const providerError = z.object({
+  error: z.string().max(80),
+  interval: z.number().int().min(1).max(86_400).optional(),
+});
+const expired = () => new GithubError('TIMEOUT', 'The GitHub verification code expired. Start again from Settings.', 'AUTH_TIMEOUT');
+const temporary = () => new GithubError('EXECUTION_FAILED', 'GitHub is temporarily unreachable. Check your connection and try again.', 'AUTH_NETWORK');
+const invalid = () => new GithubError('INVALID_TOOL_OUTPUT', 'GitHub returned an invalid authorization response.', 'AUTH_RESPONSE');
+
+const clock: { now(): number; wait(ms: number, signal: AbortSignal): Promise<void> } = {
+  now: () => Date.now(),
+  wait: (ms: number, signal: AbortSignal) => delay(ms, undefined, { signal }),
+};
+
+function retryAfter(value: string | null, now: number) {
+  if (!value) return 60_000;
+  const ms = /^\d+$/.test(value) ? Number(value) * 1000 : Date.parse(value) - now;
+  return Number.isFinite(ms) ? Math.max(1000, ms) : 60_000;
+}
 
 export class GithubAuthorization {
-  constructor(readonly config: GithubConfig, private readonly request: typeof fetch = fetch) {}
-  get registration() { return [this.config.origin, this.config.clientId, this.config.slug].join('|'); }
+  constructor(
+    readonly config: GithubConfig,
+    private readonly request: typeof fetch = fetch,
+    private readonly time = clock,
+  ) {}
+  get registration() { return githubRegistration(this.config); }
   get installUrl() { return 'https://github.com/apps/' + this.config.slug + '/installations/new'; }
 
-  private async send<T>(action: string, args: object, result: z.ZodType<T>, signal: AbortSignal): Promise<T> {
-    const endpoint = this.config.origin + '/v1/github/' + action;
+  private async send(endpoint: typeof deviceEndpoint | typeof tokenEndpoint, args: Record<string, string>, signal: AbortSignal) {
+    signal.throwIfAborted();
     let response: Response | undefined;
     try {
+      const requestSignal = AbortSignal.any([signal, AbortSignal.timeout(10_000)]);
       response = await this.request(endpoint, {
-        method: 'POST', redirect: 'error', signal: AbortSignal.any([signal, AbortSignal.timeout(10_000)]),
-        headers: { 'content-type': 'application/json', accept: 'application/json' },
-        body: JSON.stringify(args),
+        method: 'POST', redirect: 'error', credentials: 'omit', signal: requestSignal,
+        headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' },
+        body: new URLSearchParams({ client_id: this.config.clientId, ...args }),
       });
-      if (response.status === 410) throw new GithubError('PERMISSION_DENIED', 'GitHub authorization expired. Start a new connection.', 'AUTH_EXPIRED');
-      if (!response.ok) throw new GithubError('EXECUTION_FAILED',
-        action === 'revoke' ? 'GitHub revocation could not be verified.' : 'The Aria Connect broker is temporarily unavailable.',
-        action === 'revoke' ? 'REVOCATION_UNVERIFIED' : 'BROKER_UNAVAILABLE');
-      return result.parse(JSON.parse((await boundedBytes(response.body, 8192)).toString('utf8')));
+      requestSignal.throwIfAborted();
+      if (response.status === 429 || response.status === 403 && response.headers.has('retry-after')) {
+        const wait = retryAfter(response.headers.get('retry-after'), this.time.now());
+        throw new GithubError('BUDGET_EXCEEDED', 'GitHub is rate limiting authorization. Try again after the retry window.', 'RATE_LIMIT', wait);
+      }
+      if (response.status >= 500) throw temporary();
+      const bytes = await boundedBytes(response.body, 8192);
+      requestSignal.throwIfAborted();
+      let data: unknown;
+      try { data = JSON.parse(bytes.toString('utf8')); } catch { throw invalid(); }
+      const error = providerError.safeParse(data);
+      if (error.success) return { error: error.data };
+      if (!response.ok) throw invalid();
+      return { data };
     } catch (error) {
-      await response?.body?.cancel().catch(() => {});
+      void response?.body?.cancel().catch(() => {});
       signal.throwIfAborted();
       if (error instanceof GithubError) throw error;
-      throw new GithubError('EXECUTION_FAILED', 'The Aria Connect broker is temporarily unavailable.', 'BROKER_UNAVAILABLE');
+      throw temporary();
     }
   }
 
-  private pair(pair: z.infer<typeof githubTokens>): SavedTokens {
+  private pair(data: unknown): SavedTokens {
+    const parsed = responseTokens.safeParse(data);
+    if (!parsed.success) throw invalid();
+    const token = parsed.data;
+    const now = this.time.now();
     return {
-      accessToken: pair.accessToken, refreshToken: pair.refreshToken,
-      expiresAt: Date.now() + pair.expiresIn * 1000, refreshExpiresAt: Date.now() + pair.refreshExpiresIn * 1000,
+      flow: 'device', accessToken: token.access_token, refreshToken: token.refresh_token,
+      expiresAt: now + token.expires_in * 1000, refreshExpiresAt: now + token.refresh_token_expires_in * 1000,
     };
   }
 
-  async authorize(open: (url: string) => Promise<void>, signal: AbortSignal) {
-    const proof = { state: randomProof(), secret: randomProof() };
-    const verifier = randomProof();
-    const challenge = createHash('sha256').update(verifier).digest('base64url');
-    const attempt = AbortSignal.any([signal, AbortSignal.timeout(600_000)]);
-    const expected = this.config.origin + '/v1/github/callback';
-    const start = z.strictObject({ callback: z.literal(expected), expiresIn: z.number().int().min(1).max(600) });
+  private failure(code: string) {
+    if (code === 'access_denied')
+      return new GithubError('PERMISSION_DENIED', 'GitHub authorization was declined.', 'AUTH_DENIED');
+    if (code === 'device_flow_disabled' || code === 'incorrect_client_credentials' || code === 'unsupported_grant_type')
+      return new GithubError('CAPABILITY_UNAVAILABLE', 'GitHub Device Flow is unavailable. Check the GitHub App registration and client ID.', 'AUTH_CONFIGURATION');
+    return invalid();
+  }
+
+  async authorize(present: (code: DeviceCode) => Promise<void>, signal: AbortSignal) {
+    const requestedAt = this.time.now();
+    const initial = await this.send(deviceEndpoint, { scope: 'offline_access' }, signal);
+    if (initial.error) throw this.failure(initial.error.error);
+    const parsed = session.safeParse(initial.data);
+    if (!parsed.success) throw invalid();
+    const { device_code, user_code, expires_in, interval } = parsed.data;
+    const expiresAt = requestedAt + expires_in * 1000;
+    const remainingLifetime = expiresAt - this.time.now();
+    if (remainingLifetime <= 0) throw expired();
+    const lifetime = AbortSignal.timeout(remainingLifetime);
+    const active = AbortSignal.any([signal, lifetime]);
+    let minimum = interval * 1000;
+    let wait = minimum;
+    let networkFailures = 0;
     try {
-      await this.send('start', { ...proof, challenge }, start, attempt);
-      const url = new URL('https://github.com/login/oauth/authorize');
-      url.search = new URLSearchParams({
-        client_id: this.config.clientId, redirect_uri: expected, state: proof.state,
-        code_challenge: challenge, code_challenge_method: 'S256', prompt: 'select_account',
-      }).toString();
-      attempt.throwIfAborted();
-      await open(url.href);
+      await present({ userCode: user_code, expiresAt });
       for (;;) {
-        await delay(2000, undefined, { signal: attempt });
-        const reply = await this.send('status', proof, status, attempt);
-        if (reply.status === 'pending') continue;
-        if (reply.status === 'denied')
-          throw new GithubError('PERMISSION_DENIED', 'GitHub authorization was declined.', 'AUTH_DENIED');
-        return this.pair(await this.send('complete', { ...proof, verifier }, githubTokens, attempt));
+        active.throwIfAborted();
+        const remaining = expiresAt - this.time.now();
+        if (remaining <= 0) throw expired();
+        await this.time.wait(Math.min(remaining, wait), active);
+        if (this.time.now() >= expiresAt) throw expired();
+        const reply = await this.send(tokenEndpoint, { grant_type: deviceGrant, device_code }, active).catch((error: unknown) => {
+          if (!(error instanceof GithubError) || !['AUTH_NETWORK', 'RATE_LIMIT'].includes(error.category)) throw error;
+          networkFailures++;
+          wait = Math.max(minimum, error.retryAfterMs ?? Math.min(60_000, minimum * 2 ** Math.min(networkFailures, 6)));
+          return undefined;
+        });
+        if (!reply) continue;
+        active.throwIfAborted();
+        if (this.time.now() >= expiresAt) throw expired();
+        if (!reply.error) return this.pair(reply.data);
+        networkFailures = 0;
+        switch (reply.error.error) {
+          case 'authorization_pending':
+            break;
+          case 'slow_down':
+            minimum = Math.max(minimum + 5000, (reply.error.interval ?? 0) * 1000);
+            break;
+          case 'expired_token':
+          case 'token_expired':
+          case 'incorrect_device_code':
+            throw expired();
+          default:
+            throw this.failure(reply.error.error);
+        }
+        wait = minimum;
       }
     } catch (error) {
-      if (!signal.aborted && attempt.aborted)
-        throw new GithubError('TIMEOUT', 'GitHub sign-in timed out. Start a new connection.', 'AUTH_TIMEOUT');
+      signal.throwIfAborted();
+      if (lifetime.aborted) throw expired();
       throw error;
-    } finally {
-      void this.send('cancel', proof, z.object({ status: z.literal('cancelled') }), AbortSignal.timeout(4000)).catch(() => {});
     }
   }
 
-  async refresh(refreshToken: string, signal: AbortSignal) {
-    return this.pair(await this.send('refresh', { refreshToken }, githubTokens, signal));
-  }
-  async revoke(accessToken: string, signal: AbortSignal) {
-    await this.send('revoke', { accessToken }, z.strictObject({ revoked: z.literal(true) }), signal);
+  async refresh(credentials: SavedTokens, signal: AbortSignal) {
+    if (credentials.flow !== 'device')
+      throw new GithubError('PERMISSION_DENIED', 'Reconnect this account using GitHub Device Flow.', 'AUTH_EXPIRED');
+    const reply = await this.send(tokenEndpoint, { grant_type: 'refresh_token', refresh_token: credentials.refreshToken }, signal);
+    if (!reply.error) return this.pair(reply.data);
+    if (['bad_refresh_token', 'invalid_grant', 'expired_token', 'token_expired', 'access_denied'].includes(reply.error.error))
+      throw new GithubError('PERMISSION_DENIED', 'GitHub authorization expired or was revoked. Reconnect from Settings.', 'AUTH_EXPIRED');
+    throw this.failure(reply.error.error);
   }
 }

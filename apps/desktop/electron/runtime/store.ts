@@ -1,4 +1,4 @@
-import { migrateConnectors } from '../connectors/migrations';
+import { migrateConnectors, migrateGithubDeviceFlow } from '../connectors/migrations';
 import { migrateProactive } from '../proactive/migrations';
 import { createHash, randomUUID } from 'node:crypto';
 import { closeSync, existsSync, mkdirSync, openSync } from 'node:fs';
@@ -55,7 +55,7 @@ export class RuntimeStore {
     try {
       db.exec('PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 2000; PRAGMA journal_mode = WAL;');
       const version = Number(db.prepare('PRAGMA user_version').get()?.user_version);
-      if (version > 10) throw new Error('This runtime profile requires a newer version of Aria.');
+      if (version > 11) throw new Error('This runtime profile requires a newer version of Aria.');
       if (version === 0) {
         db.exec(`
           BEGIN IMMEDIATE;
@@ -240,6 +240,7 @@ export class RuntimeStore {
       }
       if (version < 9) migrateProactive(db);
       if (version < 10) migrateConnectors(db);
+      if (version < 11) migrateGithubDeviceFlow(db);
       db.exec(`
         DELETE FROM loop_checkpoints WHERE expires <= unixepoch() * 1000;
         UPDATE loop_checkpoints SET state = 'recovering'
