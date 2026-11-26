@@ -1,123 +1,51 @@
-import { useEffect, useState } from 'react';
-import { useLocation, useNavigate } from 'react-router-dom';
-import { ArrowLeft, ArrowUpRight, Check, Monitor, Moon, Sun, UserRound } from 'lucide-react';
+import { lazy, useEffect } from 'react';
+import { useLocation, useNavigate, useParams } from 'react-router-dom';
+import { settingsCategorySchema, type SettingsCategoryId } from '@aria/shared';
 import { useWorkspaceStore } from '../../stores/workspaceStore';
-import { Button, Field } from '../ui';
-import { WebBrowserSettings } from './WebBrowserSettings';
-import { ToolSettings } from './ToolSettings';
-import { ModelSettings } from './ModelSettings';
-import { MemorySettings } from './MemorySettings';
-import { UpdateSettings } from './UpdateSettings';
+import { cancelPendingCatalogRequests } from '../../stores/providerStore';
+import { SettingsLayout } from './SettingsLayout';
+import { resolveSettingsHash } from './settingsRegistry';
+
+const pages = {
+  general: lazy(() => import('./pages/GeneralSettings')),
+  appearance: lazy(() => import('./pages/AppearanceSettings')),
+  personalization: lazy(() => import('./pages/PersonalizationSettings')),
+  notifications: lazy(() => import('./pages/NotificationSettings')),
+  providers: lazy(() => import('./pages/ProviderSettings')),
+  models: lazy(() => import('./pages/ModelSettings')),
+  proactive: lazy(() => import('./pages/ProactiveAssistantSettings')),
+  conductor: lazy(() => import('./pages/ConductorSettings')),
+  memory: lazy(() => import('./pages/MemorySettings')),
+  connectors: lazy(() => import('./connectors/ConnectorsSettings')),
+  integrations: lazy(() => import('./pages/IntegrationSettings')),
+  browser: lazy(() => import('./pages/BrowserSettings')),
+  desktop: lazy(() => import('./pages/DesktopSettings')),
+  storage: lazy(() => import('./pages/StorageSettings')),
+  privacy: lazy(() => import('./pages/PrivacySettings')),
+  shortcuts: lazy(() => import('./pages/ShortcutSettings')),
+  advanced: lazy(() => import('./pages/AdvancedSettings')),
+  diagnostics: lazy(() => import('./pages/DiagnosticsSettings')),
+  about: lazy(() => import('./pages/AboutSettings')),
+};
 
 export default function SettingsView() {
-  const preferences = useWorkspaceStore((state) => state.data.preferences);
-  const update = useWorkspaceStore((state) => state.preferences);
-  const [name, setName] = useState(preferences.profileName);
   const navigate = useNavigate();
-  const { hash } = useLocation();
+  const location = useLocation();
+  const { category } = useParams();
+  const savedCategory = useWorkspaceStore((state) => state.data.preferences.settingsCategory);
+  const update = useWorkspaceStore((state) => state.preferences);
+  const legacy = resolveSettingsHash(location.hash);
+  const parsed = settingsCategorySchema.safeParse(category);
+  const active = legacy?.category ?? (parsed.success ? parsed.data : savedCategory ?? 'general');
+  const target = legacy?.settingId ?? (location.state as { settingId?: string } | null)?.settingId ?? null;
+  const Page = pages[active];
   useEffect(() => {
-    if (['#ai-models', '#web-browser', '#tools', '#skills', '#memory'].includes(hash))
-      document.getElementById(hash.slice(1))?.scrollIntoView?.();
-  }, [hash]);
-  const modifier = window.aria?.platform === 'darwin' ? '⌘' : 'Ctrl';
-  return (
-    <div className="page-scroll chat-settings">
-      <div className="settings-page">
-        <Button variant="ghost" size="sm" onClick={() => navigate('/chat')}>
-          <ArrowLeft size={14} />
-          Back to chat
-        </Button>
-        <div className="page-heading">
-          <div>
-            <h1>Make yourself at home.</h1>
-            <p>A few preferences to make Aria yours.</p>
-          </div>
-        </div>
-        <section className="settings-section">
-          <div className="settings-section-heading">
-            <h2>Appearance</h2>
-            <p>A comfortable space, day or night.</p>
-          </div>
-          <div className="theme-options">
-            {[
-              { id: 'dark' as const, icon: Moon, label: 'Dark' },
-              { id: 'light' as const, icon: Sun, label: 'Light' },
-              { id: 'system' as const, icon: Monitor, label: 'System' },
-            ].map((theme) => (
-              <button
-                key={theme.id}
-                className={`theme-option ${preferences.theme === theme.id ? 'selected' : ''}`}
-                onClick={() => update({ theme: theme.id })}
-                aria-pressed={preferences.theme === theme.id}
-              >
-                <theme.icon size={20} />
-                <span>{theme.label}</span>
-                {preferences.theme === theme.id && <Check size={14} />}
-              </button>
-            ))}
-          </div>
-        </section>
-        <ModelSettings />
-        <WebBrowserSettings />
-        <ToolSettings />
-        <MemorySettings />
-        <UpdateSettings />
-        <section className="settings-section">
-          <div className="settings-section-heading">
-            <h2>
-              <UserRound size={17} /> Local profile
-            </h2>
-            <p>Your display name on this device. No account is required.</p>
-          </div>
-          <Field label="Display name">
-            <input
-              value={name}
-              maxLength={80}
-              onChange={(event) => setName(event.target.value)}
-              onBlur={() => {
-                const value = name.trim() || 'You';
-                setName(value);
-                update({ profileName: value });
-              }}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter') event.currentTarget.blur();
-              }}
-            />
-          </Field>
-        </section>
-        <section className="settings-section">
-          <div className="settings-section-heading">
-            <h2>Keyboard shortcuts</h2>
-          </div>
-          {[
-            ['New chat', `${modifier} Shift O`],
-            ['Search conversations', `${modifier} K`],
-            ['Focus message composer', `${modifier} L`],
-            ['Send message', 'Enter'],
-            ['Insert a new line', 'Shift Enter'],
-            ['Close a dialog', 'Esc'],
-          ].map(([label, shortcut]) => (
-            <div className="shortcut-row" key={label}>
-              <span>{label}</span>
-              <kbd>{shortcut}</kbd>
-            </div>
-          ))}
-        </section>
-        <section className="settings-section">
-          <div className="settings-section-heading">
-            <h2>Advanced</h2>
-            <p>
-              Your previous projects, drafts, files, tasks, and sample workflows remain available in
-              the legacy workspace.
-            </p>
-          </div>
-          <Button onClick={() => navigate('/advanced/home')}>
-            Open legacy workspace
-            <ArrowUpRight size={14} />
-          </Button>
-        </section>
-        <p className="muted settings-version">Aria Desktop · Conversations saved on this device</p>
-      </div>
-    </div>
-  );
+    if (savedCategory !== active) update({ settingsCategory: active });
+  }, [active, savedCategory, update]);
+  const select = (next: SettingsCategoryId, settingId?: string) => {
+    if (next !== active) cancelPendingCatalogRequests();
+    if (savedCategory !== next) update({ settingsCategory: next });
+    navigate(`/settings/${next}`, { state: settingId ? { settingId } : null });
+  };
+  return <SettingsLayout activeCategory={active} highlightedSettingId={target} onSelectCategory={select} onBackToChat={() => navigate('/chat')}><Page /></SettingsLayout>;
 }

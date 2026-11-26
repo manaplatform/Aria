@@ -156,6 +156,9 @@ export const memorySource = z.strictObject({
   messageId: identifier,
 });
 export type MemorySource = z.infer<typeof memorySource>;
+export const memoryJobSource = z.strictObject({ kind: z.literal('job'), jobId: z.uuid(), attemptId: z.uuid() });
+export type MemoryJobSource = z.infer<typeof memoryJobSource>;
+export type MemoryProvenance = MemorySource | MemoryJobSource;
 export type MemoryScope =
   { kind: 'profile' } | { kind: 'project'; id: string } | { kind: 'conversation'; id: string };
 
@@ -164,7 +167,7 @@ export interface MemoryRecord {
   revision: number;
   scope: MemoryScope;
   value: MemoryInput;
-  sources: MemorySource[];
+  sources: MemoryProvenance[];
   origin: 'user' | 'extractive';
   confirmation: 'confirmed' | 'inferred';
   confidence: number;

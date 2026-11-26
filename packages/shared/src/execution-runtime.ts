@@ -1,4 +1,6 @@
 import { z } from 'zod';
+import { githubOperation, githubPublicOperation } from './connectors/index.js';
+import { proactiveOperationIds } from './proactive.js';
 import { memoryOperations } from './memory.js';
 import { computerImage, computerOperations } from './computer-use.js';
 import { loopLimitsSchema } from './loop.js';
@@ -156,6 +158,9 @@ export const evidenceSchema = z.strictObject({
 export const runtimeCallSchema = z.strictObject({
   operation: z.union([
     z.object(runtimeOperations).keyof(),
+    githubOperation,
+    githubPublicOperation,
+    z.enum(proactiveOperationIds),
     z.literal('knowledge.record_native'),
     z.literal('hosted.resources'),
     z.literal('program.start'),

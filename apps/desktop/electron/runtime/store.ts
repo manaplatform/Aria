@@ -1,3 +1,5 @@
+import { migrateConnectors, migrateGithubDeviceFlow } from '../connectors/migrations';
+import { migrateProactive } from '../proactive/migrations';
 import { createHash, randomUUID } from 'node:crypto';
 import { closeSync, existsSync, mkdirSync, openSync } from 'node:fs';
 import path from 'node:path';
@@ -42,6 +44,8 @@ export class RuntimeStore {
     return path.join(this.directory, 'runtime.sqlite');
   }
 
+  exists() { return Boolean(this.database) || existsSync(this.databaseFile); }
+
   get db() {
     if (this.database) return this.database;
     mkdirSync(this.directory, { recursive: true, mode: 0o700 });
@@ -51,7 +55,7 @@ export class RuntimeStore {
     try {
       db.exec('PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 2000; PRAGMA journal_mode = WAL;');
       const version = Number(db.prepare('PRAGMA user_version').get()?.user_version);
-      if (version > 8) throw new Error('This runtime profile requires a newer version of Aria.');
+      if (version > 11) throw new Error('This runtime profile requires a newer version of Aria.');
       if (version === 0) {
         db.exec(`
           BEGIN IMMEDIATE;
@@ -234,6 +238,9 @@ export class RuntimeStore {
           COMMIT;
         `);
       }
+      if (version < 9) migrateProactive(db);
+      if (version < 10) migrateConnectors(db);
+      if (version < 11) migrateGithubDeviceFlow(db);
       db.exec(`
         DELETE FROM loop_checkpoints WHERE expires <= unixepoch() * 1000;
         UPDATE loop_checkpoints SET state = 'recovering'

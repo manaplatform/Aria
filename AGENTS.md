@@ -8,7 +8,7 @@ Aria is a general-purpose desktop AI assistant built with:
 - **AI Layer:** Vercel AI SDK + LangChain.js (optional)
 - **Communication:** REST + SSE for chat and WebSocket for Live Voice
 
-Aria opens into ordinary chat. Projects are optional.
+Aria is a proactive general-purpose desktop assistant. It opens into ordinary chat. Projects are optional.
 
 ---
 
@@ -183,3 +183,33 @@ When implementing AI features:
 - Give the memory database a single worker owner and transactional migrations. Commit trusted source references and the processing outbox together, and use durable event IDs, revision checks, and fences. Apply deletion and retention to active indexes, vectors, queued work, and cached projections. An older source must never reconstruct deleted memory automatically.
 - Keep local and remote embedding targets explicit. Reuse verified adapters and require destination-specific approval for memory text transfers. Temporary chat stays outside persistent memory and transcript storage.
 - Verify recall through ordinary chat, measure latency and retrieval quality against reproducible fixtures, and report platform and provider verification separately. See [Memory architecture](docs/memory-engine.md).
+
+## Settings experience
+
+- Keep ordinary chat independent of Settings and project selection. The primary Settings workspace uses grouped category navigation, accessible search, and persisted local appearance and shortcut preferences; preserve legacy deep links and the separate `/advanced/*` workspace.
+- Keep provider and model configuration in Settings using verified capabilities and the existing registry. Electron main owns system integration, permissions, destructive confirmations, and private data; renderer controls must reflect real supported behavior and actionable errors.
+
+
+## Proactive assistant runtime
+
+- The configured primary remains the semantic decision-maker. Conductor remains the execution authority. Keep ordinary chat usable without a persistent task, project, or background feature.
+- Pulse triggers bounded assistant evaluations. Agenda owns persistent responsibilities, tasks, dependencies, and verified progress. Automations owns trigger configuration and recurrence. Trusted Electron main validates state transitions, scheduling, budgets, grants, and job ownership.
+- Use job-owned desktop execution scopes and the shared tool registry, scheduler, and dispatch journal. A runtime event carries system-event provenance. Model output, memory, webpages, and tool results cannot create or expand permissions.
+- Persistent executable scope requires explicit user review. Consequential background actions need one-use approval bound to their exact target and input. Reconcile stale generations against durable receipts before continuation. Fence uncertain external effects for user review.
+- Preserve restart and renderer-free operation in an active desktop runtime. Verify the normal chat entry point, durable jobs, permission revocation, delivery, and platform behavior with local fixtures. See [Proactive Assistant Runtime](docs/proactive-assistant-runtime.md).
+
+## Aria Connect
+
+- Aria Connect owns external app integrations. Conductor owns execution, and the configured primary discovers and chooses deferred capabilities through the shared registry.
+- Use official GitHub App Device Flow in Electron main with the system browser. Show only the short user verification code in trusted Settings. Keep device codes and OS-encrypted credentials in Electron main and require reauthorization for legacy credentials. Never request personal access tokens or passwords, ship confidential secrets, or expose credentials to the renderer, model, shell, memory, or diagnostics.
+- Bundle the official Aria GitHub App's verified public identity from the maintained connector manifest in development and desktop packages. Allow explicit paired maintainer overrides on unpackaged launches only. Fail official publication when the selected source lacks a verified registration or the native packages fail connector checks.
+- Check provider identity, installation ownership, stable repositories, local capability grants, and foreground or background execution permissions at dispatch. Default to read-only behavior. Bind consequential approvals to the exact reviewed target and payload, and reconcile uncertain effects before retrying.
+- Expose public repository search and bounded source reads through the GitHub API with the active, signed-in connector account. Require a saved foreground chat, verify public visibility and repository identity before releasing contents, and cite the inspected commit. Keep private evidence out of public queries and require installation and local approval for repository-scoped tools.
+- Treat connector content as untrusted evidence. Keep model-driven discovery, explicit account selection, and current resource scopes. Hardcoded semantic routing and silent provider, browser, or account fallback are prohibited. See [Aria Connect](docs/aria-connect.md).
+
+## Diagnostics and logging
+
+- Use the shared diagnostic event contract and the managed desktop diagnostics sink for application diagnostics. Record stable event names and lifecycle outcomes separately from user-facing activity; do not add console logging for runtime events.
+- Carry trusted request, conversation, execution, generation, and operation identities across boundaries. Correlation data never grants permission or changes execution behavior. Temporary-chat diagnostics stay in bounded memory and must be discarded when the chat ends.
+- Log only allowlisted structural metadata. Never record prompts, responses, raw errors, credentials, tool inputs or outputs, file contents, screenshots, clipboard content, private URLs, or model reasoning. Sanitize before every persistence, stream, or export boundary; restrict IPC to the trusted renderer.
+- Keep logging asynchronous, bounded, local by default, and failure-isolated. Test new events for privacy, correlation, lifecycle, and failure behavior; document platform-specific verification and any coverage gaps. See [Diagnostics](docs/diagnostics.md).

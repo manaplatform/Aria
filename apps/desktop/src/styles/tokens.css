@@ -15,6 +15,8 @@
   --accent-hover: #a07cff;
   --accent-soft: #8261e526;
   --accent-foreground: #fff;
+  --settings-row-py: 12px;
+  --settings-gap: 16px;
   --blue: #67b8ff;
   --teal: #44d5bb;
   --success: #64dda1;
@@ -82,4 +84,84 @@
   --shadow-sm: 0 2px 6px #30345a08;
   --shadow-md: 0 12px 36px #30345a18;
   --shadow-overlay: 0 24px 80px #30345a30;
+}
+:root[data-accent='blue'] {
+  --accent: #529dff;
+  --accent-hover: #6eabff;
+  --accent-soft: #529dff26;
+}
+:root[data-theme='light'][data-accent='blue'] {
+  --accent: #2f6fe4;
+  --accent-hover: #245cc4;
+  --accent-soft: #2f6fe418;
+}
+:root[data-accent='teal'] {
+  --accent: #32c9b0;
+  --accent-hover: #49d7bf;
+  --accent-soft: #32c9b024;
+}
+:root[data-theme='light'][data-accent='teal'] {
+  --accent: #0f8a75;
+  --accent-hover: #0b7361;
+  --accent-soft: #0f8a7518;
+}
+:root[data-accent='emerald'] {
+  --accent: #44cf8b;
+  --accent-hover: #5bd99b;
+  --accent-soft: #44cf8b24;
+}
+:root[data-theme='light'][data-accent='emerald'] {
+  --accent: #18834f;
+  --accent-hover: #136b40;
+  --accent-soft: #18834f18;
+}
+:root[data-accent='amber'] {
+  --accent: #e5a94e;
+  --accent-hover: #eeb764;
+  --accent-soft: #e5a94e24;
+}
+:root[data-theme='light'][data-accent='amber'] {
+  --accent: #b36b09;
+  --accent-hover: #975906;
+  --accent-soft: #b36b0918;
+}
+:root[data-accent='rose'] {
+  --accent: #f06d88;
+  --accent-hover: #f58299;
+  --accent-soft: #f06d8824;
+}
+:root[data-theme='light'][data-accent='rose'] {
+  --accent: #c73c59;
+  --accent-hover: #a92e48;
+  --accent-soft: #c73c5918;
+}
+:root[data-font-size='small'] {
+  --text-xs: 10.5px;
+  --text-sm: 11.5px;
+  --text-base: 12.5px;
+  --text-lg: 14px;
+  --text-xl: 18px;
+}
+:root[data-font-size='large'] {
+  --text-xs: 12px;
+  --text-sm: 13px;
+  --text-base: 14.5px;
+  --text-lg: 16.5px;
+  --text-xl: 22px;
+}
+:root[data-density='compact'] {
+  --settings-row-py: 8px;
+  --settings-gap: 10px;
+}
+:root[data-density='spacious'] {
+  --settings-row-py: 16px;
+  --settings-gap: 20px;
+}
+:root[data-motion='reduced'] *,
+:root[data-motion='reduced'] *::before,
+:root[data-motion='reduced'] *::after {
+  animation-duration: 0.01ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.01ms !important;
+  scroll-behavior: auto !important;
 }

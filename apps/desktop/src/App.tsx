@@ -1,4 +1,4 @@
-import { Component, lazy, Suspense, useEffect, type ErrorInfo, type ReactNode } from 'react';
+import { Component, lazy, Suspense, useEffect, type ReactNode } from 'react';
 import { HashRouter, Navigate, Route, Routes } from 'react-router-dom';
 import ChatLayout from './components/layout/ChatLayout';
 import { Button, ErrorState, Skeleton, TooltipProvider } from './components/ui';
@@ -6,14 +6,18 @@ import { flushPersistence, initializeWorkspace, useWorkspaceStore } from './stor
 import { bindChatBridge } from './stores/chatStore';
 const ChatView = lazy(() => import('./components/chat/ChatView'));
 const SettingsView = lazy(() => import('./components/settings/SettingsView'));
+const Agenda = lazy(() => import('./components/proactive/AgendaPage'));
+const AgendaDetail = lazy(() => import('./components/proactive/AgendaDetail'));
+const Automations = lazy(() => import('./components/proactive/AutomationsPage'));
+const Notifications = lazy(() => import('./components/proactive/NotificationCenter'));
 const LegacyWorkspace = lazy(() => import('./pages/LegacyWorkspace'));
 class ErrorBoundary extends Component<{ children: ReactNode }, { error: string | null }> {
   state = { error: null as string | null };
   static getDerivedStateFromError(error: Error) {
     return { error: error.message };
   }
-  componentDidCatch(error: Error, info: ErrorInfo) {
-    console.error('Aria renderer error', error, info.componentStack);
+  componentDidCatch() {
+    void window.aria?.diagnosticRendererError().catch(() => undefined);
   }
   render() {
     return this.state.error ? (
@@ -30,6 +34,7 @@ function Application() {
   const ready = useWorkspaceStore((state) => state.ready);
   const error = useWorkspaceStore((state) => state.loadError);
   const theme = useWorkspaceStore((state) => state.data.preferences.theme);
+  const appearance = useWorkspaceStore((state) => state.data.preferences);
   useEffect(
     () =>
       window.aria?.onBeforeClose(async () => {
@@ -58,6 +63,13 @@ function Application() {
     query.addEventListener('change', apply);
     return () => query.removeEventListener('change', apply);
   }, [theme]);
+  useEffect(() => {
+    const root = document.documentElement;
+    root.dataset.accent = appearance.accentColor ?? 'violet';
+    root.dataset.fontSize = appearance.fontSize ?? 'default';
+    root.dataset.density = appearance.density ?? 'comfortable';
+    root.dataset.motion = appearance.reducedMotion ?? 'system';
+  }, [appearance.accentColor, appearance.fontSize, appearance.density, appearance.reducedMotion]);
   if (error) return <ErrorState message={error} retry={() => window.location.reload()} />;
   if (!ready)
     return (
@@ -71,7 +83,14 @@ function Application() {
         <Routes>
           <Route element={<ChatLayout />}>
             <Route path="/chat" element={<ChatView />} />
+            <Route path="/agenda" element={<Agenda />} />
+            <Route path="/agenda/tasks/:id" element={<AgendaDetail />} />
+            <Route path="/agenda/objectives/:id" element={<AgendaDetail />} />
+            <Route path="/agenda/jobs/:id" element={<AgendaDetail />} />
+            <Route path="/automations/:id?" element={<Automations />} />
+            <Route path="/notifications" element={<Notifications />} />
             <Route path="/settings" element={<SettingsView />} />
+            <Route path="/settings/:category" element={<SettingsView />} />
           </Route>
           <Route path="/advanced/*" element={<LegacyWorkspace />} />
           <Route path="*" element={<Navigate to="/chat" replace />} />

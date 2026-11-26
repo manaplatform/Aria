@@ -7,6 +7,7 @@ import { AriaMark } from '../layout/AriaMark';
 import { Button, CopyButton, Modal } from '../ui';
 import { desktop, errorMessage, openExternal } from '../../services/desktop';
 import { notify } from '../../stores/uiStore';
+import { useWorkspaceStore } from '../../stores/workspaceStore';
 import { openResearchSource } from '../../stores/browserStore';
 import MarkdownRenderer from './MarkdownRenderer';
 import { ArtifactCard } from './ArtifactCard';
@@ -269,6 +270,7 @@ export function ChatMessage({
     execution?.state === 'recovering' ? 'Recovering execution' :
     execution?.state === 'waiting_for_tool' ? activeStep?.summary || 'Running tools' : undefined;
 
+  const expandActivity = useWorkspaceStore((state) => Boolean(state.data.preferences.expandActivityByDefault));
   return (
     <article
       id={`chat-message-${message.id}`}
@@ -326,7 +328,11 @@ export function ChatMessage({
             ? `${memorySource.confirmation} · ${new Date(memorySource.observedAt).toLocaleDateString()}`
             : 'This memory is unavailable.'}>
           {memorySource && <p>{memorySource.value.content}</p>}
-          {memorySource?.sources.slice(-3).map((source) => (
+          {memorySource?.sources.slice(-3).map((source) => 'kind' in source ? (
+            <Button key={source.attemptId} variant="ghost" size="sm" onClick={() => navigate('/agenda/jobs/' + source.jobId)}>
+              View job
+            </Button>
+          ) : (
             <Button key={source.messageId} variant="ghost" size="sm" onClick={() => {
               selectChat(source.conversationId);
               navigate('/chat', { state: { messageId: source.messageId } });
@@ -337,7 +343,7 @@ export function ChatMessage({
       )}
       {busy && execution && <ExecutionControls message={message} />}
       {message.activity?.length ? (
-        <details className="conductor-activity">
+        <details className="conductor-activity" open={expandActivity}>
           <summary>
             <Activity size={13} aria-hidden="true" />{' '}
             {activeStep?.status === 'approval'

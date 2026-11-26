@@ -8,6 +8,7 @@ import {
   managedExecutionSchema,
   runInfoSchema,
   toolProblemSchema,
+  userPersonalizationSchema,
   type ChatEvent,
 } from '@aria/shared';
 
@@ -69,6 +70,7 @@ export const managedChatRequestSchema = chatRequestSchema.safeExtend({
       .max(6)
       .optional(),
   }).optional(),
+  personalization: userPersonalizationSchema.optional(),
 });
 
 const envelope = z.object({

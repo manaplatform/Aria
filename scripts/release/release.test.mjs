@@ -15,10 +15,13 @@ import { formatNotes } from './generate-notes.mjs';
 import { findRelease, GitHubError, releaseNoteMarker, tagAnnotation } from './github.mjs';
 import { claimDraftRequest, publishDraft, publishRelease, reserveTag, uploadAssets, verifyBuilds } from './run.mjs';
 import { windowsSignerPins } from './windows-signer-pins.mjs';
+import { githubIdentity, githubIdentityDigest, verifyGithubRegistration } from './github-connector.mjs';
 
 const commit = 'a'.repeat(40);
 const tag = 'v2026.11.22';
 const version = '0.0.1';
+const connectorIdentity = { clientId: 'Iv1.fixture', slug: 'fixture-app' };
+const connectorDigest = githubIdentityDigest(connectorIdentity);
 const published = (version, sha = commit) => ({ version, commit: sha, tag });
 const state = (extra = {}) => ({ tags: new Set(), reservations: [], published: [], releases: [], ...extra });
 
@@ -32,6 +35,51 @@ test('reads canonical SemVer and validates package limits', () => {
   assert.throws(() => validatePackageVersion('1.2.100'), /bundle field limits/);
   assert.equal(channelFor('1.2.3-beta.1'), 'beta');
   assert.equal(channelFor('1.2.3'), 'stable');
+});
+
+test('production requires a complete public GitHub App manifest', () => {
+  assert.equal(githubIdentity({ github: null }, false), null);
+  assert.deepEqual(githubIdentity({ github: connectorIdentity }, true), connectorIdentity);
+  for (const manifest of [undefined, { github: null }, { github: { slug: 'fixture-app' } },
+    { github: { ...connectorIdentity, slug: '../fixture' } }, { github: { ...connectorIdentity, secret: 'fixture' } }]) {
+    assert.throws(() => githubIdentity(manifest, true), /release configuration is missing or invalid/);
+  }
+});
+
+test('production verifies App ownership, matching public identity, and live Device Flow availability', async () => {
+  const app = { slug: connectorIdentity.slug, client_id: connectorIdentity.clientId, owner: { login: 'manaplatform' } };
+  const deviceCode = 'a'.repeat(40);
+  const requests = [];
+  const waits = [];
+  const probe = (metadata, poll = { error: 'authorization_pending' }) => verifyGithubRegistration(connectorIdentity, {
+    async request(url, options) {
+      requests.push(url);
+      assert.equal(options.credentials, 'omit');
+      assert.equal(options.redirect, 'error');
+      if (url === 'https://api.github.com/apps/fixture-app') return Response.json(metadata);
+      assert.equal(options.method, 'POST');
+      assert.equal(options.body.get('client_id'), connectorIdentity.clientId);
+      assert.equal(options.body.has('client_secret'), false);
+      if (url === 'https://github.com/login/device/code') {
+        assert.equal(options.body.get('scope'), 'offline_access');
+        return Response.json({ device_code: deviceCode, user_code: 'ABCD-EFGH',
+          verification_uri: 'https://github.com/login/device', interval: 5, expires_in: 900 });
+      }
+      assert.equal(url, 'https://github.com/login/oauth/access_token');
+      assert.equal(options.body.get('device_code'), deviceCode);
+      assert.equal(options.body.get('grant_type'), 'urn:ietf:params:oauth:grant-type:device_code');
+      return Response.json(poll);
+    },
+    async wait(ms) { waits.push(ms); },
+  });
+  await assert.rejects(() => probe({ ...app, owner: { login: 'other' } }), /does not match/);
+  await assert.rejects(() => probe({ ...app, client_id: 'Iv1.other' }), /does not match/);
+  assert.equal(requests.length, 2);
+  await probe(app);
+  assert.deepEqual(waits, [5000]);
+  await assert.rejects(() => probe(app, { error: 'device_flow_disabled', device_code: deviceCode }), {
+    message: /^Could not verify GitHub Device Flow.*reachable\.$/,
+  });
 });
 
 test('Windows production signer pins accept an empty rotation setting', () => {
@@ -221,6 +269,7 @@ async function buildFixture(t, production, ref = 'HEAD') {
     }
     await writeFile(path.join(directory, 'receipt.json'), JSON.stringify({
       commit, version, platform, arch, files, production, components: [], timestamp: new Date().toISOString(),
+      githubConnector: production ? connectorDigest : null,
       ...(platform === 'macos' ? { signing: 'ad-hoc', notarized: false } : {}),
     }));
   }
@@ -240,6 +289,14 @@ test('build verification requires ad hoc macOS receipts and generates DMG update
   const receipt = await readJson(pathToReceipt);
   await writeFile(pathToReceipt, JSON.stringify({ ...receipt, signing: undefined }));
   await assert.rejects(() => verifyBuilds(builds, output, false), /Missing ad hoc signing verification/);
+});
+
+test('production build verification rejects receipts without the bundled GitHub identity', async (t) => {
+  const { builds, output, commit } = await buildFixture(t, true);
+  const filename = path.join(builds, 'aria-macos-arm64', 'receipt.json');
+  const receipt = await readJson(filename);
+  await writeFile(filename, JSON.stringify({ ...receipt, githubConnector: null }));
+  await assert.rejects(() => verifyBuilds(builds, output, true, commit, connectorDigest), /Missing GitHub connector verification/);
 });
 
 test('lost tag creation response reuses the authoritative annotated tag', async () => {
@@ -334,8 +391,8 @@ test('a publication event fills the same GitHub release with verified assets and
 
 async function exercisePublication(t, trigger) {
   const { builds, output, version, commit } = await buildFixture(t, true, trigger === 'schedule' ? 'HEAD^' : 'HEAD');
-  if (trigger === 'schedule') await assert.rejects(() => verifyBuilds(builds, output, true), /Invalid build receipt/);
-  await verifyBuilds(builds, output, true, commit);
+  if (trigger === 'schedule') await assert.rejects(() => verifyBuilds(builds, output, true, undefined, connectorDigest), /Invalid build receipt/);
+  await verifyBuilds(builds, output, true, commit, connectorDigest);
   const { privateKey, publicKey } = generateKeyPairSync('ed25519');
   const timestamp = '2026-11-22T10:30:00Z';
   const now = new Date('2026-11-22T11:00:00Z');

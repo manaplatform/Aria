@@ -11,6 +11,7 @@ import {
 } from './generate-metadata.mjs';
 import { bundleApi } from './bundle-api.mjs';
 import { windowsSignerPins } from './windows-signer-pins.mjs';
+import { githubIdentityDigest, githubManifestPath, readGithubIdentity } from './github-connector.mjs';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const desktop = path.join(root, 'apps', 'desktop');
@@ -123,6 +124,10 @@ async function testCertificate(temporary) {
 async function packageDesktop() {
   if (!['verify', 'publish', 'dir'].includes(mode)) throw new Error('Select a packaging mode.');
   if (production && env.GITHUB_ACTIONS !== 'true') throw new Error('Production packaging requires GitHub Actions.');
+  const connector = await readGithubIdentity(path.join(root, githubManifestPath), production);
+  const bundledConnector = await readGithubIdentity(path.join(desktop, 'dist-electron/connectors/providers.json'), production);
+  if (githubIdentityDigest(connector) !== githubIdentityDigest(bundledConnector))
+    throw new Error('The compiled GitHub provider manifest is stale. Rebuild Aria before packaging.');
   const updateKeys = publicKeys();
   const windowsPins = windowsSignerPins(env, { required: production && platform === 'windows' });
   const temporary = await mkdtemp(path.join(os.tmpdir(), 'aria-package-'));

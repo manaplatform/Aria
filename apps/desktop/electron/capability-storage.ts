@@ -18,6 +18,7 @@ import {
   toolDiscoverySchema,
   type CapabilityHostReply,
   type CapabilityHostRequest,
+  type ConnectorInventory,
   type SkillRef,
   type SkillSummary,
   type ToolDiscovery,
@@ -156,6 +157,19 @@ export class CapabilityStorage {
 
   setDiscovery(discovery: ToolDiscovery, proof?: string) {
     return this.save({ discovery, proof: discovery === 'openai-responses' ? proof : undefined });
+  }
+
+  resetPolicy() {
+    return this.save({
+      disabled: [],
+      discovery: 'aria',
+      proof: undefined,
+      builtinEnabled: true,
+      disabledExamples: [],
+      nativeRuntimeProofs: undefined,
+      programming: undefined,
+      programProof: undefined,
+    });
   }
 
   private programProof(primary: string, settings: ProgramSettings) {
@@ -387,6 +401,7 @@ export class CapabilityStorage {
     fingerprint: string,
     signal: AbortSignal,
     metadata?: { id: string; stepId: string; callId: string; revision: string },
+    stillAuthorized?: () => boolean,
   ) {
     signal.throwIfAborted();
     const directory = path.join(this.journal, hash(conversationId), hash(turn));
@@ -401,6 +416,7 @@ export class CapabilityStorage {
       fingerprints: (await fs.readdir(directory)).filter((key) => /^[a-f0-9]{64}$/.test(key)),
     };
     signal.throwIfAborted();
+    if (stillAuthorized && !stillAuthorized()) return false;
     return this.runtimeStore.reserveDispatch(conversationId, turn, attempt, fingerprint, legacy, metadata);
   }
 }
@@ -412,10 +428,12 @@ export function openCapabilityBridge(
   runtime?: (
     request: Extract<CapabilityHostRequest, { type: 'runtime' }>,
     signal: AbortSignal,
+    progress: (event: 'approval' | 'dispatch') => void,
   ) => Promise<RuntimeResult>,
   checkpoint?: (
     request: Extract<CapabilityHostRequest, { type: 'checkpoint' }>, signal: AbortSignal,
   ) => Promise<boolean>,
+  connectors?: (listener: (inventory: ConnectorInventory) => void) => () => void,
 ) {
   const { port1, port2 } = new MessageChannelMain();
   const active = new Map<string, AbortController>();
@@ -425,8 +443,13 @@ export function openCapabilityBridge(
     closed = true;
     active.forEach((controller) => controller.abort());
     active.clear();
+    unsubscribe?.();
     port1.close();
   };
+  const unsubscribe = connectors?.((inventory) => {
+    if (closed) return;
+    try { port1.postMessage({ event: 'connectors', inventory }); } catch { /* Closed port. */ }
+  });
   port1.on('close', close);
   port1.on('message', ({ data }) => {
     if (closed) return;
@@ -475,7 +498,11 @@ export function openCapabilityBridge(
           return { id, ok: false, code: 'PERMISSION_DENIED' };
         if (Buffer.byteLength(JSON.stringify(request.input)) > 48_000)
           return { id, ok: false, code: 'INVALID_ARGUMENT' };
-        const result = await runtime(request, signal);
+        const result = await runtime(request, signal, (event) => {
+          if (!closed && !signal.aborted) {
+            try { port1.postMessage({ event, id }); } catch { /* Closed port. */ }
+          }
+        });
         return { id, ok: true, runtime: result };
       }
       if (request.type === 'skill') {
@@ -521,6 +548,8 @@ export function openCapabilityBridge(
                   ok: false,
                   code: error.code,
                   message: error.message.slice(0, 400),
+                  category: 'category' in error && typeof error.category === 'string' ? error.category : undefined,
+                  retryAfterMs: 'retryAfterMs' in error && typeof error.retryAfterMs === 'number' ? error.retryAfterMs : undefined,
                 }
               : {
                   id: request.id,

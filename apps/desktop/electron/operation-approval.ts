@@ -25,6 +25,7 @@ export class OperationApproval {
       begin(scope: Omit<Scope, 'binding'>, fingerprint: string): string;
       finish(id: string, decision: Decision): void;
     },
+    private readonly diagnostic?: (scope: Omit<Scope, 'binding'>, decision: Decision) => void,
   ) {}
 
   within<T>(scope: Scope, work: () => T) {
@@ -82,7 +83,12 @@ export class OperationApproval {
         }
         return decision === 'approved';
       } finally {
-        if (id) this.journal!.finish(id, promptSignal.aborted ? cancelled() : decision);
+        const result = promptSignal.aborted ? cancelled() : decision;
+        if (id) this.journal!.finish(id, result);
+        if (binding) try {
+          const { conversation, request, step, operation } = binding;
+          this.diagnostic?.({ conversation, request, step, operation }, result);
+        } catch { /* Diagnostics cannot affect approval. */ }
       }
     });
     this.queue = work.then(() => undefined, () => undefined);

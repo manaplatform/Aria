@@ -277,7 +277,10 @@ export function initializeWorkspace(): Promise<void> {
             warning: 'Browser preview: open Aria Desktop for AI chat and local persistence.',
           };
       window.location.hash = '/chat';
-      useWorkspaceStore.setState({ data: initial.data, ready: true });
+      const data = initial.data.preferences.startupBehavior === 'new-chat'
+        ? { ...initial.data, chat: { ...initial.data.chat, selectedId: null } }
+        : initial.data;
+      useWorkspaceStore.setState({ data, ready: true });
       if (initial.warning) notify(initial.warning, true);
     } catch (error) {
       useWorkspaceStore.setState({ ready: true, loadError: errorMessage(error) });

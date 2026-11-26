@@ -10,6 +10,17 @@ import {
   memoryCandidates,
   memorySource,
   memorySuggestions,
+  settingsCategorySchema,
+  accentColorSchema,
+  fontSizeSchema,
+  interfaceDensitySchema,
+  motionPreferenceSchema,
+  startupBehaviorSchema,
+  responseStyleSchema,
+  logLevelSchema,
+  notificationPreferencesSchema,
+  defaultNotificationPreferences,
+  shortcutsMapSchema,
 } from '@aria/shared';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
@@ -200,6 +211,21 @@ export const localDataSchema = legacyDataSchema.extend({
       ),
     chatSidebarCollapsed: z.boolean(),
     profileName: z.string().trim().min(1).max(80),
+    settingsCategory: settingsCategorySchema.optional(),
+    settingsSidebarCollapsed: z.boolean().optional(),
+    startupBehavior: startupBehaviorSchema.optional(),
+    minimizeToTray: z.boolean().optional(),
+    accentColor: accentColorSchema.optional(),
+    fontSize: fontSizeSchema.optional(),
+    density: interfaceDensitySchema.optional(),
+    reducedMotion: motionPreferenceSchema.optional(),
+    expandActivityByDefault: z.boolean().optional(),
+    profileBio: z.string().max(160).optional(),
+    responseStyle: responseStyleSchema.optional(),
+    communicationLanguage: z.string().max(60).optional(),
+    notifications: notificationPreferencesSchema.optional(),
+    shortcuts: shortcutsMapSchema.optional(),
+    logLevel: logLevelSchema.optional(),
   }),
   chat: chatSchema,
 });
@@ -217,6 +243,36 @@ export function migrateLegacy(input: unknown): LocalData {
     chat: { conversations: [], messages: [], selectedId: null, newDraft: '' },
   });
 }
+export function defaultPreferences(): LocalData['preferences'] {
+  return {
+    theme: 'dark',
+    route: '/chat',
+    activeWorkspaceId: null,
+    sidebarCollapsed: false,
+    rightOpen: true,
+    rightWidth: 384,
+    sectionHeights: {},
+    collapsedSections: [],
+    apiUrl: 'http://localhost:3000',
+    chatSidebarCollapsed: false,
+    profileName: 'You',
+    settingsCategory: 'general',
+    settingsSidebarCollapsed: false,
+    startupBehavior: 'restore-last',
+    minimizeToTray: false,
+    accentColor: 'violet',
+    fontSize: 'default',
+    density: 'comfortable',
+    reducedMotion: 'system',
+    expandActivityByDefault: false,
+    profileBio: '',
+    responseStyle: 'balanced',
+    communicationLanguage: 'auto',
+    notifications: { ...defaultNotificationPreferences },
+    shortcuts: {},
+    logLevel: 'info',
+  };
+}
 export function emptyData(): LocalData {
   return {
     version: 3,
@@ -225,19 +281,7 @@ export function emptyData(): LocalData {
     tasks: [],
     plans: [],
     chat: { conversations: [], messages: [], selectedId: null, newDraft: '' },
-    preferences: {
-      theme: 'dark',
-      route: '/chat',
-      activeWorkspaceId: null,
-      sidebarCollapsed: false,
-      rightOpen: true,
-      rightWidth: 384,
-      sectionHeights: {},
-      collapsedSections: [],
-      apiUrl: 'http://localhost:3000',
-      chatSidebarCollapsed: false,
-      profileName: 'You',
-    },
+    preferences: defaultPreferences(),
   };
 }
 const outboxSchema = z.array(z.strictObject({
@@ -328,6 +372,26 @@ export class LocalStorage {
       ...this.data,
       workspaces: [...this.data.workspaces.filter((w) => w.root !== workspace.root), workspace],
     });
+  }
+  async unregister(workspaceId: string): Promise<void> {
+    const root = this.registered.get(workspaceId);
+    this.registered.delete(workspaceId);
+    try {
+      await this.save({
+        ...this.data,
+        workspaces: this.data.workspaces.filter((w) => w.id !== workspaceId),
+        preferences: {
+          ...this.data.preferences,
+          activeWorkspaceId:
+            this.data.preferences.activeWorkspaceId === workspaceId
+              ? null
+              : this.data.preferences.activeWorkspaceId,
+        },
+      });
+    } catch (error) {
+      if (root) this.registered.set(workspaceId, root);
+      throw error;
+    }
   }
   save(input: unknown, outbox = this.memoryOutbox): Promise<void> {
     const data = localDataSchema.parse(input);

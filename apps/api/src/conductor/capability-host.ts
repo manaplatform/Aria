@@ -2,6 +2,8 @@ import { randomUUID } from 'node:crypto';
 import { Injectable, type OnModuleDestroy } from '@nestjs/common';
 import {
   capabilityHostReply,
+  capabilityHostEvent,
+  type ConnectorInventory,
   executionLimits,
   defaultToolPolicy,
   toolPolicySchema,
@@ -36,6 +38,8 @@ export class ToolError extends RunError {
 @Injectable()
 export class CapabilityHost implements OnModuleDestroy {
   private policy = defaultToolPolicy;
+  connectors?: ConnectorInventory;
+  private readonly progressListeners = new Map<string, (event: 'approval' | 'dispatch') => void>();
   private port?: BrowserPort;
   private readonly pending = new Map<string, (reply?: CapabilityHostReply) => void>();
   private readonly standalone = new StandaloneDispatch();
@@ -52,14 +56,22 @@ export class CapabilityHost implements OnModuleDestroy {
   install(policy: unknown, port: BrowserPort) {
     this.policy = toolPolicySchema.parse(policy);
     this.port = port;
+    this.connectors = undefined;
     port.on('message', ({ data }) => {
       if (this.port !== port) return;
+      const event = capabilityHostEvent.safeParse(data);
+      if (event.success) {
+        if (event.data.event === 'connectors') this.connectors = event.data.inventory;
+        else this.progressListeners.get(event.data.id)?.(event.data.event);
+        return;
+      }
       const parsed = capabilityHostReply.safeParse(data);
       if (parsed.success) this.pending.get(parsed.data.id)?.(parsed.data);
     });
     port.on('close', () => {
       if (this.port !== port) return;
       this.port = undefined;
+      this.connectors = undefined;
       for (const settle of this.pending.values()) settle();
     });
     port.start();
@@ -69,8 +81,8 @@ export class CapabilityHost implements OnModuleDestroy {
     return (await this.dispatch(command, signal))?.content;
   }
 
-  async runtime(command: RuntimeCommand, signal: AbortSignal) {
-    const reply = await this.dispatch(command, signal);
+  async runtime(command: RuntimeCommand, signal: AbortSignal, progress?: (event: 'approval' | 'dispatch') => void) {
+    const reply = await this.dispatch(command, signal, progress);
     if (!reply?.runtime)
       throw new ToolError('EXECUTION_FAILED', 'The desktop returned no runtime result.');
     return reply.runtime;
@@ -80,7 +92,7 @@ export class CapabilityHost implements OnModuleDestroy {
     return (await this.dispatch(command, signal))?.checkpointed === true;
   }
 
-  private async dispatch(command: HostCommand, signal: AbortSignal) {
+  private async dispatch(command: HostCommand, signal: AbortSignal, progress?: (event: 'approval' | 'dispatch') => void) {
     signal.throwIfAborted();
     const port = this.port;
     if (!port) {
@@ -117,9 +129,11 @@ export class CapabilityHost implements OnModuleDestroy {
       const settle = (value?: CapabilityHostReply) => {
         deadline.removeEventListener('abort', cancel);
         this.pending.delete(id);
+        this.progressListeners.delete(id);
         resolve(value);
       };
       this.pending.set(id, settle);
+      if (progress) this.progressListeners.set(id, progress);
       deadline.addEventListener('abort', cancel, { once: true });
       try {
         port.postMessage({ ...command, id });
@@ -134,7 +148,7 @@ export class CapabilityHost implements OnModuleDestroy {
         reply.code === 'DUPLICATE_DISPATCH'
           ? 'An earlier dispatch may already have taken effect. Check the result before sending a new request.'
           : 'The tool or skill is no longer available to this turn.';
-      throw new ToolError(reply.code, reply.message ?? message);
+      throw new ToolError(reply.code, reply.message ?? message, reply.category, undefined, reply.retryAfterMs);
     }
     return reply;
   }

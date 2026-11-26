@@ -1,3 +1,6 @@
+import type { ConnectorCommand, ConnectorSnapshot, ConnectorActivity } from './connectors/index.js';
+export * from './proactive.js';
+import type { ProactiveCommand, ProactiveEvent, ProactiveResult } from './proactive.js';
 import type { MemoryDiagnostics, MemoryRecord, MemorySearch, MemorySearchResult, MemorySettings, MemoryStatus, MemoryTurnOptions } from './memory.js';
 export * from './memory.js';
 import type {
@@ -41,6 +44,28 @@ export * from './conductor.js';
 import type { ExecutionSnapshot, LoopCommand, LoopRecoveryRequest, ManagedExecution } from './loop.js';
 export * from './loop.js';
 export { projectChatEvent } from './chat-projection.js';
+import type {
+  AboutInfo,
+  AccentColor,
+  CustomizableShortcutId,
+  FontSize,
+  InterfaceDensity,
+  LogLevel,
+  MotionPreference,
+  NotificationPreferences,
+  OsPermissionsStatus,
+  ResetConfigurationScope,
+  ResponseStyle,
+  SettingsCategoryId,
+  ShortcutsMap,
+  StartupBehavior,
+  StorageInfo,
+  SystemBehaviorState,
+  UserPersonalization,
+} from './settings.js';
+export * from './settings.js';
+export * from './diagnostics.js';
+import type { DiagnosticConfig, DiagnosticEvent, DiagnosticFilter, DiagnosticPage, DiagnosticStatus } from './diagnostics.js';
 
 export interface HealthResponse {
   status: 'ok';
@@ -232,6 +257,21 @@ export interface Preferences {
   apiUrl: string;
   chatSidebarCollapsed: boolean;
   profileName: string;
+  settingsCategory?: SettingsCategoryId;
+  settingsSidebarCollapsed?: boolean;
+  startupBehavior?: StartupBehavior;
+  minimizeToTray?: boolean;
+  accentColor?: AccentColor;
+  fontSize?: FontSize;
+  density?: InterfaceDensity;
+  reducedMotion?: MotionPreference;
+  expandActivityByDefault?: boolean;
+  profileBio?: string;
+  responseStyle?: ResponseStyle;
+  communicationLanguage?: string;
+  notifications?: NotificationPreferences;
+  shortcuts?: ShortcutsMap;
+  logLevel?: LogLevel;
 }
 export interface LocalData {
   version: 3;
@@ -302,6 +342,7 @@ export interface ChatRequest {
   availableProjects?: { id: string; name: string; branch: string | null }[];
   memory?: MemoryTurnOptions;
   execution?: ManagedExecution;
+  personalization?: UserPersonalization;
 }
 export type ChatEvent = {
   requestId: string;
@@ -404,6 +445,11 @@ export interface UpdateState {
   error?: string;
 }
 export interface DesktopBridge {
+  connectors(input: ConnectorCommand): Promise<ConnectorSnapshot>;
+  connectorActivity(id: string): Promise<ConnectorActivity[]>;
+  onConnectorsChanged(callback: (state: ConnectorSnapshot) => void): () => void;
+  proactive(command: ProactiveCommand): Promise<ProactiveResult>;
+  onProactiveEvent(callback: (event: ProactiveEvent) => void): () => void;
   platform: string;
   updateState(): Promise<UpdateState>;
   updateCommand(command: UpdateCommand): Promise<void>;
@@ -506,7 +552,31 @@ export interface DesktopBridge {
   resumeExecution(request: LoopRecoveryRequest): Promise<void>;
   activeChatMessages(): Promise<ChatMessage[]>;
   onChatEvent(callback: (event: ChatEvent) => void): () => void;
+  systemBehavior(): Promise<SystemBehaviorState>;
+  setSystemBehavior(patch: { openAtLogin?: boolean; minimizeToTray?: boolean }): Promise<SystemBehaviorState>;
+  testNotification(): Promise<void>;
+  removeWorkspace(workspaceId: string): Promise<boolean>;
+  storageInfo(): Promise<StorageInfo>;
+  openStorageFolder(): Promise<void>;
+  pruneMediaCache(): Promise<{ removed: number; freedBytes: number }>;
+  clearBrowserCache(): Promise<void>;
+  osPermissions(): Promise<OsPermissionsStatus>;
+  clearChatHistory(): Promise<boolean>;
+  clearLegacyData(): Promise<boolean>;
+  exportDiagnostics(): Promise<boolean>;
+  diagnosticStatus(): Promise<DiagnosticStatus>;
+  diagnosticConfigure(config: DiagnosticConfig): Promise<DiagnosticStatus>;
+  diagnosticQuery(filter: DiagnosticFilter): Promise<DiagnosticPage>;
+  diagnosticClear(): Promise<void>;
+  diagnosticOpenDirectory(): Promise<void>;
+  diagnosticExport(filter: DiagnosticFilter): Promise<boolean>;
+  diagnosticRendererError(): Promise<void>;
+  onDiagnosticEvents(callback: (events: DiagnosticEvent[]) => void): () => void;
+  resetConfiguration(scope: ResetConfigurationScope): Promise<boolean>;
+  aboutInfo(): Promise<AboutInfo>;
+  openDevTools(): Promise<void>;
 }
 
 export * from './execution-runtime.js';
 export * from './reply-visual.js';
+export * from './connectors/index.js';

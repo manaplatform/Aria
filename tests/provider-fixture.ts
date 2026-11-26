@@ -1,4 +1,5 @@
 import http from 'node:http';
+import https from 'node:https';
 import { inflateSync } from 'node:zlib';
 import { WebSocketServer, WebSocket } from 'ws';
 
@@ -88,7 +89,7 @@ type OperationState = {
 };
 
 /** Test-only OpenAI-compatible server. Never imported by application builds. */
-export async function createProviderFixture() {
+export async function createProviderFixture(options?: { tls: { key: Buffer; cert: Buffer }; priced: boolean }) {
   const received: {
     path: string;
     authorization?: string;
@@ -131,7 +132,7 @@ export async function createProviderFixture() {
   wav.write('data', 36);
   wav.writeUInt32LE(pcm.length, 40);
   let holdSlow = false;
-  const server = http.createServer(async (request, response) => {
+  const listener: http.RequestListener = async (request, response) => {
     let input = '';
     for await (const chunk of request) input += String(chunk);
     if (request.headers.authorization === 'Bearer rejected-key') {
@@ -151,6 +152,7 @@ export async function createProviderFixture() {
                   object: 'model',
                   owned_by: 'fixture',
                   ...fixtureDescriptors[id],
+                  ...(options?.priced && { textPricing: { unit: 'usd-micros-per-million-tokens', input: 100_000, output: 200_000 } }),
                 })),
               }
             : { error: { message: 'secret-catalog-error' } },
@@ -398,7 +400,8 @@ export async function createProviderFixture() {
       clearInterval(timer);
       if (!response.writableEnded) cancelled++;
     });
-  });
+  };
+  const server = options ? https.createServer(options.tls, listener) : http.createServer(listener);
   const sockets = new WebSocketServer({ noServer: true });
   server.on('upgrade', (request, socket, head) => {
     if (
@@ -454,7 +457,7 @@ export async function createProviderFixture() {
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   return {
-    baseUrl: `http://127.0.0.1:${(server.address() as { port: number }).port}/v1`,
+    baseUrl: `${options ? 'https' : 'http'}://127.0.0.1:${(server.address() as { port: number }).port}/v1`,
     received,
     mediaReceived,
     voiceReceived,

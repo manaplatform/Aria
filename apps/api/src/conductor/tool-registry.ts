@@ -26,6 +26,10 @@ import {
   type SkillSummary,
   type ToolAvailability,
   type ToolEffect,
+  proactiveOperations,
+  proactiveReadOperations,
+  type ProactiveOperation,
+  type ProactiveRequest,
   type ToolConstraints,
   type LoopCheckpoint,
   type ToolHealth,
@@ -37,6 +41,7 @@ import { MediaService } from '../media/media.service';
 import { ModelRegistry, type ResolvedModel } from '../providers/model-registry.service';
 import { OpenAIRuntime, nativeFeatureName } from '../providers/openai-runtime';
 import type { ResearchRun } from '../web/web.service';
+import { registerConnectorTools } from './connectors/github';
 import { evaluateCalculation } from './calc';
 import { CapabilityHost, ToolError } from './capability-host';
 import { RunError, type RunAttachment, type RunFile } from './run-assets';
@@ -106,11 +111,13 @@ const delegateSchema = z.strictObject({
 
 export interface ToolContext {
   registry: Registry;
+  proactive?: ProactiveRequest;
   research: ResearchRun;
   attachments: Map<string, RunAttachment>;
   privateContent: boolean;
   memoryEnabled?: boolean;
   memoryPrivate?: boolean;
+  connectorPrivate?: boolean;
   memoryBlocked?: boolean;
   temporary?: boolean;
   budget: TurnBudget;
@@ -158,6 +165,9 @@ export interface ToolDescriptor<Input = unknown, Output extends StepValue = Step
   effect: ToolEffect;
   permission: string;
   dependency: 'local' | 'browser' | 'delegate';
+  hostJournal?: boolean;
+  connector?: string;
+  connectorScope?: 'account';
   requiredModelCapabilities: readonly string[];
   timeoutMs: number;
   deferred: boolean;
@@ -355,6 +365,29 @@ const runtimeDescriptions: Record<RuntimeOperation, readonly [string, string, To
   ],
 };
 
+const proactiveDescriptions: Record<ProactiveOperation, string> = {
+  'agenda.list_tasks': 'List owned Agenda tasks. Filter by status and paginate.',
+  'agenda.get_task': 'Inspect an Agenda task and its prerequisites.',
+  'agenda.create_task': 'Create a passive task to track a user responsibility.',
+  'agenda.update_task': 'Update task fields and dependencies using the current revision.',
+  'agenda.complete_task': 'Propose completion of an authorized task with runtime-verified progress.',
+  'agenda.cancel_task': 'Propose cancellation of an owned Agenda task.',
+  'agenda.list_objectives': 'List objectives and their lifecycle states.',
+  'agenda.create_objective': 'Create a passive objective to organize a responsibility.',
+  'agenda.get_job': 'Inspect job state and verified execution outcome.',
+  'automation.list': 'List reviewed automation definitions and schedules.',
+  'automation.create': 'Propose a new automation for explicit user review. Use the exact original user instruction and a separate bounded execution action.',
+  'automation.update': 'Propose an edit to the specified automation revision for explicit user review.',
+  'automation.pause': 'Request pausing an owned automation.',
+  'automation.resume': 'Request resuming an owned automation.',
+  'automation.delete': 'Propose deleting an automation for user review.',
+  'automation.run_now': 'Request a manual run of an owned automation.',
+  'automation.report_condition': 'Record met, not_met, or unknown against a verified target observation from this run.',
+  'pulse.get_status': 'Read the Pulse configuration and recent evaluations.',
+  'pulse.submit_actions': 'Submit one or more compatible Pulse decisions. A no_action decision stands alone.',
+  'notification.propose': 'Propose a concise, meaningful notification for the current responsibility.',
+};
+
 const localToolsForPrivateMemory = new Set([
   'calc.evaluate',
   'shell.inspect', 'shell.open', 'shell.run',
@@ -515,6 +548,7 @@ export class ToolRegistry {
     @Inject(ModelRegistry) private readonly models: ModelRegistry,
     @Inject(CapabilityHost) readonly host: CapabilityHost,
   ) {
+    registerConnectorTools(this);
     this.register({
       ...base,
       id: 'programs.run',
@@ -1007,6 +1041,30 @@ export class ToolRegistry {
       });
     }
 
+    for (const [id, input] of Object.entries(proactiveOperations)) {
+      const operation = id as ProactiveOperation;
+      this.register({
+        ...base, id, input: input as z.ZodType<Record<string, unknown>>, name: id.replace(/[._]/g, ' '),
+        description: proactiveDescriptions[operation],
+        capability: operation, output: 'data', dependency: 'local',
+        permission: 'Current profile, validated responsibility scope, and desktop review for persistent execution',
+        effect: proactiveReadOperations.has(operation) ? 'read' : 'local',
+        timeoutMs: 10_000,
+        available: (context) => Boolean(context.runtime) &&
+          (operation !== 'pulse.submit_actions' || context.proactive?.kind === 'pulse') &&
+          (operation !== 'automation.report_condition' || context.proactive?.kind === 'automation'),
+        normalize: (args) => ({ args }),
+        execute: async (args, { context, step, callId, signal }) => {
+          if (!context.runtime) throw new ToolError('PERMISSION_DENIED', 'Use an authorized desktop session.');
+          const { primary } = context.registry;
+          return this.host.runtime({
+            ...context.runtime, type: 'runtime', revision: this.host.current.revision, operation, stepId: step.id, callId,
+            input: args, primary: { connectionId: primary.connection.id, model: primary.id, endpoint: primary.connection.baseUrl },
+          }, signal);
+        },
+      });
+    }
+
     for (const op of Object.keys(researchToolArgs) as ResearchToolId[]) {
       const browser = op.startsWith('browser_');
       const consequential = ['browser_click', 'browser_type', 'browser_submit'].includes(op);
@@ -1217,7 +1275,25 @@ export class ToolRegistry {
       return 'This tool definition changed. Discover the current version.';
     if (policy.disabled.includes(descriptor.id)) return 'Disabled in Tools settings.';
     if (context?.temporary) return 'This tool is unavailable in a temporary conversation.';
-    if (context?.memoryPrivate && !descriptor.id.startsWith('memory.') &&
+    const proactiveOperation = Object.hasOwn(proactiveOperations, descriptor.id);
+    if (proactiveOperation && (!policy.desktopRuntime || context && !context.runtime))
+      return 'Available through the managed desktop runtime.';
+    const connector = descriptor.connector;
+    if (context?.connectorPrivate && !connector &&
+        !['calc.evaluate', 'files.create_text_artifact', 'automation.report_condition'].includes(descriptor.id))
+      return 'Private GitHub evidence is scoped to the approved primary and repository.';
+    if (context?.proactive) {
+      const scope = context.proactive.scope;
+      const operations = descriptor.id.startsWith('web.') || descriptor.id.startsWith('browser.');
+      const publicRead = operations && (scope.publicOrigins.length > 0 || scope.publicSearch) &&
+        (descriptor.id !== 'web.web_search' || scope.publicSearch) &&
+        !['browser.browser_media', 'browser.browser_screenshot', 'browser.browser_switch_tab'].includes(descriptor.id);
+      const memoryRead = scope.memory && ['memory.search', 'memory.read'].includes(descriptor.id);
+      if (!publicRead && !memoryRead && !proactiveOperation && !connector &&
+        !['calc.evaluate', 'files.create_text_artifact'].includes(descriptor.id))
+        return 'Outside the authorized background capability scope.';
+    }
+    if (context?.memoryPrivate && !proactiveOperation && !descriptor.id.startsWith('memory.') &&
       !localToolsForPrivateMemory.has(descriptor.id))
       return 'Disabled after private memory entered this conversation. Start a new chat or run web research before recalling memory.';
     if (descriptor.id.startsWith('memory.') && context &&
@@ -1252,6 +1328,16 @@ export class ToolRegistry {
         descriptor.requiredModelCapabilities.every((capability) =>
           model.capabilities.some((actual) => actual === capability)))))
       return 'Configure an eligible delegated model in Settings → AI Models.';
+    if (connector && !context?.proactive) {
+      const state = this.host.connectors;
+      if (descriptor.connectorScope === 'account') {
+        if (!state?.publicAccess) return 'Sign in or reconnect GitHub in Settings → Connectors to use public GitHub API tools.';
+      } else if (!state?.readable || descriptor.effect === 'consequential' && !state.writable) {
+        return state?.publicAccess
+          ? 'GitHub is signed in. Review repository access and operation permissions in Settings → Connectors.'
+          : 'Connect GitHub and review repository access in Settings → Connectors.';
+      }
+    }
     if (context && descriptor.available?.(context) === false)
       return 'This tool requires a compatible, authorized input or backend in this turn.';
   }

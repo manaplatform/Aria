@@ -4,12 +4,24 @@ import type {
   ChatEvent,
   ChatServiceStatus,
   DesktopBridge,
+  DiagnosticEvent,
   LiveEvent,
+  ProactiveEvent,
   UpdateState,
 } from '@aria/shared';
 
+window.addEventListener('unhandledrejection', () => {
+  void ipcRenderer.invoke('aria:diagnostic-renderer-error').catch(() => undefined);
+});
+
 const bridge: DesktopBridge = {
   platform: process.platform,
+  proactive: (input) => ipcRenderer.invoke('aria:proactive', input),
+  onProactiveEvent: (callback) => {
+    const listener = (_event: Electron.IpcRendererEvent, value: ProactiveEvent) => callback(value);
+    ipcRenderer.on('aria:proactive-event', listener);
+    return () => ipcRenderer.removeListener('aria:proactive-event', listener);
+  },
   updateState: () => ipcRenderer.invoke('aria:update-state'),
   updateCommand: (command) => ipcRenderer.invoke('aria:update-command', command),
   onUpdateState: (callback) => {
@@ -121,6 +133,13 @@ const bridge: DesktopBridge = {
     ipcRenderer.on('aria:live-event', listener);
     return () => ipcRenderer.removeListener('aria:live-event', listener);
   },
+  connectors: (input) => ipcRenderer.invoke('aria:connectors', input),
+  connectorActivity: (id) => ipcRenderer.invoke('aria:connector-activity', id),
+  onConnectorsChanged: (callback) => {
+    const listener: Parameters<typeof ipcRenderer.on>[1] = (_event, state) => callback(state);
+    ipcRenderer.on('aria:connectors-changed', listener);
+    return () => ipcRenderer.removeListener('aria:connectors-changed', listener);
+  },
   memoryStatus: () => ipcRenderer.invoke('aria:memory-status'),
   memoryDiagnostics: () => ipcRenderer.invoke('aria:memory-diagnostics'),
   saveMemorySettings: (settings, allowAutoRecall) =>
@@ -154,5 +173,33 @@ const bridge: DesktopBridge = {
       ipcRenderer.removeListener('aria:chat-status-update', listener);
     };
   },
+  systemBehavior: () => ipcRenderer.invoke('aria:system-behavior'),
+  setSystemBehavior: (patch) => ipcRenderer.invoke('aria:set-system-behavior', patch),
+  testNotification: () => ipcRenderer.invoke('aria:test-notification'),
+  removeWorkspace: (workspaceId) => ipcRenderer.invoke('aria:remove-workspace', workspaceId),
+  storageInfo: () => ipcRenderer.invoke('aria:storage-info'),
+  openStorageFolder: () => ipcRenderer.invoke('aria:open-storage-folder'),
+  pruneMediaCache: () => ipcRenderer.invoke('aria:prune-media-cache'),
+  clearBrowserCache: () => ipcRenderer.invoke('aria:clear-browser-cache'),
+  osPermissions: () => ipcRenderer.invoke('aria:os-permissions'),
+  clearChatHistory: () => ipcRenderer.invoke('aria:clear-chat-history'),
+  clearLegacyData: () => ipcRenderer.invoke('aria:clear-legacy-data'),
+  exportDiagnostics: () => ipcRenderer.invoke('aria:export-diagnostics'),
+  diagnosticStatus: () => ipcRenderer.invoke('aria:diagnostic-status'),
+  diagnosticConfigure: (config) => ipcRenderer.invoke('aria:diagnostic-configure', config),
+  diagnosticQuery: (filter) => ipcRenderer.invoke('aria:diagnostic-query', filter),
+  diagnosticClear: () => ipcRenderer.invoke('aria:diagnostic-clear'),
+  diagnosticOpenDirectory: () => ipcRenderer.invoke('aria:diagnostic-open'),
+  diagnosticExport: (filter) => ipcRenderer.invoke('aria:diagnostic-export', filter),
+  diagnosticRendererError: () => ipcRenderer.invoke('aria:diagnostic-renderer-error'),
+  onDiagnosticEvents: (callback) => {
+    const listener = (_event: Electron.IpcRendererEvent, events: DiagnosticEvent[]) => callback(events);
+    ipcRenderer.on('aria:diagnostic-events', listener);
+    void ipcRenderer.invoke('aria:diagnostic-subscribe', true);
+    return () => { ipcRenderer.removeListener('aria:diagnostic-events', listener); void ipcRenderer.invoke('aria:diagnostic-subscribe', false); };
+  },
+  resetConfiguration: (scope) => ipcRenderer.invoke('aria:reset-configuration', scope),
+  aboutInfo: () => ipcRenderer.invoke('aria:about-info'),
+  openDevTools: () => ipcRenderer.invoke('aria:open-devtools'),
 };
 contextBridge.exposeInMainWorld('aria', bridge);

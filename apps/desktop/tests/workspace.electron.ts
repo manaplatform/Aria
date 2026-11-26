@@ -31,6 +31,7 @@ async function launch(development = false) {
 }
 async function openLegacy() {
   await page.getByRole('button', { name: 'Open settings', exact: true }).click();
+  await page.getByRole('navigation', { name: 'Settings categories' }).getByRole('button', { name: 'Advanced', exact: true }).click();
   await page.getByRole('button', { name: 'Open legacy workspace', exact: true }).click();
   await expect(page.getByRole('navigation', { name: 'Main navigation' })).toBeVisible();
 }

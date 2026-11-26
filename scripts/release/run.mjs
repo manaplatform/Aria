@@ -11,6 +11,7 @@ import {
 } from './generate-metadata.mjs';
 import { formatNotes } from './generate-notes.mjs';
 import { findRelease, github, GitHubError, readReleaseState, releaseNoteMarker, tagAnnotation } from './github.mjs';
+import { githubIdentity, githubIdentityDigest, githubManifestPath, verifyGithubRegistration } from './github-connector.mjs';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const env = process.env;
@@ -20,6 +21,12 @@ const versionAt = (source) => applicationVersion(sourcePackage(source));
 const commit = () => git('rev-parse', 'HEAD').trim();
 const releaseVersion = (source) => validatePackageVersion(versionAt(source));
 const localVersion = async () => validatePackageVersion(applicationVersion(await readJson(path.join(root, 'package.json'))));
+function releaseGithubIdentity(source) {
+  const filename = `${source}:${githubManifestPath}`;
+  const manifest = git('ls-tree', '--name-only', source, '--', githubManifestPath).trim()
+    ? JSON.parse(git('show', filename)) : undefined;
+  return githubIdentity(manifest, true);
+}
 
 function isAncestor(source, target) {
   try {
@@ -233,7 +240,7 @@ async function prepare(mode) {
       if (versionAt(event.before) === versionAt(commit())) {
         if (!git('diff', '--name-only', event.before, commit(), '--',
           '.github/workflows/release.yml', '.github/workflows/release-build.yml', 'scripts/release',
-          'apps/desktop/electron/update-feed.ts').trim()) {
+          'apps/desktop/electron/update-feed.ts', githubManifestPath).trim()) {
           await outputs({ run: false });
           console.log('The application version and release automation are unchanged.');
           return;
@@ -259,6 +266,7 @@ async function prepare(mode) {
     if (env.ARIA_RELEASE_ENABLED !== 'true' ||
         env.ARIA_DISTRIBUTION_AUTHORIZED !== 'true')
       throw new Error('Enable production releasing and confirm distribution terms in the repository variables.');
+    await verifyGithubRegistration(releaseGithubIdentity(source));
   }
   await outputs({ run: true, mode, source });
   console.log(`Aria ${version} (${channelFor(version)}) at ${source} in ${mode} mode.`);
@@ -286,7 +294,8 @@ async function preview(notesOnly = false) {
   console.log(formatNotes({ ...notes, commit: source, tag, version, channel, compareTarget: source }));
 }
 
-export async function verifyBuilds(input, output, production, source = commit()) {
+export async function verifyBuilds(input, output, production, source = commit(),
+  githubConnector = production ? githubIdentityDigest(releaseGithubIdentity(source)) : null) {
   const version = releaseVersion(source);
   const directories = await readdir(input);
   const targets = allTargets();
@@ -302,6 +311,8 @@ export async function verifyBuilds(input, output, production, source = commit())
         production && !receipt.production) throw new Error(`Invalid build receipt for ${platform}-${arch}.`);
     if (platform === 'macos' && (receipt.signing !== 'ad-hoc' || receipt.notarized !== false))
       throw new Error(`Missing ad hoc signing verification for macOS ${arch}.`);
+    if (production && (!githubConnector || receipt.githubConnector !== githubConnector))
+      throw new Error(`Missing GitHub connector verification for ${platform}-${arch}.`);
     timestamps.push(receipt.timestamp);
     const files = platformAssets(version, platform, arch).map(({ filename }) => filename);
     if (production && platform === 'windows') files.push(windowsCertificateName);
@@ -502,6 +513,7 @@ async function publish(directory, buildTimestamp) {
   required('GH_TOKEN');
   if (env.ARIA_RELEASE_ENABLED !== 'true' || env.ARIA_DISTRIBUTION_AUTHORIZED !== 'true')
     throw new Error('The repository has not enabled and authorized production releases.');
+  releaseGithubIdentity(releaseSource(request.source ?? commit()));
   const result = await publishRelease(github(), directory, buildTimestamp, trustKeys(), new Date(), {
     ...request, runId: env.GITHUB_RUN_ID,
   });

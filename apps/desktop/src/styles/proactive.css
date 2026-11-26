@@ -1,0 +1,95 @@
+.proactive-page {
+  width: min(100%, 58rem);
+}
+.proactive-page > section {
+  display: grid;
+  gap: 0.65rem;
+  margin: 1.25rem 0;
+}
+.proactive-page h2,
+.proactive-preferences h3 {
+  font-size: 1rem;
+  font-weight: 650;
+}
+.proactive-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.55rem;
+  align-items: center;
+}
+.proactive-row,
+.proactive-card {
+  display: grid;
+  gap: 0.25rem 0.7rem;
+  padding: 0.75rem 0.9rem;
+  border: 1px solid var(--border);
+  border-radius: 0.65rem;
+  color: inherit;
+}
+.proactive-row {
+  grid-template-columns: minmax(10rem, 1fr) auto;
+  align-items: center;
+}
+.proactive-row:hover {
+  background: var(--surface-hover);
+}
+.proactive-row small {
+  grid-column: 1 / -1;
+}
+.proactive-card {
+  margin: 0.5rem 0;
+  gap: 0.55rem;
+}
+.proactive-content {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.proactive-definition {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 0.25rem 0.65rem;
+}
+.proactive-definition dd {
+  overflow-wrap: anywhere;
+}
+.proactive-form {
+  display: grid;
+  gap: 0.8rem;
+}
+.proactive-form label {
+  display: grid;
+  gap: 0.25rem;
+}
+.proactive-form label:has(input[type='checkbox']) {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+.proactive-form :is(input:not([type='checkbox']), textarea, select),
+.proactive-page :is(input:not([type='checkbox']), textarea, select) {
+  min-width: 0;
+  background: var(--surface);
+  color: inherit;
+  border: 1px solid var(--border);
+  border-radius: 0.45rem;
+  padding: 0.4rem 0.55rem;
+}
+.proactive-form fieldset {
+  padding: 0.65rem;
+  display: grid;
+  gap: 0.55rem;
+  border: 1px solid var(--border);
+  border-radius: 0.45rem;
+}
+.proactive-form legend {
+  padding: 0 0.25rem;
+  font-weight: 600;
+}
+.proactive-preferences {
+  padding: 0.75rem;
+}
+@media (max-width: 620px) {
+  .proactive-row {
+    grid-template-columns: 1fr;
+  }
+}

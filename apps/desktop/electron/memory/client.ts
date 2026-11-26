@@ -15,10 +15,15 @@ export class MemoryClient {
     }
   >();
 
-  constructor(private readonly directory: string) {}
+  constructor(private readonly directory: string,
+    private readonly diagnostic: (event: string, detail?: { method?: string; durationMs?: number }) => void = () => {}) {}
+  private report(event: string, detail?: { method?: string; durationMs?: number }) {
+    try { this.diagnostic(event, detail); } catch { /* Diagnostics cannot affect memory. */ }
+  }
 
   private start() {
     const worker = new Worker(path.join(__dirname, 'worker.js'), { workerData: this.directory });
+    this.report('worker.started');
     this.worker = worker;
     const fail = () => {
       if (this.worker !== worker) return;
@@ -29,8 +34,8 @@ export class MemoryClient {
       }
       this.pending.clear();
     };
-    worker.on('error', fail);
-    worker.on('exit', fail);
+    worker.on('error', () => { this.report('worker.failed'); fail(); });
+    worker.on('exit', (code) => { if (code !== 0 && !this.closed) this.report('worker.exited'); fail(); });
     worker.on('message', ({ id, value, error }) => {
       const entry = this.pending.get(id);
       if (!entry) return;
@@ -54,12 +59,16 @@ export class MemoryClient {
       return Promise.reject(new Error('The memory worker could not start.'));
     }
     const id = ++this.sequence;
+    const started = Date.now();
+    this.report('operation.started', { method });
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => void worker.terminate(), 12_000);
+      const timer = setTimeout(() => { this.report('operation.timed_out', { method, durationMs: Date.now() - started }); void worker.terminate(); }, 12_000);
       this.pending.set(id, {
         timer,
-        finish: (value, error) =>
-          error ? reject(new Error(error)) : resolve(value as ReturnType<MemoryStore[M]>),
+        finish: (value, error) => {
+          this.report(error ? 'operation.failed' : 'operation.completed', { method, durationMs: Date.now() - started });
+          if (error) reject(new Error(error)); else resolve(value as ReturnType<MemoryStore[M]>);
+        },
       });
       try {
         worker.postMessage({ id, method, args });

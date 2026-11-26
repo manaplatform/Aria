@@ -135,6 +135,7 @@ test('opens directly into chat without a project and restores appearance, sideba
   );
   await screenshot('chat-welcome.png');
   await page.getByRole('button', { name: 'Open settings', exact: true }).click();
+  await page.getByRole('navigation', { name: 'Settings categories' }).getByRole('button', { name: 'Appearance', exact: true }).click();
   await page.getByRole('button', { name: 'Light', exact: true }).click();
   await screenshot('chat-settings-light.png');
   await page.getByRole('button', { name: 'Back to chat', exact: true }).click();
@@ -251,7 +252,10 @@ test('keeps the approved display through restart and revokes it from Settings', 
     },
     restored,
   );
-  const settings = () => page.getByRole('button', { name: 'Open settings', exact: true }).click();
+  const settings = async () => {
+    await page.getByRole('button', { name: 'Open settings', exact: true }).click();
+    await page.getByRole('navigation', { name: 'Settings categories' }).getByRole('button', { name: 'Desktop Control', exact: true }).click();
+  };
   await launch();
   await mockDisplay(false);
   await page.getByRole('textbox', { name: 'Message Aria' }).fill('Unsent draft');
@@ -409,6 +413,7 @@ test('recovers a clarification after the managed API process exits', async () =>
 test('renders inline visuals from the primary text stream and restores them in a narrow chat', async () => {
   await launch();
   await page.getByRole('button', { name: 'Open settings', exact: true }).click();
+  await page.getByRole('navigation', { name: 'Settings categories' }).getByRole('button', { name: 'Appearance', exact: true }).click();
   await page.getByRole('button', { name: 'Dark', exact: true }).click();
   await page.getByRole('button', { name: 'Back to chat', exact: true }).click();
   const prompt = '[slow] Visualize the survey';
@@ -474,6 +479,7 @@ test('renders inline visuals from the primary text stream and restores them in a
   await screenshot('chat-rich-response.png');
 
   await page.getByRole('button', { name: 'Open settings', exact: true }).click();
+  await page.getByRole('navigation', { name: 'Settings categories' }).getByRole('button', { name: 'Appearance', exact: true }).click();
   await page.getByRole('button', { name: 'Light', exact: true }).click();
   await page.getByRole('button', { name: 'Back to chat', exact: true }).click();
   await app.close();
@@ -568,6 +574,7 @@ test('shows real provider errors, supports explicit retry, and tests the connect
   expect(fixture.received).toHaveLength(count + 1);
   await expect(page.locator('.from-user')).toHaveCount(1);
   await page.getByRole('button', { name: 'Open settings', exact: true }).click();
+  await page.getByRole('navigation', { name: 'Settings categories' }).getByRole('button', { name: 'Models', exact: true }).click();
   await page.getByRole('button', { name: 'Discover models', exact: true }).click();
   await expect(page.getByText('Connected', { exact: true })).toBeVisible();
   expect(JSON.stringify(await page.evaluate(() => window.aria!.registrySettings()))).not.toContain(
@@ -588,6 +595,7 @@ test('recovers from service crashes, preserves drafts, and supports narrow windo
   });
   await expect(page.locator('.from-assistant[data-status="interrupted"]')).toHaveCount(1);
   await page.getByRole('button', { name: 'Open settings', exact: true }).click();
+  await page.getByRole('navigation', { name: 'Settings categories' }).getByRole('button', { name: 'Conductor', exact: true }).click();
   await page.getByRole('button', { name: 'Restart service', exact: true }).click();
   await expect
     .poll(() => page.evaluate(() => window.aria!.chatStatus()))
@@ -627,6 +635,7 @@ test('development renderer uses the same managed backend and safe preload', asyn
 test('configures a provider in Settings using native encrypted storage and restores it on relaunch', async () => {
   await launch(false);
   await page.getByRole('button', { name: 'Open settings', exact: true }).click();
+  await page.getByRole('navigation', { name: 'Settings categories' }).getByRole('button', { name: 'AI Providers', exact: true }).click();
   const settings = await page.evaluate(() => window.aria!.registrySettings());
   if (!settings.encryptionAvailable) {
     await expect(page.getByText(/Unlock the system credential store/)).toBeVisible();
@@ -635,16 +644,18 @@ test('configures a provider in Settings using native encrypted storage and resto
   await page.getByRole('button', { name: 'Add connection' }).click();
   await page.getByLabel('Provider endpoint', { exact: true }).fill(fixture.baseUrl);
   await page.getByLabel('API key', { exact: true }).fill('test-only-key');
+  await page.getByRole('button', { name: 'Save providers' }).click();
+  await expect(page.getByLabel('API key', { exact: true })).toHaveValue('');
+  await page.getByRole('navigation', { name: 'Settings categories' }).getByRole('button', { name: 'Models', exact: true }).click();
   await page.getByRole('button', { name: 'Discover models' }).click();
   await page.getByRole('checkbox', { name: 'Enable fixture-model' }).check();
-  await page
-    .getByRole('combobox', { name: 'Primary model' })
-    .selectOption({ label: 'OpenAI · fixture-model' });
-  await page.getByText('System instructions', { exact: true }).click();
-  await page.getByLabel('Instructions', { exact: true }).fill('Give useful answers.');
+  await page.getByRole('combobox', { name: 'Primary model' }).selectOption({ label: 'OpenAI · fixture-model' });
   await page.getByRole('button', { name: 'Save AI Models', exact: true }).click();
   await expect(page.getByText('Primary configured', { exact: true })).toBeVisible();
-  await expect(page.getByLabel('API key', { exact: true })).toHaveValue('');
+  await page.getByRole('navigation', { name: 'Settings categories' }).getByRole('button', { name: 'Personalization', exact: true }).click();
+  await page.getByLabel('Instructions', { exact: true }).fill('Give useful answers.');
+  await page.getByRole('button', { name: 'Save instructions', exact: true }).click();
+  await expect(page.getByText('Custom instructions saved.')).toBeVisible();
   const saved = await fs.readFile(path.join(temporary, 'provider-v2.json'), 'utf8');
   expect(saved).not.toContain('test-only-key');
   expect(JSON.parse(saved).connections[0].encryptedKey).toBeTruthy();
@@ -699,6 +710,7 @@ test('verifies remote embeddings separately from runtime settings', async () => 
   });
 
   await page.getByRole('button', { name: 'Open settings', exact: true }).click();
+  await page.getByRole('navigation', { name: 'Settings categories' }).getByRole('button', { name: 'Desktop Control', exact: true }).click();
   const section = page.locator('#execution-runtime');
   const picker = section.getByRole('combobox', { name: 'Embedding model' });
   const verify = section.getByRole('button', { name: 'Verify and save embedding' });
@@ -1021,6 +1033,7 @@ test('approves a local skill in Settings and reads only its scoped resources thr
     dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [filePath] });
   }, folder);
   await page.getByRole('button', { name: 'Open settings', exact: true }).click();
+  await page.getByRole('navigation', { name: 'Settings categories' }).getByRole('button', { name: 'Tools & Integrations', exact: true }).click();
   await page.getByRole('button', { name: 'Choose skill folder', exact: true }).click();
   await expect(page.getByRole('group', { name: 'Review skill bundle' })).toContainText(
     'review-notes',
@@ -1062,6 +1075,7 @@ test('approves a local skill in Settings and reads only its scoped resources thr
     'Check independent evidence.',
   );
   await page.getByRole('button', { name: 'Open settings', exact: true }).click();
+  await page.getByRole('navigation', { name: 'Settings categories' }).getByRole('button', { name: 'Tools & Integrations', exact: true }).click();
   await page.getByRole('button', { name: 'Disable review-notes', exact: true }).click();
   await expect(
     page.getByRole('button', { name: 'Enable review-notes', exact: true }),
@@ -1119,6 +1133,7 @@ test('opens an approved installed app from ordinary chat on macOS', async () => 
     };
   });
   await page.getByRole('button', { name: 'Open settings', exact: true }).click();
+  await page.getByRole('navigation', { name: 'Settings categories' }).getByRole('button', { name: 'Desktop Control', exact: true }).click();
   await page.getByRole('button', { name: 'Select a full screen', exact: true }).click();
   await expect(page.getByRole('button', { name: 'Change display', exact: true })).toBeVisible();
   await page.getByRole('button', { name: 'Back to chat', exact: true }).click();
@@ -1595,8 +1610,9 @@ test('keeps direct chat lazy and explains an unavailable sandbox', async () => {
 test('recalls memory across conversations and restart, then forgets it without rebuilding from chat history', async () => {
   await launch();
   await page.getByRole('button', { name: 'Open settings', exact: true }).click();
-  await page.getByRole('checkbox', { name: 'Enable persistent memory' }).check();
-  await page.getByRole('checkbox', { name: 'Show follow-up suggestions' }).check();
+  await page.getByRole('navigation', { name: 'Settings categories' }).getByRole('button', { name: 'Memory', exact: true }).click();
+  await page.getByRole('switch', { name: 'Enable persistent memory' }).click();
+  await page.getByRole('switch', { name: 'Show follow-up suggestions' }).click();
   await page.getByRole('button', { name: 'Save memory settings' }).click();
   await expect(page.getByText('Memory settings saved.')).toBeVisible();
   await page.getByRole('button', { name: 'Back to chat', exact: true }).click();
@@ -1713,4 +1729,116 @@ test('requires native approval for explicit memory mutations through Conductor',
   await expect(page.locator('.from-assistant[data-status="completed"]')).toHaveCount(1);
   await expect.poll(() => page.evaluate(async () => (await window.aria!.searchMemories({})).records))
     .toMatchObject([{ confirmation: 'confirmed', value: candidate }]);
+});
+
+test('navigates settings, searches controls, and restores the category at a narrow size', async () => {
+  await launch();
+  await page.getByRole('button', { name: 'Open settings', exact: true }).click();
+  const navigation = page.getByRole('navigation', { name: 'Settings categories' });
+  await navigation.getByRole('button', { name: 'Appearance', exact: true }).click();
+  await page.getByRole('button', { name: 'Light', exact: true }).click();
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'light');
+  await page.getByRole('searchbox', { name: 'Search settings' }).fill('startup behavior');
+  await page.getByRole('option').filter({ hasText: 'Startup behavior' }).first().click();
+  await expect(page.getByRole('combobox', { name: 'Startup behavior' })).toBeVisible();
+  await navigation.getByRole('button', { name: 'Appearance', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Appearance', exact: true })).toBeVisible();
+  await expect.poll(async () => (await page.evaluate(() => window.aria!.load())).data.preferences.settingsCategory).toBe('appearance');
+  await app.close();
+  expect(JSON.parse(await fs.readFile(path.join(temporary, 'aria-v3.json'), 'utf8')).preferences.settingsCategory).toBe('appearance');
+  await launch();
+  await page.getByRole('button', { name: 'Open settings', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Appearance', exact: true })).toBeVisible();
+  await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].setContentSize(720, 600));
+  await page.getByRole('button', { name: 'Appearance', exact: true }).click();
+  const categories = page.getByRole('dialog', { name: 'Settings categories' });
+  await expect(categories).toBeVisible();
+  await categories.getByRole('button', { name: 'General', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'General', exact: true })).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  await screenshot('settings-narrow.png');
+});
+
+test('clears chat history only after native confirmation and keeps it cleared after restart', async () => {
+  await launch();
+  await send('A conversation to clear');
+  await expect(page.locator('.from-assistant[data-status="completed"]')).toHaveCount(1);
+  await page.getByRole('button', { name: 'Open settings', exact: true }).click();
+  await page.getByRole('navigation', { name: 'Settings categories' }).getByRole('button', { name: 'Privacy & Security', exact: true }).click();
+  await app.evaluate(({ dialog }) => { dialog.showMessageBox = async () => ({ response: 0, checkboxChecked: false }); });
+  await page.getByRole('button', { name: 'Clear chat history' }).click();
+  await expect(page.locator('.conversation-item')).toHaveCount(1);
+  await app.evaluate(({ dialog }) => { dialog.showMessageBox = async () => ({ response: 1, checkboxChecked: false }); });
+  await page.getByRole('button', { name: 'Clear chat history' }).click();
+  await expect(page.getByText('Chat history cleared.')).toBeVisible();
+  await expect(page.locator('.conversation-item')).toHaveCount(0);
+  await app.close();
+  await launch();
+  await expect(page.locator('.conversation-item')).toHaveCount(0);
+});
+
+test('records a shortcut, rejects conflicts, and invokes the saved binding', async () => {
+  await launch();
+  await page.getByRole('button', { name: 'Open settings', exact: true }).click();
+  await page.getByRole('navigation', { name: 'Settings categories' }).getByRole('button', { name: 'Keyboard Shortcuts', exact: true }).click();
+  const row = page.locator('#shortcut-newChat');
+  await row.getByRole('button', { name: 'Change' }).click();
+  await page.keyboard.press(`${modifier}+k`);
+  await expect(row.getByText(/Conflicts with/)).toBeVisible();
+  await page.keyboard.press(`${modifier}+Shift+n`);
+  await row.getByRole('button', { name: 'Save', exact: true }).click();
+  await page.keyboard.press(`${modifier}+Shift+n`);
+  await expect(page.getByRole('textbox', { name: 'Message Aria' })).toBeFocused();
+});
+
+test('requires confirmation to revoke an authorized directory without deleting its files', async () => {
+  await launch();
+  const project = path.join(temporary, 'settings-project');
+  await fs.mkdir(project);
+  await fs.writeFile(path.join(project, 'keep.txt'), 'keep');
+  await app.evaluate(({ dialog }, folder) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [folder] }); }, project);
+  await page.getByRole('button', { name: 'Open settings', exact: true }).click();
+  await page.getByRole('navigation', { name: 'Settings categories' }).getByRole('button', { name: 'Files & Storage', exact: true }).click();
+  await page.getByRole('button', { name: 'Add folder', exact: true }).click();
+  const directory = page.locator('#storage-directories').locator('.shortcut-row').filter({ hasText: 'settings-project' });
+  await expect(directory).toBeVisible();
+  await app.evaluate(({ dialog }) => { dialog.showMessageBox = async () => ({ response: 0, checkboxChecked: false }); });
+  await directory.getByRole('button', { name: 'Remove', exact: true }).click();
+  await expect(directory).toBeVisible();
+  await app.evaluate(({ dialog }) => { dialog.showMessageBox = async () => ({ response: 1, checkboxChecked: false }); });
+  await directory.getByRole('button', { name: 'Remove', exact: true }).click();
+  await expect(directory).toHaveCount(0);
+  expect(await fs.readFile(path.join(project, 'keep.txt'), 'utf8')).toBe('keep');
+  expect((await page.evaluate(() => window.aria!.load())).data.workspaces).toEqual([]);
+});
+
+test('confirms clearing local legacy records while keeping authorized folders and chat', async () => {
+  await launch();
+  await send('Chat to preserve during legacy cleanup');
+  await expect(page.locator('.from-assistant[data-status="completed"]')).toHaveCount(1);
+  await expect.poll(async () => (await page.evaluate(() => window.aria!.load())).data.chat.conversations.length).toBe(1);
+  const project = path.join(temporary, 'legacy-data-project');
+  await fs.mkdir(project);
+  await app.evaluate(({ dialog }, folder) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [folder] }); }, project);
+  const workspace = await page.evaluate(() => window.aria!.chooseWorkspace());
+  expect(workspace).toBeTruthy();
+  await page.evaluate(async (workspaceId) => {
+    const { data } = await window.aria!.load();
+    data.conversations = [{ id: 'legacy-draft', workspaceId, title: 'Legacy draft', draft: 'Keep until confirmed', mode: 'chat', attachments: [], updatedAt: '' }];
+    await window.aria!.save(data);
+  }, workspace!.id);
+  await page.reload();
+  await expect(page.getByRole('button', { name: 'Open settings', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Open settings', exact: true }).click();
+  await page.getByRole('navigation', { name: 'Settings categories' }).getByRole('button', { name: 'Privacy & Security', exact: true }).click();
+  await app.evaluate(({ dialog }) => { dialog.showMessageBox = async () => ({ response: 0, checkboxChecked: false }); });
+  await page.getByRole('button', { name: 'Clear local legacy data' }).click();
+  expect((await page.evaluate(() => window.aria!.load())).data.conversations).toHaveLength(1);
+  await app.evaluate(({ dialog }) => { dialog.showMessageBox = async () => ({ response: 1, checkboxChecked: false }); });
+  await page.getByRole('button', { name: 'Clear local legacy data' }).click();
+  await expect(page.getByText('Local legacy data cleared.')).toBeVisible();
+  const after = (await page.evaluate(() => window.aria!.load())).data;
+  expect(after.conversations).toHaveLength(0);
+  expect(after.chat.conversations).toHaveLength(1);
+  expect(after.workspaces.map((item) => item.id)).toContain(workspace!.id);
 });

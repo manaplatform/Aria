@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import type { DesktopBridge, KnowledgeCollection } from '@aria/shared';
 import { desktop, errorMessage } from '../../services/desktop';
 import { Button } from '../ui';
+import { SettingsDialog } from './components';
 
 export function KnowledgeSettings() {
   const [collections, setCollections] = useState<KnowledgeCollection[]>([]);
@@ -9,6 +10,7 @@ export function KnowledgeSettings() {
   const [installed, setInstalled] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [removal, setRemoval] = useState<{ id: string; fileId?: string; name: string }>();
 
   useEffect(() => {
     let mounted = true;
@@ -98,8 +100,7 @@ export function KnowledgeSettings() {
               variant="ghost"
               disabled={busy}
               onClick={() => {
-                if (confirm(`Remove the library “${item.name}” and its imported copies?`))
-                  void change({ operation: 'remove', id: item.id });
+                setRemoval({ id: item.id, name: item.name });
               }}
             >
               Remove library
@@ -115,8 +116,7 @@ export function KnowledgeSettings() {
                 variant="ghost"
                 disabled={busy}
                 onClick={() => {
-                  if (confirm(`Remove “${file.name}” from this library?`))
-                    void change({ operation: 'remove-file', id: item.id, fileId: file.id });
+                  setRemoval({ id: item.id, fileId: file.id, name: file.name });
                 }}
               >
                 Remove file
@@ -147,6 +147,15 @@ export function KnowledgeSettings() {
         </Button>
       </div>
       {error && <p role="alert">{error}</p>}
+      <SettingsDialog open={Boolean(removal)} onOpenChange={(open) => { if (!open) setRemoval(undefined); }}
+        title={removal?.fileId ? 'Remove document?' : 'Remove library?'}
+        description={removal?.fileId ? `Remove “${removal.name}” from this library?` : `Remove “${removal?.name}” and its imported copies?`}
+        confirmLabel="Remove" onConfirm={() => {
+          if (!removal) return;
+          const input = removal.fileId ? { operation: 'remove-file' as const, id: removal.id, fileId: removal.fileId } : { operation: 'remove' as const, id: removal.id };
+          setRemoval(undefined);
+          void change(input);
+        }} />
     </section>
   );
 }

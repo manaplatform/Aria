@@ -12,6 +12,12 @@ Retry and regeneration reuse the latest user message. A retry requires a matchin
 
 Desktop text chat renders charts and flowcharts from versioned JSON in top-level `aria-visual` Markdown fences. The renderer mounts a visual after the closing fence arrives and the payload passes the shared schema. Invalid or interrupted blocks expose their source for copying. Chart data, diagram connections, and locally rendered equations travel through the existing text stream and history. The existing artifact workflow handles downloadable chart files.
 
+## Settings workspace
+
+The primary Settings shell has a separate category sidebar and independently scrolling content. Its 16 categories are grouped under Preferences, Artificial Intelligence, Capabilities, and System. Category and appearance preferences are stored with the local desktop profile; provider configuration and memory retain their existing main-owned stores. Settings search and the legacy `#ai-models`, `#web-browser`, `#tools`, `#skills`, and `#memory` links navigate to their corresponding sections. Below 900px a dialog provides category navigation.
+
+Appearance and shortcut changes use persisted preferences. Login-item, tray, notification, storage and About operations use the validated Electron bridge. Notifications contain generic text rather than conversation content. Provider model selection remains in Settings and uses discovered exact IDs and existing capability checks. The legacy project workspace remains under `/advanced/*`.
+
 ## Managed NestJS service
 
 Electron main launches the staged API after app readiness with `utilityProcess.fork`, using Electron’s embedded Node runtime. A private parent-channel handshake installs the registry snapshot before reporting an ephemeral loopback port. Main generates a per-launch bearer token; only main receives the port/token. The renderer never receives provider credentials from persisted settings, the internal token, or arbitrary network/process access.
@@ -91,3 +97,6 @@ Desktop text chat extends the Part 1 capability bridge with conversation-scoped 
 ## Persistent memory
 
 Electron owns the per-profile memory worker, scope checks, trusted confirmations, and chat outbox. Conductor offers optional retrieval to the configured primary. The renderer receives typed settings, scoped source references, and optional suggestion chips through the preload bridge. See [Memory architecture](memory-engine.md).
+
+
+Agenda, Automations, and Notifications are profile-scoped routes in the chat shell. Settings includes Proactive Assistant. Electron main owns the durable runtime and exposes committed snapshots and change events through preload. See [Proactive Assistant Runtime](proactive-assistant-runtime.md).
