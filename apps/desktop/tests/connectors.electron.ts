@@ -100,25 +100,35 @@ test('connects GitHub through Settings and discovers a scoped read in normal cha
   }
 });
 
-test('discovers signed-in GitHub API search in chat without app installations or browser access', async () => {
+test('explains a public GitHub repository from its README and source without app installations or browser access', async () => {
   const executablePath = process.env.ARIA_TEST_PACKAGED_APP;
   test.skip(Boolean(executablePath) && !providers.github, 'Packaged authorization requires the bundled GitHub identity.');
   const identity = providers.github ?? fixtureGithub;
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'aria-github-public-search-'));
   const fixture = await createProviderFixture();
-  const prompt = 'Check GitHub for mana-agent';
-  const id = 'github.search_public_repositories';
-  fixture.queueTool(prompt, 'find_capabilities', { query: 'GitHub repository search', namespace: 'github', includeUnavailable: true });
+  const prompt = 'Check GitHub for mana-agent. What is it and what does its code do?';
+  const repo = 'manaplatform/mana-agent';
+  const ids = ['github.search_public_repositories', 'github.get_public_readme', 'github.list_public_files', 'github.read_public_file'];
+  fixture.queueTool(prompt, 'find_capabilities', { query: 'public GitHub repository', namespace: 'github', includeUnavailable: true });
   fixture.onToolResult(prompt, (result) => {
     const payload = result as { items?: { id: string; available: boolean }[]; loaded?: unknown;
-      data?: { results?: { name: string }[] }; sources?: { url: string; evidenceStatus: string }[] };
-    if (payload.items?.some((item) => item.id === id && item.available) &&
-        !payload.items.some((item) => item.id !== id && item.available))
-      return { name: 'load_capabilities', input: { ids: [id] } };
+      data?: { results?: { name: string }[]; path?: string; text?: string; entries?: { path: string }[] };
+      sources?: { url: string; evidenceStatus: string }[] };
+    if (payload.items && payload.items.filter((item) => item.available && ids.includes(item.id)).length === ids.length &&
+        !payload.items.some((item) => !ids.includes(item.id) && item.available))
+      return { name: 'load_capabilities', input: { ids } };
     if (payload.loaded) return { name: 'github_search_public_repositories', input: { query: 'mana-agent' } };
-    if (payload.data?.results?.[0]?.name === 'manaplatform/mana-agent' &&
-        payload.sources?.some((source) => source.url === 'https://github.com/manaplatform/mana-agent' && source.evidenceStatus === 'metadata'))
-      fixture.finalReply(prompt, 'Found [manaplatform/mana-agent](https://github.com/manaplatform/mana-agent) through the GitHub API.');
+    if (payload.data?.results?.[0]?.name === repo && payload.sources?.some((source) =>
+      source.url === `https://github.com/${repo}` && source.evidenceStatus === 'metadata'))
+      return { name: 'github_get_public_readme', input: { repository: repo } };
+    if (payload.data?.path === 'README.md' && payload.data.text?.includes('An AI assistant'))
+      return { name: 'github_list_public_files', input: { repository: repo } };
+    if (payload.data?.entries?.some((entry) => entry.path === 'src'))
+      return { name: 'github_read_public_file', input: { repository: repo, path: 'src/agent.py' } };
+    if (payload.data?.path === 'src/agent.py' && payload.data.text?.includes('return dispatch_task()') &&
+        payload.sources?.some((source) => source.evidenceStatus === 'inspected' &&
+          source.url === `https://github.com/${repo}/blob/${'b'.repeat(40)}/src/agent.py`))
+      fixture.finalReply(prompt, 'Mana-Agent is an AI assistant. Its runner calls dispatch_task().');
     return undefined;
   });
   const app = await electron.launch({
@@ -139,7 +149,7 @@ test('discovers signed-in GitHub API search in chat without app installations or
     await page.evaluate(async () => {
       const policy = await window.aria!.webSettings();
       delete policy.warning;
-      await window.aria!.saveWebSettings({ ...policy, aiBrowser: false });
+      await window.aria!.saveWebSettings({ ...policy, aiBrowser: false, fetches: 1 });
     });
     await connectGithubFixture(app, page, { reviewRepositories: false });
     expect(await page.evaluate(() => window.aria!.connectors({ action: 'status' })))
@@ -147,7 +157,7 @@ test('discovers signed-in GitHub API search in chat without app installations or
     await page.evaluate(() => { location.hash = '/chat'; });
     await page.getByRole('textbox', { name: 'Message Aria' }).fill(prompt);
     await page.getByRole('button', { name: 'Send message' }).click();
-    await expect(page.locator('.from-assistant .markdown').last()).toContainText('through the GitHub API.');
+    await expect(page.locator('.from-assistant .markdown').last()).toContainText('Its runner calls dispatch_task().');
     expect(await githubFixturePublicSearchCount(app)).toBe(1);
     for (const secret of githubFixtureSecrets) expect(JSON.stringify(fixture.received)).not.toContain(secret);
   } finally {

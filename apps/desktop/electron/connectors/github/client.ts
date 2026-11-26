@@ -39,7 +39,7 @@ export async function boundedBytes(body: ReadableStream<Uint8Array> | null, limi
 }
 
 type CacheEntry = { etag: string; value: unknown; next: boolean };
-type RequestOptions = { method?: 'GET' | 'POST' | 'PATCH' | 'PUT' | 'DELETE'; body?: object; readonlyGraphql?: boolean; onDispatch?: () => void; onAccepted?: () => void };
+type RequestOptions = { method?: 'GET' | 'POST' | 'PATCH' | 'PUT' | 'DELETE'; body?: object; readonlyGraphql?: boolean; fresh?: boolean; onDispatch?: () => void; onAccepted?: () => void };
 const idSchema = z.number().int().positive().safe();
 const userSchema = z.object({ id: idSchema, login: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_-]{0,99}$/), avatar_url: z.string().url().max(500).optional() });
 const installationsSchema = z.object({
@@ -94,7 +94,7 @@ export class GithubClient {
     if (!route.startsWith('/') || target.origin !== origin || target.username || target.password)
       throw new GithubError('INVALID_ARGUMENT', 'The GitHub route is invalid.', 'INVALID_TARGET');
     const method = options.method ?? 'GET';
-    const cached = method === 'GET' ? this.cache.get(target.href) : undefined;
+    const cached = method === 'GET' && !options.fresh ? this.cache.get(target.href) : undefined;
     const read = method === 'GET' || options.readonlyGraphql;
     return this.serial(signal, async () => {
       if (this.limitedUntil > Date.now())
@@ -181,7 +181,7 @@ export class GithubClient {
     try { value = JSON.parse(bytes.toString('utf8')); }
     catch { throw new GithubError('INVALID_TOOL_OUTPUT', 'GitHub returned an unsupported response.', 'INVALID_PROVIDER_OUTPUT'); }
     const etag = result.headers.get('etag');
-    if (!options?.method && etag && bytes.length <= 48_000 &&
+    if (!options?.method && !options?.fresh && etag && bytes.length <= 48_000 &&
         /^\/(?:user(?:\/installations.*)?$|repos\/[^/]+\/[^/]+(?:$|\/branches|\/actions\/workflows|\/git\/ref))/.test(route)) {
       if (this.cache.size >= 80) this.cache.delete(this.cache.keys().next().value!);
       this.cache.set(origin + route, { etag, value, next });

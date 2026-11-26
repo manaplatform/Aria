@@ -38,6 +38,20 @@ function summary(value: unknown) {
 
 const invalid = (message: string) => new GithubError('INVALID_REFERENCE', message, 'STALE_TARGET');
 const fail = () => new GithubError('INVALID_TOOL_OUTPUT', 'GitHub returned incomplete operation data.', 'INVALID_PROVIDER_OUTPUT');
+export function decodeGithubFile(input: unknown) {
+  const value = object(input);
+  const encoded = str(value.content).replace(/\s/g, '');
+  if (value.type === 'symlink' || value.type === 'submodule' || value.submodule_git_url ||
+      value.encoding !== 'base64' || typeof value.content !== 'string' || !/^[a-zA-Z0-9+/]*={0,2}$/.test(encoded))
+    throw new GithubError('INVALID_REFERENCE', 'This GitHub path has no supported text representation.', 'UNSUPPORTED_FILE');
+  const bytes = Buffer.from(encoded, 'base64');
+  let text: string;
+  try { text = new TextDecoder('utf-8', { fatal: true }).decode(bytes); } catch {
+    throw new GithubError('INVALID_REFERENCE', 'The selected file is binary or uses an unsupported encoding.', 'UNSUPPORTED_FILE');
+  }
+  if (text.includes('\u0000')) throw new GithubError('INVALID_REFERENCE', 'The selected file is binary.', 'UNSUPPORTED_FILE');
+  return sanitizeGithubText(text);
+}
 type Projected = {
   value?: unknown; text?: string; suffix?: string; nextPage?: number; nextOffset?: number;
   partial?: boolean; verified?: boolean; observation?: string; asset?: { bytes: Buffer; name: string };
@@ -89,19 +103,7 @@ export async function operateGithub<K extends GithubOperation>(
     const content = cap(text.slice(offset, offset + 7000), 8000);
     return { text: content, ...(text.length > offset + 7000 && { nextOffset: offset + 7000, partial: true }) };
   };
-  const fromFile = (value: ObjectValue, offset = 0) => {
-    const encoded = str(value.content).replace(/\s/g, '');
-    if (value.type === 'symlink' || value.type === 'submodule' || value.submodule_git_url ||
-        value.encoding !== 'base64' || !/^[a-zA-Z0-9+/]*={0,2}$/.test(encoded))
-      throw new GithubError('INVALID_REFERENCE', 'This GitHub path has no supported text representation.', 'UNSUPPORTED_FILE');
-    const bytes = Buffer.from(encoded, 'base64');
-    let text: string;
-    try { text = new TextDecoder('utf-8', { fatal: true }).decode(bytes); } catch {
-      throw new GithubError('INVALID_REFERENCE', 'The selected file is binary or uses an unsupported encoding.', 'UNSUPPORTED_FILE');
-    }
-    if (text.includes('\u0000')) throw new GithubError('INVALID_REFERENCE', 'The selected file is binary.', 'UNSUPPORTED_FILE');
-    return { value: summary(value), ...portion(text, offset) };
-  };
+  const fromFile = (value: ObjectValue, offset = 0) => ({ value: summary(value), ...portion(decodeGithubFile(value), offset) });
   const search = async (collection: 'code' | 'issues', kind?: 'issue' | 'pr') => {
     // Treat the user’s query as text. Append the only repository qualifier here.
     const terms = key('query').replace(/[^\p{L}\p{N}\s_.-]/gu, ' ').trim().replace(/\s+/g, ' ');

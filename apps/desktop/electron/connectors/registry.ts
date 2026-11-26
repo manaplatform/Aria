@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import {
-  githubOperation, githubOperations, githubPublicSearchInput, githubPublicSearchOperation, githubResult,
+  githubOperation, githubOperations, githubPublicOperation, githubPublicOperations, githubPublicSearchOperation, githubResult,
   type CapabilityHostRequest, type ConnectorCommand, type ConnectorInventory, type ConnectorJobGrant,
   type ConnectorSnapshot, type GithubAccount, type GithubRepository, type RuntimeResult,
 } from '@aria/shared';
@@ -10,6 +10,7 @@ import { GithubAdapter } from './github/adapter';
 import { githubVerificationUrl, type SavedTokens } from './github/authorization';
 import { githubConfig } from './github/config';
 import { GithubError, sanitizeGithubText, segment } from './github/client';
+import { inspectPublicRepository } from './github/public-repository';
 import { ConnectorStore } from './store';
 
 type Scope = Extract<CapabilityHostRequest, { type: 'runtime' }>;
@@ -34,7 +35,7 @@ const unavailable = () => new RuntimeError('CAPABILITY_UNAVAILABLE', 'GitHub is 
 const bracket = (text: string) => sanitizeGithubText(text).replace(/[\p{Cc}\p{Cf}]/gu, ' ');
 const connectionChanged = (first: GithubAccount, second: GithubAccount | undefined) =>
   !second || first.generation !== second.generation;
-const canSearchPublic = (account: GithubAccount | undefined) =>
+const canReadPublic = (account: GithubAccount | undefined) =>
   account?.state === 'connected' || account?.state === 'needs_repositories';
 
 export class ConnectorRegistry {
@@ -103,7 +104,7 @@ export class ConnectorRegistry {
     const readable = Boolean(account && primary && account.state === 'connected' && account.selected.length &&
       this.store?.approvedPrimary(account.id) === primary);
     return { active, readable, writable: Boolean(readable && account && account.policy !== 'read_only'),
-      publicSearch: canSearchPublic(account) };
+      publicAccess: canReadPublic(account) };
   }
 
   subscribe(listener: (inventory: ConnectorInventory) => void) {
@@ -390,13 +391,14 @@ export class ConnectorRegistry {
   release(request: string) { this.turns.delete(request); }
   private readonly turns = new Map<string, { connection: string; repository?: number; privateInventory?: boolean }>();
 
-  async searchPublic(scope: Scope, parent: AbortSignal, host: Pick<OperationHost, 'live' | 'network'>): Promise<RuntimeResult> {
-    const input = githubPublicSearchInput.safeParse(scope.input);
-    if (scope.operation !== githubPublicSearchOperation || !input.success || scope.programId || scope.voiceSessionId)
-      throw new RuntimeError('INVALID_ARGUMENT', 'GitHub public search requires a valid direct query.');
+  async dispatchPublic(scope: Scope, parent: AbortSignal, host: Pick<OperationHost, 'live' | 'network'>): Promise<RuntimeResult> {
+    const operation = githubPublicOperation.parse(scope.operation);
+    const input = githubPublicOperations[operation].safeParse(scope.input);
+    if (!input.success || scope.programId || scope.voiceSessionId)
+      throw new RuntimeError('INVALID_ARGUMENT', 'GitHub public access requires a valid direct operation.');
     const { github, store } = this.enabled;
     const account = this.account();
-    if (!canSearchPublic(account))
+    if (!canReadPublic(account))
       throw new RuntimeError('PERMISSION_DENIED', 'Sign in or reconnect GitHub in Settings → Connectors.');
     const primary = this.host.identity()?.key;
     const signal = AbortSignal.any([parent, this.epoch(account.id)]);
@@ -410,18 +412,24 @@ export class ConnectorRegistry {
     };
     assertLive();
     this.turns.set(scope.requestId, { connection: account.id });
-    const search = async (forceRefresh = false) => {
+    const read = async (forceRefresh = false) => {
       assertLive();
       const credentials = await this.credentials(account, signal, forceRefresh);
-      return github.client(account.id).searchPublicRepositories(credentials.accessToken, input.data, signal, () => {
+      const client = github.client(account.id);
+      const onDispatch = () => {
         assertLive();
         host.network();
-      });
+      };
+      if (operation === githubPublicSearchOperation && 'query' in input.data)
+        return client.searchPublicRepositories(credentials.accessToken, input.data, signal, onDispatch);
+      if (operation !== githubPublicSearchOperation && 'repository' in input.data)
+        return inspectPublicRepository(client, credentials.accessToken, operation, input.data, signal, onDispatch);
+      throw new RuntimeError('INVALID_ARGUMENT', 'GitHub public operation arguments do not match the tool.');
     };
     try {
-      const data = await search().catch((error: unknown) => {
+      const data = await read().catch((error: unknown) => {
         if (!(error instanceof GithubError) || error.category !== 'AUTH_REJECTED') throw error;
-        return search(true);
+        return read(true);
       });
       assertLive();
       return { data };

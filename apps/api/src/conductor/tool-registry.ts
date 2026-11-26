@@ -1331,9 +1331,9 @@ export class ToolRegistry {
     if (connector && !context?.proactive) {
       const state = this.host.connectors;
       if (descriptor.connectorScope === 'account') {
-        if (!state?.publicSearch) return 'Sign in or reconnect GitHub in Settings → Connectors to use API search.';
+        if (!state?.publicAccess) return 'Sign in or reconnect GitHub in Settings → Connectors to use public GitHub API tools.';
       } else if (!state?.readable || descriptor.effect === 'consequential' && !state.writable) {
-        return state?.publicSearch
+        return state?.publicAccess
           ? 'GitHub is signed in. Review repository access and operation permissions in Settings → Connectors.'
           : 'Connect GitHub and review repository access in Settings → Connectors.';
       }

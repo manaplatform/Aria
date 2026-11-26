@@ -3,7 +3,10 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { githubAccount, githubPublicSearchOperation, type CapabilityHostRequest, type GithubOperation } from '@aria/shared';
+import {
+  githubAccount, githubPublicReadmeOperation, githubPublicSearchOperation, type CapabilityHostRequest,
+  type GithubOperation, type GithubPublicOperation,
+} from '@aria/shared';
 import { ConnectorRegistry } from '../electron/connectors/registry';
 import { ConnectorStore } from '../electron/connectors/store';
 import { GithubAuthorization } from '../electron/connectors/github/authorization';
@@ -41,7 +44,7 @@ const repo = { id: 20, installation: 30, name: 'owner/repo', private: true, desc
 const registered = githubAccount.parse({ id: randomUUID(), userId: 1, login: 'user', avatar: null, connectedAt: 1, verifiedAt: 1,
   state: 'connected', generation: 1, selected: [repo.id], repositories: [repo], policy: 'read_only', grants: [] });
 const signal = () => new AbortController().signal;
-const request = (operation: GithubOperation | typeof githubPublicSearchOperation, input: Record<string, unknown>, requestId = randomUUID()) =>
+const request = (operation: GithubOperation | GithubPublicOperation, input: Record<string, unknown>, requestId = randomUUID()) =>
   ({ type: 'runtime', id: randomUUID(), requestId, conversationId: scopeOwner, assistantMessageId: randomUUID(),
     callId: randomUUID(), stepId: randomUUID(), revision: 'initial', operation, input, primary }) satisfies CapabilityHostRequest;
 
@@ -112,7 +115,7 @@ describe('Aria Connect GitHub boundaries', () => {
   it('uses the signed-in account token for public API search before any repository is approved', async () => {
     const { registry, store, fetcher } = await fixture({ expired: true });
     store.update({ ...registered, state: 'needs_repositories', repositories: [], selected: [] });
-    expect(registry.inventory()).toMatchObject({ publicSearch: true, readable: false, writable: false });
+    expect(registry.inventory()).toMatchObject({ publicAccess: true, readable: false, writable: false });
     const original = fetcher.getMockImplementation()!;
     const search = vi.fn(() => Response.json({ incomplete_results: false, total_count: 2, items: [
       { full_name: 'manaplatform/mana-agent', private: false, description: 'Example ' + credential,
@@ -130,16 +133,16 @@ describe('Aria Connect GitHub boundaries', () => {
       return search();
     });
     const call = request(githubPublicSearchOperation, { query: 'manaplatform/mana-agent' });
-    await expect(registry.searchPublic(call, signal(), operations)).resolves.toEqual({ data: { partial: false,
+    await expect(registry.dispatchPublic(call, signal(), operations)).resolves.toEqual({ data: { partial: false,
       nextPage: undefined, results: [{ name: 'manaplatform/mana-agent', description: 'Example [redacted GitHub credential]',
         language: 'Python', stars: 12 }] } });
-    await expect(registry.searchPublic({ ...call, input: { query: 'mana-agent is:private' } }, signal(), operations))
-      .rejects.toThrow(/valid direct query/);
+    await expect(registry.dispatchPublic({ ...call, input: { query: 'mana-agent is:private' } }, signal(), operations))
+      .rejects.toThrow(/valid direct operation/);
     await expect(registry.dispatch(request('github.read_file', { repository: repo.name, path: 'README.md' }), signal(), operations))
       .rejects.toThrow(/scope changed/);
     await registry.command({ action: 'disconnect', id: registered.id });
-    expect(registry.inventory().publicSearch).toBe(false);
-    await expect(registry.searchPublic(call, signal(), operations)).rejects.toThrow(/unavailable/);
+    expect(registry.inventory().publicAccess).toBe(false);
+    await expect(registry.dispatchPublic(call, signal(), operations)).rejects.toThrow(/unavailable/);
     expect(search).toHaveBeenCalledTimes(1);
     expect(fetcher.mock.calls.some(([url]) => String(url).includes('/user/installations'))).toBe(false);
   });
@@ -148,10 +151,39 @@ describe('Aria Connect GitHub boundaries', () => {
     const { registry, fetcher } = await fixture();
     const turn = randomUUID();
     await registry.dispatch(request('github.read_file', { repository: repo.name, path: 'README.md' }, turn), signal(), operations);
-    await expect(registry.searchPublic(request(githubPublicSearchOperation, { query: 'repo' }, turn), signal(), operations))
+    await expect(registry.dispatchPublic(request(githubPublicSearchOperation, { query: 'repo' }, turn), signal(), operations))
       .rejects.toThrow(/scope changed/);
     expect(fetcher.mock.calls.some(([url]) => String(url).includes('/search/repositories'))).toBe(false);
   });
+
+  it.each(['private at dispatch', 'became private', 'repository replaced'])(
+    'does not release public README content when the repository is %s', async (scenario) => {
+      const { registry, fetcher } = await fixture();
+      const base = '/repos/example/public-repo';
+      let checks = 0;
+      fetcher.mockImplementation(async (url, options) => {
+        const target = new URL(String(url));
+        expect(target.origin).toBe('https://api.github.com');
+        expect(new Headers(options?.headers).get('authorization')).toBe('Bearer ' + credential);
+        expect(new Headers(options?.headers).has('if-none-match')).toBe(false);
+        if (target.pathname === base) {
+          checks++;
+          return Response.json({ id: checks === 2 && scenario === 'repository replaced' ? 2 : 1,
+            full_name: 'example/public-repo', default_branch: 'main',
+            private: scenario === 'private at dispatch' || checks === 2 && scenario === 'became private',
+          }, { headers: { etag: '"fixture-repository"' } });
+        }
+        if (target.pathname === base + '/branches/main') return Response.json({ name: 'main', commit: { sha: 'b'.repeat(40) } });
+        if (target.pathname === base + '/readme') {
+          expect(target.searchParams.get('ref')).toBe('b'.repeat(40));
+          return Response.json({ type: 'file', path: 'README.md', encoding: 'base64', content: Buffer.from('withheld').toString('base64') });
+        }
+        throw new Error('unexpected request');
+      });
+      const call = request(githubPublicReadmeOperation, { repository: 'example/public-repo' });
+      await expect(registry.dispatchPublic(call, signal(), operations)).rejects.toMatchObject({ category: 'PUBLIC_REPOSITORY_REQUIRED' });
+      expect(fetcher).toHaveBeenCalledTimes(scenario === 'private at dispatch' ? 1 : 4);
+    });
 
   it('projects only authorized repositories and cleans credential text from tool results', async () => {
     const { registry, fetcher } = await fixture();

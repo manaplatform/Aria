@@ -334,7 +334,9 @@ export class ExecutionEngine {
                 : descriptor.connector === 'github' && outcome.data?.verified === true
                   ? 'GitHub result verified'
                 : outcome.sources?.length
-                  ? `${outcome.sources.length} verified source references`
+                  ? outcome.sources.every((source) => ['discovered', 'metadata'].includes(source.evidenceStatus ?? ''))
+                    ? `${outcome.sources.length} source ${outcome.sources.length === 1 ? 'link' : 'links'}`
+                    : `${outcome.sources.length} verified source references`
                   : 'Result received'
               : undefined,
           resultId: outcome?.artifact?.id,

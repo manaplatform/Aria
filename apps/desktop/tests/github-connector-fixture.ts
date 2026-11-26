@@ -85,6 +85,20 @@ export async function installGithubFixture(app: ElectronApplication, identity: G
             language: 'Python', stargazers_count: 12,
           }] });
         }
+        const publicRepo = '/repos/manaplatform/mana-agent';
+        const publicCommit = 'b'.repeat(40);
+        if (url.pathname === publicRepo) return Response.json({ id: 42, full_name: 'manaplatform/mana-agent',
+          default_branch: 'main', private: false, visibility: 'public' });
+        if (url.pathname === publicRepo + '/branches/main') return Response.json({ name: 'main', commit: { sha: publicCommit } });
+        if (url.pathname.startsWith(publicRepo + '/')) {
+          if (url.searchParams.get('ref') !== publicCommit) throw new Error('Expected a pinned public GitHub read');
+          if (url.pathname === publicRepo + '/contents') return Response.json([{ path: 'src', type: 'dir' }]);
+          const readme = url.pathname === publicRepo + '/readme';
+          if (readme || url.pathname === publicRepo + '/contents/src/agent.py') {
+            return Response.json({ type: 'file', encoding: 'base64', path: readme ? 'README.md' : 'src/agent.py',
+              content: Buffer.from(readme ? '# Mana-Agent\nAn AI assistant with local agent state.' : 'def run_agent():\n    return dispatch_task()').toString('base64') });
+          }
+        }
         if (url.pathname === '/user/installations/10/repositories') return Response.json({ repositories: [
           { id: 20, full_name: 'example/connector-fixture', private: true, default_branch: 'main', permissions: { push: true } },
         ] });

@@ -123,6 +123,9 @@ export type GithubArguments<Operation extends GithubOperation> = z.infer<(typeof
 export const githubPublicSearchOperation = 'github.search_public_repositories';
 const publicRepositoryName = githubRepositoryName.refine((name) =>
   name.split('/').every((part) => part !== '.' && part !== '..'));
+export const githubPublicReadmeOperation = 'github.get_public_readme';
+export const githubPublicFilesOperation = 'github.list_public_files';
+export const githubPublicFileOperation = 'github.read_public_file';
 export const githubPublicSearchInput = z.strictObject({
   query: z.string().trim().min(1).max(160).refine((query) =>
     publicRepositoryName.safeParse(query).success ||
@@ -141,6 +144,24 @@ export const githubPublicSearchResult = z.strictObject({
   nextPage: page.page,
   partial: z.boolean(),
 });
+const publicFileOffset = z.number().int().min(0).max(1_000_000).optional();
+const publicDirectoryOffset = z.number().int().min(0).max(1000).optional();
+const publicRepo = { repository: publicRepositoryName.describe('Exact public GitHub repository in owner/name format.') };
+export const githubPublicOperations = {
+  [githubPublicSearchOperation]: githubPublicSearchInput,
+  [githubPublicReadmeOperation]: z.strictObject({ ...publicRepo, offset: publicFileOffset }),
+  [githubPublicFilesOperation]: z.strictObject({ ...publicRepo, path: path.optional(), offset: publicDirectoryOffset }),
+  [githubPublicFileOperation]: z.strictObject({ ...publicRepo, path, offset: publicFileOffset }),
+};
+export type GithubPublicOperation = keyof typeof githubPublicOperations;
+export const githubPublicOperation = z.enum(Object.keys(githubPublicOperations) as [GithubPublicOperation, ...GithubPublicOperation[]]);
+export const githubPublicContentResult = z.discriminatedUnion('kind', [
+  z.strictObject({ kind: z.literal('file'), ...publicRepo, commit: sha, path,
+    text: z.string().max(8000), nextOffset: publicFileOffset, partial: z.boolean() }),
+  z.strictObject({ kind: z.literal('directory'), ...publicRepo, commit: sha, path: path.optional(),
+    entries: z.array(z.strictObject({ path, type: z.enum(['file', 'dir', 'symlink', 'submodule']) })).max(30),
+    nextOffset: publicDirectoryOffset, partial: z.boolean() }),
+]);
 
 export const connectorPolicy = z.enum(['read_only', 'ask', 'scoped']);
 export type ConnectorPolicy = z.infer<typeof connectorPolicy>;
@@ -195,7 +216,7 @@ export type ConnectorJobGrant = z.infer<typeof connectorJobGrant>;
 
 export const connectorInventory = z.strictObject({
   active: githubAccountId.nullable(), readable: z.boolean(), writable: z.boolean(),
-  publicSearch: z.boolean().optional(),
+  publicAccess: z.boolean().optional(),
 });
 export type ConnectorInventory = z.infer<typeof connectorInventory>;
 export const githubResult = z.strictObject({
