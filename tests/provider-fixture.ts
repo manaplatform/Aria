@@ -179,27 +179,23 @@ export async function createProviderFixture(options?: { tls: { key: Buffer; cert
           .end(JSON.stringify({ error: { message: 'secret-response-text' } }));
         return;
       }
-      const finish = () => {
-        if (request.url === '/v1/audio/speech')
-          response.writeHead(200, { 'Content-Type': 'audio/wav' }).end(wav);
-        else
-          response
-            .writeHead(200, { 'Content-Type': 'application/json' })
-            .end(
-              JSON.stringify(
-                request.url === '/v1/audio/transcriptions'
-                  ? { text: 'A transcript from the uploaded audio.' }
-                  : { data: [{ b64_json: png.toString('base64') }] },
-              ),
-            );
-      };
       if (input.includes('[slow]')) {
-        const timeout = setTimeout(finish, 5000);
-        response.on('close', () => {
-          clearTimeout(timeout);
-          if (!response.writableEnded) cancelled++;
-        });
-      } else finish();
+        // Cancellation tests control when their in-flight media request ends.
+        response.once('close', () => { cancelled++; });
+        return;
+      }
+      if (request.url === '/v1/audio/speech')
+        response.writeHead(200, { 'Content-Type': 'audio/wav' }).end(wav);
+      else
+        response
+          .writeHead(200, { 'Content-Type': 'application/json' })
+          .end(
+            JSON.stringify(
+              request.url === '/v1/audio/transcriptions'
+                ? { text: 'A transcript from the uploaded audio.' }
+                : { data: [{ b64_json: png.toString('base64') }] },
+            ),
+          );
       return;
     }
     if (request.url !== '/v1/chat/completions') {

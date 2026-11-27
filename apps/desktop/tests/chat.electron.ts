@@ -10,6 +10,7 @@ import type { ExecutionStep } from '@aria/shared';
 
 const root = path.resolve(__dirname, '..');
 const screenshots = path.join(root, '.artifacts/screenshots');
+const managedTurnTimeout = 15_000;
 let fixture: Awaited<ReturnType<typeof createProviderFixture>>;
 let app: ElectronApplication;
 let page: Page;
@@ -799,16 +800,24 @@ test('configures a provider in Settings using native encrypted storage and resto
   expect(saved).not.toContain('test-only-key');
   expect(JSON.parse(saved).connections[0].encryptedKey).toBeTruthy();
   await page.getByRole('button', { name: 'Back to chat', exact: true }).click();
+  const received = fixture.received.length;
   await send('Use my saved provider');
-  await expect(page.locator('.from-assistant[data-status="completed"]')).toHaveCount(1);
-  expect(fixture.received.at(-1)?.body.messages[0]).toMatchObject({
+  // A managed turn saves the conversation before contacting the provider.
+  const completed = '.from-assistant[data-status="completed"]';
+  await expect(page.locator(completed)).toHaveCount(1, { timeout: managedTurnTimeout });
+  const firstRequest = fixture.received[received];
+  expect(firstRequest?.body.messages.at(-1)).toMatchObject({
+    role: 'user',
+    content: 'Use my saved provider',
+  });
+  expect(firstRequest?.body.messages[0]).toMatchObject({
     role: 'system',
     content: expect.stringContaining('Give useful answers.'),
   });
   await app.close();
   await launch(false, false, true);
   await send('The saved key still works');
-  await expect(page.locator('.from-assistant[data-status="completed"]')).toHaveCount(2);
+  await expect(page.locator(completed)).toHaveCount(2, { timeout: managedTurnTimeout });
 });
 
 test('verifies remote embeddings separately from runtime settings', async () => {
@@ -1098,7 +1107,10 @@ test('cancels delegated generation and labels another billed attempt explicitly'
     ],
   });
   await send('Generate a harbor');
-  await expect(page.locator('.from-assistant[data-status="failed"]')).toHaveCount(1);
+  await expect(page.locator('.from-assistant').last()).toHaveAttribute('data-status', 'failed', {
+    timeout: managedTurnTimeout,
+  });
+  expect(fixture.mediaReceived).toHaveLength(count + 2);
   await expect(page.getByRole('alert')).not.toContainText('secret-response-text');
   await expect(page.getByRole('button', { name: 'Send again', exact: true })).toBeVisible();
   await app.close();
@@ -1113,6 +1125,7 @@ test('cancels delegated generation and labels another billed attempt explicitly'
   await page.getByRole('button', { name: 'Send again', exact: true }).click();
   await expect(page.getByRole('alert')).toContainText(
     'An earlier dispatch may already have taken effect',
+    { timeout: managedTurnTimeout },
   );
   expect(fixture.mediaReceived).toHaveLength(count + 2);
 });
