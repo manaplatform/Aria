@@ -13,9 +13,17 @@ import { flushPersistence, useWorkspaceStore } from './workspaceStore';
 import { notify } from './uiStore';
 import { applyLiveEvent, endLiveVoice, useLiveVoiceStore } from './liveVoiceStore';
 
-export const useChatStore = create<{ status: ChatServiceStatus }>(() => ({
-  status: { state: 'starting', configured: false, model: '' },
-}));
+function createChatStatusStore() {
+  return create<{ status: ChatServiceStatus }>(() => ({
+    status: { state: 'starting', configured: false, model: '' },
+  }));
+}
+
+// Vite can load a fresh module URL while mounted components still use the existing store.
+const hotData = import.meta.hot?.data as { chatStatusStore?: ReturnType<typeof createChatStatusStore> } | undefined;
+export const useChatStore = hotData?.chatStatusStore ?? createChatStatusStore();
+if (hotData) hotData.chatStatusStore = useChatStore;
+
 export const generating = (message: ChatMessage) =>
   message.status === 'pending' || message.status === 'streaming';
 export function updateChat(update: (chat: ChatData) => ChatData): void {

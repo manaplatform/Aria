@@ -628,7 +628,16 @@ test('recovers from service crashes, preserves drafts, and supports narrow windo
 });
 test('development renderer uses the same managed backend and safe preload', async () => {
   await launch(true, true);
+  await expect(page.getByRole('button', { name: 'fixture-model', exact: true })).toBeVisible();
+  // Vite uses a timestamped URL when it reloads a module during development.
+  const refreshedStatus = await page.evaluate(async () => {
+    const url = '/src/stores/chatStore.ts';
+    const refreshed = await import(`${url}?t=${Date.now()}`);
+    return refreshed.useChatStore.getState().status;
+  });
+  expect(refreshedStatus).toMatchObject({ state: 'ready', configured: true, model: 'fixture-model' });
   await send('Hello from development');
+  await expect(page.locator('.from-user')).toHaveText('Hello from development');
   await expect(page.locator('.from-assistant[data-status="completed"]')).toHaveCount(1);
   expect(await page.evaluate(() => typeof window.aria?.submitChat)).toBe('function');
 });
