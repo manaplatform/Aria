@@ -78,6 +78,9 @@ const bridge: DesktopBridge = {
     return () => ipcRenderer.removeListener('aria:browser-state-update', listener);
   },
   webSettings: () => ipcRenderer.invoke('aria:web-settings'),
+  weatherSettings: () => ipcRenderer.invoke('aria:weather-settings'),
+  saveWeatherSettings: (input) => ipcRenderer.invoke('aria:save-weather-settings', input),
+  clearWeatherCache: () => ipcRenderer.invoke('aria:clear-weather-cache'),
   saveWebSettings: (input) => ipcRenderer.invoke('aria:save-web-settings', input),
   toolSettings: () => ipcRenderer.invoke('aria:tool-settings'),
   setProgramSettings: (settings) => ipcRenderer.invoke('aria:set-program-settings', settings),

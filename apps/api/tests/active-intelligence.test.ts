@@ -203,6 +203,43 @@ async function runChat(
   };
 }
 
+it('discovers and executes native weather through the desktop without opening a browser', async () => {
+  const now = new Date().toISOString();
+  const { dispatchedRuntime, browserOps } = installRuntime({ onRuntime(req) {
+    if (req.operation !== 'weather.current') return {};
+    return { data: { location: { name: 'Oslo', latitude: 59.91, longitude: 10.75, timezone: 'Europe/Oslo' }, kind: 'forecast',
+      current: { kind: 'estimated_current', time: now, temperature: 10, apparentTemperature: null, humidity: 60,
+        windSpeed: 2, windDirection: 180, condition: 'clearsky_day', precipitationAmount: 0, precipitationProbability: null },
+      provider: 'MET Norway', attribution: 'MET Norway', generatedAt: now, retrievedAt: now, freshUntil: now,
+      units: { temperature: 'celsius', wind: 'm/s', precipitation: 'mm', humidity: '%', windDirection: 'degrees' } } };
+  } });
+  const prompt = 'What is the weather in Oslo today?';
+  fixture.queueTool(prompt, 'find_capabilities', { query: '', ids: ['weather.current'] });
+  fixture.queueTool(prompt, 'load_capabilities', { ids: ['weather.current'] });
+  fixture.queueTool(prompt, 'weather_current', { location: { latitude: 59.91, longitude: 10.75, name: 'Oslo', timezone: 'Europe/Oslo' } });
+  fixture.finalReply(prompt, 'The estimated temperature in Oslo is 10°C, according to MET Norway.');
+  const result = await runChat([{ role: 'user', content: prompt }]);
+  expect(dispatchedRuntime).toContain('weather.current');
+  expect(browserOps).toEqual([]);
+  expect(result.events.some((event) => event.type === 'activity' && event.activity.target === 'weather.current' && event.activity.status === 'completed')).toBe(true);
+});
+
+it('returns a weather provider failure to the primary without launching a browser', async () => {
+  const { dispatchedRuntime, browserOps } = installRuntime({ onRuntime(req) {
+    if (req.operation === 'weather.current') throw Object.assign(new Error('The provider is unavailable.'), { code: 'EXECUTION_FAILED' });
+    return {};
+  } });
+  const prompt = 'Get the Oslo forecast.';
+  fixture.queueTool(prompt, 'find_capabilities', { query: '', ids: ['weather.current'] });
+  fixture.queueTool(prompt, 'load_capabilities', { ids: ['weather.current'] });
+  fixture.queueTool(prompt, 'weather_current', { location: { latitude: 59.91, longitude: 10.75, name: 'Oslo', timezone: 'Europe/Oslo' } });
+  fixture.finalReply(prompt, 'The weather provider is unavailable.');
+  const result = await runChat([{ role: 'user', content: prompt }]);
+  expect(dispatchedRuntime).toContain('weather.current');
+  expect(browserOps).toEqual([]);
+  expect(result.events.some((event) => event.type === 'activity' && event.activity.target === 'weather.current' && event.activity.status === 'failed')).toBe(true);
+});
+
 it('ships AI browsing enabled by default and grounds the "What is Mana-Agent?" regression via discovery + search snippets + citations', async () => {
   expect(defaultWebPolicy.aiBrowser).toBe(true);
   const { browserOps } = installRuntime({

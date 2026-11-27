@@ -36,6 +36,7 @@ import { BrowserController } from './browser/controller';
 import { openBrowserBridge } from './browser/bridge';
 import { CapabilityStorage, openCapabilityBridge } from './capability-storage';
 import { WebSettingsStorage } from './web-settings-storage';
+import { WeatherService } from './weather';
 import { ProviderStorage } from './provider-storage';
 import {
   browserCommandSchema,
@@ -83,6 +84,9 @@ import {
   registryInputSchema,
   selectChatContext,
   programSettingsSchema,
+  weatherOperations,
+  weatherSettingsSchema,
+  type WeatherOperation,
 } from '@aria/shared';
 import { personaAction } from './persona-actions';
 import { ChatService } from './chat-service';
@@ -147,6 +151,7 @@ let appIcon: NativeImage | undefined;
 let dataDirectory = '';
 let storage: LocalStorage;
 let webSettings: WebSettingsStorage;
+let weather: WeatherService;
 let capabilities: CapabilityStorage;
 let browser: BrowserController;
 let provider: ProviderStorage;
@@ -476,6 +481,10 @@ const toolList = z
           artifacts: z.boolean().optional(),
           budget: webBudgetKeySchema.optional(),
           requiredModelCapabilities: z.array(z.string().max(40)).max(8).optional(),
+          mechanism: z.enum(['native_api', 'web_search', 'web_content', 'browser', 'connected_service', 'local', 'model']).optional(),
+          network: z.enum(['required', 'optional', 'none']).optional(),
+          cost: z.enum(['free', 'may_incur_cost', 'unknown']).optional(),
+          latency: z.enum(['low', 'network', 'variable']).optional(),
         })
         .optional(),
       inputHint: z
@@ -1035,6 +1044,14 @@ function registerIpc(): void {
     await changeCapabilities(() => computerRuntime.closeLocalSessions(), async () => undefined);
   });
   handle('aria:web-settings', () => webSettings.get());
+  handle('aria:weather-settings', () => weather.settings());
+  handle('aria:save-weather-settings', (input) => {
+    const parsed = weatherSettingsSchema.parse(input);
+    return parsed.enabled !== weather.settings().enabled || parsed.provider !== weather.settings().provider
+      ? changeCapabilities(() => weather.configure(parsed), async () => weather.settings())
+      : weather.configure(parsed);
+  });
+  handle('aria:clear-weather-cache', () => weather.clearCache());
   handle('aria:save-web-settings', async (input) => {
     const parsed = webSettingsInputSchema.parse(input);
     const previous = webSettings.get();
@@ -2182,6 +2199,9 @@ app
     }
     webSettings = new WebSettingsStorage(directory);
     await webSettings.load();
+    weather = new WeatherService(directory, (event, metadata, context) =>
+      diagnostics?.log(event === 'validation_failed' ? 'warn' : 'debug', 'desktop', 'weather', `weather.${event}`, context, metadata));
+    await weather.load();
     browser = new BrowserController(directory, () => webSettings.get(), approve, () => diagnostics?.log('error', 'browser', 'lifecycle', 'browser.renderer_gone'));
     await browser.load();
     virtualComputer = new VirtualComputer(() => executionRuntime.settings(), directory);
@@ -2378,6 +2398,7 @@ app
         policy: (registry) => ({
           ...runtimePolicy(registry),
           desktopRuntime: true,
+          weatherEnabled: weather.settings().enabled,
           dockerConfigured: Boolean(executionRuntime.settings().engineSocket.trim()),
           workspacesCount: initial.data.workspaces.length,
           connectors: [
@@ -2455,6 +2476,7 @@ app
                   live: () => Boolean(chat.authorizeRuntime(request) &&
                     (!job || proactive?.supervisor.live(request.requestId, request.conversationId))),
                 })).then(async (result) => {
+                  if (result.privateContent) chat.markPrivateRuntimeContent(request.requestId);
                   if (job && result.privateContent) proactive?.markPrivate(job.jobId);
                   const evidence = githubResult.safeParse(result.data);
                   if (job && evidence.success && evidence.data.verified)
@@ -2479,6 +2501,22 @@ app
                   });
                 throw new Error('This operation is outside the background grant.');
               }
+              if (Object.hasOwn(weatherOperations, request.operation)) {
+                if (request.programId || chat.temporaryForTurn(request.requestId) || chat.privateContextForTurn(request.requestId))
+                  throw new Error('Weather is unavailable for this execution or private context.');
+                const started = Date.now();
+                const execution = chat.executionForTurn(request.requestId);
+                const context = { conversationId: request.conversationId, requestId: request.requestId, operationId: request.stepId,
+                  ...(execution && { executionId: execution.executionId, generation: execution.generation }) };
+                diagnostics?.log('info', 'desktop', 'weather', 'weather.execution_started', context, { capability: request.operation, provider: 'met_norway' });
+                return weather.dispatch(request.operation as WeatherOperation, request.input, signal, context).then((data) => {
+                  diagnostics?.log('info', 'desktop', 'weather', 'weather.execution_completed', context, { capability: request.operation, durationMs: Date.now() - started });
+                  return { data };
+                }, (error: unknown) => {
+                  diagnostics?.log('warn', 'desktop', 'weather', 'weather.execution_failed', context, { capability: request.operation, durationMs: Date.now() - started, status: signal.aborted ? 'cancelled' : 'failed' });
+                  throw error;
+                });
+              }
               if (request.programId)
                 executionRuntime.store.assertProgramChild(request, chat.executionIdentity());
               return approvals.within({
@@ -2486,9 +2524,10 @@ app
                 operation: request.operation,
                 binding: [request.revision, request.primary, request.input, request.programId],
               }, () => {
-                if (request.operation.startsWith('memory.')) return memory.dispatch(request, signal);
-                return request.operation.startsWith('computer.') ? computerRuntime.dispatch(request, signal)
+                const result = request.operation.startsWith('memory.') ? memory.dispatch(request, signal)
+                  : request.operation.startsWith('computer.') ? computerRuntime.dispatch(request, signal)
                   : executionRuntime.dispatch(request, signal);
+                return result.then((value) => { if (value.privateContent) chat.markPrivateRuntimeContent(request.requestId); return value; });
               });
             },
             (request, signal) => {

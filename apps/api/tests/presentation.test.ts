@@ -12,7 +12,7 @@ const base = {
   roots: ['heading'],
   nodes: [{ id: 'heading', type: 'heading', text: 'Hello' }],
 };
-function stream(latest = '', outcome?: Outcome) {
+function stream(latest = '', outcome?: Outcome, weather = false) {
   const data = { text: '', parts: [] as PresentationPart[], validated: [] as boolean[] };
   const output = new PresentationOutput(
     {
@@ -20,6 +20,7 @@ function stream(latest = '', outcome?: Outcome) {
       outcome: (id) => (outcome?.id === id ? outcome : undefined),
       hasStep: (id) => id === outcome?.id,
       hasSource: () => false,
+      hasWeatherStep: (id) => weather && id === outcome?.id,
     },
     (text) => {
       data.text += text;
@@ -31,6 +32,25 @@ function stream(latest = '', outcome?: Outcome) {
 }
 
 describe('Persona presentation stream', () => {
+  it('binds weather cards only to a completed weather receipt and rejects injected data', () => {
+    const id = 'bd17bada-78cf-4ce1-aa1f-21f6c88d3c1e';
+    const timestamp = new Date().toISOString();
+    const forecast = { location: { name: 'Oslo', latitude: 59.9, longitude: 10.7, timezone: 'Europe/Oslo' }, kind: 'forecast',
+      provider: 'MET Norway', attribution: 'MET Norway', generatedAt: timestamp, retrievedAt: timestamp, freshUntil: timestamp,
+      units: { temperature: 'celsius', wind: 'm/s', precipitation: 'mm', humidity: '%', windDirection: 'degrees' } };
+    const node = { id: 'weather', type: 'weather', stepId: id, view: 'current' };
+    const input = { ...base, roots: ['weather'], nodes: [node] };
+    const receipt: Outcome = { id, status: 'completed', data: forecast };
+    const accepted = stream('', receipt, true);
+    accepted.output.append(fence(input)); accepted.output.finish();
+    expect(accepted.data.parts).toMatchObject([{ kind: 'block', block: { nodes: [{ data: forecast }] } }]);
+    const injected = stream('', receipt, true);
+    injected.output.append(fence({ ...input, nodes: [{ ...node, data: forecast }] })); injected.output.finish();
+    expect(injected.data.parts[0].kind).toBe('unavailable');
+    const unowned = stream('', receipt);
+    unowned.output.append(fence(input)); unowned.output.finish();
+    expect(unowned.data.parts[0].kind).toBe('unavailable');
+  });
   it('forwards plain text immediately and projects full blocks under arbitrary chunk boundaries', () => {
     const { output, data } = stream();
     output.append('First text');

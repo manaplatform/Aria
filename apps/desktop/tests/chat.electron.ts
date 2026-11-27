@@ -123,6 +123,53 @@ test.afterEach(async () => {
   expect(errors).toEqual([]);
 });
 
+test('uses a cached native weather forecast in ordinary chat without browser activity', async () => {
+  const now = Date.now();
+  const timestamp = new Date(now).toISOString();
+  const url = 'https://api.met.no/weatherapi/locationforecast/2.0/compact?lat=59.91&lon=10.75';
+  await fs.writeFile(path.join(temporary, 'weather-cache-v1.json'), JSON.stringify({ [url]: {
+    retrievedAt: now, expires: now + 3 * 60 * 60_000,
+    body: { properties: { meta: { updated_at: timestamp }, timeseries: [{ time: timestamp,
+      data: { instant: { details: { air_temperature: 10, relative_humidity: 60, wind_speed: 2 } },
+        next_1_hours: { summary: { symbol_code: 'clearsky_day' }, details: { precipitation_amount: 0 } } } }] } },
+  } }));
+  await launch();
+  const prompt = 'What is the weather in Oslo today?';
+  fixture.queueTool(prompt, 'find_capabilities', { query: '', ids: ['weather.current'] });
+  fixture.queueTool(prompt, 'load_capabilities', { ids: ['weather.current'] });
+  fixture.queueTool(prompt, 'weather_current', { location: { name: 'Oslo', latitude: 59.91, longitude: 10.75, timezone: 'Europe/Oslo' } });
+  fixture.finalReply(prompt, 'Estimated temperature: 10°C. Source: MET Norway.');
+  fixture.onToolResult(prompt, (value) => {
+    const result = value as { id?: string; data?: { provider?: string } };
+    if (result.id && result.data?.provider === 'MET Norway') {
+      const block = { v: 1, id: 'weather', revision: 1, roots: ['forecast'],
+        nodes: [{ id: 'forecast', type: 'weather', stepId: result.id, view: 'current' }] };
+      fixture.finalReply(prompt, 'Estimated temperature: 10°C.\n\n```aria-ui\n' + JSON.stringify(block) + '\n```\n');
+    }
+    return undefined;
+  });
+  await send(prompt);
+  await expect(page.locator('.from-assistant').last()).toContainText('Estimated temperature: 10°C');
+  await expect(page.locator('.weather-card')).toContainText('MET Norway');
+  const events = await page.evaluate(async () => (await window.aria!.load()).data.chat.messages.at(-1)?.activity ?? []);
+  expect(events.some((item) => item.target === 'weather.current' && item.status === 'completed')).toBe(true);
+  expect(events.some((item) => item.target.startsWith('browser.'))).toBe(false);
+});
+
+test('persists weather settings in the desktop profile', async () => {
+  await launch(false);
+  await page.getByRole('button', { name: 'Open settings', exact: true }).click();
+  await page.getByRole('navigation', { name: 'Settings categories' }).getByRole('button', { name: 'Weather & Location', exact: true }).click();
+  await page.getByRole('textbox', { name: 'Default location' }).fill('Oslo, Norway');
+  await page.getByRole('textbox', { name: 'Default location' }).blur();
+  await expect.poll(() => page.evaluate(() => window.aria!.weatherSettings())).toMatchObject({ defaultLocation: 'Oslo, Norway' });
+  await page.getByRole('combobox', { name: 'Temperature' }).selectOption('fahrenheit');
+  await expect.poll(() => page.evaluate(() => window.aria!.weatherSettings())).toMatchObject({ temperature: 'fahrenheit' });
+  await app.close();
+  await launch(false);
+  expect(await page.evaluate(() => window.aria!.weatherSettings())).toMatchObject({ defaultLocation: 'Oslo, Norway', temperature: 'fahrenheit' });
+});
+
 test('opens directly into chat without a project and restores appearance, sidebar preference, and welcome draft', async () => {
   await launch(false);
   await expect(page.getByRole('heading', { name: 'How can I help you today?' })).toBeVisible();

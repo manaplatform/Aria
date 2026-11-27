@@ -145,6 +145,7 @@ export class ConductorLoopExecutor {
     if (session) this.sessions.set(requestId, { request, session });
     const signal = session?.signal ?? AbortSignal.any([parent, AbortSignal.timeout(limits.activeMs)]);
     const presentationSteps = new Set<string>();
+    const presentationWeatherSteps = new Set<string>();
     const presentationSources = new Set<string>();
     let presentationOutput: PresentationOutput | undefined;
     const emit = (event: ConductorEvent) => {
@@ -152,6 +153,7 @@ export class ConductorLoopExecutor {
         const activity = event.activity;
         presentationSteps.add(activity.stepId);
         if (!activity.privateContent && activity.status === 'completed') {
+          if (activity.target.startsWith('weather.')) presentationWeatherSteps.add(activity.stepId);
           for (const source of activity.sources ?? []) if (source.id) presentationSources.add(source.id);
         }
         const research = /^(?:browser|web)\./.test(activity.target);
@@ -372,7 +374,7 @@ export class ConductorLoopExecutor {
         ...(personaEnabled ? [personaPrompt(persona, explicitPersona), presentationPrompt] : []),
         'Answer directly when you already possess sufficient reliable information. When information is missing, uncertain, time-sensitive, or refers to an unfamiliar term, product, project, person, error, or repository, proactively check available capabilities (memory, web search, workspace, knowledge, skills, or connectors) instead of asking the user to supply links or perform discovery yourself. Do not invent facts, sources, execution results, or capabilities.',
         ...(discoveryProblem ? [discoveryProblem.message] : []),
-        'Use find_capabilities with a capability query or namespace, then load the needed schemas by ID. A connector status describes the integration and supplies no evidence about the external entity. Search discovers public sources, fetch reads static HTTP content, and browser reads rendered pages. Choose any authorized method independently. An exact user-supplied site has a direct path. For an observed destination, copy the sourceId and add its producerStepId to dependsOn. Copy tab and document handles from completed results. Prefer primary sources, cite observed evidence, and verify approved effects.',
+        'Use find_capabilities with a capability query or namespace, then load the needed schemas by ID. Prefer suitable structured API capabilities when available; choose a browser when rendered interaction is useful. Never silently substitute a capability after failure. A connector status describes the integration and supplies no evidence about the external entity. Search discovers public sources, fetch reads static HTTP content, and browser reads rendered pages. Choose authorized methods independently. An exact user-supplied site has a direct path. For an observed destination, copy the sourceId and add its producerStepId to dependsOn. Copy tab and document handles from completed results. Prefer primary sources, cite observed evidence, preserve weather attribution and estimate labels, and verify approved effects.',
         'For GitHub repository requests, discover the github namespace and prefer its API tools. Search resolves a name to a repository and supplies metadata only. When asked what a repository is, read its README. When asked about the code, use the README and directory listings to locate and read a representative source file before spending additional calls paging through documentation. Cite the files you actually read. The signed-in public tools work before repository approval. Use repository-scoped tools for approved private repositories. Treat repository names as lookup targets, not connector names.',
         'When inspecting current articles, distinguish publication from modification dates and preserve localized dates when the conversion is unclear. For a site audit, identify the sample and distinguish HTTP, rendered DOM, and measured performance evidence. Respect access restrictions and robots directives when choosing crawl scope. Report gaps in observed data.',
         ...(context.runtime
@@ -586,6 +588,7 @@ export class ConductorLoopExecutor {
             latest: request.messages.at(-1)?.content ?? '',
             outcome: (id) => engine?.presentationOutcome(id),
             hasStep: (id) => presentationSteps.has(id),
+            hasWeatherStep: (id) => presentationWeatherSteps.has(id),
             hasSource: (id) => presentationSources.has(id),
           }, (text) => emit({ type: 'delta', text }),
           (part) => emit({ type: 'presentation', part }),

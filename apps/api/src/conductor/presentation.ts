@@ -7,6 +7,7 @@ import {
   presentationLimits,
   updatePresentation,
   type PresentationPart,
+  weatherResult,
 } from '@aria/shared';
 import { z } from 'zod';
 import type { Outcome } from './execution-engine';
@@ -16,6 +17,7 @@ export const presentationPrompt = [
   'Nodes: text, heading, markdown, code, math, badge and callout use text; list uses items and optional ordered; divider and icon are available. Layout types card,row,column,grid,tabs,section,comparison use children:[node IDs]. Label tabs and layouts as needed.',
   'Tables and charts use dataset ID. Table supports sortable and filterable. Chart uses chart:bar|line|pie|scatter (category column then numeric columns; scatter uses two numeric columns). Metric and progress use dataset, zero-based row and column, optional unit. Use datasets:[{id,columns,data:{kind:"user",quote:"exact JSON array of rows or exact tab-separated/comma-separated rows"} }]. For a completed tool result use data:{kind:"result",stepId,path:[keys or indexes in result.data],keys?:[object row keys]}. Illustrative datasets use data:{kind:"illustrative",rows} and must be clearly described as illustrative. Never represent invented data as observed.',
   'Diagram uses kind:svg|flowchart|architecture|dependency|sequence|timeline|tree, description, nodes:[{id,label,group?}], edges:[{from,to,label?}]. Status uses real stepId. Sources are real source UUIDs already returned to you. Use only observed relationships for factual diagrams.',
+  'For a useful weather display, use a weather node with stepId from a completed weather capability and view:current|hourly|daily|forecast|comparison. Do not supply data; Aria binds the verified result. Simple questions can use ordinary prose.',
   'Form and calculator use fields:[{id,label,kind:checkbox|text|date|select|slider,value?,options?,min?,max?,step?}]. Calculator accepts expression with numeric field placeholders such as "{amount} * 1.1". Form may reference a followUp action. Button uses action ID. Define actions:[{id,label,kind:"followUp",request}, {id,label,kind:"copy"|"export",target:nodeID}, {id,label,kind:"link",sourceId}, or {id,label,kind:"approval",stepId}]. A follow-up opens a request for the user to review. Approval buttons refer to an existing approval. Keep secrets, credentials, private URLs and unnecessary personal data out of blocks.',
 ].join('\n');
 
@@ -24,6 +26,7 @@ type Provenance = {
   outcome(id: string): Outcome | undefined;
   hasStep(id: string): boolean;
   hasSource(id: string): boolean;
+  hasWeatherStep?(id: string): boolean;
 };
 const table = z
   .array(z.array(presentationCell).min(1).max(presentationLimits.columns))
@@ -72,6 +75,15 @@ function resolveBlock(body: string, provenance: Provenance) {
   }
   if (block.nodes.some((node) => node.type === 'status' && !provenance.hasStep(node.stepId)))
     throw new Error('Invalid step.');
+  const nodes = block.nodes.map((node) => {
+    if (node.type !== 'weather') return node;
+    if (node.data || !provenance.hasWeatherStep?.(node.stepId)) throw new Error('Weather data must come from an observed weather result.');
+    const outcome = provenance.outcome(node.stepId);
+    const data = weatherResult.safeParse(outcome?.data);
+    if (outcome?.status !== 'completed' || !data.success || (!('provider' in data.data) && !('results' in data.data)))
+      throw new Error('Invalid weather result.');
+    return { ...node, data: data.data };
+  });
   const datasets = block.datasets?.map(({ id, columns, data }) => {
     if (data.kind === 'illustrative') return { id, columns, rows: data.rows, illustrative: true };
     if (data.kind === 'user') {
@@ -98,7 +110,7 @@ function resolveBlock(body: string, provenance: Provenance) {
     }
     return { id, columns, rows: table.parse(value), illustrative: false, stepId: data.stepId };
   });
-  const projected = presentationBlockSchema.parse({ ...block, datasets });
+  const projected = presentationBlockSchema.parse({ ...block, nodes, datasets });
   if (containsSecret(JSON.stringify(projected))) throw new Error('Sensitive presentation data.');
   return projected;
 }

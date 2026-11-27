@@ -35,6 +35,7 @@ import {
   type ToolHealth,
   type ToolInputHint,
   type ToolSummary,
+  weatherResult,
 } from '@aria/shared';
 import { AiService } from '../ai/ai.service';
 import { MediaService } from '../media/media.service';
@@ -238,6 +239,13 @@ const researchDescriptions: Record<ResearchToolId, string> = {
 };
 
 const runtimeDescriptions: Record<RuntimeOperation, readonly [string, string, ToolEffect]> = {
+  'location.search': ['Search locations', 'Resolve a place name to possible geographic locations. If several places match, ask for clarification.', 'read'],
+  'location.current': ['Get device location', 'Get the device location only with the user’s explicit location permission.', 'read'],
+  'weather.current': ['Get current weather', 'Get estimated current weather from a structured weather API for a place, coordinates, or the configured default. This is a forecast, not an observation.', 'read'],
+  'weather.hourly': ['Get hourly weather', 'Get up to 24 hourly forecast entries. Use nextHourOffset in a new call to read later entries.', 'read'],
+  'weather.daily': ['Get daily weather', 'Get local-day weather forecasts from a structured weather API.', 'read'],
+  'weather.forecast': ['Get weather forecast', 'Get current, hourly and daily weather from a structured weather API.', 'read'],
+  'weather.compare': ['Compare weather', 'Compare structured weather forecasts for multiple locations.', 'read'],
   'computer.inspect': [
     'Inspect computer environments',
     'Report the verified Computer Use environments and their limits.',
@@ -498,6 +506,15 @@ function summarize(
     inputHint?: ToolInputHint;
   },
 ): ToolSummary {
+  const weather = descriptor.id.startsWith('weather.') || descriptor.id === 'location.search';
+  const mechanism: NonNullable<ToolConstraints['mechanism']> = weather ? 'native_api'
+    : descriptor.id === 'web.web_search' ? 'web_search'
+    : descriptor.id.startsWith('web.') ? 'web_content'
+    : descriptor.id.startsWith('browser.') ? 'browser'
+    : descriptor.connector ? 'connected_service'
+    : descriptor.dependency === 'delegate' ? 'model' : 'local';
+  const network: NonNullable<ToolConstraints['network']> = mechanism === 'web_search' || descriptor.id === 'web.web_fetch' || mechanism === 'connected_service' || mechanism === 'model' ? 'required'
+    : ['calc.evaluate', 'files.create_text_artifact', 'web.web_read', 'web.web_find'].includes(descriptor.id) ? 'none' : 'optional';
   return {
     id: descriptor.id,
     namespace: descriptor.id.split('.')[0],
@@ -518,6 +535,9 @@ function summarize(
       tags: descriptor.tags ?? descriptorTags[descriptor.id],
     }),
     constraints: {
+      mechanism, network,
+      cost: weather ? 'free' : mechanism === 'model' ? 'may_incur_cost' : 'unknown',
+      latency: network === 'none' ? 'low' : network === 'required' ? 'network' : 'variable',
       timeoutMs: descriptor.timeoutMs,
       modes: [...descriptor.modes],
       ...(descriptor.parallelRead && { parallelRead: true }),
@@ -749,6 +769,7 @@ export class ToolRegistry {
               : undefined;
       this.register({
         ...base,
+        ...((operation.startsWith('weather.') || operation === 'location.search') && { outputSchema: z.strictObject({ data: weatherResult, managedArtifact: desktopArtifactSchema.optional() }) }),
         id: operation,
         name,
         description,
@@ -757,11 +778,11 @@ export class ToolRegistry {
         capability: operation,
         effect,
         dependency: 'local',
-        permission: operation.startsWith('memory.') ? 'Active memory scope and trusted desktop approval' : 'Authorized desktop conversation runtime',
+        permission: operation.startsWith('memory.') ? 'Active memory scope and trusted desktop approval' : operation.startsWith('weather.') || operation.startsWith('location.') ? 'Weather settings and authorized desktop conversation; device location requires explicit permission.' : 'Authorized desktop conversation runtime',
         timeoutMs: executionLimits.operationMs + 1000,
-        parallelRead: operation.startsWith('workspace.') || (operation.startsWith('memory.') && effect === 'read') ||
+        parallelRead: operation.startsWith('weather.') || operation === 'location.search' || operation.startsWith('workspace.') || (operation.startsWith('memory.') && effect === 'read') ||
           operation === 'knowledge.list' || operation === 'knowledge.search' || operation === 'files.read_document',
-        repeatable: operation === 'computer.observe' || operation === 'computer.act' ||
+        repeatable: operation.startsWith('weather.') || operation.startsWith('location.') || operation === 'computer.observe' || operation === 'computer.act' ||
           operation.startsWith('workspace.') ||
           (operation.startsWith('memory.') && effect === 'read'),
         ...(program && { program, programmaticEligible: true, modes: ['direct', 'programmatic'] }),
@@ -771,6 +792,7 @@ export class ToolRegistry {
           Boolean(
             context.runtime &&
             this.host.current.desktopRuntime &&
+            (!(operation.startsWith('weather.') || operation.startsWith('location.')) || !context.privateContent && !context.memoryPrivate && !context.memoryBlocked && !context.connectorPrivate && !context.proactive) &&
             (!operation.startsWith('workspace.') || this.host.current.workspacesCount !== 0) &&
             (!operation.startsWith('computer.') ||
               operation === 'computer.inspect' ||
@@ -1274,6 +1296,9 @@ export class ToolRegistry {
     if (this.entries.get(descriptor.id) !== descriptor)
       return 'This tool definition changed. Discover the current version.';
     if (policy.disabled.includes(descriptor.id)) return 'Disabled in Tools settings.';
+    if ((descriptor.id.startsWith('weather.') || descriptor.id.startsWith('location.')) && policy.weatherEnabled === false)
+      return 'Disabled in Weather & Location settings.';
+    if (descriptor.id === 'location.current') return 'Device location is unavailable in this installation. Use a location name or coordinates.';
     if (context?.temporary) return 'This tool is unavailable in a temporary conversation.';
     const proactiveOperation = Object.hasOwn(proactiveOperations, descriptor.id);
     if (proactiveOperation && (!policy.desktopRuntime || context && !context.runtime))

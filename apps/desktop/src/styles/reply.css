@@ -328,5 +328,18 @@
 .persona-diagram-scroll svg { display: block; font-family: system-ui, sans-serif; font-size: 13px; }
 .persona-diagram-group { fill: none; stroke: var(--border-strong); stroke-dasharray: 4 4; }
 .persona-diagram-node { fill: var(--surface-raised); stroke: var(--border-strong); }
+.weather-card { border: 1px solid var(--border-strong); border-radius: 0.8rem; padding: 1rem; background: var(--surface-raised); min-width: 0; }
+.weather-card h4, .weather-card h5 { margin: 0.4rem 0; }
+.weather-card p { color: var(--muted); margin: 0.25rem 0; }
+.weather-card small { color: var(--muted); }
+.weather-current { display: flex; align-items: center; gap: 0.7rem; flex-wrap: wrap; padding: 0.7rem 0; }
+.weather-current > span { display: inline-flex; align-items: center; gap: 0.25rem; }
+.weather-current strong { font-size: 1.5rem; }
+.weather-comparison { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 15rem), 1fr)); gap: 0.8rem; }
+.weather-hourly { display: flex; overflow-x: auto; gap: 0.7rem; padding: 0.5rem 0; }
+.weather-hourly > div { min-width: 4.5rem; display: grid; justify-items: center; gap: 0.25rem; }
+.weather-hourly span { font-size: 0.75rem; color: var(--muted); }
+.weather-chart { width: 100%; height: 10rem; }
+.weather-daily > div { display: flex; gap: 0.8rem; align-items: center; padding: 0.25rem 0; }
 .persona-block pre { overflow-x: auto; }
 .persona-block svg { flex: none; }

@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { replyVisualSchema } from './reply-visual.js';
+import { weatherResult } from './weather.js';
 
 export const presentationLimits = {
   blocks: 4,
@@ -105,6 +106,7 @@ export const presentationNodeSchema = z.discriminatedUnion('type', [
     unit: label.optional(),
   }),
   z.strictObject({ ...named, type: z.literal('status'), stepId: z.uuid() }),
+  z.strictObject({ ...base, type: z.literal('weather'), stepId: z.uuid(), view: z.enum(['current', 'hourly', 'daily', 'forecast', 'comparison']), data: weatherResult.optional() }),
   z.strictObject({
     ...named,
     type: z.literal('diagram'),

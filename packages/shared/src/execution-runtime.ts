@@ -4,6 +4,7 @@ import { proactiveOperationIds } from './proactive.js';
 import { memoryOperations } from './memory.js';
 import { computerImage, computerOperations } from './computer-use.js';
 import { loopLimitsSchema } from './loop.js';
+import { weatherOperations } from './weather.js';
 
 const id = z.string().uuid();
 export const openAIRuntimeFeatureSchema = z.enum([
@@ -32,6 +33,7 @@ export const workspaceFilename = z
   .regex(/^[\p{L}\p{N}_-][\p{L}\p{N}_. -]*$/u);
 
 export const runtimeOperations = {
+  ...weatherOperations,
   ...computerOperations,
   ...memoryOperations,
   'shell.inspect': z.strictObject({}),

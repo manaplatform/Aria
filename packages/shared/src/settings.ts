@@ -14,6 +14,7 @@ export const settingsCategoryIds = [
   'integrations',
   'connectors',
   'browser',
+  'weather',
   'desktop',
   'storage',
   'privacy',

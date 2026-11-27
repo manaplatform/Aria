@@ -132,6 +132,13 @@ When implementing AI features:
 - Distinguish public entities from integration availability. Use actual evidence, active budgets, and structured failures to decide when to continue. Require an explicit, eligible retry for an unchanged failed research operation and verify consequential effects before reporting completion.
 - Keep discovered, inspected, partial, and metadata-only evidence distinguishable. Retain source and freshness information with the conversation. Use approved memory writes when the user requests persistent research memory. Test ordinary chat, direct browsing, and grounded news and site audits on deterministic sites, with public sites and live models available as opt-in checks.
 
+## API-first capabilities
+
+- Aria is a general-purpose assistant, not a browser-first agent. Conductor supports structured APIs, public search and retrieval, browser interaction, local capabilities, and connected services; the configured primary chooses among authorized capabilities.
+- Prefer suitable structured APIs when they serve the task. Use browser automation when rendered interaction is useful. Never add keyword-based intent routing, silent capability fallbacks, or fabricated external data.
+- Integrate external providers through typed contracts and reusable adapters. Validate responses, preserve attribution and freshness, and render structured results only through trusted presentation components. Preserve privacy, permissions, and execution observability.
+- Weather and location requests run in the trusted desktop runtime with local caching and no hosted Aria proxy. Honor provider terms and current traffic limits, and do not claim that per-device limits enforce an application-wide quota. See [Weather Intelligence](docs/weather-intelligence.md).
+
 ## Conductor tools and skills
 
 - Conductor is the central orchestration authority. The configured primary chat model decides whether to answer directly, discover a tool, load a skill, invoke an authorized capability, or ask the user for information.

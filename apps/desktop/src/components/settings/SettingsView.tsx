@@ -19,6 +19,7 @@ const pages = {
   connectors: lazy(() => import('./connectors/ConnectorsSettings')),
   integrations: lazy(() => import('./pages/IntegrationSettings')),
   browser: lazy(() => import('./pages/BrowserSettings')),
+  weather: lazy(() => import('./pages/WeatherSettings')),
   desktop: lazy(() => import('./pages/DesktopSettings')),
   storage: lazy(() => import('./pages/StorageSettings')),
   privacy: lazy(() => import('./pages/PrivacySettings')),

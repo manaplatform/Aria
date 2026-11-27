@@ -35,6 +35,7 @@ import MarkdownRenderer from './MarkdownRenderer';
 const Chart = lazy(() => import('./ReplyChart'));
 const Diagram = lazy(() => import('./PresentationDiagram'));
 const Equation = lazy(() => import('./ReplyEquation'));
+const WeatherCard = lazy(() => import('./WeatherCard'));
 const icons = { info: Info, check: Check, link: Link, server: Server, file: FileText };
 type Values = NonNullable<PresentationActionRequest['values']>;
 type Stateful = {
@@ -507,6 +508,8 @@ const PresentationBlock = memo(
           </Button>
         );
       }
+      if (node.type === 'weather')
+        return <Suspense key={id} fallback={<span>Loading weather…</span>}><WeatherCard node={node} /></Suspense>;
       if (node.type === 'status')
         return (
           <p key={id}>

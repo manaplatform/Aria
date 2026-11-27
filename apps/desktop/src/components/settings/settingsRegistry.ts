@@ -3,6 +3,7 @@ import {
   Bell,
   Brain,
   Cpu,
+  CloudSun,
   FolderCog,
   Globe,
   Info,
@@ -129,6 +130,10 @@ export const settingsCategories: SettingsCategoryMeta[] = [
     icon: Globe,
   },
   {
+    id: 'weather', group: 'capabilities', label: 'Weather & Location',
+    description: 'Weather provider, default location, and measurement units.', icon: CloudSun,
+  },
+  {
     id: 'desktop',
     group: 'capabilities',
     label: 'Desktop Control',
@@ -174,6 +179,7 @@ export const settingsCategories: SettingsCategoryMeta[] = [
 ];
 
 export const settingsSearchIndex: SettingsSearchItem[] = [
+  { id: 'weather-settings', category: 'weather', title: 'Weather & Location', description: 'Weather provider, default city, forecast cache, and units.', keywords: ['forecast', 'temperature', 'wind', 'geocoding', 'cache'] },
   { id: 'diagnostic-logs', category: 'diagnostics', title: 'Developer and Diagnostics', description: 'View and export local logs.', keywords: ['logs', 'debug', 'trace', 'export'], settingId: 'diagnostics-logs' },
   { id: 'connector-github', category: 'connectors', title: 'GitHub', description: 'Connect a GitHub account and manage repository access and write permissions.', keywords: ['OAuth', 'app', 'sign in', 'disconnect', 'repository'], settingId: 'connector-github' },
   { id: 'gen-name', category: 'general', title: 'Display name', description: 'Your local name shown in the sidebar and conversations.', keywords: ['profile', 'name', 'user'], settingId: 'general-display-name' },

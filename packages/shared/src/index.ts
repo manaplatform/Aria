@@ -24,6 +24,7 @@ import type {
   ComputerSupervision,
 } from './computer-use.js';
 import type { WebSettings, WebSettingsInput } from './web.js';
+import type { WeatherSettings, WeatherSettingsView } from './weather.js';
 export * from './browser.js';
 export * from './computer-use.js';
 export * from './web.js';
@@ -489,6 +490,9 @@ export interface DesktopBridge {
   onComputerSession(callback: (state: ComputerSessionSummary) => void): () => void;
   onBrowserState(callback: (state: BrowserState) => void): () => void;
   webSettings(): Promise<WebSettings>;
+  weatherSettings(): Promise<WeatherSettingsView>;
+  saveWeatherSettings(input: WeatherSettings): Promise<WeatherSettingsView>;
+  clearWeatherCache(): Promise<WeatherSettingsView>;
   saveWebSettings(input: WebSettingsInput): Promise<WebSettings>;
   toolSettings(): Promise<ToolSettings>;
   executionHistory(): Promise<ExecutionHistoryEntry[]>;
@@ -589,6 +593,7 @@ export interface DesktopBridge {
 export * from './execution-runtime.js';
 export * from './reply-visual.js';
 export * from './persona.js';
+export * from './weather.js';
 export * from './presentation.js';
 export * from './calculation.js';
 export * from './connectors/index.js';
