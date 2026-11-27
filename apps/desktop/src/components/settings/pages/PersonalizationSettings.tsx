@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { registryDraft, type ResponseStyle } from '@aria/shared';
+import { registryDraft } from '@aria/shared';
 import { desktop, errorMessage } from '../../../services/desktop';
 import { useChatStore } from '../../../stores/chatStore';
 import {
@@ -9,6 +9,7 @@ import {
 } from '../../../stores/providerStore';
 import { useWorkspaceStore } from '../../../stores/workspaceStore';
 import { Button } from '../../ui';
+import PersonaControls from './PersonaControls';
 import { SettingsPage } from '../SettingsPage';
 import { useSettingsNavigation } from '../SettingsContext';
 import {
@@ -69,9 +70,10 @@ export default function PersonalizationSettings() {
 
   return (
     <SettingsPage
-      title="Personalization"
+      title="Persona & Communication"
       description="Tailor how Aria communicates and remembers your personal context."
     >
+      <PersonaControls />
       <SettingsSection
         id="personalization-profile"
         title="Personal profile"
@@ -108,18 +110,6 @@ export default function PersonalizationSettings() {
         description="Applied directly on new ordinary chat turns."
       >
         <SettingsGroup>
-          <SettingsSelect
-            id="personalization-style"
-            label="Assistant response preferences"
-            description="Guide the level of detail Aria aims for when replying."
-            value={preferences.responseStyle ?? 'balanced'}
-            highlighted={highlightedSettingId === 'personalization-style'}
-            onChange={(value) => update({ responseStyle: value as ResponseStyle })}
-          >
-            <option value="balanced">Balanced</option>
-            <option value="concise">Concise and direct</option>
-            <option value="detailed">Detailed and thorough</option>
-          </SettingsSelect>
           <SettingsSelect
             id="personalization-language"
             label="Preferred communication language"

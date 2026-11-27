@@ -1,4 +1,6 @@
 import { z } from 'zod';
+import type { CommunicationCandidate } from './persona.js';
+import type { PresentationPart } from './presentation.js';
 import type { MemoryInput } from './memory.js';
 import { evidenceSchema } from './execution-runtime.js';
 import { capabilityId, effectSchema, type ToolProblem } from './capabilities.js';
@@ -279,9 +281,10 @@ export type ConductorEvent =
   | { type: 'execution'; execution: ExecutionSnapshot }
   | { type: 'delta'; text: string }
   | { type: 'reset' }
+  | { type: 'presentation'; part?: PresentationPart }
   | { type: 'activity'; activity: ConductorActivity }
   | { type: 'artifact'; artifact: ArtifactReference }
-  | { type: 'completed'; partial?: boolean; run?: ConductorRunInfo; suggestions?: string[]; memoryCandidates?: MemoryInput[] }
+  | { type: 'completed'; partial?: boolean; run?: ConductorRunInfo; suggestions?: string[]; memoryCandidates?: MemoryInput[]; communicationCandidates?: CommunicationCandidate[] }
   | {
       type: 'failed';
       error: string;

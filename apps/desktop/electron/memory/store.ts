@@ -4,6 +4,10 @@ import path from 'node:path';
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
 import {
   defaultMemorySettings,
+  containsSecret,
+  communicationCandidatesSchema,
+  type CommunicationCandidate,
+  type CommunicationProposal,
   memoryInput,
   memorySettingsSchema,
   type MemoryInput,
@@ -20,6 +24,7 @@ export interface MemoryAccess {
   conversationId?: string;
   projectId?: string;
   management?: boolean;
+  communication?: boolean;
 }
 
 export interface MemoryIntake {
@@ -29,6 +34,7 @@ export interface MemoryIntake {
   scope: MemoryScope;
   source: MemorySource;
   candidates: MemoryInput[];
+  communication?: CommunicationCandidate[];
 }
 
 type Ranked = { id: string; rank: number };
@@ -39,12 +45,6 @@ const normalize = (value: string) =>
 const day = 86_400_000;
 const maxCandidates = 180;
 const cacheSize = 80;
-
-export function containsSecret(value: string): boolean {
-  return /-----BEGIN[ A-Z]*PRIVATE KEY-----|\b(?:sk-[a-z0-9_-]{16,}|(?:gh[pousr]_|github_pat_|xox[baprs]-|AKIA)[a-z0-9_-]{12,})\b|\b(?:password|passwd|passphrase|(?:api|access|secret|private)[ _-]?key|(?:auth|access|refresh)[ _-]?token|client[ _-]?secret|seed phrase)\s*(?::|=|is\b)\s*\S|\b(?:authorization\s*:\s*)?bearer\s+[a-z0-9._~-]{12,}|:\/\/[^\s/:]+:[^\s/@]+@/iu.test(
-    value,
-  );
-}
 
 function rowPayload(row: Record<string, unknown>): MemoryRecord {
   return JSON.parse(String(row.payload)) as MemoryRecord;
@@ -58,6 +58,10 @@ function projectRecord(entry: Entry): MemoryRecord {
   const record: MemoryRecord & { checksum?: string } = { ...entry };
   delete record.checksum;
   return record;
+}
+
+function communicationFactKey(dimension: string, quote: string) {
+  return 'aria.communication.' + dimension + ':' + digest(normalize(quote)).slice(0, 24);
 }
 
 function scopeKey(scope: MemoryScope) {
@@ -91,8 +95,15 @@ export class MemoryStore {
         'PRAGMA foreign_keys=ON; PRAGMA busy_timeout=1500; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA secure_delete=ON;',
       );
       const version = Number(this.db.prepare('PRAGMA user_version').get()?.user_version);
-      if (version > 1) throw new Error('This memory database requires a newer version of Aria.');
+      if (version > 2) throw new Error('This memory database requires a newer version of Aria.');
       if (!version) this.migrate();
+      if (version < 2) this.transaction(() => this.db.exec(`
+        CREATE TABLE communication_proposals (
+          id TEXT PRIMARY KEY, conversation TEXT NOT NULL, message TEXT NOT NULL,
+          observed INTEGER NOT NULL, dimension TEXT NOT NULL, quote TEXT NOT NULL
+        );
+        PRAGMA user_version=2;
+      `));
     } catch (error) {
       this.db.close();
       throw error;
@@ -289,6 +300,7 @@ export class MemoryStore {
       clauses.push("m.state!='expired'", '(m.expires IS NULL OR m.expires>?)');
       args.push(Date.now());
     }
+    if (access.communication === false) clauses.push("(m.fact_key IS NULL OR m.fact_key NOT LIKE 'aria.communication.%')");
     const retention = this.state.settings.retentionDays;
     if (retention) {
       clauses.push('m.observed>=?');
@@ -489,10 +501,11 @@ export class MemoryStore {
         .prepare(
           `
       SELECT payload,checksum FROM memories WHERE profile=? AND scope=? AND category=? AND checksum=?
+        AND (fact_key IS ? OR (coalesce(fact_key, '') NOT LIKE 'aria.communication.%' AND coalesce(?, '') NOT LIKE 'aria.communication.%'))
         AND state IN ('active','conflicting') LIMIT 1
     `,
         )
-        .get(this.profile, key, parsed.category, checksum);
+        .get(this.profile, key, parsed.category, checksum, fact ?? null, fact ?? null);
     if (duplicate) {
       this.metrics.duplicates++;
       const matched = rowPayload(duplicate);
@@ -670,6 +683,8 @@ export class MemoryStore {
 
   clear(filter: { category?: MemoryInput['category']; projectId?: string }) {
     return this.transaction(() => {
+      if (!filter.projectId && (!filter.category || filter.category === 'preference'))
+        this.db.exec('DELETE FROM communication_proposals');
       const { sql, args } = this.scopeWhere({ management: true }, filter);
       const category = filter.category ? ' AND m.category=?' : '';
       if (filter.category) args.push(filter.category);
@@ -705,6 +720,7 @@ export class MemoryStore {
 
   removeConversation(conversationId: string) {
     this.transaction(() => {
+      this.db.prepare('DELETE FROM communication_proposals WHERE conversation=?').run(conversationId);
       const ids = this.db
         .prepare('SELECT id FROM memories WHERE scope=?')
         .all(`conversation:${conversationId}`)
@@ -749,6 +765,7 @@ export class MemoryStore {
             const event = JSON.parse(String(job.data)) as MemoryIntake;
             for (const candidate of event.candidates)
               this.write(candidate, event.scope, event.source, 'extractive', event.observedAt);
+            this.stageCommunication(event);
             this.changed();
           }
           this.db
@@ -775,10 +792,64 @@ export class MemoryStore {
     return jobs.length;
   }
 
+  private stageCommunication(event: MemoryIntake) {
+    const parsed = communicationCandidatesSchema.safeParse(event.communication);
+    if (!parsed.success || this.db.prepare('SELECT 1 FROM blocked_sources WHERE conversation=? AND message=?')
+        .get(event.source.conversationId, event.source.messageId)) return;
+    for (const candidate of parsed.data) {
+      if (containsSecret(candidate.quote) || this.db.prepare(`SELECT 1 FROM memories WHERE profile=? AND scope='profile'
+        AND category='preference' AND fact_key=? AND checksum=? AND state='active'`)
+        .get(this.profile, communicationFactKey(candidate.dimension, candidate.quote), digest(normalize(candidate.quote)))) continue;
+      const id = digest(JSON.stringify([event.source, candidate.dimension, candidate.quote]));
+      if (this.db.prepare('SELECT 1 FROM receipts WHERE id=?').get(id)) continue;
+      this.db.prepare('INSERT OR IGNORE INTO communication_proposals VALUES (?,?,?,?,?,?)')
+        .run(id, event.source.conversationId, event.source.messageId, event.observedAt, candidate.dimension, candidate.quote);
+    }
+    this.db.exec(`DELETE FROM communication_proposals WHERE id IN (
+      SELECT id FROM communication_proposals ORDER BY observed DESC, id LIMIT -1 OFFSET 64
+    )`);
+  }
+
+  communicationPreferences() {
+    const cutoff = this.state.settings.retentionDays;
+    const proposals = this.db.prepare('SELECT * FROM communication_proposals WHERE observed>=? ORDER BY observed DESC, id LIMIT 64')
+      .all(cutoff ? Date.now() - cutoff * day : 0)
+      .map((item): CommunicationProposal => ({
+        id: String(item.id), dimension: item.dimension as CommunicationCandidate['dimension'], quote: String(item.quote),
+        source: { conversationId: String(item.conversation), messageId: String(item.message) },
+      }));
+    const { sql, args } = this.visibility({ management: true }, { category: 'preference' });
+    const records = this.db.prepare(`SELECT m.payload FROM memories m WHERE ${sql}
+      AND m.fact_key LIKE 'aria.communication.%' AND m.state='active' ORDER BY m.observed DESC LIMIT 32`)
+      .all(...args).map(rowPayload);
+    return { proposals, records };
+  }
+
+  reviewCommunicationPreference(id: string, accept: boolean, epoch: number) {
+    this.transaction(() => {
+      const { settings, epoch: current } = this.state;
+      const proposal = this.db.prepare('SELECT * FROM communication_proposals WHERE id=?').get(id);
+      if (!proposal || current !== epoch || (accept && !settings.enabled)) throw new Error('This proposal changed or is unavailable.');
+      if (accept) {
+        const observed = Number(proposal.observed);
+        const source = { conversationId: String(proposal.conversation), messageId: String(proposal.message) };
+        if ((settings.retentionDays && observed < Date.now() - settings.retentionDays * day) ||
+            this.db.prepare('SELECT 1 FROM blocked_sources WHERE conversation=? AND message=?').get(source.conversationId, source.messageId))
+          throw new Error('This proposal is outside the current memory scope.');
+        this.write({ category: 'preference', content: String(proposal.quote),
+          factKey: communicationFactKey(String(proposal.dimension), String(proposal.quote)) }, { kind: 'profile' }, source, 'user', observed);
+        this.changed();
+      }
+      this.db.prepare("INSERT OR IGNORE INTO receipts VALUES (?,?,'completed')").run(id, Date.now());
+      this.db.prepare('DELETE FROM communication_proposals WHERE id=?').run(id);
+    });
+  }
+
   maintain() {
     this.transaction(() => {
       const retention = this.state.settings.retentionDays;
       const now = Date.now();
+      if (retention) this.db.prepare('DELETE FROM communication_proposals WHERE observed<?').run(now - retention * day);
       const rows = this.db
         .prepare(
           `

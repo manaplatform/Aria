@@ -213,3 +213,10 @@ When implementing AI features:
 - Carry trusted request, conversation, execution, generation, and operation identities across boundaries. Correlation data never grants permission or changes execution behavior. Temporary-chat diagnostics stay in bounded memory and must be discarded when the chat ends.
 - Log only allowlisted structural metadata. Never record prompts, responses, raw errors, credentials, tool inputs or outputs, file contents, screenshots, clipboard content, private URLs, or model reasoning. Sanitize before every persistence, stream, or export boundary; restrict IPC to the trusted renderer.
 - Keep logging asynchronous, bounded, local by default, and failure-isolated. Test new events for privacy, correlation, lifecycle, and failure behavior; document platform-specific verification and any coverage gaps. See [Diagnostics](docs/diagnostics.md).
+
+## Aria Persona
+
+- The configured primary model owns communication, language, tone, and presentation decisions. Keep direct chat usable in one streamed request. Use current instructions, explicit Settings choices, and selectively recalled confirmed preferences in that order.
+- Use the existing Memory service to review source-backed communication proposals before they become cross-chat preferences. Keep temporary content, sensitive attributes, and credentials out of learning and diagnostics.
+- Treat generated components as untrusted declarative data. Validate the version, shape, size, references, and ownership before rendering or acting. Use approved React and SVG primitives and preserve Arabic-script and mixed-direction content.
+- Keep Conductor responsible for capability selection, execution, and approvals. A generated request enters normal chat after the user reviews and sends it. Ground data and operation state in observed inputs and receipts. Prefer prose when it meets the user's needs. See [Aria Persona](docs/persona.md).

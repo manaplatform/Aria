@@ -1,5 +1,6 @@
 // @vitest-environment node
 import { mkdtemp, readFile, readdir, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -74,6 +75,26 @@ describe('local diagnostics', () => {
     await new Promise((resolve) => setTimeout(resolve, 150));
     expect(JSON.stringify(batches)).not.toContain('secret');
     await logger.close();
+  });
+  it('accepts timed Persona validation with only structural metadata', async () => {
+    await service.configure({ ...defaultDiagnosticConfig, debug: true, level: 'debug' });
+    const event = {
+      version: 1, id: randomUUID(), timestamp: new Date().toISOString(), level: 'debug',
+      component: 'api', subsystem: 'persona', event: 'persona.presentation_validation',
+      message: 'untrusted message', context: { requestId: 'request-a' },
+      processId: 1, appVersion: 'managed',
+      metadata: { durationMs: 2.5, status: 'accepted', model: 'unexpected-value' },
+    };
+    service.acceptRemote(event, false);
+    service.acceptRemote({ ...event, id: randomUUID(), event: 'persona.unrecognized' }, false);
+    const { events } = await service.query({});
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      event: 'persona.presentation_validation', context: { requestId: 'request-a' },
+      metadata: { durationMs: 2.5, status: 'accepted' },
+    });
+    expect(JSON.stringify(events)).not.toContain('untrusted message');
+    expect(JSON.stringify(events)).not.toContain('unexpected-value');
   });
   it('applies configuration changes and retains them across restart', async () => {
     await service.configure({

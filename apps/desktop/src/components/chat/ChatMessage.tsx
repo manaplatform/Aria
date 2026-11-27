@@ -1,7 +1,7 @@
-import { useMemo, useState } from 'react';
+import { Fragment, lazy, memo, Suspense, useMemo, useState, type ReactNode } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { Activity, ExternalLink, RotateCcw } from 'lucide-react';
-import type { ChatMessage as Message, ConductorActivity, LoopCommand, MemoryRecord } from '@aria/shared';
+import { presentationId, type ChatMessage as Message, type ConductorActivity, type LoopCommand, type MemoryRecord } from '@aria/shared';
 import { generating, regenerateChat, selectChat, updateChat, useChatStore } from '../../stores/chatStore';
 import { AriaMark } from '../layout/AriaMark';
 import { Button, CopyButton, Modal } from '../ui';
@@ -13,6 +13,29 @@ import MarkdownRenderer from './MarkdownRenderer';
 import { ArtifactCard } from './ArtifactCard';
 import { DocumentEvidence } from './DocumentEvidence';
 import { MediaPreview } from './MediaPreview';
+
+const PresentationBlock = lazy(() => import('./PresentationBlock'));
+const PresentationBoundary = lazy(() => import('./PresentationBlock').then(({ PresentationBoundary }) => ({ default: PresentationBoundary })));
+
+function presentReply(message: Message, markdown: (text: string) => ReactNode) {
+  const parts = message.presentation;
+  if (!parts?.length) return markdown(message.content);
+  let offset = 0;
+  return <>{parts.map((part) => {
+    const text = message.content.slice(offset, part.offset);
+    offset = part.offset;
+    const fallback = <p role="status">Interactive content is unavailable.</p>;
+    return <Fragment key={presentationId(part)}>
+      {text && markdown(text)}
+      {part.kind === 'unavailable' ? fallback :
+        <Suspense fallback={<p role="status">Loading interactive content…</p>}>
+          <PresentationBoundary id={message.id}>
+            <PresentationBlock block={part.block} message={message} />
+          </PresentationBoundary>
+        </Suspense>}
+    </Fragment>;
+  })}{message.content.slice(offset) && markdown(message.content.slice(offset))}</>;
+}
 
 const phaseLabels: Record<string, string> = {
   initializing: 'Starting',
@@ -220,7 +243,7 @@ function ActivityList({ steps, message, live }: {
   );
 }
 
-export function ChatMessage({
+export const ChatMessage = memo(function ChatMessage({
   message,
   last,
   canRegenerate,
@@ -292,10 +315,10 @@ export function ChatMessage({
       )}
       <div className="conversation-message-content">
         {message.role === 'user' ? (
-          <div className="user-message-text">{message.content}</div>
-        ) : message.content ? (
-          <MarkdownRenderer
-            content={message.content}
+          <div className="user-message-text" dir="auto">{message.content}</div>
+        ) : message.content || message.presentation?.length ? (
+          presentReply(message, (text) => <MarkdownRenderer
+            content={text}
             sources={sources}
             research={research}
             evidenceIds={evidence.map((item) => item.id)}
@@ -305,7 +328,7 @@ export function ChatMessage({
               .then(setMemorySource).catch(() => setMemorySource(null))}
             rich={!message.liveSessionId}
             streaming={busy}
-          />
+          />)
         ) : busy ? (
           <div className="thinking-indicator" aria-label="Waiting for response">
             <i />
@@ -525,4 +548,4 @@ export function ChatMessage({
       )}
     </article>
   );
-}
+});

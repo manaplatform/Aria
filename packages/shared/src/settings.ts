@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { personaOverridesSchema } from './persona.js';
 
 export const settingsCategoryIds = [
   'general',
@@ -235,6 +236,7 @@ export const userPersonalizationSchema = z
     profileName: z.string().trim().min(1).max(80).optional(),
     profileBio: z.string().trim().max(160).optional(),
     responseStyle: responseStyleSchema.optional(),
+    persona: personaOverridesSchema.optional(),
     communicationLanguage: z.string().trim().max(60).optional(),
   })
   .strict();

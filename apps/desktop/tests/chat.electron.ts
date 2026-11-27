@@ -471,7 +471,7 @@ test('renders inline visuals from the primary text stream and restores them in a
   );
   expect(
     turn?.body.messages.some(
-      ({ role, content }) => role === 'system' && content.includes('```aria-visual'),
+      ({ role, content }) => role === 'system' && content.includes('aria-ui'),
     ),
   ).toBe(true);
   await bar.getByText('Show data').click();
@@ -652,7 +652,7 @@ test('configures a provider in Settings using native encrypted storage and resto
   await page.getByRole('combobox', { name: 'Primary model' }).selectOption({ label: 'OpenAI · fixture-model' });
   await page.getByRole('button', { name: 'Save AI Models', exact: true }).click();
   await expect(page.getByText('Primary configured', { exact: true })).toBeVisible();
-  await page.getByRole('navigation', { name: 'Settings categories' }).getByRole('button', { name: 'Personalization', exact: true }).click();
+  await page.getByRole('navigation', { name: 'Settings categories' }).getByRole('button', { name: 'Persona & Communication', exact: true }).click();
   await page.getByLabel('Instructions', { exact: true }).fill('Give useful answers.');
   await page.getByRole('button', { name: 'Save instructions', exact: true }).click();
   await expect(page.getByText('Custom instructions saved.')).toBeVisible();
@@ -1841,4 +1841,240 @@ test('confirms clearing local legacy records while keeping authorized folders an
   expect(after.conversations).toHaveLength(0);
   expect(after.chat.conversations).toHaveLength(1);
   expect(after.workspaces.map((item) => item.id)).toContain(workspace!.id);
+});
+
+
+test('measures warm first-text latency with the same local chat fixture', async () => {
+  test.skip(process.env.ARIA_BENCHMARK_PERSONA !== '1', 'Enable the local latency benchmark explicitly.');
+  await launch();
+  const samples: number[] = [];
+  const count = fixture.received.length;
+  for (let index = 0; index < 23; index++) {
+    await page.getByRole('textbox', { name: 'Message Aria' }).fill('Warm latency sample ' + index);
+    const firstText = await page.evaluate(() => new Promise<number>((resolve, reject) => {
+      const started = performance.now();
+      const timer = setTimeout(() => { unsubscribe(); reject(new Error('No text from the fixture.')); }, 5000);
+      const unsubscribe = window.aria!.onChatEvent((event) => {
+        if (event.type !== 'delta' || !event.text.trim()) return;
+        clearTimeout(timer);
+        unsubscribe();
+        resolve(performance.now() - started);
+      });
+      document.querySelector<HTMLButtonElement>('button[aria-label="Send message"]')!.click();
+    }));
+    if (index >= 3) samples.push(firstText);
+    await expect(page.locator('.from-assistant[data-status="completed"]')).toHaveCount(index + 1);
+  }
+  expect(fixture.received.length - count).toBe(23);
+  samples.sort((a, b) => a - b);
+  process.stdout.write(JSON.stringify({ benchmark: 'first-text', samples: samples.length,
+    medianMs: (samples[9] + samples[10]) / 2, p95Ms: samples[18] }) + '\n');
+});
+
+test('renders progressive Persona components and reviews generated requests through chat', async () => {
+  await launch();
+  const rows = '[["تهران",40],["شیراز",12]]';
+  const prompt = '[slow] نمایش زمان پاسخ «' + rows + '»';
+  const block = {
+    v: 1, id: 'latency', revision: 1, roots: ['table', 'chart', 'graph', 'form', 'export', 'export-svg'],
+    nodes: [
+      { id: 'table', type: 'table', label: 'زمان پاسخ', dataset: 'data', sortable: true, filterable: true },
+      { id: 'chart', type: 'chart', label: 'Latency chart', chart: 'bar', dataset: 'data' },
+      { id: 'graph', type: 'diagram', kind: 'architecture', label: 'مسیر درخواست', description: 'آریا درخواست را ارسال می‌کند.',
+        nodes: [{ id: 'a', label: 'آریا', group: 'App' }, { id: 'b', label: 'سرور', group: 'Network' }],
+        edges: [{ from: 'a', to: 'b', label: 'درخواست' }] },
+      { id: 'form', type: 'form', label: 'Filter preferences', action: 'follow', fields: [
+        { id: 'include', kind: 'checkbox', label: 'Include details' },
+        { id: 'text', kind: 'text', label: 'Notes' },
+      ] },
+      { id: 'export', type: 'button', label: 'Export data', action: 'csv' },
+      { id: 'export-svg', type: 'button', label: 'Export diagram', action: 'svg' },
+    ],
+    datasets: [{ id: 'data', columns: ['شهر', 'ms'], data: { kind: 'user', quote: rows } }],
+    actions: [{ id: 'follow', label: 'Continue', kind: 'followUp', request: 'Compare the two cities.' },
+      { id: 'csv', label: 'Export CSV', kind: 'export', target: 'table' },
+      { id: 'svg', label: 'Export SVG', kind: 'export', target: 'graph' }],
+  };
+  fixture.finalReply(prompt, 'زمان پاسخ این شهرها را مقایسه کنید.\n\n```aria-ui\n' + JSON.stringify(block) + '\n```\n\nپایان گزارش.');
+  await send(prompt);
+  const answer = page.locator('.from-assistant').last();
+  await expect(answer.locator('.markdown').first()).toContainText('زمان پاسخ این شهرها');
+  expect(await answer.locator('.markdown').first().evaluate((node) => getComputedStyle(node).direction)).toBe('rtl');
+  const table = answer.getByRole('table', { name: 'زمان پاسخ' });
+  await expect(table).toBeVisible({ timeout: 15000 });
+  await expect(answer).toHaveAttribute('data-status', 'streaming');
+  await expect(answer.getByRole('img', { name: 'مسیر درخواست' })).toBeVisible();
+  await expect(answer.locator('.recharts-bar-rectangle').first()).toBeVisible();
+  await table.getByRole('button', { name: 'ms', exact: true }).click();
+  await expect(table.locator('tbody tr').first()).toContainText('شیراز');
+  await answer.getByRole('searchbox').fill('تهران');
+  await expect(table.locator('tbody tr')).toHaveCount(1);
+  await answer.getByRole('searchbox').fill('');
+  await answer.getByRole('checkbox', { name: 'Include details' }).check();
+  await fixture.releaseSlow();
+  await expect(answer).toHaveAttribute('data-status', 'completed');
+  await expect(table.locator('tbody tr')).toHaveCount(2);
+  const receipt = await page.evaluate(() => window.aria!.load());
+  const message = receipt.data.chat.messages.find((item) => item.role === 'assistant');
+  if (!message) throw new Error('No assistant response');
+  await expect(page.evaluate(({ conversationId, id }) => window.aria!.personaAction({
+    conversationId, messageId: id, blockId: 'latency', revision: 2, actionId: 'follow',
+  }), message)).rejects.toThrow(/unavailable/);
+  const csv = path.join(temporary, 'data.csv');
+  const svg = path.join(temporary, 'diagram.svg');
+  for (const [target, label, content] of [[csv, 'Export data', /"شیراز","12"/], [svg, 'Export diagram', /<desc>آریا/]] as const) {
+    await app.evaluate(({ dialog }, filePath) => { dialog.showSaveDialog = async () => ({ canceled: false, filePath }); }, target);
+    await answer.getByRole('button', { name: label, exact: true }).click();
+    await expect.poll(() => fs.readFile(target, 'utf8').catch(() => '')).toMatch(content);
+  }
+  await expect.poll(async () => {
+    const { chat } = JSON.parse(await fs.readFile(path.join(temporary, 'aria-v3.json'), 'utf8'));
+    return chat.messages.find((item: { id: string }) => item.id === message.id);
+  }).toMatchObject({
+    status: 'completed', presentation: [{ kind: 'block' }],
+    presentationState: { 'latency:table': 2, 'latency:form:include': true },
+  });
+  await page.getByRole('button', { name: 'Open settings', exact: true }).click();
+  await page.getByRole('navigation', { name: 'Settings categories' }).getByRole('button', { name: 'Appearance', exact: true }).click();
+  await page.getByRole('button', { name: 'Light', exact: true }).click();
+  await page.getByRole('button', { name: 'Back to chat', exact: true }).click();
+  await app.close();
+  await launch(false, false, true);
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'light');
+  const restored = page.locator('.from-assistant').last();
+  const restoredTable = restored.getByRole('table', { name: 'زمان پاسخ' });
+  await expect(restoredTable.locator('tbody tr').first()).toContainText('شیراز');
+  await expect(restored.getByRole('checkbox', { name: 'Include details' })).toBeChecked();
+  await restored.getByRole('textbox', { name: 'Notes' }).fill('Compare measured values');
+  const received = fixture.received.length;
+  await restored.getByRole('button', { name: 'Review request' }).click();
+  const review = page.getByRole('dialog', { name: 'Review generated request' });
+  await expect(review.getByRole('textbox', { name: 'Message' })).toHaveValue(/Include details: true/);
+  expect(fixture.received).toHaveLength(received);
+  await review.getByRole('button', { name: 'Send request' }).click();
+  await expect(page.locator('.from-user').last()).toContainText('Compare measured values');
+  await expect(page.locator('.from-assistant').last()).toHaveAttribute('data-status', 'completed');
+  expect(fixture.received.length).toBe(received + 1);
+});
+
+test('persists Persona settings and reviews communication memory in Settings', async () => {
+  await launch();
+  await page.evaluate(async () => {
+    const { settings } = await window.aria!.memoryStatus();
+    await window.aria!.saveMemorySettings({ ...settings, enabled: true });
+  });
+  const openPersona = async () => {
+    await page.getByRole('button', { name: 'Open settings', exact: true }).click();
+    await page.getByRole('navigation', { name: 'Settings categories' }).getByRole('button', { name: 'Persona & Communication', exact: true }).click();
+  };
+  await openPersona();
+  await expect(page.getByLabel('Personality mode')).toHaveValue('Adaptive');
+  await expect(page.getByLabel('Warmth', { exact: true })).toHaveValue('75');
+  await page.getByLabel('Personality mode').selectOption('Professional');
+  await page.getByRole('switch', { name: 'Emoji', exact: true }).click();
+  await page.getByRole('button', { name: 'Back to chat', exact: true }).click();
+  const quote = 'Use short numbered lists when you explain command results.';
+  fixture.queueTool(quote, 'aria_reply_metadata', { communication: [{ dimension: 'format', quote }] }, 'I’ll use numbered lists here.');
+  await send(quote);
+  await expect(page.locator('.from-assistant').last()).toHaveAttribute('data-status', 'completed');
+  expect(fixture.received.at(-1)?.body.messages[0].content).toContain('personality=Professional');
+  expect(fixture.received.at(-1)?.body.messages[0].content).toContain('emoji=false');
+  expect((await page.evaluate(() => window.aria!.searchMemories({ query: 'numbered lists' }))).records).toHaveLength(0);
+  await openPersona();
+  await expect(page.getByRole('button', { name: 'Accept', exact: true })).toBeVisible({ timeout: 15000 });
+  await page.getByRole('button', { name: 'Accept', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Correct', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Correct', exact: true }).click();
+  await page.getByRole('textbox', { name: 'Preference', exact: true }).fill('Use short lists for terminal command results.');
+  await page.getByRole('button', { name: 'Save correction' }).click();
+  await expect(page.getByText('Use short lists for terminal command results.')).toBeVisible();
+  await page.evaluate(async () => {
+    const { settings } = await window.aria!.memoryStatus();
+    await window.aria!.saveMemorySettings(settings, true);
+  });
+  await page.getByRole('button', { name: 'Back to chat', exact: true }).click();
+  await page.getByRole('button', { name: 'New chat', exact: true }).click();
+  const followUp = 'How should you present terminal command results?';
+  await send(followUp);
+  await expect(page.locator('.from-assistant').last()).toHaveAttribute('data-status', 'completed');
+  const recalled = fixture.received.filter(({ body }) => body.messages.some(({ content }) => content === followUp)).at(-1);
+  expect(JSON.stringify(recalled?.body.messages)).toContain('confirmed communication setting=format');
+  expect(JSON.stringify(recalled?.body.messages)).toContain('Use short lists for terminal command results.');
+
+  await openPersona();
+  await page.getByRole('switch', { name: 'Learn preferences', exact: true }).click();
+  await page.getByRole('button', { name: 'Back to chat', exact: true }).click();
+  await page.getByRole('button', { name: 'New chat', exact: true }).click();
+  const disabledFollowUp = 'Summarize terminal command results for this example.';
+  await send(disabledFollowUp);
+  await expect(page.locator('.from-assistant').last()).toHaveAttribute('data-status', 'completed');
+  const disabled = fixture.received.filter(({ body }) => body.messages.some(({ content }) => content === disabledFollowUp)).at(-1);
+  expect(disabled).toBeDefined();
+  expect(JSON.stringify(disabled?.body.messages)).not.toContain('Use short lists for terminal command results.');
+  await app.close();
+  await launch(false, false, true);
+  await openPersona();
+  await expect(page.getByLabel('Personality mode')).toHaveValue('Professional');
+  await expect(page.getByRole('switch', { name: 'Emoji', exact: true })).toHaveAttribute('aria-checked', 'false');
+  await page.getByRole('button', { name: 'Delete', exact: true }).click();
+  await page.getByRole('button', { name: 'Delete preference', exact: true }).click();
+  await expect(page.getByText('No communication preferences to review')).toBeVisible();
+  await page.getByRole('button', { name: 'Reset Persona defaults', exact: true }).click();
+  await expect(page.getByLabel('Personality mode')).toHaveValue('Adaptive');
+  await expect(page.getByRole('switch', { name: 'Emoji', exact: true })).toHaveAttribute('aria-checked', 'true');
+});
+
+test('measures Persona validation and table paint for small and maximum-row datasets', async () => {
+  test.skip(process.env.ARIA_BENCHMARK_PERSONA !== '1', 'Enable the local latency benchmark explicitly.');
+  await launch();
+  await page.evaluate(async () => {
+    const status = await window.aria!.diagnosticStatus();
+    await window.aria!.diagnosticConfigure({ ...status.config, debug: true, level: 'debug' });
+  });
+  const measurements: { rows: number; paintMs: number }[] = [];
+  for (const [iteration, rows] of [12, 12, 12, 500, 500, 500].entries()) {
+    const blockId = 'benchmark-' + iteration;
+    const prompt = 'Benchmark presentation ' + iteration;
+    const block = {
+      v: 1, id: blockId, revision: 1, roots: ['table'],
+      nodes: [{ id: 'table', type: 'table', label: 'Measured dataset', dataset: 'data', filterable: true, sortable: true }],
+      datasets: [{ id: 'data', columns: Array.from({ length: 12 }, (_, index) => 'Column ' + index),
+        data: { kind: 'illustrative', rows: Array.from({ length: rows }, (_, index) =>
+          ['Row ' + index, ...Array.from({ length: 11 }, (_, column) => (column + 1) * (index + 1) * 30)]) } }],
+    };
+    fixture.finalReply(prompt, 'Table fixture.\n\n```aria-ui\n' + JSON.stringify(block) + '\n```\n');
+    await page.getByRole('textbox', { name: 'Message Aria' }).fill(prompt);
+    const paintMs = await page.evaluate((id) => new Promise<number>((resolve, reject) => {
+      const timer = setTimeout(() => { unsubscribe(); reject(new Error('The table was not rendered.')); }, 15000);
+      const unsubscribe = window.aria!.onChatEvent((event) => {
+        if (event.type !== 'presentation' || event.part?.kind !== 'block' || event.part.block.id !== id) return;
+        const started = performance.now();
+        unsubscribe();
+        const untilPaint = () => {
+          if (!document.querySelector('[data-persona-block="' + id + '"] table tbody td[dir="auto"]')) {
+            if (performance.now() - started < 5000) requestAnimationFrame(untilPaint);
+            return;
+          }
+          clearTimeout(timer);
+          resolve(performance.now() - started);
+        };
+        requestAnimationFrame(untilPaint);
+      });
+      document.querySelector<HTMLButtonElement>('button[aria-label="Send message"]')!.click();
+    }), blockId);
+    measurements.push({ rows, paintMs });
+    const table = page.locator('[data-persona-block="' + blockId + '"] table');
+    await expect(table).toHaveAttribute('aria-rowcount', String(rows + 1));
+    if (rows === 500) expect(await table.locator('tbody tr').count()).toBeLessThan(50);
+    await expect(page.locator('.from-assistant').last()).toHaveAttribute('data-status', 'completed');
+  }
+  const readTimings = () => page.evaluate(async () => {
+    const { events } = await window.aria!.diagnosticQuery({ search: 'persona.presentation_validation', limit: 100 });
+    return events.filter(({ event, metadata }) => event === 'persona.presentation_validation' && metadata.status === 'accepted')
+      .sort((a, b) => a.timestamp.localeCompare(b.timestamp)).map(({ metadata }) => metadata.durationMs);
+  });
+  await expect.poll(readTimings).toHaveLength(measurements.length);
+  const validation = await readTimings();
+  const samples = measurements.map((sample, index) => ({ ...sample, validationMs: validation[index] }));
+  process.stdout.write(JSON.stringify({ benchmark: 'presentation', samples }) + '\n');
 });

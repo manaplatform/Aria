@@ -243,3 +243,90 @@
 .reply-visual-details .reply-table-scroll {
   margin: 8px 0 0;
 }
+
+.persona-block {
+  display: grid;
+  gap: 0.7rem;
+  margin-block: 0.75rem;
+  min-width: 0;
+  text-align: start;
+  overflow-wrap: anywhere;
+}
+
+.persona-layout, .persona-form, .persona-metric, .persona-data {
+  display: grid;
+  gap: 0.65rem;
+  min-width: 0;
+  margin: 0;
+}
+
+.persona-card, .persona-comparison, .persona-data, .persona-form, .persona-metric, .persona-callout {
+  padding: 0.85rem;
+  border: 1px solid var(--border);
+  border-radius: 0.75rem;
+  background: var(--surface-raised);
+}
+
+.persona-row, .persona-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.persona-grid, .persona-comparison {
+  grid-template-columns: repeat(auto-fit, minmax(min(210px, 100%), 1fr));
+}
+
+.persona-layout > h4 { grid-column: 1 / -1; }
+.persona-row > h4 { flex-basis: 100%; }
+
+.persona-field {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  margin-block: 0.4rem;
+}
+
+.persona-field input:not([type='checkbox'], [type='range']), .persona-field select,
+.persona-review textarea {
+  min-width: 8rem;
+  max-width: 100%;
+  padding: 0.45rem 0.6rem;
+  border: 1px solid var(--border-strong);
+  border-radius: 0.45rem;
+  color: var(--foreground);
+  background: var(--surface);
+}
+
+.persona-form legend { font-weight: 600; }
+.persona-form output { display: block; margin-block-start: 0.5rem; }
+.persona-badge, .persona-tab {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  border-radius: 0.4rem;
+  padding: 0.25rem 0.5rem;
+  width: fit-content;
+}
+.persona-tab[data-state='active'] { border-color: var(--accent); }
+.persona-table {
+  max-height: 22rem;
+  overflow: auto;
+}
+.persona-table table { width: 100%; border-collapse: collapse; }
+.persona-table th, .persona-table td {
+  padding: 0.35rem 0.55rem;
+  border-block-end: 1px solid var(--border);
+  text-align: start;
+  height: 37px;
+  white-space: nowrap;
+}
+.persona-table thead { position: sticky; top: 0; background: var(--surface-raised); }
+.persona-table th button { text-align: start; }
+.persona-diagram-scroll { overflow: auto; max-height: 36rem; color: var(--muted); }
+.persona-diagram-scroll svg { display: block; font-family: system-ui, sans-serif; font-size: 13px; }
+.persona-diagram-group { fill: none; stroke: var(--border-strong); stroke-dasharray: 4 4; }
+.persona-diagram-node { fill: var(--surface-raised); stroke: var(--border-strong); }
+.persona-block pre { overflow-x: auto; }
+.persona-block svg { flex: none; }

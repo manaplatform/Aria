@@ -192,11 +192,18 @@ export class Diagnostics {
         Object.fromEntries(
           Object.entries(v).filter(([, x]) => typeof x !== 'string' || safeValue(x)),
         );
+      const persona = e.component === 'api' && e.subsystem === 'persona' &&
+        ['persona.preferences_resolved', 'persona.memory_context', 'persona.presentation_validation',
+          'persona.streaming_interrupted'].includes(e.event);
+      const { count, durationMs, status } = e.metadata;
       const clean = diagnosticEventSchema.safeParse({
         ...e,
         message: e.event.replace(/[._-]+/g, ' '),
         context: { ...safeEntries(e.context), sessionId: this.sessionId },
-        metadata: safeEntries(e.metadata),
+        metadata: persona ? {
+          count, durationMs,
+          status: status && ['accepted', 'rejected', 'interrupted'].includes(status) ? status : undefined,
+        } : safeEntries(e.metadata),
         error: undefined,
         appVersion: this.appVersion,
       });
@@ -221,7 +228,7 @@ export class Diagnostics {
         e.component === 'conductor' &&
         e.subsystem === 'loop' &&
         ['loop.iteration', 'loop.no_progress'].includes(e.event);
-      if (!clean.success || (!model && !tool && !loop)) {
+      if (!clean.success || (!model && !tool && !loop && !persona)) {
         this.dropped++;
         return;
       }

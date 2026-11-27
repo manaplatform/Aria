@@ -146,6 +146,11 @@ export class ExecutionEngine {
     }));
   }
 
+  presentationOutcome(id: string) {
+    const result = this.results.get(id);
+    return result?.status === 'completed' && !result.privateContent && !this.unverified.has(id) ? result : undefined;
+  }
+
   get needsVerification() { return this.unverified.size > 0; }
 
   verify(steps: string[], resolutions: { stepId: string; evidenceStepId: string }[]) {

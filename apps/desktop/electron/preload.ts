@@ -140,6 +140,10 @@ const bridge: DesktopBridge = {
     ipcRenderer.on('aria:connectors-changed', listener);
     return () => ipcRenderer.removeListener('aria:connectors-changed', listener);
   },
+  personaAction: (input) => ipcRenderer.invoke('aria:persona-action', input),
+  personaRender: (id, status, duration) => ipcRenderer.invoke('aria:persona-render', id, status, duration),
+  communicationPreferences: () => ipcRenderer.invoke('aria:communication-preferences'),
+  reviewCommunicationPreference: (id, accept) => ipcRenderer.invoke('aria:review-communication-preference', id, accept),
   memoryStatus: () => ipcRenderer.invoke('aria:memory-status'),
   memoryDiagnostics: () => ipcRenderer.invoke('aria:memory-diagnostics'),
   saveMemorySettings: (settings, allowAutoRecall) =>

@@ -100,3 +100,7 @@ Electron owns the per-profile memory worker, scope checks, trusted confirmations
 
 
 Agenda, Automations, and Notifications are profile-scoped routes in the chat shell. Settings includes Proactive Assistant. Electron main owns the durable runtime and exposes committed snapshots and change events through preload. See [Proactive Assistant Runtime](proactive-assistant-runtime.md).
+
+## Persona
+
+Desktop text chat accepts versioned Persona presentation blocks with stable identity and bound action references. The existing stream carries validated presentation alongside prose. The desktop persists trusted components with the assistant message and reviews generated requests before ordinary chat submission. See [Aria Persona](persona.md).

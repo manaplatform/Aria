@@ -1,5 +1,8 @@
 import {
   activitySchema,
+  messagePresentationSchema,
+  presentationStateSchema,
+  personaOverridesSchema,
   conductorLimits,
   conductorAttemptSchema,
   endActivity,
@@ -8,6 +11,7 @@ import {
   executionSnapshotSchema,
   sourceSchema,
   memoryCandidates,
+  communicationCandidatesSchema,
   memorySource,
   memorySuggestions,
   settingsCategorySchema,
@@ -149,6 +153,8 @@ const chatSchema = z
           requestId: id,
           role: z.enum(['user', 'assistant']),
           content: text,
+          presentation: messagePresentationSchema.optional().catch(undefined),
+          presentationState: presentationStateSchema.optional().catch(undefined),
           createdAt: z.string(),
           status: z.enum(['pending', 'streaming', 'completed', 'stopped', 'failed', 'interrupted']),
           sequence: z.number().int().nonnegative(),
@@ -222,6 +228,7 @@ export const localDataSchema = legacyDataSchema.extend({
     expandActivityByDefault: z.boolean().optional(),
     profileBio: z.string().max(160).optional(),
     responseStyle: responseStyleSchema.optional(),
+    persona: personaOverridesSchema.optional(),
     communicationLanguage: z.string().max(60).optional(),
     notifications: notificationPreferencesSchema.optional(),
     shortcuts: shortcutsMapSchema.optional(),
@@ -295,6 +302,7 @@ const outboxSchema = z.array(z.strictObject({
   ]),
   source: memorySource,
   candidates: memoryCandidates,
+  communication: communicationCandidatesSchema.optional(),
 })).max(192);
 
 export class LocalStorage {

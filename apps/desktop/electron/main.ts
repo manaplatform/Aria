@@ -6,6 +6,7 @@ import {
   ipcMain,
   Menu,
   nativeImage,
+  nativeTheme,
   Notification,
   powerMonitor,
   screen,
@@ -50,6 +51,8 @@ import {
   effectSchema,
   modelReference,
   memoryClear,
+  resolvePersona,
+  presentationActionRequest,
   memoryCategory,
   memoryManagementSearch,
   memoryOperations,
@@ -81,6 +84,7 @@ import {
   selectChatContext,
   programSettingsSchema,
 } from '@aria/shared';
+import { personaAction } from './persona-actions';
 import { ChatService } from './chat-service';
 import { Diagnostics } from './diagnostics/service';
 import { diagnosticConfigSchema, diagnosticFilterSchema } from '@aria/shared';
@@ -247,6 +251,7 @@ function personalizationContext(): UserPersonalization | undefined {
   const payload: UserPersonalization = {
     ...(profileName && profileName !== 'You' ? { profileName } : {}),
     ...(profileBio ? { profileBio } : {}),
+    persona: prefs.persona ?? {},
     ...(responseStyle && responseStyle !== 'balanced' ? { responseStyle } : {}),
     ...(communicationLanguage && communicationLanguage !== 'auto' ? { communicationLanguage } : {}),
   };
@@ -672,6 +677,46 @@ function registerIpc(): void {
   }));
   handle('aria:active-chat-messages', () => [...activeMessages.values()].filter((message) =>
     savedConversation(message.conversationId)));
+  const presentationMessage = (conversationId: string, messageId: string) => {
+    if (!savedConversation(conversationId)) return undefined;
+    const projected = activeMessages.get(messageId);
+    return projected?.conversationId === conversationId ? projected
+      : initial.data.chat.messages.find((message) => message.id === messageId && message.conversationId === conversationId);
+  };
+  handle('aria:persona-action', async (input) => {
+    if (!mainWindow) throw new Error('Open the conversation to use this action.');
+    const parsed = presentationActionRequest.parse(input);
+    const started = performance.now();
+    const message = presentationMessage(parsed.conversationId, parsed.messageId);
+    let status = 'rejected';
+    try {
+      const theme = initial.data.preferences.theme;
+      const result = await personaAction(parsed, presentationMessage, mainWindow,
+        theme === 'dark' || (theme === 'system' && nativeTheme.shouldUseDarkColors));
+      status = result.kind;
+      return result;
+    } finally {
+      if (message && savedConversation(message.conversationId))
+        diagnostics?.log('debug', 'chat', 'persona', 'persona.action', {
+          conversationId: message.conversationId, requestId: message.requestId,
+          executionId: message.execution?.executionId, generation: message.execution?.generation,
+        }, { status, durationMs: performance.now() - started }, temporaryConversations.has(message.conversationId));
+    }
+  });
+  handle('aria:persona-render', (id, input, timing) => {
+    const messageId = identifier.parse(id);
+    const status = z.enum(['rendered', 'failed']).parse(input);
+    const durationMs = z.number().min(0).max(30_000).parse(timing);
+    const message = activeMessages.get(messageId) ?? initial.data.chat.messages.find((item) => item.id === messageId);
+    if (message?.presentation?.length && savedConversation(message.conversationId))
+      diagnostics?.log('debug', 'renderer', 'persona', 'persona.render', {
+        conversationId: message.conversationId, requestId: message.requestId,
+        executionId: message.execution?.executionId, generation: message.execution?.generation,
+      }, { status, durationMs }, temporaryConversations.has(message.conversationId));
+  });
+  handle('aria:communication-preferences', () => memory.communicationPreferences());
+  handle('aria:review-communication-preference', (id, accept) =>
+    memory.reviewCommunicationPreference(z.string().regex(/^[0-9a-f]{64}$/).parse(id), z.boolean().parse(accept)));
   handle('aria:memory-status', () => memory.status());
   handle('aria:memory-diagnostics', () => memory.diagnosticSnapshot());
   handle('aria:save-memory-settings', (input, rawConsent) => {
@@ -792,8 +837,13 @@ function registerIpc(): void {
         }
         const previousMessages = new Map(previous.chat.messages.map((item) => [item.id, item]));
         for (const item of parsed.chat.messages) {
-          if (!item.memoryReferences?.length) continue;
           const old = previousMessages.get(item.id);
+          const projected = activeMessages.get(item.id);
+          const trusted = projected?.requestId === item.requestId && projected.conversationId === item.conversationId
+            ? projected : old?.requestId === item.requestId && old.conversationId === item.conversationId ? old : undefined;
+          item.presentation = item.role === 'assistant' ? trusted?.presentation?.filter((part) => part.offset <= item.content.length) : undefined;
+          if (!item.presentation?.length) item.presentationState = undefined;
+          if (!item.memoryReferences?.length) continue;
           const permitted = item.memoryReferences.filter((id) =>
             old?.memoryReferences?.includes(id) || memory.canInspect(item.conversationId, id, item.id));
           item.memoryReferences = permitted.length ? permitted : undefined;
@@ -812,8 +862,10 @@ function registerIpc(): void {
         syncTray(Boolean(mergedData.preferences.minimizeToTray) || Boolean(proactive?.background()));
         for (const message of parsed.chat.messages) {
           const projection = activeMessages.get(message.id);
-          if (projection?.requestId === message.requestId && message.sequence >= projection.sequence &&
-              !chat.activeTurn(message)) activeMessages.delete(message.id);
+          if (projection?.requestId !== message.requestId || projection.conversationId !== message.conversationId) continue;
+          if (message.sequence >= projection.sequence && !chat.activeTurn(message)) activeMessages.delete(message.id);
+          else if (message.presentationState && projection.presentation?.length)
+            activeMessages.set(message.id, { ...projection, presentationState: message.presentationState });
         }
         for (const { id } of parsed.chat.conversations) pendingChatProjects.delete(id);
         void drainMemoryOutbox();
@@ -2108,7 +2160,8 @@ app
       () => { workingContext.clear(); proactive?.invalidateMemory(); }, purgeMemoryOutbox, () => chat.executionIdentity(),
       (event, detail) => diagnostics?.log(event.includes('failed') || event.includes('timed_out') || event.includes('exited') ? 'error'
         : event.startsWith('worker.') ? 'info' : 'debug', 'memory', 'worker', `memory.${event}`,
-        {}, { capability: detail?.method, durationMs: detail?.durationMs }));
+        {}, { capability: detail?.method, durationMs: detail?.durationMs }),
+      () => resolvePersona(initial.data.preferences.persona).learnPreferences);
     void memory.start().then(drainMemoryOutbox);
     const memoryDrainTimer = setInterval(() => void drainMemoryOutbox(), 4000);
     memoryDrainTimer.unref();
@@ -2239,7 +2292,7 @@ app
             `chat.${event.type}`, context, {}, temporary);
         }
         const references = memory.event(event);
-        const visible = event.type === 'completed' && 'run' in event ? {
+        const visible = event.type === 'completed' ? {
           type: event.type, requestId: event.requestId, conversationId: event.conversationId,
           assistantMessageId: event.assistantMessageId, sequence: event.sequence,
           executionId: event.executionId, generation: event.generation,

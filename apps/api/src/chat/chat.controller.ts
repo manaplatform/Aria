@@ -17,7 +17,7 @@ import {
 } from '@nestjs/common';
 import { FilesInterceptor } from '@nestjs/platform-express';
 import type { Request, Response } from 'express';
-import { artifactReferenceSchema, identifier, loopCommandSchema, managedExecutionSchema } from '@aria/shared';
+import { artifactReferenceSchema, identifier, loopCommandSchema, managedExecutionSchema, userPersonalizationSchema } from '@aria/shared';
 import { Conductor } from '../conductor/conductor.service';
 import { ToolRegistry } from '../conductor/tool-registry';
 import { WebService } from '../web/web.service';
@@ -104,6 +104,9 @@ export class ChatController {
 
   @Post('stream')
   async stream(@Body() input: ChatRequestDto, @Req() request: Request, @Res() response: Response) {
+    if (input.personalization?.persona && (process.env.ARIA_MANAGED !== '1' ||
+        !userPersonalizationSchema.safeParse({ ...input.personalization }).success))
+      throw new BadRequestException('Invalid Persona settings.');
     if (input.execution && (process.env.ARIA_MANAGED !== '1' || !managedExecutionSchema.safeParse(input.execution).success))
       throw new BadRequestException('Invalid managed execution identity.');
     if (

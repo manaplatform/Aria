@@ -1,5 +1,5 @@
 import type { ChatMessage } from '@aria/shared';
-import { containsSecret } from './store';
+import { containsSecret } from '@aria/shared';
 
 const bounded = (value: string, size: number) => value.replace(/\s+/gu, ' ').trim().slice(0, size);
 

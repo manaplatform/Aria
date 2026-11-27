@@ -1,6 +1,9 @@
 import { createHash } from 'node:crypto';
 import {
   defaultMemorySettings,
+  containsSecret,
+  communicationCandidatesSchema,
+  communicationDimension,
   memoryCandidates,
   memoryOperations,
   type ChatConversation,
@@ -23,7 +26,7 @@ import { RuntimeError } from '../runtime/store';
 import { embeddingRevision, type LocalEmbeddings } from '../runtime/embeddings';
 import { RemoteEmbeddings } from '../runtime/remote-embeddings';
 import { MemoryClient } from './client';
-import { containsSecret, type MemoryAccess, type MemoryIntake } from './store';
+import type { MemoryAccess, MemoryIntake } from './store';
 
 type Request = Extract<CapabilityHostRequest, { type: 'runtime' }>;
 type Disposition = 'recall' | 'write' | 'transfer';
@@ -34,6 +37,7 @@ interface ManagedTurn {
   assistantId: string;
   epoch: number;
   started: number;
+  learning: boolean;
   recalled?: boolean;
   consent?: Promise<boolean>;
   references?: Set<string>;
@@ -116,6 +120,7 @@ export class DesktopMemory {
     private readonly purgeOutbox: () => Promise<void>,
     private readonly providerIdentity: () => string | undefined = () => undefined,
     diagnostic?: (event: string, detail?: { method?: string; durationMs?: number }) => void,
+    private readonly learning = () => true,
   ) {
     this.client = new MemoryClient(directory, diagnostic);
     this.timer = setInterval(() => void this.tick(), 4000);
@@ -180,6 +185,7 @@ export class DesktopMemory {
       const access: MemoryAccess = {
         conversationId: conversation.id,
         projectId: conversation.projectId,
+        communication: this.learning(),
       };
       const result = await Promise.race([
         this.client.call('search', access, { query: query.slice(0, 300), limit: 4 }),
@@ -203,6 +209,7 @@ export class DesktopMemory {
           category: record.value.category,
           content,
           confirmation: record.confirmation,
+          communication: communicationDimension(record.value.factKey),
           observedAt: record.observedAt,
         });
         if (turn && turn.assistantId === assistantId) {
@@ -233,6 +240,7 @@ export class DesktopMemory {
         assistantId: assistant.id,
         epoch: this.epoch,
         started: Date.now() + 1,
+        learning: this.learning(),
       });
     }
     return { enabled, suggestions, ...(conversation.temporary && { temporary: true }) };
@@ -253,16 +261,20 @@ export class DesktopMemory {
     if (
       !turn ||
       event.type !== 'completed' ||
-      !('memoryCandidates' in event) ||
-      !event.memoryCandidates ||
+      (!event.memoryCandidates?.length && !event.communicationCandidates?.length) ||
+      event.partial ||
       turn.epoch !== this.epoch ||
       event.conversationId !== turn.conversation.id ||
       event.assistantMessageId !== turn.assistantId
     )
       return references;
-    const parsed = memoryCandidates.safeParse(event.memoryCandidates);
+    const parsed = memoryCandidates.safeParse(event.memoryCandidates ?? []);
     if (!parsed.success) return references;
     const user = simplified(turn.user.content);
+    const proposed = communicationCandidatesSchema.safeParse(event.communicationCandidates ?? []);
+    const communication = turn.learning && this.learning() && proposed.success
+      ? proposed.data.filter(({ quote }) => turn.user.content.includes(quote) && !containsSecret(quote))
+      : [];
     // Automatic proposals are extractive and bound to the newest saved user turn.
     const candidates = parsed.data.filter((item) => {
       const quote = simplified(item.content);
@@ -270,6 +282,8 @@ export class DesktopMemory {
         quote.length >= 12 &&
         user.includes(quote) &&
         !containsSecret(JSON.stringify(item)) &&
+        !item.factKey?.startsWith('aria.communication.') &&
+        !communication.some(({ quote: source }) => quote.includes(simplified(source))) &&
         (!item.factKey || user.toLowerCase().includes(simplified(item.factKey).toLowerCase())) &&
         !item.dependsOn?.length &&
         !item.relationships?.length &&
@@ -282,7 +296,7 @@ export class DesktopMemory {
         )
       );
     });
-    if (!candidates.length || this.completed.size >= maxOutbox) return references;
+    if ((!candidates.length && !communication.length) || this.completed.size >= maxOutbox) return references;
     this.completed.set(event.assistantMessageId, {
       id: fingerprint(
         JSON.stringify([event.conversationId, turn.user.id, event.assistantMessageId]),
@@ -294,6 +308,7 @@ export class DesktopMemory {
       observedAt: Date.parse(turn.user.createdAt) || turn.started,
       source: { conversationId: turn.conversation.id, messageId: turn.user.id },
       candidates,
+      ...(communication.length && { communication }),
     });
     return references;
   }
@@ -335,9 +350,22 @@ export class DesktopMemory {
     return [...new Map(pending.map((event) => [event.id, event])).values()];
   }
 
+  async communicationPreferences() {
+    const result = await this.client.call('communicationPreferences');
+    return { ...result, proposals: result.proposals.filter(({ source }) => Boolean(this.conversations(source.conversationId))) };
+  }
+
+  async reviewCommunicationPreference(id: string, accept: boolean) {
+    const { proposals } = await this.communicationPreferences();
+    if (!proposals.some((proposal) => proposal.id === id) || (accept && (!this.settings.enabled || !this.learning())))
+      throw new Error('This communication preference is unavailable.');
+    await this.client.call('reviewCommunicationPreference', id, accept, this.epoch);
+  }
+
   async ingest(events: MemoryIntake[]) {
     if (!events.length) return [];
-    const accepted = await this.client.call('enqueue', events);
+    const admitted = this.learning() ? events : events.map((event) => ({ ...event, communication: undefined }));
+    const accepted = await this.client.call('enqueue', admitted);
     for (const [id, event] of this.completed)
       if (accepted.includes(event.id)) this.completed.delete(id);
     return accepted;
@@ -653,6 +681,7 @@ export class DesktopMemory {
     const access = {
       conversationId: request.conversationId,
       projectId: turn.conversation.projectId,
+      communication: turn.learning && this.learning(),
     };
     const source = { conversationId: request.conversationId, messageId: turn.user.id };
     let data: Record<string, unknown>;
@@ -670,6 +699,7 @@ export class DesktopMemory {
       }
       case 'memory.remember': {
         const input = memoryOperations[request.operation].parse(request.input);
+        if (input.value.factKey?.startsWith('aria.communication.')) throw blocked();
         if (input.value.category === 'project' && !access.projectId) throw blocked();
         const kind = input.scope ?? (access.projectId ? 'project' : 'profile');
         const scope: MemoryScope =
@@ -808,6 +838,7 @@ export class DesktopMemory {
         id: record.id,
         revision: record.revision,
         scope: record.scope,
+        ...(record.value.factKey?.startsWith('aria.communication.') && { communicationPreference: communicationDimension(record.value.factKey) }),
         category: record.value.category,
         content: record.value.content.slice(0, 520),
         taskState: record.value.taskState,
