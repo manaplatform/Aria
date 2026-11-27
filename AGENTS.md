@@ -132,6 +132,13 @@ When implementing AI features:
 - Distinguish public entities from integration availability. Use actual evidence, active budgets, and structured failures to decide when to continue. Require an explicit, eligible retry for an unchanged failed research operation and verify consequential effects before reporting completion.
 - Keep discovered, inspected, partial, and metadata-only evidence distinguishable. Retain source and freshness information with the conversation. Use approved memory writes when the user requests persistent research memory. Test ordinary chat, direct browsing, and grounded news and site audits on deterministic sites, with public sites and live models available as opt-in checks.
 
+## API-first capabilities
+
+- Aria is a general-purpose assistant, not a browser-first agent. Conductor supports structured APIs, public search and retrieval, browser interaction, local capabilities, and connected services; the configured primary chooses among authorized capabilities.
+- Prefer suitable structured APIs when they serve the task. Use browser automation when rendered interaction is useful. Never add keyword-based intent routing, silent capability fallbacks, or fabricated external data.
+- Integrate external providers through typed contracts and reusable adapters. Validate responses, preserve attribution and freshness, and render structured results only through trusted presentation components. Preserve privacy, permissions, and execution observability.
+- Weather and location requests run in the trusted desktop runtime with local caching and no hosted Aria proxy. Honor provider terms and current traffic limits, and do not claim that per-device limits enforce an application-wide quota. See [Weather Intelligence](docs/weather-intelligence.md).
+
 ## Conductor tools and skills
 
 - Conductor is the central orchestration authority. The configured primary chat model decides whether to answer directly, discover a tool, load a skill, invoke an authorized capability, or ask the user for information.
@@ -213,3 +220,10 @@ When implementing AI features:
 - Carry trusted request, conversation, execution, generation, and operation identities across boundaries. Correlation data never grants permission or changes execution behavior. Temporary-chat diagnostics stay in bounded memory and must be discarded when the chat ends.
 - Log only allowlisted structural metadata. Never record prompts, responses, raw errors, credentials, tool inputs or outputs, file contents, screenshots, clipboard content, private URLs, or model reasoning. Sanitize before every persistence, stream, or export boundary; restrict IPC to the trusted renderer.
 - Keep logging asynchronous, bounded, local by default, and failure-isolated. Test new events for privacy, correlation, lifecycle, and failure behavior; document platform-specific verification and any coverage gaps. See [Diagnostics](docs/diagnostics.md).
+
+## Aria Persona
+
+- The configured primary model owns communication, language, tone, and presentation decisions. Keep direct chat usable in one streamed request. Use current instructions, explicit Settings choices, and selectively recalled confirmed preferences in that order.
+- Use the existing Memory service to review source-backed communication proposals before they become cross-chat preferences. Keep temporary content, sensitive attributes, and credentials out of learning and diagnostics.
+- Treat generated components as untrusted declarative data. Validate the version, shape, size, references, and ownership before rendering or acting. Use approved React and SVG primitives and preserve Arabic-script and mixed-direction content.
+- Keep Conductor responsible for capability selection, execution, and approvals. A generated request enters normal chat after the user reviews and sends it. Ground data and operation state in observed inputs and receipts. Prefer prose when it meets the user's needs. See [Aria Persona](docs/persona.md).

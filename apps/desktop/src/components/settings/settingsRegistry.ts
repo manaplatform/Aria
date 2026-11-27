@@ -3,6 +3,7 @@ import {
   Bell,
   Brain,
   Cpu,
+  CloudSun,
   FolderCog,
   Globe,
   Info,
@@ -64,7 +65,7 @@ export const settingsCategories: SettingsCategoryMeta[] = [
   {
     id: 'personalization',
     group: 'preferences',
-    label: 'Personalization',
+    label: 'Persona & Communication',
     description: 'Custom instructions, response style, language, and personal context.',
     icon: UserCog,
   },
@@ -129,6 +130,10 @@ export const settingsCategories: SettingsCategoryMeta[] = [
     icon: Globe,
   },
   {
+    id: 'weather', group: 'capabilities', label: 'Weather & Location',
+    description: 'Weather provider, default location, and measurement units.', icon: CloudSun,
+  },
+  {
     id: 'desktop',
     group: 'capabilities',
     label: 'Desktop Control',
@@ -174,6 +179,7 @@ export const settingsCategories: SettingsCategoryMeta[] = [
 ];
 
 export const settingsSearchIndex: SettingsSearchItem[] = [
+  { id: 'weather-settings', category: 'weather', title: 'Weather & Location', description: 'Weather provider, default city, forecast cache, and units.', keywords: ['forecast', 'temperature', 'wind', 'geocoding', 'cache'] },
   { id: 'diagnostic-logs', category: 'diagnostics', title: 'Developer and Diagnostics', description: 'View and export local logs.', keywords: ['logs', 'debug', 'trace', 'export'], settingId: 'diagnostics-logs' },
   { id: 'connector-github', category: 'connectors', title: 'GitHub', description: 'Connect a GitHub account and manage repository access and write permissions.', keywords: ['OAuth', 'app', 'sign in', 'disconnect', 'repository'], settingId: 'connector-github' },
   { id: 'gen-name', category: 'general', title: 'Display name', description: 'Your local name shown in the sidebar and conversations.', keywords: ['profile', 'name', 'user'], settingId: 'general-display-name' },
@@ -188,7 +194,10 @@ export const settingsSearchIndex: SettingsSearchItem[] = [
   { id: 'app-motion', category: 'appearance', title: 'Animation preferences', description: 'Follow system motion settings or reduce animations.', keywords: ['motion', 'animation', 'accessibility'], settingId: 'appearance-motion' },
   { id: 'per-profile', category: 'personalization', title: 'Personal profile', description: 'Display name and brief personal context.', keywords: ['bio', 'about me', 'profile'], settingId: 'personalization-profile' },
   { id: 'per-instructions', category: 'personalization', title: 'Custom instructions', description: 'Persistent instructions passed to Aria’s primary model.', keywords: ['system prompt', 'instructions', 'rules'], settingId: 'personalization-instructions' },
-  { id: 'per-style', category: 'personalization', title: 'Assistant response preferences', description: 'Prefer balanced, concise, or detailed replies.', keywords: ['tone', 'concise', 'detailed', 'style'], settingId: 'personalization-style' },
+  { id: 'per-style', category: 'personalization', title: 'Response detail', description: 'Set how much detail Aria aims to provide.', keywords: ['tone', 'concise', 'detailed', 'style'], settingId: 'personalization-style' },
+  { id: 'persona-modes', category: 'personalization', title: 'Personality', description: 'Choose an adaptive or custom communication style.', keywords: ['warmth', 'humor', 'personality', 'persona'], settingId: 'persona-modes' },
+  { id: 'persona-visual', category: 'personalization', title: 'Adaptive visuals', description: 'Use interactive presentation when helpful.', keywords: ['chart', 'diagram', 'emoji', 'symbols'], settingId: 'persona-adaptiveVisuals' },
+  { id: 'persona-learning', category: 'personalization', title: 'Communication memory', description: 'Review and manage learned communication preferences.', keywords: ['memory', 'review', 'learn', 'preferences'], settingId: 'persona-communication-memory' },
   { id: 'per-language', category: 'personalization', title: 'Preferred communication language', description: 'Language Aria uses when responding.', keywords: ['reply language', 'locale'], settingId: 'personalization-language' },
   { id: 'not-desktop', category: 'notifications', title: 'Desktop notifications', description: 'Enable OS notifications when Aria is in the background.', keywords: ['alerts', 'banner', 'os'], settingId: 'notifications-enabled' },
   { id: 'proactive-pulse', category: 'proactive', title: 'Pulse and background work', description: 'Set heartbeat frequency, quiet hours, notifications, and job limits.', keywords: ['agenda', 'automation', 'heartbeat', 'emergency pause'] },

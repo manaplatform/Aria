@@ -28,7 +28,7 @@ import {
   type WebSearchEngine,
 } from '@aria/shared';
 import { BrowserProxy } from './egress-proxy';
-import { inspectPage, inspectWhileLoading } from './page-inspector';
+import { inspectPage, inspectWithDebugger } from './page-inspector';
 import { BrowserError, fetchPublicPage } from './http-fetch';
 import { BrowserSessionPolicy } from './session-policy';
 import { BrowserStateStorage, type BrowserDiskState } from './state-storage';
@@ -862,8 +862,12 @@ export class BrowserController {
     let ready!: () => void;
     const dom = new Promise<void>((resolve) => { ready = resolve; });
     const onDom = () => { if (tab.domDocument === tab.documentId) ready(); };
+    const onHttpError = (_event: Electron.Event, _url: string, status: number) => {
+      if (status >= 400) ready();
+    };
     const inPage = (_event: Electron.Event, _url: string, main: boolean) => { if (main) onDom(); };
     contents.on('dom-ready', onDom);
+    contents.on('did-navigate', onHttpError);
     contents.on('did-navigate-in-page', inPage);
     try {
       progress('navigating');
@@ -892,6 +896,7 @@ export class BrowserController {
     } finally {
       deadline.removeEventListener('abort', stop);
       contents.off('dom-ready', onDom);
+      contents.off('did-navigate', onHttpError);
       contents.off('did-navigate-in-page', inPage);
     }
   }
@@ -1499,9 +1504,8 @@ export class BrowserController {
         );
       const command = { op: 'search-results', documentId } as const;
       progress('inspecting');
-      const read = () => contents.isLoading()
-        ? inspectWhileLoading(contents, command, active)
-        : whenActive(inspectPage(contents, command), active);
+      // The fixed read works even when Chromium is still waiting for page assets.
+      const read = () => inspectWithDebugger(contents, command, active);
       let evidence = await read();
       for (let check = 0; check < 6 && !evidence.results?.length &&
           !evidence.searchEmpty && !evidence.captchaDetected; check++) {
@@ -1546,10 +1550,10 @@ export class BrowserController {
         );
       return results;
     } catch (error) {
-      if (!signal.aborted && active.aborted && !tab.lifetime.signal.aborted)
-        throw new BrowserError('TIMEOUT', 'The search page did not become readable before its deadline.', 'timed_out', 1000);
       if (tab.httpStatus === 429 && error instanceof BrowserError)
         throw Object.assign(error, { rateLimited: true });
+      if (!signal.aborted && active.aborted && !tab.lifetime.signal.aborted)
+        throw new BrowserError('TIMEOUT', 'The search page did not become readable before its deadline.', 'timed_out', 1000);
       throw error;
     } finally {
       this.closeTab(tab);
@@ -1756,7 +1760,7 @@ export class BrowserController {
             if (args.condition === 'visible_text' && readable) {
               const id = tab.documentId;
               const command = { op: 'read-view', documentId: id } as const;
-              const result = contents.isLoading() ? await inspectWhileLoading(contents, command, deadline)
+              const result = contents.isLoading() ? await inspectWithDebugger(contents, command, deadline)
                 : await whenActive(inspectPage(contents, command), deadline);
               matched = id === tab.documentId && Boolean(result.text?.includes(args.text!));
             }
@@ -1800,7 +1804,7 @@ export class BrowserController {
         snapshot(true);
         progress('inspecting');
         try {
-          const value = contents.isLoading() ? await inspectWhileLoading(contents, command, timeout)
+          const value = contents.isLoading() ? await inspectWithDebugger(contents, command, timeout)
             : await whenActive(inspectPage(contents, command), timeout);
           snapshot(true);
           return value;

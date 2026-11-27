@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import type { CommunicationCandidate } from './persona.js';
 import { identifier } from './model-registry.js';
 
 export const memoryCategories = [
@@ -211,6 +212,7 @@ export interface MemoryContextHint {
   category: MemoryRecord['value']['category'];
   content: string;
   confirmation: MemoryRecord['confirmation'];
+  communication?: CommunicationCandidate['dimension'];
   observedAt: number;
 }
 export interface MemoryTurnOptions {

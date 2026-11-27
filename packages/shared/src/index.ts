@@ -1,5 +1,7 @@
 import type { ConnectorCommand, ConnectorSnapshot, ConnectorActivity } from './connectors/index.js';
 export * from './proactive.js';
+import type { PersonaSettings, CommunicationProposal } from './persona.js';
+import type { PresentationPart, PresentationState, PresentationActionRequest, PresentationActionResult } from './presentation.js';
 import type { ProactiveCommand, ProactiveEvent, ProactiveResult } from './proactive.js';
 import type { MemoryDiagnostics, MemoryRecord, MemorySearch, MemorySearchResult, MemorySettings, MemoryStatus, MemoryTurnOptions } from './memory.js';
 export * from './memory.js';
@@ -22,6 +24,7 @@ import type {
   ComputerSupervision,
 } from './computer-use.js';
 import type { WebSettings, WebSettingsInput } from './web.js';
+import type { WeatherSettings, WeatherSettingsView } from './weather.js';
 export * from './browser.js';
 export * from './computer-use.js';
 export * from './web.js';
@@ -268,6 +271,7 @@ export interface Preferences {
   expandActivityByDefault?: boolean;
   profileBio?: string;
   responseStyle?: ResponseStyle;
+  persona?: Partial<PersonaSettings>;
   communicationLanguage?: string;
   notifications?: NotificationPreferences;
   shortcuts?: ShortcutsMap;
@@ -303,6 +307,8 @@ export interface ChatMessage {
   content: string;
   createdAt: string;
   status: ChatMessageStatus;
+  presentation?: PresentationPart[];
+  presentationState?: PresentationState;
   sequence: number;
   error?: string;
   operation?: OperationInput;
@@ -352,9 +358,9 @@ export type ChatEvent = {
   executionId?: string;
   generation?: number;
 } & (
-  | ConductorEvent
+  | Exclude<ConductorEvent, { type: 'completed' }>
   | { type: 'asset'; asset: MediaAsset }
-  | { type: 'completed'; assets?: MediaAsset[]; suggestions?: string[]; memoryReferences?: string[] }
+  | (Extract<ConductorEvent, { type: 'completed' }> & { assets?: MediaAsset[]; memoryReferences?: string[] })
 );
 export interface ChatCapabilities {
   configured: boolean;
@@ -484,6 +490,9 @@ export interface DesktopBridge {
   onComputerSession(callback: (state: ComputerSessionSummary) => void): () => void;
   onBrowserState(callback: (state: BrowserState) => void): () => void;
   webSettings(): Promise<WebSettings>;
+  weatherSettings(): Promise<WeatherSettingsView>;
+  saveWeatherSettings(input: WeatherSettings): Promise<WeatherSettingsView>;
+  clearWeatherCache(): Promise<WeatherSettingsView>;
   saveWebSettings(input: WebSettingsInput): Promise<WebSettings>;
   toolSettings(): Promise<ToolSettings>;
   executionHistory(): Promise<ExecutionHistoryEntry[]>;
@@ -534,6 +543,10 @@ export interface DesktopBridge {
   muteLive(sessionId: string, muted: boolean): Promise<void>;
   endLive(): Promise<void>;
   onLiveEvent(callback: (event: LiveEvent) => void): () => void;
+  personaAction(input: PresentationActionRequest): Promise<PresentationActionResult>;
+  personaRender(messageId: string, status: 'rendered' | 'failed', durationMs: number): Promise<void>;
+  communicationPreferences(): Promise<{ proposals: CommunicationProposal[]; records: MemoryRecord[] }>;
+  reviewCommunicationPreference(id: string, accept: boolean): Promise<void>;
   memoryStatus(): Promise<MemoryStatus>;
   memoryDiagnostics(): Promise<MemoryDiagnostics>;
   saveMemorySettings(settings: MemorySettings, allowAutoRecall?: boolean): Promise<MemoryStatus>;
@@ -579,4 +592,10 @@ export interface DesktopBridge {
 
 export * from './execution-runtime.js';
 export * from './reply-visual.js';
+export * from './persona.js';
+export * from './weather.js';
+export * from './presentation.js';
+export * from './calculation.js';
 export * from './connectors/index.js';
+
+export * from './sensitive-data.js';

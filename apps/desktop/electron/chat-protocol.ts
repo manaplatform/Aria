@@ -1,6 +1,9 @@
 import { z } from 'zod';
 import {
   activitySchema,
+  communicationCandidatesSchema,
+  communicationDimensionSchema,
+  presentationPartSchema,
   memoryCandidates,
   memorySuggestions,
   artifactReferenceSchema,
@@ -64,6 +67,7 @@ export const managedChatRequestSchema = chatRequestSchema.safeExtend({
           category: z.enum(['episode', 'fact', 'preference', 'procedure', 'project', 'task']),
           content: z.string().max(300),
           confirmation: z.enum(['confirmed', 'inferred']),
+          communication: communicationDimensionSchema.optional(),
           observedAt: z.number().int().nonnegative(),
         }),
       )
@@ -86,6 +90,7 @@ export const conductorEventSchema = z.discriminatedUnion('type', [
   z.strictObject({ type: z.literal('execution'), execution: executionSnapshotSchema }),
   z.strictObject({ type: z.literal('delta'), text: z.string().max(100000) }),
   z.strictObject({ type: z.literal('reset') }),
+  z.strictObject({ type: z.literal('presentation'), part: presentationPartSchema.optional().catch(undefined) }),
   z.strictObject({ type: z.literal('activity'), activity: activitySchema }),
   z.strictObject({ type: z.literal('artifact'), artifact: artifactReferenceSchema }),
   z.strictObject({
@@ -93,6 +98,7 @@ export const conductorEventSchema = z.discriminatedUnion('type', [
     partial: z.boolean().optional(),
     suggestions: memorySuggestions.optional(),
     memoryCandidates: memoryCandidates.optional(),
+    communicationCandidates: communicationCandidatesSchema.optional().catch(undefined),
     run: runInfoSchema.optional(),
   }),
   z.strictObject({ type: z.literal('stopped') }),

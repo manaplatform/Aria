@@ -9,6 +9,8 @@ export const methods = [
   'read',
   'resolve',
   'remember',
+  'communicationPreferences',
+  'reviewCommunicationPreference',
   'edit',
   'forget',
   'clear',

@@ -10,6 +10,8 @@ AI DOM inspection runs fixed code in an isolated world. Node references are scop
 
 Conductor exposes only tools enabled for the run. Browser search uses the Brave website (with configurable Bing fallback when Brave is rate-limited or unavailable) and sends no search API credentials. Search discoveries are transient. Publisher reads provide provenance used for persistent citations. Saved web policy, browser history, and session state live outside model configuration and conversation history. Approval payloads and AI page bodies are transient. Explicit screenshots use the existing artifact store and conversation retention.
 
+Search uses a fixed isolated read after main-frame DOM readiness. It can collect Bing's organic publisher links from the results container before the page reveals the container. Human verification markers prevent this early extraction. A committed HTTP error can end navigation immediately, even while ancillary resources are loading. The built Electron fixture covers a rate-limited primary engine, pending assets, early results, and verification challenges.
+
 Automated fixtures should cover network denial, managed browser requests, source history, cancellation, and process isolation on the built macOS and Windows desktop. Local fixtures are evidence for those test cases. Public-site smoke tests, live provider acceptance, and third-party redistribution review are separate release checks. Validate the latest available security patch for the Electron series before shipping a build.
 
 ## Tool authorization and retry

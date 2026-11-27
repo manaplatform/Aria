@@ -29,7 +29,7 @@ export type Outcome = StepValue & {
   status: 'completed' | 'failed' | 'blocked' | 'cancelled';
   problem?: ToolProblem;
   artifact?: ArtifactReference;
-  retry?: { eligible: boolean; afterMs?: number; phase?: BrowserPhase | string };
+  retry?: { eligible: boolean; attemptId?: string; afterMs?: number; phase?: BrowserPhase | string };
 };
 
 export type Invocation = {
@@ -144,6 +144,11 @@ export class ExecutionEngine {
       const resource = key as keyof typeof this.counters;
       return [resource, Math.max(0, this.context.research.policy[resource] - this.counters[resource])];
     }));
+  }
+
+  presentationOutcome(id: string) {
+    const result = this.results.get(id);
+    return result?.status === 'completed' && !result.privateContent && !this.unverified.has(id) ? result : undefined;
   }
 
   get needsVerification() { return this.unverified.size > 0; }
@@ -354,6 +359,8 @@ export class ExecutionEngine {
     let readKey: string | undefined;
     let previousAttempt: ReadAttempt | undefined;
     let retryDelay: number | undefined;
+    let retryOffer: Outcome['retry'];
+    const readRetryLimit = this.context.execution?.readRetries ?? 2;
     let budgetKey: ToolDescriptor['budget'] | undefined;
     let admittedFingerprint: string | undefined;
     let settleArtifact: ReturnType<ToolContext['budget']['artifact']> | undefined;
@@ -501,16 +508,27 @@ export class ExecutionEngine {
         const observation = typeof dispatchInput?.tabId === 'string' &&
           [...this.observations.values()].some(({ target, ordinal }) =>
             target === dispatchInput.tabId && ordinal > (previousAttempt?.ordinal ?? -1));
-        const windowElapsed = previousAttempt?.retryAt !== undefined && Date.now() >= previousAttempt.retryAt;
-        if (retryOf && retryOf !== previousAttempt?.id)
-          throw new ToolError('INVALID_REFERENCE', 'retryOf must reference the latest attempt of this same operation.', 'RETRY_REFERENCE_INVALID');
+        const afterMs = previousAttempt?.retryAt === undefined
+          ? undefined : Math.max(0, previousAttempt.retryAt - Date.now());
+        const eligible = previousAttempt?.retryable && previousAttempt.count <= readRetryLimit;
+        const offer = previousAttempt && eligible && researchRetry
+          ? { eligible: true, attemptId: previousAttempt.id, afterMs } : undefined;
+        if (retryOf && retryOf !== previousAttempt?.id) {
+          retryOffer = offer;
+          throw new ToolError('INVALID_REFERENCE',
+            'For unchanged arguments, copy retry.attemptId from the latest eligible failure of this operation. For different arguments, omit retryOf.',
+            'RETRY_REFERENCE_INVALID');
+        }
         if (
           previousAttempt &&
-          (!previousAttempt.retryable || previousAttempt.count > (this.context.execution?.readRetries ?? 2) ||
-            (researchRetry && (!retryOf || (!observation && !windowElapsed))))
-        )
-          if (!(researchRetry && descriptor.repeatable && this.results.get(previousAttempt.id)?.status === 'completed' && !retryOf))
-            throw new ToolError('DUPLICATE_DISPATCH', 'This operation already ran. For a retry, use the returned attempt ID after a fresh observation or the reported retry window.', 'UNCHANGED_ATTEMPT');
+          (!eligible || (researchRetry && (!retryOf || (!observation && afterMs !== 0)))) &&
+          !(researchRetry && descriptor.repeatable && this.results.get(previousAttempt.id)?.status === 'completed' && !retryOf)
+        ) {
+          retryOffer = offer;
+          throw new ToolError('DUPLICATE_DISPATCH', offer
+            ? 'For an explicit retry, pass retry.attemptId as retryOf after the reported delay or a fresh tab observation.'
+            : 'This operation already ran and has no eligible retry.', 'UNCHANGED_ATTEMPT');
+        }
       } else if (!descriptor.repeatable && this.dispatched.has(fingerprint))
         throw new ToolError('DUPLICATE_DISPATCH', 'This operation already ran.');
       else if (retryOf)
@@ -772,6 +790,7 @@ export class ExecutionEngine {
         status: code === 'CANCELLED' ? 'cancelled' : code === 'DUPLICATE_DISPATCH' ? 'blocked' : 'failed',
         problem: { code, message: message.slice(0, 400),
           category: error instanceof ToolError ? error.category : undefined },
+        ...(retryOffer && { retry: retryOffer }),
       };
     } finally {
       settleArtifact?.();
@@ -816,11 +835,10 @@ export class ExecutionEngine {
         ? retryDelay !== undefined || result.problem?.category === 'STALE_PAGE'
         : result.problem?.code === 'TIMEOUT' || result.problem?.code === 'EXECUTION_FAILED'));
       if (attempt.retryable && retryDelay !== undefined) attempt.retryAt = Date.now() + retryDelay;
-      if (research && result.problem) result.retry = {
-        eligible: attempt.retryable && attempt.count <= (this.context.execution?.readRetries ?? 2),
-        afterMs: retryDelay,
-        phase,
-      };
+      if (research && result.problem) {
+        const eligible = attempt.retryable && attempt.count <= readRetryLimit;
+        result.retry = { eligible, ...(eligible && { attemptId: id, afterMs: retryDelay }), phase };
+      }
     }
     this.results.set(id, result);
     activity(result.problem?.code === 'OUTCOME_UNCERTAIN' ? 'uncertain' : result.status, result);
@@ -831,7 +849,7 @@ export class ExecutionEngine {
       durationMs: Date.now() - start,
       fingerprint, sourceId, dependencyState, phase,
       failureCategory: result.problem?.category ?? result.problem?.code,
-      retryEligible: result.retry?.eligible,
+      retryEligible: readKey ? result.retry?.eligible : undefined,
       ...(readKey && {
         attemptCount: this.readAttempts.get(readKey)?.count,
         retryAt: this.readAttempts.get(readKey)?.retryAt,

@@ -68,3 +68,7 @@ Add managed memory actions to the shared schemas and Tool Registry, then wire th
 
 
 A reviewed background job can perform bounded profile recall with current standing consent. Job-owned verified findings have explicit job and attempt provenance when the user saves them through the existing Memory confirmation. See [Proactive Assistant Runtime](proactive-assistant-runtime.md).
+
+## Communication preferences
+
+Persona stages source-backed communication proposals through the existing intake. The v2 memory database stores pending review separately from active records and searches. Acceptance creates a confirmed, source-linked preference. Persona Settings manages proposals and accepted records. Retention, recall consent, and deletion fences apply to both. See [Aria Persona](persona.md).

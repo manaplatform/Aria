@@ -94,8 +94,10 @@ export const replyVisualSchema = z
 
 export type ReplyVisual = z.infer<typeof replyVisualSchema>;
 
+export const replyMarkdownPrompt = 'Format desktop chat replies with readable Markdown. Lead with the answer. Use short headings and lists for longer explanations, tables for exact comparisons, and meaningful symbols where helpful. Use $$formula$$ for inline LaTeX and put $$ on separate lines around a display equation.';
+
 export const replyFormattingPrompt = [
-  'Format desktop chat replies with readable Markdown. Lead with the answer. Use short headings and lists for longer explanations, tables for exact comparisons, and meaningful symbols where helpful. Use $$formula$$ for inline LaTeX and put $$ on separate lines around a display equation.',
+  replyMarkdownPrompt,
   `When a chart or flowchart helps, put one JSON object in a top-level \`\`\`${replyVisualFence} block, close the fence on its own line, and continue the reply as Markdown. Use data from the conversation or observed results. Clearly label illustrative values. Summarize the main takeaway in prose. Use the artifact workflow when the user requests a downloadable chart.`,
   'Every visual has v:1, type and a short title. For type "bar", "line" or "area", add categories (ordered strings) and series ([{"name":"Series","values":[12,20,null]}], one value per category, null for a gap). For "scatter", add series ([{"name":"Series","points":[[1,2],[3,4]]}]). These charts accept xLabel and yLabel for axes and units. For "pie", use categories and a single named series of nonnegative values with at least one positive value. For "flowchart", use nodes ([{"id":"start","label":"Start"}]) and edges ([{"from":"start","to":"next","label":"optional"}]) using existing node IDs.',
   `Use up to ${replyVisualLimits.blocks} blocks per reply, ${replyVisualLimits.categories} categories or points per series, ${replyVisualLimits.series} series, ${replyVisualLimits.slices} pie slices, and ${replyVisualLimits.nodes} nodes and ${replyVisualLimits.edges} edges per flowchart.`,

@@ -1,6 +1,8 @@
 import type { ChatEvent, ChatMessage } from './index.js';
 import { conductorLimits, endActivity, type ConductorSource } from './conductor.js';
 
+import { updatePresentation } from './presentation.js';
+
 const evidenceRanks = { discovered: 0, metadata: 1, partial: 2, inspected: 3 };
 
 function mergeSources(previous: ConductorSource[], incoming: ConductorSource[]) {
@@ -39,6 +41,8 @@ export function projectChatEvent(item: ChatMessage, event: ChatEvent): ChatMessa
       status: 'streaming',
       error: undefined,
       content: '',
+      presentation: undefined,
+      presentationState: undefined,
       retryConfirmed: false,
       settingsHelp: undefined,
       execution: event.execution,
@@ -55,7 +59,10 @@ export function projectChatEvent(item: ChatMessage, event: ChatEvent): ChatMessa
   const next = { ...item, sequence: event.sequence };
   if (event.type === 'execution') return { ...next, execution: event.execution };
   if (event.type === 'started') return { ...next, status: 'streaming', run: event.run };
-  if (event.type === 'reset') return { ...next, content: '' };
+  if (event.type === 'reset') return { ...next, content: '', presentation: undefined, presentationState: undefined };
+  if (event.type === 'presentation') return !event.part || event.part.offset > next.content.length ? next : {
+    ...next, presentation: updatePresentation(next.presentation ?? [], event.part),
+  };
   if (event.type === 'delta')
     return {
       ...next,

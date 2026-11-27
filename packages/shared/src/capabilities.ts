@@ -63,6 +63,7 @@ export const toolPolicySchema = z.strictObject({
   discovery: toolDiscoverySchema,
   nativeVerified: z.boolean().optional(),
   desktopRuntime: z.boolean().optional(),
+  weatherEnabled: z.boolean().optional(),
   dockerConfigured: z.boolean().optional(),
   localEmbeddings: z.boolean().optional(),
   workspacesCount: z.number().int().min(0).max(1000).optional(),
@@ -105,6 +106,10 @@ export interface ToolConstraints {
   artifacts?: boolean;
   budget?: z.infer<typeof webBudgetKeySchema>;
   requiredModelCapabilities?: string[];
+  mechanism?: 'native_api' | 'web_search' | 'web_content' | 'browser' | 'connected_service' | 'local' | 'model';
+  network?: 'required' | 'optional' | 'none';
+  cost?: 'free' | 'may_incur_cost' | 'unknown';
+  latency?: 'low' | 'network' | 'variable';
 }
 export interface ToolSummary {
   id: string;

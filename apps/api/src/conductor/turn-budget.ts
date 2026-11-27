@@ -199,7 +199,7 @@ export class TurnBudget {
           contextHints
             .map(
               (hint) =>
-                `- [${hint.id}] (${hint.scope}/${hint.category}, ${hint.confirmation}, ${new Date(hint.observedAt).toISOString().slice(0, 10)}): ${hint.content}`,
+                `- [${hint.id}] (${hint.scope}/${hint.category}, ${hint.confirmation}${hint.communication ? ' communication setting=' + hint.communication : ''}, ${new Date(hint.observedAt).toISOString().slice(0, 10)}): ${hint.content}`,
             )
             .join('\n'),
       );

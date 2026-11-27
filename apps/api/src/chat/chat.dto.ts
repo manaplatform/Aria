@@ -65,6 +65,10 @@ class AvailableProjectDto {
 }
 
 class MemoryContextHintDto {
+  @IsOptional()
+  @IsIn(['tone', 'language', 'detail', 'format', 'emoji', 'symbols'])
+  communication?: 'tone' | 'language' | 'detail' | 'format' | 'emoji' | 'symbols';
+
   @IsUUID()
   id!: string;
 
@@ -115,6 +119,10 @@ class MemoryTurnDto {
 }
 
 class PersonalizationDto implements UserPersonalization {
+  @IsOptional()
+  @IsObject()
+  persona?: UserPersonalization['persona'];
+
   @IsOptional()
   @IsString()
   @MaxLength(80)

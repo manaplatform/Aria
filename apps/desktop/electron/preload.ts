@@ -78,6 +78,9 @@ const bridge: DesktopBridge = {
     return () => ipcRenderer.removeListener('aria:browser-state-update', listener);
   },
   webSettings: () => ipcRenderer.invoke('aria:web-settings'),
+  weatherSettings: () => ipcRenderer.invoke('aria:weather-settings'),
+  saveWeatherSettings: (input) => ipcRenderer.invoke('aria:save-weather-settings', input),
+  clearWeatherCache: () => ipcRenderer.invoke('aria:clear-weather-cache'),
   saveWebSettings: (input) => ipcRenderer.invoke('aria:save-web-settings', input),
   toolSettings: () => ipcRenderer.invoke('aria:tool-settings'),
   setProgramSettings: (settings) => ipcRenderer.invoke('aria:set-program-settings', settings),
@@ -140,6 +143,10 @@ const bridge: DesktopBridge = {
     ipcRenderer.on('aria:connectors-changed', listener);
     return () => ipcRenderer.removeListener('aria:connectors-changed', listener);
   },
+  personaAction: (input) => ipcRenderer.invoke('aria:persona-action', input),
+  personaRender: (id, status, duration) => ipcRenderer.invoke('aria:persona-render', id, status, duration),
+  communicationPreferences: () => ipcRenderer.invoke('aria:communication-preferences'),
+  reviewCommunicationPreference: (id, accept) => ipcRenderer.invoke('aria:review-communication-preference', id, accept),
   memoryStatus: () => ipcRenderer.invoke('aria:memory-status'),
   memoryDiagnostics: () => ipcRenderer.invoke('aria:memory-diagnostics'),
   saveMemorySettings: (settings, allowAutoRecall) =>

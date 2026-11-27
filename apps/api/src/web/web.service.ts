@@ -152,7 +152,7 @@ export class ResearchRun {
       }
     }
     throw new ToolError('INVALID_REFERENCE',
-      'Use an exact user-provided destination or a source returned by a completed dependency.',
+      'Use an exact user-provided destination or copy sourceId and producerStepId from a completed tool result. A failed search provides no verified destination.',
       'DESTINATION_UNVERIFIED',
     );
   }

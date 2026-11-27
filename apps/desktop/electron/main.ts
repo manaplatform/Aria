@@ -6,6 +6,7 @@ import {
   ipcMain,
   Menu,
   nativeImage,
+  nativeTheme,
   Notification,
   powerMonitor,
   screen,
@@ -35,6 +36,7 @@ import { BrowserController } from './browser/controller';
 import { openBrowserBridge } from './browser/bridge';
 import { CapabilityStorage, openCapabilityBridge } from './capability-storage';
 import { WebSettingsStorage } from './web-settings-storage';
+import { WeatherService } from './weather';
 import { ProviderStorage } from './provider-storage';
 import {
   browserCommandSchema,
@@ -50,6 +52,8 @@ import {
   effectSchema,
   modelReference,
   memoryClear,
+  resolvePersona,
+  presentationActionRequest,
   memoryCategory,
   memoryManagementSearch,
   memoryOperations,
@@ -80,7 +84,11 @@ import {
   registryInputSchema,
   selectChatContext,
   programSettingsSchema,
+  weatherOperations,
+  weatherSettingsSchema,
+  type WeatherOperation,
 } from '@aria/shared';
+import { personaAction } from './persona-actions';
 import { ChatService } from './chat-service';
 import { Diagnostics } from './diagnostics/service';
 import { diagnosticConfigSchema, diagnosticFilterSchema } from '@aria/shared';
@@ -143,6 +151,7 @@ let appIcon: NativeImage | undefined;
 let dataDirectory = '';
 let storage: LocalStorage;
 let webSettings: WebSettingsStorage;
+let weather: WeatherService;
 let capabilities: CapabilityStorage;
 let browser: BrowserController;
 let provider: ProviderStorage;
@@ -247,6 +256,7 @@ function personalizationContext(): UserPersonalization | undefined {
   const payload: UserPersonalization = {
     ...(profileName && profileName !== 'You' ? { profileName } : {}),
     ...(profileBio ? { profileBio } : {}),
+    persona: prefs.persona ?? {},
     ...(responseStyle && responseStyle !== 'balanced' ? { responseStyle } : {}),
     ...(communicationLanguage && communicationLanguage !== 'auto' ? { communicationLanguage } : {}),
   };
@@ -471,6 +481,10 @@ const toolList = z
           artifacts: z.boolean().optional(),
           budget: webBudgetKeySchema.optional(),
           requiredModelCapabilities: z.array(z.string().max(40)).max(8).optional(),
+          mechanism: z.enum(['native_api', 'web_search', 'web_content', 'browser', 'connected_service', 'local', 'model']).optional(),
+          network: z.enum(['required', 'optional', 'none']).optional(),
+          cost: z.enum(['free', 'may_incur_cost', 'unknown']).optional(),
+          latency: z.enum(['low', 'network', 'variable']).optional(),
         })
         .optional(),
       inputHint: z
@@ -672,6 +686,46 @@ function registerIpc(): void {
   }));
   handle('aria:active-chat-messages', () => [...activeMessages.values()].filter((message) =>
     savedConversation(message.conversationId)));
+  const presentationMessage = (conversationId: string, messageId: string) => {
+    if (!savedConversation(conversationId)) return undefined;
+    const projected = activeMessages.get(messageId);
+    return projected?.conversationId === conversationId ? projected
+      : initial.data.chat.messages.find((message) => message.id === messageId && message.conversationId === conversationId);
+  };
+  handle('aria:persona-action', async (input) => {
+    if (!mainWindow) throw new Error('Open the conversation to use this action.');
+    const parsed = presentationActionRequest.parse(input);
+    const started = performance.now();
+    const message = presentationMessage(parsed.conversationId, parsed.messageId);
+    let status = 'rejected';
+    try {
+      const theme = initial.data.preferences.theme;
+      const result = await personaAction(parsed, presentationMessage, mainWindow,
+        theme === 'dark' || (theme === 'system' && nativeTheme.shouldUseDarkColors));
+      status = result.kind;
+      return result;
+    } finally {
+      if (message && savedConversation(message.conversationId))
+        diagnostics?.log('debug', 'chat', 'persona', 'persona.action', {
+          conversationId: message.conversationId, requestId: message.requestId,
+          executionId: message.execution?.executionId, generation: message.execution?.generation,
+        }, { status, durationMs: performance.now() - started }, temporaryConversations.has(message.conversationId));
+    }
+  });
+  handle('aria:persona-render', (id, input, timing) => {
+    const messageId = identifier.parse(id);
+    const status = z.enum(['rendered', 'failed']).parse(input);
+    const durationMs = z.number().min(0).max(30_000).parse(timing);
+    const message = activeMessages.get(messageId) ?? initial.data.chat.messages.find((item) => item.id === messageId);
+    if (message?.presentation?.length && savedConversation(message.conversationId))
+      diagnostics?.log('debug', 'renderer', 'persona', 'persona.render', {
+        conversationId: message.conversationId, requestId: message.requestId,
+        executionId: message.execution?.executionId, generation: message.execution?.generation,
+      }, { status, durationMs }, temporaryConversations.has(message.conversationId));
+  });
+  handle('aria:communication-preferences', () => memory.communicationPreferences());
+  handle('aria:review-communication-preference', (id, accept) =>
+    memory.reviewCommunicationPreference(z.string().regex(/^[0-9a-f]{64}$/).parse(id), z.boolean().parse(accept)));
   handle('aria:memory-status', () => memory.status());
   handle('aria:memory-diagnostics', () => memory.diagnosticSnapshot());
   handle('aria:save-memory-settings', (input, rawConsent) => {
@@ -792,8 +846,13 @@ function registerIpc(): void {
         }
         const previousMessages = new Map(previous.chat.messages.map((item) => [item.id, item]));
         for (const item of parsed.chat.messages) {
-          if (!item.memoryReferences?.length) continue;
           const old = previousMessages.get(item.id);
+          const projected = activeMessages.get(item.id);
+          const trusted = projected?.requestId === item.requestId && projected.conversationId === item.conversationId
+            ? projected : old?.requestId === item.requestId && old.conversationId === item.conversationId ? old : undefined;
+          item.presentation = item.role === 'assistant' ? trusted?.presentation?.filter((part) => part.offset <= item.content.length) : undefined;
+          if (!item.presentation?.length) item.presentationState = undefined;
+          if (!item.memoryReferences?.length) continue;
           const permitted = item.memoryReferences.filter((id) =>
             old?.memoryReferences?.includes(id) || memory.canInspect(item.conversationId, id, item.id));
           item.memoryReferences = permitted.length ? permitted : undefined;
@@ -812,8 +871,10 @@ function registerIpc(): void {
         syncTray(Boolean(mergedData.preferences.minimizeToTray) || Boolean(proactive?.background()));
         for (const message of parsed.chat.messages) {
           const projection = activeMessages.get(message.id);
-          if (projection?.requestId === message.requestId && message.sequence >= projection.sequence &&
-              !chat.activeTurn(message)) activeMessages.delete(message.id);
+          if (projection?.requestId !== message.requestId || projection.conversationId !== message.conversationId) continue;
+          if (message.sequence >= projection.sequence && !chat.activeTurn(message)) activeMessages.delete(message.id);
+          else if (message.presentationState && projection.presentation?.length)
+            activeMessages.set(message.id, { ...projection, presentationState: message.presentationState });
         }
         for (const { id } of parsed.chat.conversations) pendingChatProjects.delete(id);
         void drainMemoryOutbox();
@@ -983,6 +1044,14 @@ function registerIpc(): void {
     await changeCapabilities(() => computerRuntime.closeLocalSessions(), async () => undefined);
   });
   handle('aria:web-settings', () => webSettings.get());
+  handle('aria:weather-settings', () => weather.settings());
+  handle('aria:save-weather-settings', (input) => {
+    const parsed = weatherSettingsSchema.parse(input);
+    return parsed.enabled !== weather.settings().enabled || parsed.provider !== weather.settings().provider
+      ? changeCapabilities(() => weather.configure(parsed), async () => weather.settings())
+      : weather.configure(parsed);
+  });
+  handle('aria:clear-weather-cache', () => weather.clearCache());
   handle('aria:save-web-settings', async (input) => {
     const parsed = webSettingsInputSchema.parse(input);
     const previous = webSettings.get();
@@ -2108,7 +2177,8 @@ app
       () => { workingContext.clear(); proactive?.invalidateMemory(); }, purgeMemoryOutbox, () => chat.executionIdentity(),
       (event, detail) => diagnostics?.log(event.includes('failed') || event.includes('timed_out') || event.includes('exited') ? 'error'
         : event.startsWith('worker.') ? 'info' : 'debug', 'memory', 'worker', `memory.${event}`,
-        {}, { capability: detail?.method, durationMs: detail?.durationMs }));
+        {}, { capability: detail?.method, durationMs: detail?.durationMs }),
+      () => resolvePersona(initial.data.preferences.persona).learnPreferences);
     void memory.start().then(drainMemoryOutbox);
     const memoryDrainTimer = setInterval(() => void drainMemoryOutbox(), 4000);
     memoryDrainTimer.unref();
@@ -2129,6 +2199,9 @@ app
     }
     webSettings = new WebSettingsStorage(directory);
     await webSettings.load();
+    weather = new WeatherService(directory, (event, metadata, context) =>
+      diagnostics?.log(event === 'validation_failed' ? 'warn' : 'debug', 'desktop', 'weather', `weather.${event}`, context, metadata));
+    await weather.load();
     browser = new BrowserController(directory, () => webSettings.get(), approve, () => diagnostics?.log('error', 'browser', 'lifecycle', 'browser.renderer_gone'));
     await browser.load();
     virtualComputer = new VirtualComputer(() => executionRuntime.settings(), directory);
@@ -2239,7 +2312,7 @@ app
             `chat.${event.type}`, context, {}, temporary);
         }
         const references = memory.event(event);
-        const visible = event.type === 'completed' && 'run' in event ? {
+        const visible = event.type === 'completed' ? {
           type: event.type, requestId: event.requestId, conversationId: event.conversationId,
           assistantMessageId: event.assistantMessageId, sequence: event.sequence,
           executionId: event.executionId, generation: event.generation,
@@ -2325,6 +2398,7 @@ app
         policy: (registry) => ({
           ...runtimePolicy(registry),
           desktopRuntime: true,
+          weatherEnabled: weather.settings().enabled,
           dockerConfigured: Boolean(executionRuntime.settings().engineSocket.trim()),
           workspacesCount: initial.data.workspaces.length,
           connectors: [
@@ -2402,6 +2476,7 @@ app
                   live: () => Boolean(chat.authorizeRuntime(request) &&
                     (!job || proactive?.supervisor.live(request.requestId, request.conversationId))),
                 })).then(async (result) => {
+                  if (result.privateContent) chat.markPrivateRuntimeContent(request.requestId);
                   if (job && result.privateContent) proactive?.markPrivate(job.jobId);
                   const evidence = githubResult.safeParse(result.data);
                   if (job && evidence.success && evidence.data.verified)
@@ -2426,6 +2501,22 @@ app
                   });
                 throw new Error('This operation is outside the background grant.');
               }
+              if (Object.hasOwn(weatherOperations, request.operation)) {
+                if (request.programId || chat.temporaryForTurn(request.requestId) || chat.privateContextForTurn(request.requestId))
+                  throw new Error('Weather is unavailable for this execution or private context.');
+                const started = Date.now();
+                const execution = chat.executionForTurn(request.requestId);
+                const context = { conversationId: request.conversationId, requestId: request.requestId, operationId: request.stepId,
+                  ...(execution && { executionId: execution.executionId, generation: execution.generation }) };
+                diagnostics?.log('info', 'desktop', 'weather', 'weather.execution_started', context, { capability: request.operation, provider: 'met_norway' });
+                return weather.dispatch(request.operation as WeatherOperation, request.input, signal, context).then((data) => {
+                  diagnostics?.log('info', 'desktop', 'weather', 'weather.execution_completed', context, { capability: request.operation, durationMs: Date.now() - started });
+                  return { data };
+                }, (error: unknown) => {
+                  diagnostics?.log('warn', 'desktop', 'weather', 'weather.execution_failed', context, { capability: request.operation, durationMs: Date.now() - started, status: signal.aborted ? 'cancelled' : 'failed' });
+                  throw error;
+                });
+              }
               if (request.programId)
                 executionRuntime.store.assertProgramChild(request, chat.executionIdentity());
               return approvals.within({
@@ -2433,9 +2524,10 @@ app
                 operation: request.operation,
                 binding: [request.revision, request.primary, request.input, request.programId],
               }, () => {
-                if (request.operation.startsWith('memory.')) return memory.dispatch(request, signal);
-                return request.operation.startsWith('computer.') ? computerRuntime.dispatch(request, signal)
+                const result = request.operation.startsWith('memory.') ? memory.dispatch(request, signal)
+                  : request.operation.startsWith('computer.') ? computerRuntime.dispatch(request, signal)
                   : executionRuntime.dispatch(request, signal);
+                return result.then((value) => { if (value.privateContent) chat.markPrivateRuntimeContent(request.requestId); return value; });
               });
             },
             (request, signal) => {

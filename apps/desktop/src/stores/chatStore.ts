@@ -13,9 +13,17 @@ import { flushPersistence, useWorkspaceStore } from './workspaceStore';
 import { notify } from './uiStore';
 import { applyLiveEvent, endLiveVoice, useLiveVoiceStore } from './liveVoiceStore';
 
-export const useChatStore = create<{ status: ChatServiceStatus }>(() => ({
-  status: { state: 'starting', configured: false, model: '' },
-}));
+function createChatStatusStore() {
+  return create<{ status: ChatServiceStatus }>(() => ({
+    status: { state: 'starting', configured: false, model: '' },
+  }));
+}
+
+// Vite can load a fresh module URL while mounted components still use the existing store.
+const hotData = import.meta.hot?.data as { chatStatusStore?: ReturnType<typeof createChatStatusStore> } | undefined;
+export const useChatStore = hotData?.chatStatusStore ?? createChatStatusStore();
+if (hotData) hotData.chatStatusStore = useChatStore;
+
 export const generating = (message: ChatMessage) =>
   message.status === 'pending' || message.status === 'streaming';
 export function updateChat(update: (chat: ChatData) => ChatData): void {
@@ -177,24 +185,21 @@ async function submitRequest(request: ChatRequest): Promise<void> {
     });
   }
 }
-export async function sendChat(suggestion?: string): Promise<void> {
+export function sendingAllowed(conversationId: string | null): boolean {
   const { status } = useChatStore.getState();
-  if (
-    status.state !== 'ready' ||
-    !status.configured ||
-    useLiveVoiceStore.getState().phase !== 'idle'
-  )
-    return;
+  return status.state === 'ready' && status.configured &&
+    useLiveVoiceStore.getState().phase === 'idle' &&
+    !useWorkspaceStore.getState().data.chat.messages.some((item) =>
+      item.conversationId === conversationId && generating(item));
+}
+export async function sendChat(suggestion?: string): Promise<void> {
   const chat = useWorkspaceStore.getState().data.chat;
   const selected = chat.conversations.find((item) => item.id === chat.selectedId);
+  if (!sendingAllowed(selected?.id ?? null)) return;
   const prompt = (suggestion ?? (selected?.draft ?? chat.newDraft)).trim();
   const attachments = suggestion ? [] : selected?.attachments ?? chat.newAttachments ?? [];
   const text = prompt || (attachments.length ? 'See attached files.' : '');
-  if (
-    !text ||
-    chat.messages.some((item) => item.conversationId === selected?.id && generating(item))
-  )
-    return;
+  if (!text) return;
   if (!selected && chat.conversations.length >= 500) {
     notify(
       'You have reached the limit of 500 conversations. Delete a conversation to start another.',
@@ -306,6 +311,8 @@ export async function regenerateChat(id: string, expectedRevision?: string): Pro
             ...item,
             requestId,
             content: '',
+            presentation: undefined,
+            presentationState: undefined,
             assets: undefined,
             operation: undefined,
             run: undefined,

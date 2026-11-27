@@ -301,3 +301,25 @@ it('filters elapsed retention immediately and paginates beyond the retrieval can
   } while (cursor);
   expect(seen.size).toBe(188);
 });
+
+it('holds communication preferences for review, then scopes, corrects, and fences them', () => {
+  const epoch = enabled();
+  const quote = 'I generally prefer concise release notes.';
+  const proposal: MemoryIntake = { ...event(epoch, []), communication: [{ dimension: 'detail', quote }] };
+  store.enqueue([proposal]);
+  expect(store.process()).toBe(1);
+  expect(store.search(management, { query: 'concise release' }).records).toHaveLength(0);
+  const [pending] = store.communicationPreferences().proposals;
+  expect(pending).toMatchObject({ quote, source });
+  store.reviewCommunicationPreference(pending.id, true, epoch);
+  const [saved] = store.communicationPreferences().records;
+  expect(saved).toMatchObject({ confirmation: 'confirmed', sources: [source], value: { content: quote } });
+  expect(store.search({ communication: false }, { query: 'concise release' }).records).toHaveLength(0);
+  expect(store.read(saved.id, { communication: false })).toBeUndefined();
+  const corrected = store.edit(saved.id, saved.revision, { ...saved.value, content: 'I prefer concise notes for patch releases.' }, management);
+  expect(store.communicationPreferences().records[0]?.id).toBe(corrected.id);
+  store.forget(corrected.id, corrected.revision, management);
+  store.enqueue([{ ...event(enabled(), []), communication: proposal.communication }]);
+  store.process();
+  expect(store.communicationPreferences()).toEqual({ proposals: [], records: [] });
+});

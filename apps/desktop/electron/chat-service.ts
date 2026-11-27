@@ -59,6 +59,7 @@ interface ActiveRequest {
   proactive?: ProactiveRequest;
   controller: AbortController;
   stopped: boolean;
+  privateRuntimeContent?: boolean;
   sequence: number;
   length: number;
   done: Promise<void>;
@@ -403,6 +404,14 @@ export class ChatService {
   }
   proactiveForTurn(id: string) { return this.requests.get(id)?.proactive; }
   temporaryForTurn(id: string) { return this.requests.get(id)?.request.memory?.temporary === true; }
+  privateContextForTurn(id: string) {
+    const turn = this.requests.get(id);
+    return !turn || turn.privateRuntimeContent === true || turn.request.programPrivateHistory === true || turn.request.memory?.privateHistory === true;
+  }
+  markPrivateRuntimeContent(id: string) {
+    const turn = this.requests.get(id);
+    if (turn) turn.privateRuntimeContent = true;
+  }
 
   async runProactive(input: ProactiveRequest, signal: AbortSignal, emit: (event: ChatEvent) => void) {
     const run = proactiveRequestSchema.parse(input);

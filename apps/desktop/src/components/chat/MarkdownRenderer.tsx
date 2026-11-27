@@ -84,6 +84,7 @@ export default function MarkdownRenderer({
   onMemory,
   rich = false,
   streaming = false,
+  passive = false,
 }: {
   content: string;
   sources?: ConductorSource[];
@@ -94,16 +95,17 @@ export default function MarkdownRenderer({
   onMemory?: (id: string) => void;
   rich?: boolean;
   streaming?: boolean;
+  passive?: boolean;
 }): ReactNode {
   return (
-    <div className={rich ? 'markdown reply-markdown' : 'markdown'}>
+    <div className={rich ? 'markdown reply-markdown' : 'markdown'} dir="auto">
       <ReactMarkdown
         remarkPlugins={
           rich
             ? [
                 remarkGfm,
                 [remarkMath, { singleDollarTextMath: false }],
-                [replyMarkdown, { streaming }],
+                ...(!passive ? [[replyMarkdown, { streaming }] as [typeof replyMarkdown, { streaming: boolean }]] : []),
               ]
             : [remarkGfm]
         }
@@ -118,7 +120,7 @@ export default function MarkdownRenderer({
           code: MarkdownCode,
           ...(rich && { table: MarkdownTable }),
           a: ({ href, children }) =>
-            href?.startsWith('aria-memory:') && memoryIds.includes(href.slice(12)) ? (
+            passive ? <>{children}</> : href?.startsWith('aria-memory:') && memoryIds.includes(href.slice(12)) ? (
               <button className="document-evidence-link" type="button" onClick={() => onMemory?.(href.slice(12))}>
                 {children}
               </button>
