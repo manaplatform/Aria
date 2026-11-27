@@ -39,6 +39,7 @@ import { DocumentLibrary } from './library';
 import { Knowledge, type SearchFile } from './knowledge';
 import { RemoteEmbeddings } from './remote-embeddings';
 import { DockerSandbox, sandboxImage } from './sandbox';
+import { LocalShell, localShellSupported } from './local-shell';
 import { digest, RuntimeError, RuntimeStore } from './store';
 import { ProgramRuntime } from './programs';
 
@@ -74,6 +75,7 @@ export class DesktopRuntime {
   readonly library: DocumentLibrary;
   readonly embeddings: LocalEmbeddings;
   readonly programs = new ProgramRuntime();
+  private readonly localShell: LocalShell;
   private engine?: DockerSandbox;
   private readonly busy = new Set<string>();
   private readonly grants = new Map<string, Set<string>>();
@@ -92,12 +94,14 @@ export class DesktopRuntime {
     private readonly providerIdentity: () => string | undefined,
     private readonly resolveRegistry: () => Promise<RuntimeRegistry>,
     private readonly programCipher: SecretCipher,
+    private readonly restrictedLocalShellContext: (requestId: string) => boolean,
     private readonly workspaces: () => { id: string; name: string; root: string; branch: string | null }[] = () => [],
   ) {
     this.store = skills.runtimeStore;
     this.knowledge = new Knowledge(this.store, extractDocument);
     this.library = new DocumentLibrary(directory, this.store);
     this.embeddings = new LocalEmbeddings(directory);
+    this.localShell = new LocalShell(directory);
   }
 
   history(): ExecutionHistoryEntry[] {
@@ -136,7 +140,7 @@ export class DesktopRuntime {
         next.embeddingTarget.model !== previous.embeddingTarget?.model)
     )
       await this.verifyEmbeddingTarget(next.embeddingTarget);
-    if (previous.engineSocket !== next.engineSocket) await this.sweep(true);
+    if (previous.engineSocket !== next.engineSocket) await this.sweep(this.sandbox(), true);
     this.store.settings = next;
     await this.expireArtifacts();
   }
@@ -163,7 +167,13 @@ export class DesktopRuntime {
     return this.engine;
   }
 
-  async inspect(signal: AbortSignal) {
+  async inspect(signal: AbortSignal, backend = localShellSupported ? 'local' : 'managed') {
+    if (backend === 'local')
+      return {
+        backend,
+        ...await this.localShell.probe(signal),
+        commandMs: this.store.settings.commandMs,
+      };
     const engine = this.sandbox();
     const probe = await engine.probe(AbortSignal.any([signal, AbortSignal.timeout(8000)]));
     return {
@@ -189,7 +199,11 @@ export class DesktopRuntime {
     return JSON.stringify(JSON.parse(result), null, 2);
   }
 
-  async dispatch(request: RuntimeRequest, signal: AbortSignal): Promise<RuntimeResult> {
+  async dispatch(
+    request: RuntimeRequest,
+    signal: AbortSignal,
+    onApproval?: () => void,
+  ): Promise<RuntimeResult> {
     if (request.voiceSessionId)
       throw new RuntimeError('PERMISSION_DENIED', 'Open desktop chat to use the runtime.');
     signal.throwIfAborted();
@@ -341,8 +355,10 @@ export class DesktopRuntime {
           signal,
         );
       }
-      case 'shell.inspect':
-        return { data: await this.inspect(signal) };
+      case 'shell.inspect': {
+        const { backend } = checked(runtimeOperations[request.operation].safeParse(request.input));
+        return { data: await this.inspect(signal, backend) };
+      }
       case 'files.read_document': {
         const { fileId, offset } = checked(
           runtimeOperations[request.operation].safeParse(request.input),
@@ -412,13 +428,14 @@ Skills: ${[...references, ...inline].join(', ') || 'none'}`,
             input.commands.map((command) => ['/bin/sh', '-c', command]),
             input.timeoutMs,
             signal,
+            onApproval,
           ),
         );
       }
       case 'shell.fetch': {
         const input = checked(runtimeOperations[request.operation].safeParse(request.input));
         return this.lock(input.sessionId, async () => {
-          const engine = this.authorizeSession(request, input.sessionId);
+          const engine = this.authorizeManagedSession(request, input.sessionId);
           if (
             !(await this.approve(
               'Download a workspace file?',
@@ -443,7 +460,7 @@ Skills: ${[...references, ...inline].join(', ') || 'none'}`,
       case 'skills.run_script': {
         const input = checked(runtimeOperations[request.operation].safeParse(request.input));
         return this.lock(input.sessionId, async () => {
-          const engine = this.authorizeSession(request, input.sessionId);
+          const engine = this.authorizeManagedSession(request, input.sessionId);
           const script = await this.skills.executionScript(input.skill, input.scriptId, signal);
           if (!script)
             throw new RuntimeError(
@@ -554,7 +571,7 @@ Skills: ${[...references, ...inline].join(', ') || 'none'}`,
               request.requestId,
               request.stepId,
               input.sessionId,
-              'managed',
+              engine instanceof LocalShell ? 'local-shell' : 'managed',
             );
             return { artifact: { ...asset, storage: 'desktop' } };
           } catch (error) {
@@ -956,9 +973,17 @@ ${files
     input: RuntimeArgs<'shell.open'>,
     signal: AbortSignal,
   ) {
-    const engine = this.sandbox();
+    const engine = input.backend === 'local' ? this.localShell : this.sandbox();
+    const local = engine instanceof LocalShell;
+    if (local) {
+      this.requireLocalShellScope(request);
+      if (input.inputs?.length)
+        throw new RuntimeError('INVALID_ARGUMENT', 'Use a managed workspace to stage chat attachments.');
+    }
     await engine.probe(AbortSignal.any([signal, AbortSignal.timeout(8000)]));
-    await this.sweep();
+    await this.sweep(engine);
+    if (engine !== this.localShell) await this.sweep(this.localShell);
+    signal.throwIfAborted();
     const db = this.store.db;
     const files: SearchFile[] = [];
     for (const id of new Set(input.inputs ?? []))
@@ -973,9 +998,16 @@ ${files
         )
         .get(request.conversationId, engine.endpoint, binding)?.id ?? '',
     );
-    if (id && !(await engine.owns(id, engine.profile(this.directory), signal))) {
-      await this.retire(id, engine);
-      id = '';
+    if (id) {
+      const current = id;
+      id = await this.lock(current, async () => {
+        const owns = local ? await engine.owns(current)
+          : await engine.owns(current, engine.profile(this.directory), signal);
+        if (owns) return current;
+        signal.throwIfAborted();
+        await this.retire(current, engine);
+        return '';
+      });
     }
     let environment: Record<string, unknown> | undefined;
     if (!id) {
@@ -994,14 +1026,18 @@ ${files
         Date.now(),
         Date.now(),
       );
-      try {
-        environment = await engine.create(id, engine.profile(this.directory), signal);
-      } catch (error) {
-        await this.retire(id, engine);
-        throw error;
-      }
+      const created = id;
+      await this.lock(created, async () => {
+        try {
+          if (local) await engine.create(created, signal);
+          else environment = await engine.create(created, engine.profile(this.directory), signal);
+        } catch (error) {
+          await this.retire(created, engine);
+          throw error;
+        }
+      });
       this.sweepTimer ??= setInterval(() => {
-        void this.sweep().catch(() => undefined);
+        void Promise.allSettled([this.sweep(this.sandbox()), this.sweep(this.localShell)]);
       }, 60_000);
       this.sweepTimer.unref();
     }
@@ -1010,17 +1046,19 @@ ${files
     return this.lock(id, async () => {
       this.authorizeSession(request, workspaceId);
       const paths: { id: string; path: string }[] = [];
-      for (const { asset, bytes } of files) {
-        const suffix = path
-          .extname(asset.name)
-          .slice(0, 12)
-          .replace(/[^a-zA-Z.0-9]/g, '');
-        const simple = asset.name.replace(/[^\p{L}\p{N}_. -]/gu, '_').slice(0, 100);
-        const name = workspaceFilename.safeParse(simple).success
-          ? `${asset.id}-${simple}`
-          : `${asset.id}${suffix}`;
-        await this.stage(workspaceId, asset.id, name, bytes, engine, signal);
-        paths.push({ id: asset.id, path: `/workspace/inputs/${name}` });
+      if (!local) {
+        for (const { asset, bytes } of files) {
+          const suffix = path
+            .extname(asset.name)
+            .slice(0, 12)
+            .replace(/[^a-zA-Z.0-9]/g, '');
+          const simple = asset.name.replace(/[^\p{L}\p{N}_. -]/gu, '_').slice(0, 100);
+          const name = workspaceFilename.safeParse(simple).success
+            ? `${asset.id}-${simple}`
+            : `${asset.id}${suffix}`;
+          await this.stage(workspaceId, asset.id, name, bytes, engine, signal);
+          paths.push({ id: asset.id, path: `/workspace/inputs/${name}` });
+        }
       }
       return {
         data: {
@@ -1028,8 +1066,8 @@ ${files
           backend: input.backend,
           ...environment,
           inputs: paths,
-          workingDirectory: '/workspace/working',
-          outputDirectory: '/workspace/outputs',
+          workingDirectory: local ? '.' : '/workspace/working',
+          outputDirectory: local ? '../outputs' : '/workspace/outputs',
         },
         privateContent: files.length > 0,
       };
@@ -1068,25 +1106,25 @@ ${files
   }
 
   private authorizeSession(request: RuntimeRequest, id: string) {
-    const engine = this.sandbox();
     const identity = this.providerIdentity();
     const binding = identity ? digest(`${identity}/${request.revision}`) : null;
     const found = this.store.db
       .prepare(
-        "SELECT 1 FROM sessions WHERE id = ? AND conversation = ? AND engine = ? AND provider = ? AND state = 'active' AND touched > ?",
+        "SELECT engine FROM sessions WHERE id = ? AND conversation = ? AND provider = ? AND state = 'active' AND touched > ?",
       )
       .get(
         id,
         request.conversationId,
-        engine.endpoint,
         binding,
         Date.now() - executionLimits.idleMs,
       );
-    if (!found || this.unavailable.has(id) || !this.verified.has(id))
+    const engine = found?.engine === this.localShell.endpoint ? this.localShell : this.sandbox();
+    if (!found || found.engine !== engine.endpoint || this.unavailable.has(id) || !this.verified.has(id))
       throw new RuntimeError(
         'CAPABILITY_UNAVAILABLE',
         'This authorized workspace expired or is unavailable. Prepare a fresh workspace.',
       );
+    if (engine instanceof LocalShell) this.requireLocalShellScope(request);
     const scoped = this.scopeAssets(request.conversationId);
     const staged = this.store.db
       .prepare("SELECT asset FROM staged_inputs WHERE session = ? AND area = 'inputs'")
@@ -1106,6 +1144,21 @@ ${files
       );
     this.store.db.prepare('UPDATE sessions SET touched = ? WHERE id = ?').run(Date.now(), id);
     return engine;
+  }
+
+  private authorizeManagedSession(request: RuntimeRequest, id: string) {
+    const engine = this.authorizeSession(request, id);
+    if (engine instanceof LocalShell)
+      throw new RuntimeError('CAPABILITY_UNAVAILABLE', 'This operation requires an isolated managed workspace.');
+    return engine;
+  }
+
+  private requireLocalShellScope(request: RuntimeRequest) {
+    if (request.programId || this.restrictedLocalShellContext(request.requestId))
+      throw new RuntimeError(
+        'PERMISSION_DENIED',
+        'Local Shell requires a direct chat operation without private memory or connector evidence.',
+      );
   }
 
   private async lock<T>(id: string, operation: () => Promise<T>) {
@@ -1128,8 +1181,19 @@ ${files
     commands: string[][],
     requestedMs: number | undefined,
     signal: AbortSignal,
+    onApproval?: () => void,
   ) {
     const engine = this.authorizeSession(request, id);
+    const local = engine instanceof LocalShell;
+    if (local) {
+      if (commands.length !== 1 || commands[0][2].includes('\0'))
+        throw new RuntimeError('INVALID_ARGUMENT', 'Submit one local shell command without null bytes.');
+      onApproval?.();
+      if (!(await this.approve('Run a command on this desktop?', engine.review(id, commands[0][2]), signal)))
+        throw new RuntimeError('PERMISSION_DENIED', 'The local command was declined.');
+      signal.throwIfAborted();
+      this.requireLocalShellScope(request);
+    }
     const maxMs = Math.min(requestedMs ?? 30_000, this.store.settings.commandMs);
     const started = Date.now();
     const results: Record<string, unknown>[] = [];
@@ -1142,7 +1206,9 @@ ${files
       const attempt = this.store.begin(request, id, [id, command]);
       const start = Date.now();
       try {
-        const result = await engine.run(id, command, signal, remaining);
+        const result = local
+          ? await engine.run(id, command[2], signal, remaining)
+          : await engine.run(id, command, signal, remaining);
         exit = result.code;
         const outcome = result.timedOut
           ? 'timeout'
@@ -1153,7 +1219,7 @@ ${files
               : 'exit';
         this.store.finish(
           attempt,
-          outcome === 'exit' ? (exit === 0 ? 'completed' : 'failed') : outcome,
+          outcome === 'exit' ? (exit === 0 ? 'completed' : 'failed') : local ? 'uncertain' : outcome,
           exit ?? undefined,
         );
         if (result.recycled) await this.retire(id, engine);
@@ -1205,7 +1271,7 @@ ${files
     };
   }
 
-  private async retire(id: string, engine: DockerSandbox) {
+  private async retire(id: string, engine: DockerSandbox | LocalShell) {
     this.unavailable.add(id);
     this.verified.delete(id);
     const removed = await engine.remove(id);
@@ -1215,8 +1281,8 @@ ${files
     this.unavailable.delete(id);
   }
 
-  private async sweep(all = false) {
-    const engine = this.sandbox();
+  private async sweep(engine: DockerSandbox | LocalShell, all = false) {
+    if (engine instanceof DockerSandbox && engine.endpoint === this.localShell.endpoint) return;
     const idle = all ? Date.now() + 1 : Date.now() - executionLimits.idleMs;
     const rows = this.store.db
       .prepare(
@@ -1239,7 +1305,7 @@ ${files
     request: string,
     step: string,
     session: string,
-    provenance: 'managed' | 'openai-shell' | 'computer' | 'conductor',
+    provenance: 'managed' | 'local-shell' | 'openai-shell' | 'computer' | 'conductor',
   ) {
     this.store.db
       .prepare('INSERT INTO artifacts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
@@ -1541,7 +1607,7 @@ ${files
     this.embeddings.close();
     if (this.sweepTimer) {
       clearInterval(this.sweepTimer);
-      await this.sweep(true);
+      await Promise.all([this.sweep(this.sandbox(), true), this.sweep(this.localShell, true)]);
     }
     this.store.close();
   }

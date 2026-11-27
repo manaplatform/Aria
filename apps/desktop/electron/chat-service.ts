@@ -60,6 +60,7 @@ interface ActiveRequest {
   controller: AbortController;
   stopped: boolean;
   privateRuntimeContent?: boolean;
+  restrictedShellContent?: boolean;
   sequence: number;
   length: number;
   done: Promise<void>;
@@ -408,9 +409,16 @@ export class ChatService {
     const turn = this.requests.get(id);
     return !turn || turn.privateRuntimeContent === true || turn.request.programPrivateHistory === true || turn.request.memory?.privateHistory === true;
   }
-  markPrivateRuntimeContent(id: string) {
+  restrictedLocalShellContext(id: string) {
     const turn = this.requests.get(id);
-    if (turn) turn.privateRuntimeContent = true;
+    return !turn || turn.restrictedShellContent === true || turn.request.memory?.privateHistory === true;
+  }
+  markPrivateRuntimeContent(id: string, restrictLocalShell = false) {
+    const turn = this.requests.get(id);
+    if (turn) {
+      turn.privateRuntimeContent = true;
+      if (restrictLocalShell) turn.restrictedShellContent = true;
+    }
   }
 
   async runProactive(input: ProactiveRequest, signal: AbortSignal, emit: (event: ChatEvent) => void) {

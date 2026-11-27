@@ -36,13 +36,15 @@ export const runtimeOperations = {
   ...weatherOperations,
   ...computerOperations,
   ...memoryOperations,
-  'shell.inspect': z.strictObject({}),
+  'shell.inspect': z.strictObject({
+    backend: z.enum(['local', 'managed']).optional(),
+  }),
   'shell.open': z.strictObject({
     inlineSkills: z
       .array(z.strictObject({ id: z.string().max(100), version: z.string().max(100) }))
       .max(2)
       .optional(),
-    backend: z.enum(['managed', 'openai-local', 'openai-hosted']),
+    backend: z.enum(['local', 'managed', 'openai-local', 'openai-hosted']),
     allowDomains: z
       .array(
         z

@@ -288,17 +288,17 @@ const runtimeDescriptions: Record<RuntimeOperation, readonly [string, string, To
   ],
   'shell.inspect': [
     'Inspect execution environments',
-    'Check the configured sandbox, available runtimes and limits before choosing commands.',
+    'Check Shell availability and limits. In supported desktop chats, omit backend to inspect the local shell; select managed to inspect the offline Docker workspace.',
     'read',
   ],
   'shell.open': [
     'Prepare execution workspace',
-    'Explicitly select a verified managed or OpenAI Shell backend. Managed inputs are staged in /workspace/inputs. Hosted outputs use /mnt/data.',
+    'Choose local for approved commands on the desktop with no Docker setup, managed for offline Docker and attachment staging, or a verified OpenAI Shell mode. Use the returned working and output directories.',
     'local',
   ],
   'shell.run': [
-    'Run sandbox commands',
-    'Run ordered POSIX shell commands in /workspace/working. Put requested downloadable files in /workspace/outputs. Results include actual exit outcomes and partial output.',
+    'Run Shell commands',
+    'Run POSIX shell commands in the selected workspace. A local session accepts one command string per call and asks for exact desktop approval. Save downloadable files in the output directory returned by shell.open.',
     'local',
   ],
   'shell.fetch': [
@@ -813,6 +813,11 @@ export class ToolRegistry {
           const { primary } = context.registry;
           if (context.memoryPrivate && operation === 'shell.open' && input.backend !== 'managed')
             throw new ToolError('PERMISSION_DENIED', 'Private memory requires the isolated offline workspace.');
+          if (operation === 'shell.open' && input.backend === 'local' && context.connectorPrivate)
+            throw new ToolError('PERMISSION_DENIED', 'Local Shell is unavailable after retrieving private connector evidence.');
+          if (operation === 'shell.open' && input.backend === 'local' &&
+              (this.host.current.localShell !== true || programId || context.proactive))
+            throw new ToolError('CAPABILITY_UNAVAILABLE', 'Local Shell is available in foreground chat on macOS and Linux.');
           if (operation === 'computer.open') {
             const args = computerOperations[operation].parse(input);
             if (
@@ -961,6 +966,7 @@ export class ToolRegistry {
               },
             },
             signal,
+            (event) => { if (event === 'approval') approval(); },
           );
           if (operation.startsWith('memory.') && value.privateContent) context.memoryPrivate = true;
           if (operation === 'computer.open') {
@@ -1395,6 +1401,7 @@ export class ToolRegistry {
     }
     const requiresApproval =
       descriptor.effect === 'consequential' ||
+      (descriptor.id === 'shell.run' && policy.localShell === true) ||
       [
         'shell.fetch',
         'knowledge.search',
@@ -1409,6 +1416,7 @@ export class ToolRegistry {
     const shellUnconfigured =
       (descriptor.id === 'shell.open' || descriptor.id === 'shell.run') &&
       policy.dockerConfigured === false &&
+      policy.localShell !== true &&
       !policy.nativeRuntime?.some((feature) => feature === 'hosted-shell' || feature === 'local-shell');
     return {
       available: true,

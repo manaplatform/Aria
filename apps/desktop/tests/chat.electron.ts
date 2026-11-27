@@ -1,5 +1,6 @@
 import { test, expect } from '@playwright/test';
 import { _electron as electron, type ElectronApplication, type Page } from 'playwright';
+import type { MessageBoxOptions } from 'electron';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -1728,7 +1729,7 @@ test('keeps direct chat lazy and explains an unavailable sandbox', async () => {
 
   const prompt = 'Run a numerical calculation in the execution workspace';
   scriptRuntime(prompt, ['shell.inspect'], (result, step) => {
-    if (!step) return { name: 'shell_inspect', input: {} };
+    if (!step) return { name: 'shell_inspect', input: { backend: 'managed' } };
     const problem = result.problem as { code?: string } | undefined;
     if (problem?.code === 'CAPABILITY_UNAVAILABLE')
       fixture.finalReply(
@@ -1743,6 +1744,61 @@ test('keeps direct chat lazy and explains an unavailable sandbox', async () => {
   await expect(
     page.locator('.from-assistant').getByRole('button', { name: 'Save file', exact: true }),
   ).toHaveCount(0);
+});
+
+test('runs approved local Shell commands in ordinary chat without a Docker endpoint', async () => {
+  test.skip(process.platform !== 'darwin' && process.platform !== 'linux', 'Requires the native POSIX shell.');
+  await launch();
+  expect((await page.evaluate(() => window.aria!.runtimeSettings())).engineSocket).toBe('');
+  await app.evaluate(({ dialog }) => {
+    dialog.showMessageBox = async (_window, options?: MessageBoxOptions) => {
+      const approve = options?.message === 'Run a command on this desktop?' &&
+        options.detail?.includes('printf approved > ../outputs/approved.txt') &&
+        options.buttons?.join(',') === 'Decline,Allow once';
+      return { response: approve ? 1 : 0, checkboxChecked: false };
+    };
+  });
+  const prompt = 'Run a command on this desktop and attach its output';
+  const command = 'printf approved > ../outputs/approved.txt; uname -s';
+  let sessionId = '';
+  scriptRuntime(prompt, ['shell.inspect', 'shell.open', 'shell.run', 'artifacts.publish'], (result, step) => {
+    if (step === 0) return { name: 'shell_inspect', input: {} };
+    if (step === 1) {
+      expect(result.data).toMatchObject({ backend: 'local', runtime: '/bin/sh', network: 'host' });
+      return { name: 'shell_open', input: { backend: 'local' } };
+    }
+    if (step === 2) {
+      const workspace = result.data as { sessionId: string };
+      expect(workspace).toMatchObject({ backend: 'local', workingDirectory: '.', outputDirectory: '../outputs' });
+      sessionId = workspace.sessionId;
+      return { name: 'shell_run', input: { sessionId, commands: [command] } };
+    }
+    if (step === 3) {
+      expect(result.data).toMatchObject({
+        results: [{ exitCode: 0, stdout: process.platform === 'darwin' ? 'Darwin\n' : 'Linux\n' }],
+      });
+      return { name: 'artifacts_publish', input: { sessionId, filename: 'approved.txt' } };
+    }
+    if (result.artifact) fixture.finalReply(prompt, 'Local command completed and the file is attached.');
+  });
+  await send(prompt);
+  await expect(page.locator('.from-assistant .markdown').last()).toContainText('Local command completed');
+  await expect(page.getByText(/approved.txt ·/)).toBeVisible();
+
+  const declined = 'Try another command on this desktop';
+  scriptRuntime(declined, ['shell.run'], (result, step) => {
+    if (step === 0)
+      return {
+        name: 'shell_run',
+        input: { sessionId, commands: ['printf denied > ../outputs/denied.txt'] },
+      };
+    expect(result.problem).toMatchObject({ code: 'PERMISSION_DENIED' });
+    fixture.finalReply(declined, 'The desktop command was declined.');
+  });
+  await send(declined);
+  await expect(page.locator('.from-assistant .markdown').last()).toContainText('The desktop command was declined.');
+  await expect(fs.access(path.join(temporary, 'local-shell', sessionId, 'outputs', 'denied.txt')))
+    .rejects.toMatchObject({ code: 'ENOENT' });
 });
 
 test('recalls memory across conversations and restart, then forgets it without rebuilding from chat history', async () => {

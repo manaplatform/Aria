@@ -65,6 +65,7 @@ export const toolPolicySchema = z.strictObject({
   desktopRuntime: z.boolean().optional(),
   weatherEnabled: z.boolean().optional(),
   dockerConfigured: z.boolean().optional(),
+  localShell: z.boolean().optional(),
   localEmbeddings: z.boolean().optional(),
   workspacesCount: z.number().int().min(0).max(1000).optional(),
   connectors: z.array(connectorSummarySchema).max(32).optional(),

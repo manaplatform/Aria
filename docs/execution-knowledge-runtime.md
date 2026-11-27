@@ -2,6 +2,12 @@
 
 Conductor discovers and calls Shell, document search, executable skills, and artifact publishing through ordinary chat. Electron main checks ownership, manages local storage, prompts for transfers, and brokers execution. The model chooses when to use these operations. Part 2’s runtime is available in managed desktop text chat.
 
+## Local Shell
+
+On macOS and Linux, Shell can run `/bin/sh` directly in a conversation workspace. `shell.inspect` checks the native shell by default on these platforms. `shell.open` selects it with `backend: "local"`. Local Shell is available in foreground chat and supports publishing files written to the workspace’s `../outputs` directory.
+
+Aria shows the exact command and its starting folder in a native approval dialog before dispatch. The command runs with the desktop user’s file and network access, and its output goes to the configured primary model. Each invocation takes one command string and has a time and output limit. Use the managed workspace for offline execution, staged chat attachments, and reviewed skill scripts.
+
 ## Managed execution
 
 In **Settings → Tools → Execution and knowledge**, enter the endpoint of a local Docker Desktop Linux engine or a rootless Docker Engine on Linux with cgroups v2 and seccomp. Use a Unix socket on macOS/Linux or a Docker named pipe on Windows. The runtime reports the actual endpoint check. Install the pinned OCI image before opening a workspace.

@@ -199,8 +199,9 @@ export function RuntimeSettings() {
     <section className="settings-section" id="execution-runtime">
       <h2>Execution and knowledge</h2>
       <p className="muted">
-        Aria runs commands in an offline Linux workspace. Configure a local Docker Engine socket to
-        enable it.
+        {window.aria?.platform !== 'win32' &&
+          'Local Shell runs commands with your account’s access after you approve each command. '}
+        Configure Docker below to use an offline Linux workspace.
       </p>
       {value && (
         <>
