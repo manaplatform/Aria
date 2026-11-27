@@ -2,6 +2,7 @@ import { Cloud, CloudRain, Sun, Wind } from 'lucide-react';
 import {
   Bar,
   BarChart,
+  CartesianGrid,
   Line,
   LineChart,
   ResponsiveContainer,
@@ -13,6 +14,24 @@ import type { PresentationNode } from '@aria/shared';
 
 type Node = Extract<PresentationNode, { type: 'weather' }>;
 type Forecast = Extract<NonNullable<Node['data']>, { provider: string }>;
+const axisStyle = {
+  tick: { fill: 'var(--muted)' },
+  axisLine: { stroke: 'var(--border-strong)' },
+  tickLine: false,
+};
+const timeAxis = {
+  ...axisStyle,
+  dataKey: 'label',
+  minTickGap: 20,
+  interval: 'preserveStartEnd' as const,
+};
+const chartMargin = { left: 2, right: 12, top: 8 };
+const tooltipStyle = {
+  backgroundColor: 'var(--surface-raised)',
+  borderColor: 'var(--border)',
+  borderRadius: 8,
+  color: 'var(--foreground)',
+};
 const number = (value: number | null) =>
   value === null
     ? '—'
@@ -54,25 +73,40 @@ function HourlyForecast({ forecast }: { forecast: Forecast }) {
   const data = forecast.hourly
     .slice(0, 24)
     .map((entry) => ({ ...entry, label: format.format(new Date(entry.time)) }));
+  const temperatureUnit = forecast.units.temperature === 'celsius' ? '°C' : '°F';
+  const hasTemperature = data.some((entry) => entry.temperature !== null);
+  const hasPrecipitationData = data.some((entry) => entry.precipitationAmount !== null);
+  const hasPrecipitation = data.some(
+    (entry) => entry.precipitationAmount !== null && entry.precipitationAmount !== 0,
+  );
   return (
     <section aria-label="Hourly forecast">
       <h5>Hourly forecast</h5>
-      <div className="weather-chart" role="img" aria-label="Hourly forecast temperature chart">
-        <ResponsiveContainer width="100%" height="100%">
-          <LineChart data={data}>
-            <XAxis dataKey="label" minTickGap={25} />
-            <YAxis width={36} />
-            <Tooltip />
-            <Line
-              type="monotone"
-              dataKey="temperature"
-              stroke="var(--reply-chart-1)"
-              dot={false}
-              connectNulls={false}
-            />
-          </LineChart>
-        </ResponsiveContainer>
-      </div>
+      {hasTemperature ? (
+        <figure className="weather-chart" aria-label="Hourly forecast temperature chart">
+          <ResponsiveContainer width="100%" height="100%" minWidth={0}>
+            <LineChart data={data} margin={chartMargin}>
+              <CartesianGrid vertical={false} stroke="var(--border)" />
+              <XAxis {...timeAxis} />
+              <YAxis {...axisStyle} width="auto" domain={['auto', 'auto']} unit={temperatureUnit} />
+              <Tooltip isAnimationActive={false} contentStyle={tooltipStyle} />
+              <Line
+                type="monotone"
+                dataKey="temperature"
+                name="Temperature"
+                unit={temperatureUnit}
+                stroke="var(--reply-chart-1)"
+                strokeWidth={2}
+                dot={{ r: 2 }}
+                connectNulls={false}
+                isAnimationActive={false}
+              />
+            </LineChart>
+          </ResponsiveContainer>
+        </figure>
+      ) : (
+        <p>Hourly temperatures unavailable.</p>
+      )}
       <div className="weather-hourly">
         {data.map((entry) => (
           <div key={entry.time}>
@@ -85,17 +119,35 @@ function HourlyForecast({ forecast }: { forecast: Forecast }) {
           </div>
         ))}
       </div>
-      {data.some((entry) => entry.precipitationAmount !== null) && (
-        <div className="weather-chart" role="img" aria-label="Hourly precipitation chart">
-          <ResponsiveContainer width="100%" height="100%">
-            <BarChart data={data}>
-              <XAxis dataKey="label" minTickGap={25} />
-              <YAxis width={36} />
-              <Tooltip />
-              <Bar dataKey="precipitationAmount" fill="var(--reply-chart-2)" />
-            </BarChart>
-          </ResponsiveContainer>
-        </div>
+      {hasPrecipitationData && (
+        <>
+          <h6>Hourly precipitation</h6>
+          {hasPrecipitation ? (
+            <figure className="weather-chart" aria-label="Hourly precipitation chart">
+              <ResponsiveContainer width="100%" height="100%" minWidth={0}>
+                <BarChart data={data} margin={chartMargin}>
+                  <CartesianGrid vertical={false} stroke="var(--border)" />
+                  <XAxis {...timeAxis} />
+                  <YAxis {...axisStyle} width="auto" unit=" mm" />
+                  <Tooltip isAnimationActive={false} contentStyle={tooltipStyle} />
+                  <Bar
+                    dataKey="precipitationAmount"
+                    name="Precipitation"
+                    unit=" mm"
+                    fill="var(--reply-chart-2)"
+                    isAnimationActive={false}
+                  />
+                </BarChart>
+              </ResponsiveContainer>
+            </figure>
+          ) : (
+            <p>
+              {data.every((entry) => entry.precipitationAmount === 0)
+                ? '0 mm forecast for all shown hours.'
+                : '0 mm forecast for hours with precipitation data.'}
+            </p>
+          )}
+        </>
       )}
     </section>
   );

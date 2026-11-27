@@ -156,6 +156,88 @@ test('uses a cached native weather forecast in ordinary chat without browser act
   expect(events.some((item) => item.target.startsWith('browser.'))).toBe(false);
 });
 
+test('plots hourly weather data and labels dry forecasts in ordinary chat', async () => {
+  const now = Date.now();
+  const url = 'https://api.met.no/weatherapi/locationforecast/2.0/compact?lat=59.91&lon=10.75';
+  const location = { name: 'Oslo', latitude: 59.91, longitude: 10.75, timezone: 'Europe/Oslo' };
+  const timeseries = Array.from({ length: 48 }, (_, hour) => ({
+    time: new Date(now + hour * 60 * 60_000).toISOString(),
+    data: {
+      instant: { details: { air_temperature: hour - 6 } },
+      next_1_hours: { details: { precipitation_amount: hour === 3 ? 1.5 : 0 } },
+    },
+  }));
+  await fs.writeFile(
+    path.join(temporary, 'weather-cache-v1.json'),
+    JSON.stringify({
+      [url]: {
+        retrievedAt: now,
+        expires: now + 3 * 60 * 60_000,
+        body: { properties: { meta: { updated_at: timeseries[0].time }, timeseries } },
+      },
+    }),
+  );
+  await launch();
+
+  async function requestForecast(prompt: string, hourOffset: number) {
+    fixture.queueTool(prompt, 'find_capabilities', { query: '', ids: ['weather.hourly'] });
+    fixture.queueTool(prompt, 'load_capabilities', { ids: ['weather.hourly'] });
+    fixture.queueTool(prompt, 'weather_hourly', { location, hourOffset });
+    fixture.onToolResult(prompt, (value) => {
+      const result = value as { id?: string; data?: { provider?: string } };
+      if (result.id && result.data?.provider === 'MET Norway') {
+        const block = {
+          v: 1,
+          id: 'weather',
+          revision: 1,
+          roots: ['forecast'],
+          nodes: [{ id: 'forecast', type: 'weather', stepId: result.id, view: 'hourly' }],
+        };
+        fixture.finalReply(
+          prompt,
+          'Hourly forecast.\n\n```aria-ui\n' + JSON.stringify(block) + '\n```',
+        );
+      }
+      return undefined;
+    });
+    await send(prompt);
+    const answer = page.locator('.from-assistant').last();
+    await expect(answer).toHaveAttribute('data-status', 'completed');
+    return answer.locator('.weather-card');
+  }
+
+  const wet = await requestForecast('Show the first day of hourly weather.', 0);
+  const temperature = wet.getByRole('figure', { name: 'Hourly forecast temperature chart' });
+  const line = temperature.locator('.recharts-line-curve');
+  await expect(line).toBeVisible();
+  await expect(line).toHaveCSS('stroke', 'rgb(172, 145, 255)');
+  const precipitation = wet.getByRole('figure', { name: 'Hourly precipitation chart' });
+  const bar = precipitation.locator('.recharts-bar-rectangle path');
+  await expect(bar).toBeVisible();
+  await expect(bar).toHaveCSS('fill', 'rgb(65, 211, 191)');
+  await wet.scrollIntoViewIfNeeded();
+  await screenshot('chat-weather-charts-dark.png');
+
+  await page.getByRole('button', { name: 'Open settings', exact: true }).click();
+  await page
+    .getByRole('navigation', { name: 'Settings categories' })
+    .getByRole('button', { name: 'Appearance', exact: true })
+    .click();
+  await page.getByRole('button', { name: 'Light', exact: true }).click();
+  await page.getByRole('button', { name: 'Back to chat', exact: true }).click();
+  await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].setSize(1140, 940));
+  await page.getByRole('button', { name: 'Split', exact: true }).click();
+  await expect(line).toHaveCSS('stroke', 'rgb(118, 80, 217)');
+  await expect(bar).toHaveCSS('fill', 'rgb(8, 125, 115)');
+  await expect.poll(() => temperature.evaluate((node) => node.clientWidth)).toBeLessThan(500);
+  await wet.scrollIntoViewIfNeeded();
+  await screenshot('chat-weather-charts-light-split.png');
+
+  const dry = await requestForecast('Show the second day of hourly weather.', 24);
+  await expect(dry).toContainText('0 mm forecast for all shown hours.');
+  await expect(dry.getByRole('figure', { name: 'Hourly precipitation chart' })).toHaveCount(0);
+});
+
 test('persists weather settings in the desktop profile', async () => {
   await launch(false);
   await page.getByRole('button', { name: 'Open settings', exact: true }).click();
