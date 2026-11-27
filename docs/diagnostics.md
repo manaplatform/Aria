@@ -4,6 +4,8 @@ The managed desktop keeps structured JSON Lines events in `logs` under Electron'
 
 The shared event contract supports request, conversation, execution, generation, parent and operation identifiers. The managed chat service checks child events against its active request before accepting them. Model calls and Conductor tool activity use that scope. The live viewer and diagnostic export receive validated events, never raw stream data. Tool activity is recorded independently of its renderer presentation. Temporary-chat events remain in a bounded in-memory buffer and are discarded on conversation removal or shutdown; exports exclude them.
 
+Conductor web and browser events include the operation phase and structured failure code when available. A browser failure can be traced to its preceding phases using the operation ID.
+
 Only fixed structural metadata is accepted. Exception messages and paths are not persisted: error frames retain line and column only, and cause chains retain approved error codes. No raw prompts, model responses, tool arguments, shell output, file content, screenshots, credentials, or hidden reasoning are recorded. Exports pseudonymize context identifiers. Users must still review any diagnostic bundle before sharing it.
 
 Settings control filtering and retention. Debug and trace are off by default. The legacy `info`, `warn` or `error` preference initializes the diagnostic level when no diagnostic configuration exists. Queue overflow and persistence errors are reported in Settings; logging failures do not abort the work being observed.

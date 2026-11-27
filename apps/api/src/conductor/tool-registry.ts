@@ -1089,7 +1089,7 @@ export class ToolRegistry {
         description: researchDescriptions[op],
         input: z.strictObject({
           args: researchToolArgs[op], ...withDependencies,
-          retryOf: z.uuid().optional().describe('Execution ID of the prior failed attempt, only when it is marked retryable.'),
+          retryOf: z.uuid().optional().describe('Copy retry.attemptId from the latest eligible failed result, after its retry delay or a fresh tab observation. Reuse the same arguments. Omit for a new operation.'),
         }),
         capability: op === 'web_search' ? 'web-search' : op,
         output: op === 'browser_screenshot' ? 'image' : op === 'web_read' ? 'text' : 'data',

@@ -154,9 +154,11 @@ export class ConductorLoopExecutor {
         if (!activity.privateContent && activity.status === 'completed') {
           for (const source of activity.sources ?? []) if (source.id) presentationSources.add(source.id);
         }
+        const research = /^(?:browser|web)\./.test(activity.target);
         diagnostic(activity.status === 'failed' ? 'error' : 'info', 'conductor', 'tool', `tool.${activity.status}`,
           { ...diagnosticContext, operationId: activity.stepId, parentOperationId: activity.parentStepId ?? requestId },
-          { capability: activity.capability, status: activity.status, durationMs: activity.durationMs });
+          { capability: activity.capability, status: activity.status, durationMs: activity.durationMs,
+            ...(research && { phase: activity.phase, code: activity.failureCategory }) });
         session?.activity(activity);
       }
       forward(event);
@@ -415,6 +417,7 @@ export class ConductorLoopExecutor {
         ...(context.research.native && !context.privateContent && !context.temporary
           ? [
               `Web and browser turn limits: up to ${context.research.policy.searches} searches, ${context.research.policy.fetches} page fetches, and ${context.research.policy.screenshots} browser screenshots. Plan focused queries and reuse observed results rather than repeating searches.`,
+              'For a research retry, copy retry.attemptId into retryOf, keep the same arguments, and respect the reported delay or required fresh tab observation. Omit retryOf for changed arguments. A failed search provides no sources. Fetch or open only exact user-supplied destinations or sources from completed dependencies.',
             ]
           : []),
         `Preference: ${registry.config.preference}. Available namespaces: ${namespaces.join('; ') || 'none'}.`,

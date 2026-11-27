@@ -332,6 +332,12 @@ function execute(command: Command) {
   }
   if (command.op === 'search-results') {
     const results: { url: string; title: string; snippet?: string }[] = [];
+    const bing = location.hostname === 'bing.com' || location.hostname.endsWith('.bing.com');
+    const captchaDetected = Boolean(document.querySelector(
+      '[data-testid="captcha"], .cf-turnstile, iframe[src*="captcha"], iframe[src*="turnstile"], iframe[src*="hcaptcha"], iframe[src*="recaptcha"], #b_captcha, .b_captcha',
+    )) || /verify (?:that )?you are human|complete the (?:security|captcha) check|unusual traffic/i.test(
+      document.body?.innerText?.slice(0, 2000) ?? '',
+    );
     const decodeSearchUrl = (rawHref: string): string | undefined => {
       try {
         const parsed = new URL(rawHref);
@@ -388,10 +394,22 @@ function execute(command: Command) {
       });
       if (results.length === 8) break;
     }
-    if (!results.length) {
+    if (bing && !results.length) {
+      const bingContent = document.querySelector<HTMLElement>('#b_content');
+      // Bing ships organic links in its HTML before the results container is revealed.
+      const stagedResults = !captchaDetected && bingContent?.style.visibility === 'hidden'
+        ? bingContent.querySelector('#b_results') : null;
+      const stagedLink = (anchor: HTMLAnchorElement, item: Element) => {
+        if (!stagedResults || item.parentElement !== stagedResults || !anchor.getClientRects().length ||
+            anchor.closest('[hidden], [inert], [aria-hidden="true"]')) return false;
+        for (let node: HTMLElement | null = anchor; node && node !== bingContent; node = node.parentElement) {
+          if (['hidden', 'collapse'].includes(node.style.visibility)) return false;
+        }
+        return true;
+      };
       for (const item of document.querySelectorAll('li.b_algo')) {
         const anchor = item.querySelector<HTMLAnchorElement>('h2 a[href], .b_title a[href]');
-        if (!anchor || !visible(anchor)) continue;
+        if (!anchor || (!visible(anchor) && !stagedLink(anchor, item))) continue;
         const resolvedUrl = decodeSearchUrl(anchor.href);
         if (!resolvedUrl || new URL(resolvedUrl).origin === location.origin ||
             results.some((result) => result.url === resolvedUrl)) continue;
@@ -417,7 +435,7 @@ function execute(command: Command) {
     }
     const bNo = document.querySelector('.b_no');
     const searchEmpty = !results.length && (
-      Boolean(location.hostname.endsWith('.bing.com') && bNo && visible(bNo)) ||
+      Boolean(bing && bNo && visible(bNo)) ||
       [...document.querySelectorAll('h1, h2, [role="heading"]')].some(
         (heading) =>
           /^no (?:search )?results(?: found)?[.!]?$|^there are no results for\b/i.test(
@@ -425,17 +443,7 @@ function execute(command: Command) {
           ) && visible(heading),
       )
     );
-    const captchaDetected =
-      !results.length &&
-      (Boolean(
-        document.querySelector(
-          '[data-testid="captcha"], .cf-turnstile, iframe[src*="captcha"], iframe[src*="turnstile"], iframe[src*="hcaptcha"], iframe[src*="recaptcha"], #b_captcha, .b_captcha',
-        ),
-      ) ||
-        /verify (?:that )?you are human|complete the (?:security|captcha) check|unusual traffic/i.test(
-          document.body?.innerText?.slice(0, 2000) ?? '',
-        ));
-    return { results, searchEmpty, ...(captchaDetected ? { captchaDetected: true } : {}) };
+    return { results, searchEmpty, ...(captchaDetected && !results.length && { captchaDetected: true }) };
   }
   if (command.op === 'selected')
     return { selected: window.getSelection()?.toString().slice(0, 4000) || '' };
@@ -689,9 +697,9 @@ export async function inspectPage(contents: WebContents, command: Command) {
   return parseInspection(raw);
 }
 
-export async function inspectWhileLoading(contents: WebContents, command: Command, signal: AbortSignal) {
+export async function inspectWithDebugger(contents: WebContents, command: Command, signal: AbortSignal) {
   if (command.op !== 'read-view' && command.op !== 'search-results')
-    throw new Error('Only fixed read operations may inspect an unfinished document.');
+    throw new Error('Only fixed read operations may use this inspection path.');
   signal.throwIfAborted();
   const client = contents.debugger;
   if (client.isAttached()) throw new Error('The browser tab is already under inspection.');

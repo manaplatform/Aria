@@ -337,6 +337,54 @@ it('charges a launched search timeout, blocks a blind repeat, and still opens th
   }));
 });
 
+it('returns the eligible search attempt ID and keeps it bound to the same query', async () => {
+  let searches = 0;
+  const { browserOps } = installRuntime({
+    onBrowser() {
+      if (++searches === 1)
+        throw { code: 'TIMEOUT', message: 'Search response timed out.', retryAfterMs: 0, sent: true };
+      return { ok: true, text: JSON.stringify({ results: [{ url: 'https://example.org/', title: 'Example' }] }) };
+    },
+  });
+  const prompt = 'Search for public examples';
+  const ids = ['web.web_search'];
+  fixture.queueTool(prompt, 'find_capabilities', { query: '', ids });
+  fixture.queueTool(prompt, 'load_capabilities', { ids });
+  const search = (query: string, retryOf?: string) => ({
+    name: 'web_web_search', input: { args: { query }, retryOf },
+  });
+  const query = 'public example domains';
+  fixture.queueTool(prompt, 'web_web_search', search(query).input);
+  const responses: { id: string; retry?: { attemptId: string } }[] = [];
+  fixture.onToolResult(prompt, (raw) => {
+    const result = raw as (typeof responses)[number];
+    if (!result.id) return undefined;
+    responses.push(result);
+    switch (responses.length) {
+      case 1:
+        return search('different query', result.retry?.attemptId ?? result.id);
+      case 2:
+        return search(query, result.id);
+      case 3:
+        return search(query, result.retry?.attemptId ?? responses[0].id);
+      default:
+        return undefined;
+    }
+  });
+  fixture.finalReply(prompt, 'The example results are available.');
+  const result = await runChat([{ role: 'user', content: prompt }]);
+  const retry = { eligible: true, attemptId: responses[0]?.id, afterMs: 0 };
+  expect(responses).toMatchObject([
+    { problem: { category: 'TIMEOUT' }, retry },
+    { problem: { category: 'RETRY_REFERENCE_INVALID' } },
+    { problem: { category: 'RETRY_REFERENCE_INVALID' }, retry },
+    { status: 'completed', data: { status: 'results' } },
+  ]);
+  expect(responses[1].retry).toBeUndefined();
+  expect(browserOps).toEqual(['web_search', 'web_search']);
+  expect(result.events.at(-1)).toMatchObject({ type: 'completed', run: { usage: { searches: 2 } } });
+});
+
 it('answers simple questions directly in one provider call with zero tools', async () => {
   installRuntime();
   const prompt = 'What is 2 + 2?';
