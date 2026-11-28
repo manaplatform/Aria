@@ -60,11 +60,25 @@ interface ActiveRequest {
   controller: AbortController;
   stopped: boolean;
   privateRuntimeContent?: boolean;
+  restrictedShellContent?: boolean;
   sequence: number;
   length: number;
   done: Promise<void>;
   emit: (event: ChatEvent) => void;
 }
+
+const maxRecentDiagnosticTurns = 128;
+const diagnosticTurnRetentionMs = 30_000;
+
+function diagnosticTurnScope(request: ChatRequest) {
+  return {
+    conversationId: request.conversationId,
+    executionId: request.execution?.executionId,
+    generation: request.execution?.generation,
+    temporary: request.memory?.temporary === true,
+  };
+}
+
 export class ChatService {
   onDiagnostic?: (event: DiagnosticEvent, temporary: boolean) => void;
   private diagnosticConfig?: DiagnosticConfig;
@@ -83,6 +97,9 @@ export class ChatService {
   private runtimeProviderKey?: string;
   private starting?: Promise<void>;
   private requests = new Map<string, ActiveRequest>();
+  private readonly recentDiagnosticTurns = new Map<
+    string, ReturnType<typeof diagnosticTurnScope> & { expiresAt: number }
+  >();
   private status: ChatServiceStatus = { state: 'starting', configured: false, model: '' };
   constructor(
     private readonly provider: ProviderStorage,
@@ -122,6 +139,7 @@ export class ChatService {
   }
   private async boot(): Promise<void> {
     const generation = ++this.generation;
+    this.recentDiagnosticTurns.clear();
     this.setStatus({ state: 'starting', configured: false, model: '' });
     try {
       let registry: RuntimeRegistry;
@@ -173,11 +191,19 @@ export class ChatService {
         const parsed = diagnosticEventSchema.safeParse(message.entry);
         if (!parsed.success) return;
         const context = parsed.data.context;
-        const turn = context.requestId && this.requests.get(context.requestId);
-        if (!turn || turn.request.conversationId !== context.conversationId ||
-            turn.request.execution?.executionId !== context.executionId ||
-            turn.request.execution?.generation !== context.generation) return;
-        this.onDiagnostic?.(parsed.data, turn.request.memory?.temporary === true);
+        if (!context.requestId) return;
+        const active = this.requests.get(context.requestId);
+        const recent = active ? undefined : this.recentDiagnosticTurns.get(context.requestId);
+        const turn = active ? diagnosticTurnScope(active.request) : recent;
+        if (
+          !turn ||
+          (recent && recent.expiresAt <= performance.now()) ||
+          turn.conversationId !== context.conversationId ||
+          turn.executionId !== context.executionId ||
+          turn.generation !== context.generation
+        )
+          return;
+        this.onDiagnostic?.(parsed.data, turn.temporary);
       });
       const native = this.browser?.open((request) => {
         const turn = this.requests.get(request.requestId);
@@ -256,6 +282,7 @@ export class ChatService {
         capabilityPort?.close();
         if (generation !== this.generation) return;
         ++this.generation;
+        this.recentDiagnosticTurns.clear();
         this.child = undefined;
         this.url = '';
         this.requests.forEach((request) => request.controller.abort());
@@ -359,6 +386,7 @@ export class ChatService {
       done: Promise.resolve(),
       emit,
     };
+    this.recentDiagnosticTurns.delete(request.requestId);
     this.requests.set(request.requestId, active);
     const abort = () => active.controller.abort();
     signal?.addEventListener('abort', abort, { once: true });
@@ -408,9 +436,16 @@ export class ChatService {
     const turn = this.requests.get(id);
     return !turn || turn.privateRuntimeContent === true || turn.request.programPrivateHistory === true || turn.request.memory?.privateHistory === true;
   }
-  markPrivateRuntimeContent(id: string) {
+  restrictedLocalShellContext(id: string) {
     const turn = this.requests.get(id);
-    if (turn) turn.privateRuntimeContent = true;
+    return !turn || turn.restrictedShellContent === true || turn.request.memory?.privateHistory === true;
+  }
+  markPrivateRuntimeContent(id: string, restrictLocalShell = false) {
+    const turn = this.requests.get(id);
+    if (turn) {
+      turn.privateRuntimeContent = true;
+      if (restrictLocalShell) turn.restrictedShellContent = true;
+    }
   }
 
   async runProactive(input: ProactiveRequest, signal: AbortSignal, emit: (event: ChatEvent) => void) {
@@ -441,6 +476,7 @@ export class ChatService {
 
   private async consume(active: ActiveRequest): Promise<void> {
     const { request, controller } = active;
+    const generation = this.generation;
     let terminal = false;
     let failure = 'The response was interrupted. Check the connection and send it again.';
     const artifacts = new Map<string, string>();
@@ -566,6 +602,17 @@ export class ChatService {
         });
       controller.abort();
       this.requests.delete(request.requestId);
+      // The terminal SSE event can arrive before diagnostics sent over utility-process IPC.
+      if (generation === this.generation) {
+        this.recentDiagnosticTurns.set(request.requestId, {
+          ...diagnosticTurnScope(request),
+          expiresAt: performance.now() + diagnosticTurnRetentionMs,
+        });
+        if (this.recentDiagnosticTurns.size > maxRecentDiagnosticTurns) {
+          const oldest = this.recentDiagnosticTurns.keys().next().value;
+          if (oldest !== undefined) this.recentDiagnosticTurns.delete(oldest);
+        }
+      }
       this.capabilities?.release?.(request.requestId);
       void this.releaseAssets(request.requestId);
     }
@@ -676,6 +723,7 @@ export class ChatService {
   }
   async close(): Promise<void> {
     ++this.generation;
+    this.recentDiagnosticTurns.clear();
     await this.interruptAll();
     this.browserSession?.close();
     this.capabilitySession?.close();

@@ -2,7 +2,9 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { describe, expect, it } from 'vitest';
+import { LocalShell, localShellSupported } from '../electron/runtime/local-shell';
 import { DockerSandbox } from '../electron/runtime/sandbox';
 import { RuntimeStore } from '../electron/runtime/store';
 import { Knowledge, textPassages } from '../electron/runtime/knowledge';
@@ -150,6 +152,29 @@ describe('durable runtime', () => {
 });
 
 const docker = process.env.ARIA_TEST_DOCKER_ENDPOINT;
+
+it.skipIf(!localShellSupported)('captures partial native output and stops child processes on timeout', async () => {
+  const profile = await mkdtemp(path.join(tmpdir(), 'aria-local-shell-'));
+  const shell = new LocalShell(profile);
+  const id = randomUUID();
+  const signal = AbortSignal.timeout(5000);
+  try {
+    await shell.create(id, signal);
+    const result = await shell.run(
+      id,
+      'printf started; (sleep 1; printf too-late > ../outputs/late.txt) & wait',
+      signal,
+      400,
+    );
+    expect(result).toMatchObject({ timedOut: true, recycled: true });
+    expect(result.stdout.toString()).toBe('started');
+    await sleep(1000);
+    await expect(shell.output(id, 'late.txt', signal)).rejects.toMatchObject({ code: 'INVALID_ARGUMENT' });
+  } finally {
+    await rm(profile, { recursive: true, force: true });
+  }
+});
+
 describe.skipIf(!docker)('real Aria sandbox', () => {
   it('exchanges bounded Computer Use messages with a separate offline Python process', async () => {
     const sandbox = new DockerSandbox(docker!);

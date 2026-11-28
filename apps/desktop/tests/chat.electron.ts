@@ -1,5 +1,6 @@
 import { test, expect } from '@playwright/test';
 import { _electron as electron, type ElectronApplication, type Page } from 'playwright';
+import type { MessageBoxOptions } from 'electron';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -9,6 +10,7 @@ import type { ExecutionStep } from '@aria/shared';
 
 const root = path.resolve(__dirname, '..');
 const screenshots = path.join(root, '.artifacts/screenshots');
+const managedTurnTimeout = 15_000;
 let fixture: Awaited<ReturnType<typeof createProviderFixture>>;
 let app: ElectronApplication;
 let page: Page;
@@ -154,6 +156,88 @@ test('uses a cached native weather forecast in ordinary chat without browser act
   const events = await page.evaluate(async () => (await window.aria!.load()).data.chat.messages.at(-1)?.activity ?? []);
   expect(events.some((item) => item.target === 'weather.current' && item.status === 'completed')).toBe(true);
   expect(events.some((item) => item.target.startsWith('browser.'))).toBe(false);
+});
+
+test('plots hourly weather data and labels dry forecasts in ordinary chat', async () => {
+  const now = Date.now();
+  const url = 'https://api.met.no/weatherapi/locationforecast/2.0/compact?lat=59.91&lon=10.75';
+  const location = { name: 'Oslo', latitude: 59.91, longitude: 10.75, timezone: 'Europe/Oslo' };
+  const timeseries = Array.from({ length: 48 }, (_, hour) => ({
+    time: new Date(now + hour * 60 * 60_000).toISOString(),
+    data: {
+      instant: { details: { air_temperature: hour - 6 } },
+      next_1_hours: { details: { precipitation_amount: hour === 3 ? 1.5 : 0 } },
+    },
+  }));
+  await fs.writeFile(
+    path.join(temporary, 'weather-cache-v1.json'),
+    JSON.stringify({
+      [url]: {
+        retrievedAt: now,
+        expires: now + 3 * 60 * 60_000,
+        body: { properties: { meta: { updated_at: timeseries[0].time }, timeseries } },
+      },
+    }),
+  );
+  await launch();
+
+  async function requestForecast(prompt: string, hourOffset: number) {
+    fixture.queueTool(prompt, 'find_capabilities', { query: '', ids: ['weather.hourly'] });
+    fixture.queueTool(prompt, 'load_capabilities', { ids: ['weather.hourly'] });
+    fixture.queueTool(prompt, 'weather_hourly', { location, hourOffset });
+    fixture.onToolResult(prompt, (value) => {
+      const result = value as { id?: string; data?: { provider?: string } };
+      if (result.id && result.data?.provider === 'MET Norway') {
+        const block = {
+          v: 1,
+          id: 'weather',
+          revision: 1,
+          roots: ['forecast'],
+          nodes: [{ id: 'forecast', type: 'weather', stepId: result.id, view: 'hourly' }],
+        };
+        fixture.finalReply(
+          prompt,
+          'Hourly forecast.\n\n```aria-ui\n' + JSON.stringify(block) + '\n```',
+        );
+      }
+      return undefined;
+    });
+    await send(prompt);
+    const answer = page.locator('.from-assistant').last();
+    await expect(answer).toHaveAttribute('data-status', 'completed');
+    return answer.locator('.weather-card');
+  }
+
+  const wet = await requestForecast('Show the first day of hourly weather.', 0);
+  const temperature = wet.getByRole('figure', { name: 'Hourly forecast temperature chart' });
+  const line = temperature.locator('.recharts-line-curve');
+  await expect(line).toBeVisible();
+  await expect(line).toHaveCSS('stroke', 'rgb(172, 145, 255)');
+  const precipitation = wet.getByRole('figure', { name: 'Hourly precipitation chart' });
+  const bar = precipitation.locator('.recharts-bar-rectangle path');
+  await expect(bar).toBeVisible();
+  await expect(bar).toHaveCSS('fill', 'rgb(65, 211, 191)');
+  await wet.scrollIntoViewIfNeeded();
+  await screenshot('chat-weather-charts-dark.png');
+
+  await page.getByRole('button', { name: 'Open settings', exact: true }).click();
+  await page
+    .getByRole('navigation', { name: 'Settings categories' })
+    .getByRole('button', { name: 'Appearance', exact: true })
+    .click();
+  await page.getByRole('button', { name: 'Light', exact: true }).click();
+  await page.getByRole('button', { name: 'Back to chat', exact: true }).click();
+  await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].setSize(1140, 940));
+  await page.getByRole('button', { name: 'Split', exact: true }).click();
+  await expect(line).toHaveCSS('stroke', 'rgb(118, 80, 217)');
+  await expect(bar).toHaveCSS('fill', 'rgb(8, 125, 115)');
+  await expect.poll(() => temperature.evaluate((node) => node.clientWidth)).toBeLessThan(500);
+  await wet.scrollIntoViewIfNeeded();
+  await screenshot('chat-weather-charts-light-split.png');
+
+  const dry = await requestForecast('Show the second day of hourly weather.', 24);
+  await expect(dry).toContainText('0 mm forecast for all shown hours.');
+  await expect(dry.getByRole('figure', { name: 'Hourly precipitation chart' })).toHaveCount(0);
 });
 
 test('persists weather settings in the desktop profile', async () => {
@@ -716,16 +800,24 @@ test('configures a provider in Settings using native encrypted storage and resto
   expect(saved).not.toContain('test-only-key');
   expect(JSON.parse(saved).connections[0].encryptedKey).toBeTruthy();
   await page.getByRole('button', { name: 'Back to chat', exact: true }).click();
+  const received = fixture.received.length;
   await send('Use my saved provider');
-  await expect(page.locator('.from-assistant[data-status="completed"]')).toHaveCount(1);
-  expect(fixture.received.at(-1)?.body.messages[0]).toMatchObject({
+  // A managed turn saves the conversation before contacting the provider.
+  const completed = '.from-assistant[data-status="completed"]';
+  await expect(page.locator(completed)).toHaveCount(1, { timeout: managedTurnTimeout });
+  const firstRequest = fixture.received[received];
+  expect(firstRequest?.body.messages.at(-1)).toMatchObject({
+    role: 'user',
+    content: 'Use my saved provider',
+  });
+  expect(firstRequest?.body.messages[0]).toMatchObject({
     role: 'system',
     content: expect.stringContaining('Give useful answers.'),
   });
   await app.close();
   await launch(false, false, true);
   await send('The saved key still works');
-  await expect(page.locator('.from-assistant[data-status="completed"]')).toHaveCount(2);
+  await expect(page.locator(completed)).toHaveCount(2, { timeout: managedTurnTimeout });
 });
 
 test('verifies remote embeddings separately from runtime settings', async () => {
@@ -1015,7 +1107,10 @@ test('cancels delegated generation and labels another billed attempt explicitly'
     ],
   });
   await send('Generate a harbor');
-  await expect(page.locator('.from-assistant[data-status="failed"]')).toHaveCount(1);
+  await expect(page.locator('.from-assistant').last()).toHaveAttribute('data-status', 'failed', {
+    timeout: managedTurnTimeout,
+  });
+  expect(fixture.mediaReceived).toHaveLength(count + 2);
   await expect(page.getByRole('alert')).not.toContainText('secret-response-text');
   await expect(page.getByRole('button', { name: 'Send again', exact: true })).toBeVisible();
   await app.close();
@@ -1030,6 +1125,7 @@ test('cancels delegated generation and labels another billed attempt explicitly'
   await page.getByRole('button', { name: 'Send again', exact: true }).click();
   await expect(page.getByRole('alert')).toContainText(
     'An earlier dispatch may already have taken effect',
+    { timeout: managedTurnTimeout },
   );
   expect(fixture.mediaReceived).toHaveLength(count + 2);
 });
@@ -1646,7 +1742,7 @@ test('keeps direct chat lazy and explains an unavailable sandbox', async () => {
 
   const prompt = 'Run a numerical calculation in the execution workspace';
   scriptRuntime(prompt, ['shell.inspect'], (result, step) => {
-    if (!step) return { name: 'shell_inspect', input: {} };
+    if (!step) return { name: 'shell_inspect', input: { backend: 'managed' } };
     const problem = result.problem as { code?: string } | undefined;
     if (problem?.code === 'CAPABILITY_UNAVAILABLE')
       fixture.finalReply(
@@ -1661,6 +1757,61 @@ test('keeps direct chat lazy and explains an unavailable sandbox', async () => {
   await expect(
     page.locator('.from-assistant').getByRole('button', { name: 'Save file', exact: true }),
   ).toHaveCount(0);
+});
+
+test('runs approved local Shell commands in ordinary chat without a Docker endpoint', async () => {
+  test.skip(process.platform !== 'darwin' && process.platform !== 'linux', 'Requires the native POSIX shell.');
+  await launch();
+  expect((await page.evaluate(() => window.aria!.runtimeSettings())).engineSocket).toBe('');
+  await app.evaluate(({ dialog }) => {
+    dialog.showMessageBox = async (_window, options?: MessageBoxOptions) => {
+      const approve = options?.message === 'Run a command on this desktop?' &&
+        options.detail?.includes('printf approved > ../outputs/approved.txt') &&
+        options.buttons?.join(',') === 'Decline,Allow once';
+      return { response: approve ? 1 : 0, checkboxChecked: false };
+    };
+  });
+  const prompt = 'Run a command on this desktop and attach its output';
+  const command = 'printf approved > ../outputs/approved.txt; uname -s';
+  let sessionId = '';
+  scriptRuntime(prompt, ['shell.inspect', 'shell.open', 'shell.run', 'artifacts.publish'], (result, step) => {
+    if (step === 0) return { name: 'shell_inspect', input: {} };
+    if (step === 1) {
+      expect(result.data).toMatchObject({ backend: 'local', runtime: '/bin/sh', network: 'host' });
+      return { name: 'shell_open', input: { backend: 'local' } };
+    }
+    if (step === 2) {
+      const workspace = result.data as { sessionId: string };
+      expect(workspace).toMatchObject({ backend: 'local', workingDirectory: '.', outputDirectory: '../outputs' });
+      sessionId = workspace.sessionId;
+      return { name: 'shell_run', input: { sessionId, commands: [command] } };
+    }
+    if (step === 3) {
+      expect(result.data).toMatchObject({
+        results: [{ exitCode: 0, stdout: process.platform === 'darwin' ? 'Darwin\n' : 'Linux\n' }],
+      });
+      return { name: 'artifacts_publish', input: { sessionId, filename: 'approved.txt' } };
+    }
+    if (result.artifact) fixture.finalReply(prompt, 'Local command completed and the file is attached.');
+  });
+  await send(prompt);
+  await expect(page.locator('.from-assistant .markdown').last()).toContainText('Local command completed');
+  await expect(page.getByText(/approved.txt ·/)).toBeVisible();
+
+  const declined = 'Try another command on this desktop';
+  scriptRuntime(declined, ['shell.run'], (result, step) => {
+    if (step === 0)
+      return {
+        name: 'shell_run',
+        input: { sessionId, commands: ['printf denied > ../outputs/denied.txt'] },
+      };
+    expect(result.problem).toMatchObject({ code: 'PERMISSION_DENIED' });
+    fixture.finalReply(declined, 'The desktop command was declined.');
+  });
+  await send(declined);
+  await expect(page.locator('.from-assistant .markdown').last()).toContainText('The desktop command was declined.');
+  await expect(fs.access(path.join(temporary, 'local-shell', sessionId, 'outputs', 'denied.txt')))
+    .rejects.toMatchObject({ code: 'ENOENT' });
 });
 
 test('recalls memory across conversations and restart, then forgets it without rebuilding from chat history', async () => {

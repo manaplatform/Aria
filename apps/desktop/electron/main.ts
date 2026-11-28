@@ -96,6 +96,7 @@ import { DesktopMemory } from './memory/service';
 import { WorkingContext } from './memory/working-context';
 import { LoopRecovery } from './loop-recovery';
 import { DesktopRuntime } from './runtime/controller';
+import { localShellSupported } from './runtime/local-shell';
 import { ComputerRuntime } from './runtime/computer';
 import { VirtualComputer } from './runtime/virtual-computer';
 import { LocalComputer } from './runtime/local-computer';
@@ -1288,7 +1289,7 @@ function registerIpc(): void {
       return capabilities.verifyNativeRuntime(feature, proof);
     }, nativeRuntimeModes);
   });
-  handle('aria:probe-runtime', () => executionRuntime.inspect(AbortSignal.timeout(10_000)));
+  handle('aria:probe-runtime', () => executionRuntime.inspect(AbortSignal.timeout(10_000), 'managed'));
   handle('aria:local-embeddings', () => executionRuntime.embeddings.available());
   handle('aria:install-local-embeddings', async () => {
     chat.assertIdle();
@@ -2141,6 +2142,7 @@ app
       () => chat.executionIdentity(),
       () => provider.resolve(),
       cipher,
+      (requestId) => chat.restrictedLocalShellContext(requestId),
       () => initial.data.workspaces,
     );
     connectors = new ConnectorRegistry(connectorConfig, executionRuntime.store, cipher, {
@@ -2400,6 +2402,7 @@ app
           desktopRuntime: true,
           weatherEnabled: weather.settings().enabled,
           dockerConfigured: Boolean(executionRuntime.settings().engineSocket.trim()),
+          localShell: localShellSupported,
           workspacesCount: initial.data.workspaces.length,
           connectors: [
             {
@@ -2476,7 +2479,7 @@ app
                   live: () => Boolean(chat.authorizeRuntime(request) &&
                     (!job || proactive?.supervisor.live(request.requestId, request.conversationId))),
                 })).then(async (result) => {
-                  if (result.privateContent) chat.markPrivateRuntimeContent(request.requestId);
+                  if (result.privateContent) chat.markPrivateRuntimeContent(request.requestId, true);
                   if (job && result.privateContent) proactive?.markPrivate(job.jobId);
                   const evidence = githubResult.safeParse(result.data);
                   if (job && evidence.success && evidence.data.verified)
@@ -2526,8 +2529,12 @@ app
               }, () => {
                 const result = request.operation.startsWith('memory.') ? memory.dispatch(request, signal)
                   : request.operation.startsWith('computer.') ? computerRuntime.dispatch(request, signal)
-                  : executionRuntime.dispatch(request, signal);
-                return result.then((value) => { if (value.privateContent) chat.markPrivateRuntimeContent(request.requestId); return value; });
+                  : executionRuntime.dispatch(request, signal, () => progress('approval'));
+                return result.then((value) => {
+                  if (value.privateContent)
+                    chat.markPrivateRuntimeContent(request.requestId, request.operation.startsWith('memory.'));
+                  return value;
+                });
               });
             },
             (request, signal) => {

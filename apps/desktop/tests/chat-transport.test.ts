@@ -104,6 +104,8 @@ beforeEach(async () => {
       requestId: input.requestId,
       conversationId: mode === 'wrong' ? 'another-chat' : input.conversationId,
       assistantMessageId: input.assistantMessageId,
+      executionId: input.execution?.executionId,
+      generation: input.execution?.generation,
     };
     response.write(`data: ${JSON.stringify({ ...current, sequence: 1, type: 'started' })}\n\n`);
     response.write(
@@ -155,6 +157,71 @@ it('starts one managed service, streams once, and restarts without replaying mes
   await service.restart();
   expect(children).toHaveLength(2);
   expect(events.filter((event) => event.type === 'delta')).toHaveLength(1);
+});
+it('accepts a late temporary diagnostic only for its own turn and utility process', async () => {
+  const execution = {
+    executionId: '10000000-0000-4000-8000-000000000001',
+    generation: 1,
+    userMessageId: 'user',
+  };
+  const onDiagnostic = vi.fn();
+  service.onDiagnostic = onDiagnostic;
+  await service.start();
+  service.submit({
+    ...request,
+    execution,
+    memory: { enabled: false, suggestions: false, temporary: true },
+  });
+  await vi.waitFor(() => expect(events.at(-1)?.type).toBe('completed'));
+  expect(service.activeTurn(request)).toBeUndefined();
+  const context = {
+    requestId: request.requestId,
+    conversationId: request.conversationId,
+    executionId: execution.executionId,
+    generation: execution.generation,
+  };
+  const entry = {
+    version: 1,
+    id: '10000000-0000-4000-8000-000000000002',
+    timestamp: new Date().toISOString(),
+    level: 'info',
+    component: 'api',
+    subsystem: 'model',
+    event: 'model.completed',
+    message: 'model completed',
+    context,
+    processId: 1,
+    appVersion: 'managed',
+    metadata: {},
+  };
+  for (const mismatched of [
+    { requestId: 'another-request' },
+    { conversationId: 'another-chat' },
+    { executionId: 'another-execution' },
+    { generation: 2 },
+  ])
+    children[0].emit('message', {
+      type: 'diagnostic',
+      entry: { ...entry, context: { ...context, ...mismatched } },
+    });
+  expect(onDiagnostic).not.toHaveBeenCalled();
+
+  const message = { type: 'diagnostic', entry };
+  children[0].emit('message', message);
+  expect(onDiagnostic).toHaveBeenCalledExactlyOnceWith(entry, true);
+
+  const clock = vi.spyOn(performance, 'now').mockReturnValue(performance.now() + 31_000);
+  try {
+    children[0].emit('message', message);
+    expect(onDiagnostic).toHaveBeenCalledTimes(1);
+  } finally {
+    clock.mockRestore();
+  }
+
+  await service.restart();
+  children[0].emit('message', message);
+  children[1].emit('message', message);
+  expect(onDiagnostic).toHaveBeenCalledTimes(1);
 });
 it('forwards main-owned private-history metadata while rejecting it at the renderer boundary', async () => {
   const managedRequest = { ...request, programPrivateHistory: true };
